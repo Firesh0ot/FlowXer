@@ -187,3 +187,31 @@ python scripts/generate_stinger.py --dest storage/stingers/replay-wipe
 ## License
 
 Apache-2.0. MXL is Apache-2.0; GStreamer plugins remain under their upstream licenses.
+
+## Branches and releases
+
+FlowXer uses three long-lived branches. Version numbers are **(merges to main).(promotions to stage).(pushes to dev)** and live in `VERSION`.
+
+```
+dev  →  stage  →  main
+code     test       container
+```
+
+| Branch | What you do | Automation |
+|--------|-------------|------------|
+| **dev** | Write code. Open PRs into `dev`. | Push increments the **patch** (code) counter. Tests run on the PR (`ci.yml`). |
+| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. |
+| **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, and publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`. |
+
+Example: `1.4.12` means 1 production release, 4 stage promotions, 12 coding pushes since the counters started.
+
+### Cursor environment on stage
+
+Two options (both are valid):
+
+1. **GitHub secret `CURSOR_API_KEY`** — `stage.yml` calls `https://api.cursor.com/v1/agents` with `startingRef: stage`.
+2. **Cursor Automation** — [cursor.com/automations](https://cursor.com/automations), trigger **Push to branch: `stage`**. Prompt is in `.cursor/automations/stage-test.md`.
+
+Rebuilding a Cursor *environment snapshot* on every stage push is the wrong lever (that snapshot is for agent VM setup). The automation/agent **uses** that environment to run the tests.
+
+Do not merge `dev` straight to `main`. Stage is the test gate; main is the container release.

@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from flowxer import __version__
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -19,7 +20,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 9610
     title: str = "FlowXer Vision Mixer"
-    version: str = "0.1.0"
+    version: str = __version__
 
     mxl_domain: Path = Path("./data/mxl-domain")
     storage_root: Path = Path("./storage")
