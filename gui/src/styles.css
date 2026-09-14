@@ -79,6 +79,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .transition-bank .ftb { background: #121212; border-color: #444; }
 .transition-bank .wipe { background: #2a2410; border-color: #6a5a20; }
 .transition-bank .wipe.armed { outline: 2px solid #e0b025; background: #4a3a12; }
+.transition-bank .wipe.playing, .transition-bank .cut.sting { outline: 2px solid #2ec4ff; }
 .transition-bank button:hover { filter: brightness(1.15); }
 .source-tile { background: var(--panel); border: 1px solid var(--line); min-width: 180px; }
 .source-tile header {

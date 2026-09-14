@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -66,6 +67,8 @@ class VisionMixer:
         self.gst: GstRuntime | None = None
         self.stinger_player: StingerPlayer | None = None
         self.last_transition: str = "cut"
+        self._lock = threading.RLock()
+        self._stinger_clock: threading.Thread | None = None
         self.overlay = Html5Overlay(
             url=settings.overlay_url,
             cache_dir=settings.graphics_dir,
@@ -636,7 +639,8 @@ class VisionMixer:
         if self.state != MixerState.running:
             self.start(MixerStartRequest())
         if self.stinger_player and not self.stinger_player.done:
-            raise MixerError("a stinger is already playing")
+            remaining = self.stinger_player.info.frame_count - self.stinger_player.frame + 1
+            self.advance_stinger(max(remaining, 1))
         info = self.get_stinger(stinger_id)
         self.get_input(target_input_id)
         if direction is None:
@@ -657,6 +661,7 @@ class VisionMixer:
             self.gst.set_compositor_alpha("sink_2", 1.0)
         # Advance to first frame so status reports "playing".
         self.advance_stinger(1)
+        self._arm_stinger_clock()
         return self.status()
 
     def advance_stinger(self, frames: int = 1) -> MixerStatus:
@@ -694,6 +699,26 @@ class VisionMixer:
                 self.gst.set_compositor_alpha("sink_2", 0.0)
             self.stinger_player = None
         return self.status()
+
+    def _arm_stinger_clock(self) -> None:
+        """Advance the TGA FSM in simulate (and when no GST pad probe is ticking)."""
+        if not self.settings.stinger_auto_tick:
+            return
+        if self._stinger_clock is not None and self._stinger_clock.is_alive():
+            return
+
+        def tick() -> None:
+            delay = 1.0 / max(self.settings.fps, 1.0)
+            while True:
+                time.sleep(delay)
+                if self.stinger_player is None:
+                    return
+                self.advance_stinger(1)
+                if self.stinger_player is None:
+                    return
+
+        self._stinger_clock = threading.Thread(target=tick, daemon=True, name="stinger-clock")
+        self._stinger_clock.start()
 
     def set_overlay(self, **kwargs) -> MixerStatus:
         self.overlay.update(**kwargs)

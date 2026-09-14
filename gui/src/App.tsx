@@ -27,11 +27,22 @@ export default function App() {
     }
   };
 
+  const command = async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "command failed");
+    }
+  };
+
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 1000);
+    const stinging =
+      snapshot?.mixer.stinger.phase === "playing" || snapshot?.mixer.stinger.phase === "cut";
+    const timer = window.setInterval(() => void refresh(), stinging ? 200 : 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [snapshot?.mixer.stinger.phase]);
 
   if (!snapshot) {
     return <div className="boot">{error ?? "Connecting to vision mixer…"}</div>;
@@ -179,18 +190,19 @@ export default function App() {
               input={input}
               panel={panel}
               webrtc={webrtc}
-              onPreview={() => void api.preview(input.id, panel.id).then(refresh)}
-              onProgram={() => void api.take(input.id, panel.id).then(refresh)}
+              onPreview={() => void command(() => api.preview(input.id, panel.id))}
+              onProgram={() => void command(() => api.take(input.id, panel.id))}
               onSettings={() => setSourceEdit(input)}
             />
           ))}
         </div>
         <TransitionBank
           panel={panel}
-          onCut={() => void api.cut(panel.id).then(refresh)}
-          onFade={() => void api.fade(panel.id).then(refresh)}
-          onFadeToBlack={() => void api.fadeToBlack(panel.id).then(refresh)}
-          onWipe={() => void api.wipe(panel.id).then(refresh)}
+          stingerPhase={snapshot.mixer.stinger.phase}
+          onCut={() => void command(() => api.cut(panel.id))}
+          onFade={() => void command(() => api.fade(panel.id))}
+          onFadeToBlack={() => void command(() => api.fadeToBlack(panel.id))}
+          onWipe={() => void command(() => api.wipe(panel.id))}
         />
       </section>
 

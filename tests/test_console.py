@@ -1,3 +1,5 @@
+import time
+
 from fastapi.testclient import TestClient
 
 from flowxer.api.schemas import MixerStartRequest, WorkspaceUpdate
@@ -116,6 +118,20 @@ def test_wipe_arms_stinger_for_next_cut(mixer: VisionMixer) -> None:
     mixer.advance_stinger(remaining)
     assert mixer.program_input_id == "cam-2"
     assert mixer.preview_input_id == "cam-3"
+
+
+def test_wipe_cut_auto_ticks_stinger(mixer: VisionMixer) -> None:
+    mixer.settings.stinger_auto_tick = True
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.set_wipe()
+    mixer.cut()
+    deadline = time.time() + 2
+    while mixer.stinger_player is not None and time.time() < deadline:
+        time.sleep(0.02)
+    assert mixer.stinger_player is None
+    assert mixer.program_input_id == "cam-2"
+    assert mixer.preview_input_id == "cam-1"
 
 
 def test_transition_bank_api(client: TestClient) -> None:

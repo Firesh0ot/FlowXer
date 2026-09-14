@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     overlay_url: str = "http://127.0.0.1:9610/graphics/lower-third.html"
     default_stinger: str = "replay-wipe"
     stinger_frame_count: int = 24
+    stinger_auto_tick: bool = True
 
     @property
     def clips_dir(self) -> Path:
