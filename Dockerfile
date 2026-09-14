@@ -30,6 +30,7 @@ COPY configs /app/configs
 COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN pip3 install --no-cache-dir --break-system-packages /app \
+    && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
     && mkdir -p /mxl-domain /storage/clips /storage/stingers /storage/graphics \
     && cp /app/configs/domain_def.json /mxl-domain/domain_def.json

@@ -1,13 +1,13 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowxer"
 version = "0.1.0"
 description = "DMF Vision Mixer microservice for uncompressed MXL (v210 + float32) workflows"
 readme = "README.md"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 authors = [{ name = "FlowXer" }]
 dependencies = [
@@ -30,8 +30,11 @@ dev = [
 [project.scripts]
 flowxer = "flowxer.app:run"
 
-[tool.hatch.build.targets.wheel]
-only-include = ["flowxer"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+flowxer = ["static/*", "graphics/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
