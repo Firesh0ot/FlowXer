@@ -33,14 +33,6 @@ from flowxer.engine.pipeline import build_pipeline_description
 from flowxer.engine.stinger import StingerPlayer, generate_replay_wipe, inspect_stinger, list_stingers
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
-from flowxer.domain import nmos
-from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
-from flowxer.engine.capabilities import probe_backend
-from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
-from flowxer.engine.overlay import Html5Overlay
-from flowxer.engine.pipeline import build_pipeline_description
-from flowxer.engine.stinger import StingerPlayer, generate_replay_wipe, inspect_stinger, list_stingers
-from flowxer.settings import Settings, ensure_storage
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +65,7 @@ class VisionMixer:
         self.outputs: OutputFlows | None = None
         self.gst: GstRuntime | None = None
         self.stinger_player: StingerPlayer | None = None
+        self.last_transition: str = "cut"
         self.overlay = Html5Overlay(
             url=settings.overlay_url,
             cache_dir=settings.graphics_dir,
@@ -505,22 +498,100 @@ class VisionMixer:
         stinger_id: str | None = None,
         panel_id: str = "me-1",
     ) -> MixerStatus:
+        """Direct source → Program (source-tile right-click). Does not consume Wipe."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest(program_input_id=input_id, preview_input_id=input_id))
         target = self.get_input(input_id)
         panel = self.get_panel(panel_id)
         if transition == TransitionType.stinger:
             return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id)
+        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False)
+        return self.status()
+
+    def cut(self, panel_id: str = "me-1") -> MixerStatus:
+        """Flip Preview onto Program. If Wipe is armed, play the TGA stinger instead."""
+        panel = self._ensure_running_panel(panel_id)
+        incoming = self._preview_id(panel)
+        if panel.wipe_armed:
+            outgoing = panel.program_input_id
+            stinger_id = self._stinger_for("to_replay" if self._is_replay(incoming) else "to_live")
+            status = self.play_stinger(
+                stinger_id,
+                incoming,
+                direction="to_replay" if self._is_replay(incoming) else "to_live",
+                outgoing_input_id=outgoing,
+                flip_flop=True,
+                panel_id=panel.id,
+            )
+            panel.wipe_armed = False
+            return status
+        self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True)
+        return self.status()
+
+    def fade(self, panel_id: str = "me-1", duration_ms: int = 400) -> MixerStatus:
+        """Dissolve Preview onto Program. Does not consume an armed Wipe."""
+        panel = self._ensure_running_panel(panel_id)
+        incoming = self._preview_id(panel)
+        self._put_on_program(panel, incoming, TransitionType.mix, flip_flop=True, duration_ms=duration_ms)
+        return self.status()
+
+    def fade_to_black(self, panel_id: str = "me-1", duration_ms: int = 600) -> MixerStatus:
+        """Fade Program to Black, or fade up from Black onto Preview."""
+        panel = self._ensure_running_panel(panel_id)
+        if "black" not in self.inputs:
+            raise MixerError("no black input is registered")
+        if panel.program_input_id == "black":
+            target = self._preview_id(panel)
+        else:
+            target = "black"
+        self._put_on_program(panel, target, TransitionType.mix, flip_flop=False, duration_ms=duration_ms)
+        return self.status()
+
+    def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
+        """Arm (or toggle) Wipe so the next Cut plays the TGA stinger."""
+        panel = self._ensure_running_panel(panel_id)
+        panel.wipe_armed = (not panel.wipe_armed) if armed is None else armed
+        return self.status()
+
+    def _ensure_running_panel(self, panel_id: str) -> MixerPanel:
+        if self.state != MixerState.running:
+            self.start(MixerStartRequest())
+        return self.get_panel(panel_id)
+
+    def _preview_id(self, panel: MixerPanel) -> str:
+        incoming = panel.preview_input_id
+        if not incoming:
+            raise MixerError("arm a source on Preview before cutting or fading")
+        self.get_input(incoming)
+        return incoming
+
+    def _put_on_program(
+        self,
+        panel: MixerPanel,
+        input_id: str,
+        transition: TransitionType,
+        *,
+        flip_flop: bool,
+        duration_ms: int = 0,
+    ) -> None:
+        target = self.get_input(input_id)
+        outgoing = panel.program_input_id
         panel.program_input_id = target.id
-        if panel.id == self.panels[0].id:
+        panel.last_transition = transition.value
+        self.last_transition = transition.value
+        if flip_flop and outgoing and outgoing != target.id:
+            panel.preview_input_id = outgoing
+        if panel.id == (self.panels[0].id if self.panels else panel.id):
             self.program_input_id = target.id
+            if flip_flop and outgoing and outgoing != target.id:
+                self.preview_input_id = outgoing
             if target.kind not in {InputKind.replay, InputKind.file}:
                 self.last_live_input_id = target.id
                 self.program_bus = ProgramBus.live
             else:
                 self.program_bus = ProgramBus.replay
             self._apply_program()
-        return self.status()
+        _ = duration_ms  # mix duration is recorded; GST input-selector is a hard switch
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
         if self.state != MixerState.running:
@@ -553,15 +624,35 @@ class VisionMixer:
         live_id = input_id or self.last_live_input_id or self._default_program_id()
         return self.play_stinger(stinger_id or self._stinger_for("to_live"), live_id, direction="to_live")
 
-    def play_stinger(self, stinger_id: str, target_input_id: str, direction: str | None = None) -> MixerStatus:
-        self._require_running()
+    def play_stinger(
+        self,
+        stinger_id: str,
+        target_input_id: str,
+        direction: str | None = None,
+        outgoing_input_id: str | None = None,
+        flip_flop: bool = False,
+        panel_id: str | None = None,
+    ) -> MixerStatus:
+        if self.state != MixerState.running:
+            self.start(MixerStartRequest())
         if self.stinger_player and not self.stinger_player.done:
             raise MixerError("a stinger is already playing")
         info = self.get_stinger(stinger_id)
         self.get_input(target_input_id)
         if direction is None:
             direction = "to_replay" if self._is_replay(target_input_id) else "to_live"
-        self.stinger_player = StingerPlayer(info, target_input_id, direction)
+        panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
+        outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
+        self.last_transition = "stinger"
+        panel.last_transition = "stinger"
+        self.stinger_player = StingerPlayer(
+            info,
+            target_input_id,
+            direction,
+            outgoing_input_id=outgoing,
+            flip_flop=flip_flop,
+            panel_id=panel.id,
+        )
         if self.gst is not None:
             self.gst.set_compositor_alpha("sink_2", 1.0)
         # Advance to first frame so status reports "playing".
@@ -574,7 +665,24 @@ class VisionMixer:
             return self.status()
         snapshot = self.stinger_player.advance(frames)
         if "cut" in snapshot["events"]:
-            self.program_input_id = self.stinger_player.target_input_id
+            target_id = self.stinger_player.target_input_id
+            panel = None
+            if self.stinger_player.panel_id:
+                try:
+                    panel = self.get_panel(self.stinger_player.panel_id)
+                except MixerError:
+                    panel = None
+            if panel is None and self.panels:
+                panel = self.panels[0]
+            if panel is not None:
+                outgoing = self.stinger_player.outgoing_input_id
+                panel.program_input_id = target_id
+                panel.last_transition = "stinger"
+                if self.stinger_player.flip_flop and outgoing and outgoing != target_id:
+                    panel.preview_input_id = outgoing
+            self.program_input_id = target_id
+            if self.stinger_player.flip_flop and self.stinger_player.outgoing_input_id:
+                self.preview_input_id = self.stinger_player.outgoing_input_id
             if self.stinger_player.direction == "to_live":
                 self.last_live_input_id = self.program_input_id
                 self.program_bus = ProgramBus.live
@@ -657,6 +765,8 @@ class VisionMixer:
             keyers=[keyer.model_dump() for keyer in self.keyers],
             stinger_slots=[slot.model_dump() for slot in self.stinger_slots],
             webrtc_enabled=webrtc_available(),
+            wipe_armed=bool(self.panels[0].wipe_armed) if self.panels else False,
+            last_transition=self.last_transition,
         )
 
     def domain_flows(self):

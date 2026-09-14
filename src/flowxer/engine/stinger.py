@@ -108,10 +108,21 @@ def generate_replay_wipe(
 class StingerPlayer:
     """Frame-accurate stinger state machine independent of GStreamer."""
 
-    def __init__(self, info: StingerInfo, target_input_id: str, direction: str) -> None:
+    def __init__(
+        self,
+        info: StingerInfo,
+        target_input_id: str,
+        direction: str,
+        outgoing_input_id: str | None = None,
+        flip_flop: bool = False,
+        panel_id: str | None = None,
+    ) -> None:
         self.info = info
         self.target_input_id = target_input_id
         self.direction = direction
+        self.outgoing_input_id = outgoing_input_id
+        self.flip_flop = flip_flop
+        self.panel_id = panel_id
         self.frame = 0
         self.cut_fired = False
         self.done = False
