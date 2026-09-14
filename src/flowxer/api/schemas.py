@@ -154,6 +154,20 @@ class PreviewRequest(BaseModel):
     panel_id: str = Field(default="me-1", description="Mixer panel (ME) to arm on preview")
 
 
+class PanelTransitionRequest(BaseModel):
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME) that owns Preview/Program")
+    duration_ms: int = Field(
+        default=400,
+        ge=0,
+        le=10000,
+        description="Mix duration for Fade and Fade to Black. Ignored by Cut.",
+    )
+    armed: bool | None = Field(
+        default=None,
+        description="For Wipe: true arms, false disarms. Omit to toggle.",
+    )
+
+
 class OverlayUpdate(BaseModel):
     enabled: bool | None = None
     url: str | None = Field(
@@ -266,6 +280,8 @@ class MixerStatus(BaseModel):
     keyers: list[dict[str, Any]] = Field(default_factory=list)
     stinger_slots: list[dict[str, Any]] = Field(default_factory=list)
     webrtc_enabled: bool = False
+    wipe_armed: bool = False
+    last_transition: str = "cut"
 
 
 class HealthResponse(BaseModel):
@@ -288,6 +304,8 @@ class MixerPanel(BaseModel):
     label: str
     program_input_id: str | None = None
     preview_input_id: str | None = None
+    wipe_armed: bool = False
+    last_transition: str = "cut"
 
 
 class DownstreamKeyer(BaseModel):

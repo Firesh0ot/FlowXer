@@ -18,6 +18,7 @@ from flowxer.api.schemas import (
     MixerStatus,
     OverlayStatus,
     OverlayUpdate,
+    PanelTransitionRequest,
     PreviewRequest,
     ReplayLoadRequest,
     ReplayTransitionRequest,
@@ -250,6 +251,74 @@ def mixer_preview(
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="preview", mixer=body)
+
+
+@router.post(
+    "/mixer/cut",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Cut Preview to Program. If Wipe is armed, play the TGA stinger instead.",
+)
+def mixer_cut(
+    payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> MixerCommandResponse:
+    payload = payload or PanelTransitionRequest()
+    try:
+        body = mixer.cut(payload.panel_id)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="cut", mixer=body)
+
+
+@router.post(
+    "/mixer/fade",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Fade (mix) Preview onto Program",
+)
+def mixer_fade(
+    payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> MixerCommandResponse:
+    payload = payload or PanelTransitionRequest()
+    try:
+        body = mixer.fade(payload.panel_id, payload.duration_ms)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="fade", mixer=body)
+
+
+@router.post(
+    "/mixer/fade-to-black",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Fade Program to the Black source, or fade up from Black onto Preview",
+)
+def mixer_fade_to_black(
+    payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> MixerCommandResponse:
+    payload = payload or PanelTransitionRequest()
+    try:
+        body = mixer.fade_to_black(payload.panel_id, payload.duration_ms)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="fade_to_black", mixer=body)
+
+
+@router.post(
+    "/mixer/wipe",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Arm Wipe so the next Cut plays the TGA stinger (toggle if armed is omitted)",
+)
+def mixer_wipe(
+    payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> MixerCommandResponse:
+    payload = payload or PanelTransitionRequest()
+    try:
+        body = mixer.set_wipe(payload.panel_id, payload.armed)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="wipe", mixer=body)
 
 
 @router.get(

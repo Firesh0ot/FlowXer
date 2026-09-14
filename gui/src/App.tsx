@@ -4,6 +4,7 @@ import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
+import { TransitionBank } from "./components/TransitionBank";
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<ConsoleState | null>(null);
@@ -170,18 +171,27 @@ export default function App() {
         </div>
       </section>
 
-      <section className="source-strip">
-        {snapshot.inputs.map((input) => (
-          <SourceTile
-            key={input.id}
-            input={input}
-            panel={panel}
-            webrtc={webrtc}
-            onPreview={() => void api.preview(input.id, panel.id).then(refresh)}
-            onProgram={() => void api.take(input.id, panel.id).then(refresh)}
-            onSettings={() => setSourceEdit(input)}
-          />
-        ))}
+      <section className="deck">
+        <div className="source-strip">
+          {snapshot.inputs.map((input) => (
+            <SourceTile
+              key={input.id}
+              input={input}
+              panel={panel}
+              webrtc={webrtc}
+              onPreview={() => void api.preview(input.id, panel.id).then(refresh)}
+              onProgram={() => void api.take(input.id, panel.id).then(refresh)}
+              onSettings={() => setSourceEdit(input)}
+            />
+          ))}
+        </div>
+        <TransitionBank
+          panel={panel}
+          onCut={() => void api.cut(panel.id).then(refresh)}
+          onFade={() => void api.fade(panel.id).then(refresh)}
+          onFadeToBlack={() => void api.fadeToBlack(panel.id).then(refresh)}
+          onWipe={() => void api.wipe(panel.id).then(refresh)}
+        />
       </section>
 
       {error ? <div className="toast">{error}</div> : null}
