@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlowXer · Vision Mixer</title>
+  <link rel="icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/static/panel.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="mark">FX</span>
+      <div>
+        <h1>FlowXer</h1>
+        <p>DMF Vision Mixer · uncompressed v210 + float32</p>
+      </div>
+    </div>
+    <nav>
+      <a href="/docs" target="_blank" rel="noreferrer">OpenAPI</a>
+      <a href="/redoc" target="_blank" rel="noreferrer">ReDoc</a>
+      <a href="/graphics/lower-third.html" target="_blank" rel="noreferrer">HTML5 graphics</a>
+    </nav>
+    <div id="health" class="pill">…</div>
+  </header>
+
+  <main>
+    <section class="status-grid">
+      <article>
+        <h2>Program</h2>
+        <div id="pgm" class="bus">—</div>
+        <div id="bus" class="muted"></div>
+      </article>
+      <article>
+        <h2>Preview</h2>
+        <div id="pvw" class="bus">—</div>
+      </article>
+      <article>
+        <h2>Stinger</h2>
+        <div id="stinger">idle</div>
+      </article>
+      <article>
+        <h2>Overlay</h2>
+        <div id="overlay">off</div>
+      </article>
+    </section>
+
+    <section>
+      <div class="row">
+        <h2>Logical inputs</h2>
+        <div class="actions">
+          <button id="start">Start mixer</button>
+          <button id="stop" class="ghost">Stop</button>
+        </div>
+      </div>
+      <div id="inputs" class="inputs"></div>
+    </section>
+
+    <section class="split">
+      <div>
+        <h2>HTML5 overlay</h2>
+        <label>Title <input id="title" value="FLOWXER" /></label>
+        <label>Subtitle <input id="subtitle" value="DMF Vision Mixer" /></label>
+        <label>URL <input id="url" /></label>
+        <div class="actions">
+          <button id="key-on">Key ON</button>
+          <button id="key-off" class="ghost">Key OFF</button>
+        </div>
+      </div>
+      <div>
+        <h2>Replay</h2>
+        <label>Clip
+          <select id="clips"></select>
+        </label>
+        <div class="actions">
+          <button id="load">Load clip</button>
+          <button id="to-replay">Stinger → Replay</button>
+          <button id="to-live" class="ghost">Stinger → Live</button>
+        </div>
+        <p class="muted">TGA sequence <code>replay-wipe</code> covers the cut at its opaque frame.</p>
+      </div>
+    </section>
+  </main>
+  <script src="/static/panel.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+.dockerignore
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+storage/clips/*
+storage/stingers/**
+!storage/clips/.gitkeep
+!storage/stingers/.gitkeep
+data

@@ -1,0 +1,47 @@
+name: flowxer
+
+volumes:
+  mxl-domain:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m,uid=1000,gid=1000,mode=0755"
+
+services:
+  vision-mixer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flowxer-vision-mixer:latest
+    container_name: flowxer-vision-mixer
+    hostname: flowxer
+    ports:
+      - "9610:9610"
+    environment:
+      FLOWXER_MXL_DOMAIN: /mxl-domain
+      FLOWXER_STORAGE_ROOT: /storage
+      FLOWXER_GROUP_HINT: FlowXer
+      FLOWXER_WIDTH: "1920"
+      FLOWXER_HEIGHT: "1080"
+      FLOWXER_FRAME_RATE_NUM: "50"
+      FLOWXER_FRAME_RATE_DEN: "1"
+      FLOWXER_GST_MODE: auto
+      FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
+    volumes:
+      - type: volume
+        source: mxl-domain
+        target: /mxl-domain
+      - type: bind
+        source: ./storage
+        target: /storage
+      # Drop a built MXL SDK + gst-mxl plugin here to publish real flows:
+      # - ./opt/mxl:/opt/mxl:ro
+    shm_size: "2gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9610/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 8

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>FlowXer Lower Third</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      overflow: hidden;
+      font-family: "Segoe UI", sans-serif;
+    }
+    .bar {
+      position: absolute;
+      left: 80px;
+      bottom: 80px;
+      display: flex;
+      min-width: 640px;
+      background: rgba(8, 12, 28, 0.82);
+      color: white;
+      border-left: 8px solid #00c4ff;
+    }
+    .copy { padding: 18px 28px; }
+    h1 { margin: 0; font-size: 42px; letter-spacing: 0.04em; }
+    p { margin: 8px 0 0; color: #b4dcff; font-size: 22px; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <div class="copy">
+      <h1 id="title">FLOWXER</h1>
+      <p id="subtitle">DMF Vision Mixer · v210 / float32</p>
+    </div>
+  </div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.get("title")) document.getElementById("title").textContent = params.get("title");
+    if (params.get("subtitle")) document.getElementById("subtitle").textContent = params.get("subtitle");
+  </script>
+</body>
+</html>

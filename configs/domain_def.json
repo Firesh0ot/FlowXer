@@ -1,0 +1,5 @@
+{
+  "id": "flowxer-domain",
+  "label": "FlowXer MXL domain",
+  "description": "Uncompressed v210 video and float32 audio essences for the FlowXer vision mixer"
+}
