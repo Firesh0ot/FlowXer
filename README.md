@@ -51,13 +51,47 @@ flowchart LR
 - **Storage access** plays files from `storage/clips` (`.mp4`, `.ts`, `.mov`, `.mxf`, …) as uncompressed v210 + float32.
 - **HTML5 graphics overlay** keys a page over program (`cefsrc` when installed, Pillow fallback otherwise). A sample lower-third is served at `/graphics/lower-third.html`.
 - **Replay stinger** plays a **TGA sequence with alpha**. At the fully opaque frame the mixer cuts program to replay (or back to live), then finishes the sequence.
-- Runs in a **Docker** container with a shared MXL domain volume.
+- Runs in **Docker** (`vision-mixer` + `gui` services) with a shared MXL domain volume.
+
+## Operator GUI
+
+The GUI is a **separate React service** (Vite + TypeScript) so the mixer container stays a media function. It talks to the mixer API and shows live pictures over **WebRTC WHEP** (JPEG snapshots if WebRTC is unavailable).
+
+```
+┌─ File  Settings  Help ──────── CPU · RAM · raster · issues ─┐
+│  PREVIEW (WebRTC)          PROGRAM (WebRTC)                 │
+│  DSK 1  Stinger IN/OUT                                      │
+│                                                             │
+│  [Name ⚙] [Name ⚙] …   logical sources along the bottom     │
+│  left click picture = PVW · right click picture = PGM       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Settings** (classic menu) configure:
+
+- video format (1080p50, 720p50, 2160p50, … uncompressed v210)
+- how many logical sources
+- how many mixer panels (MEs)
+- stingers: same TGA for in and out, or separate in/out, and how many
+- how many downstream keyers for HTML5 graphics
+
+The gear on each source opens source-specific setup (name, kind, MXL flow UUIDs, clip).
+
+| | |
+|--|--|
+| Operator GUI | http://localhost:9620 |
+| Mixer API / OpenAPI | http://localhost:9610/docs |
+
+```bash
+cd gui && npm install && npm run dev   # proxies /api to :9610
+```
 
 ## API
 
 | | |
 |--|--|
-| Control surface | http://localhost:9610 |
+| Operator GUI | http://localhost:9620 |
+| Mixer landing | http://localhost:9610 |
 | Swagger UI | http://localhost:9610/docs |
 | ReDoc | http://localhost:9610/redoc |
 | OpenAPI JSON | http://localhost:9610/openapi.json |
@@ -102,12 +136,13 @@ mkdir -p storage/clips
 docker compose up --build
 ```
 
-The container:
+Services:
 
-- serves the API and operator panel on port **9610**
-- mounts a tmpfs MXL domain at `/mxl-domain`
-- bind-mounts `./storage` for clips, generated TGA stingers, and overlay PNG cache
-- uses GStreamer (`videotestsrc`, `input-selector`, `compositor`, `multifilesrc`, `videoconvert` → **v210** / **F32LE**)
+- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, settings)
+- **vision-mixer** on port **9610** — control API, OpenAPI, WHEP previews
+- tmpfs MXL domain at `/mxl-domain`
+- bind-mount `./storage` for clips, TGA stingers, overlay cache
+- GStreamer path: `videotestsrc` / `filesrc` → `input-selector` → compositor → **v210** / **F32LE**
 
 ### Real MXL I/O
 

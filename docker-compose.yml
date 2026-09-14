@@ -45,3 +45,16 @@ services:
       interval: 10s
       timeout: 3s
       retries: 8
+
+  gui:
+    build:
+      context: .
+      dockerfile: gui/Dockerfile
+    image: flowxer-gui:latest
+    container_name: flowxer-gui
+    hostname: flowxer-gui
+    ports:
+      - "9620:9620"
+    depends_on:
+      - vision-mixer
+

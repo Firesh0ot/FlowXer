@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from flowxer.api.schemas import (
+    DownstreamKeyer,
     InputKind,
     LogicalInput,
     LogicalInputCreate,
     LogicalInputUpdate,
+    MixerPanel,
     MixerStartRequest,
     MixerState,
     MixerStatus,
@@ -15,8 +18,21 @@ from flowxer.api.schemas import (
     OverlayStatus,
     ProgramBus,
     StingerInfo,
+    StingerSlot,
     TransitionType,
+    WorkspaceConfig,
+    WorkspaceUpdate,
 )
+from flowxer.domain import nmos
+from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
+from flowxer.engine.capabilities import probe_backend
+from flowxer.engine.formats import format_by_id
+from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
+from flowxer.engine.overlay import Html5Overlay
+from flowxer.engine.pipeline import build_pipeline_description
+from flowxer.engine.stinger import StingerPlayer, generate_replay_wipe, inspect_stinger, list_stingers
+from flowxer.engine.webrtc import webrtc_available
+from flowxer.settings import Settings, ensure_storage
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
 from flowxer.engine.capabilities import probe_backend
@@ -41,6 +57,11 @@ class VisionMixer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.inputs: dict[str, LogicalInput] = {}
+        self.workspace = WorkspaceConfig()
+        self.panels: list[MixerPanel] = []
+        self.keyers: list[DownstreamKeyer] = []
+        self.stinger_slots: list[StingerSlot] = []
+        self.started_at = time.time()
         self.state = MixerState.idle
         self.backend = "idle"
         self.program_input_id: str | None = None
@@ -61,7 +82,10 @@ class VisionMixer:
         ensure_storage(settings)
         self.overlay.render_fallback_png()
         self._ensure_default_stinger()
-        self._seed_default_inputs()
+        self._sync_sources()
+        self._sync_panels()
+        self._sync_keyers()
+        self._sync_stinger_slots()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -77,29 +101,166 @@ class VisionMixer:
             frame_count=self.settings.stinger_frame_count,
         )
 
+    def _sync_sources(self) -> None:
+        desired = self.workspace.logical_source_count
+        while len(self.inputs) > desired:
+            last = self.list_inputs()[-1]
+            if last.id in {self.program_input_id, self.preview_input_id}:
+                break
+            del self.inputs[last.id]
+        existing = {item.id for item in self.inputs.values()}
+        slot = len(self.inputs)
+        index = 1
+        while len(self.inputs) < desired:
+            source_id = f"cam-{index}"
+            index += 1
+            if source_id in existing:
+                continue
+            kind = InputKind.test
+            label = f"Camera {index - 1}"
+            remaining = desired - len(self.inputs)
+            if remaining == 2 and "black" not in existing:
+                source_id, label, kind = "black", "Black", InputKind.black
+            elif remaining == 1 and "replay" not in existing:
+                source_id, label, kind = "replay", "Replay", InputKind.replay
+            self.inputs[source_id] = LogicalInput(
+                id=source_id, label=label, kind=kind, slot=slot
+            )
+            existing.add(source_id)
+            slot += 1
+        for slot, item in enumerate(self.list_inputs()):
+            item.slot = slot
+
+    def _sync_panels(self) -> None:
+        desired = self.workspace.mixer_panel_count
+        while len(self.panels) < desired:
+            n = len(self.panels) + 1
+            self.panels.append(
+                MixerPanel(
+                    id=f"me-{n}",
+                    label=f"ME {n}",
+                    program_input_id=self.program_input_id,
+                    preview_input_id=self.preview_input_id,
+                )
+            )
+        self.panels = self.panels[:desired]
+        if self.panels:
+            if self.program_input_id:
+                self.panels[0].program_input_id = self.program_input_id
+            if self.preview_input_id:
+                self.panels[0].preview_input_id = self.preview_input_id
+
+    def _sync_keyers(self) -> None:
+        desired = self.workspace.downstream_keyer_count
+        while len(self.keyers) < desired:
+            n = len(self.keyers) + 1
+            self.keyers.append(
+                DownstreamKeyer(
+                    id=f"dsk-{n}",
+                    label=f"DSK {n}",
+                    url=self.settings.overlay_url,
+                    title=self.overlay.title,
+                    subtitle=self.overlay.subtitle,
+                    enabled=self.overlay.enabled if n == 1 else False,
+                )
+            )
+        self.keyers = self.keyers[:desired]
+        if self.keyers:
+            first = self.keyers[0]
+            self.overlay.url = first.url
+            self.overlay.title = first.title
+            self.overlay.subtitle = first.subtitle
+            self.overlay.enabled = first.enabled
+
+    def _sync_stinger_slots(self) -> None:
+        slots: list[StingerSlot] = []
+        count = self.workspace.stinger_count
+        default = self.settings.default_stinger
+        if self.workspace.stinger_mode == "separate":
+            for n in range(1, count + 1):
+                slots.append(
+                    StingerSlot(id=f"in-{n}", role="in", label=f"Stinger IN {n}", stinger_id=default)
+                )
+                slots.append(
+                    StingerSlot(id=f"out-{n}", role="out", label=f"Stinger OUT {n}", stinger_id=default)
+                )
+        else:
+            for n in range(1, count + 1):
+                slots.append(
+                    StingerSlot(
+                        id=f"shared-{n}",
+                        role="shared",
+                        label=f"Stinger {n}",
+                        stinger_id=default,
+                    )
+                )
+        self.stinger_slots = slots
+
+    def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
+        if self.state == MixerState.running:
+            raise MixerError("stop the mixer before changing console layout")
+        data = self.workspace.model_dump()
+        patch = payload.model_dump(exclude_unset=True)
+        if patch.get("stinger_mode") not in {None, "shared", "separate"}:
+            raise MixerError("stinger_mode must be shared or separate")
+        data.update(patch)
+        if data["format_id"] != self.workspace.format_id:
+            fmt = format_by_id(data["format_id"])
+            self.settings.width = fmt.width
+            self.settings.height = fmt.height
+            self.settings.frame_rate_num = fmt.frame_rate_num
+            self.settings.frame_rate_den = fmt.frame_rate_den
+        self.workspace = WorkspaceConfig(**data)
+        self._sync_sources()
+        self._sync_panels()
+        self._sync_keyers()
+        self._sync_stinger_slots()
+        return self.workspace
+
+    def get_panel(self, panel_id: str) -> MixerPanel:
+        for panel in self.panels:
+            if panel.id == panel_id:
+                return panel
+        raise MixerError(f"unknown mixer panel {panel_id}")
+
+    def get_keyer(self, keyer_id: str) -> DownstreamKeyer:
+        for keyer in self.keyers:
+            if keyer.id == keyer_id:
+                return keyer
+        raise MixerError(f"unknown downstream keyer {keyer_id}")
+
+    def update_keyer(self, keyer_id: str, **kwargs) -> DownstreamKeyer:
+        keyer = self.get_keyer(keyer_id)
+        for field, value in kwargs.items():
+            if value is not None:
+                setattr(keyer, field, value)
+        if keyer.id == (self.keyers[0].id if self.keyers else ""):
+            self.overlay.update(
+                enabled=keyer.enabled,
+                url=keyer.url,
+                title=keyer.title,
+                subtitle=keyer.subtitle,
+            )
+            self._apply_overlay_alpha()
+        return keyer
+
+    def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
+        self.get_stinger(stinger_id)
+        for slot in self.stinger_slots:
+            if slot.id == slot_id:
+                slot.stinger_id = stinger_id
+                return slot
+        raise MixerError(f"unknown stinger slot {slot_id}")
+
+    def _stinger_for(self, direction: str) -> str:
+        role = "in" if direction == "to_replay" else "out"
+        for slot in self.stinger_slots:
+            if slot.role in {role, "shared"}:
+                return slot.stinger_id
+        return self.settings.default_stinger
+
     def _seed_default_inputs(self) -> None:
-        if self.inputs:
-            return
-        self.register_input(
-            LogicalInputCreate(
-                id="cam-1",
-                label="Camera 1",
-                kind=InputKind.test,
-            )
-        )
-        self.register_input(
-            LogicalInputCreate(
-                id="cam-2",
-                label="Camera 2",
-                kind=InputKind.test,
-            )
-        )
-        self.register_input(
-            LogicalInputCreate(id="black", label="Black", kind=InputKind.black)
-        )
-        self.register_input(
-            LogicalInputCreate(id="replay", label="Replay", kind=InputKind.replay)
-        )
+        self._sync_sources()
 
     def register_input(self, payload: LogicalInputCreate) -> LogicalInput:
         if self.state == MixerState.running:
@@ -118,6 +279,8 @@ class VisionMixer:
             data = current.model_dump()
             if payload.label is not None:
                 data["label"] = payload.label
+            if payload.kind is not None:
+                data["kind"] = payload.kind
             if payload.video is not None:
                 data["video"] = payload.video
             if payload.audio is not None:
@@ -275,6 +438,9 @@ class VisionMixer:
         self.preview_input_id = request.preview_input_id or self.program_input_id
         self.last_live_input_id = self.program_input_id
         self.program_bus = ProgramBus.replay if self._is_replay(self.program_input_id) else ProgramBus.live
+        if self.panels:
+            self.panels[0].program_input_id = self.program_input_id
+            self.panels[0].preview_input_id = self.preview_input_id
         self._apply_program()
         self._apply_overlay_alpha()
         return self.status()
@@ -332,24 +498,38 @@ class VisionMixer:
 
     # ── takes / replay / overlay ─────────────────────────────────────────────
 
-    def take(self, input_id: str, transition: TransitionType = TransitionType.cut, stinger_id: str | None = None) -> MixerStatus:
-        self._require_running()
+    def take(
+        self,
+        input_id: str,
+        transition: TransitionType = TransitionType.cut,
+        stinger_id: str | None = None,
+        panel_id: str = "me-1",
+    ) -> MixerStatus:
+        if self.state != MixerState.running:
+            self.start(MixerStartRequest(program_input_id=input_id, preview_input_id=input_id))
         target = self.get_input(input_id)
+        panel = self.get_panel(panel_id)
         if transition == TransitionType.stinger:
-            return self.play_stinger(stinger_id or self.settings.default_stinger, input_id)
-        self.program_input_id = target.id
-        if target.kind not in {InputKind.replay, InputKind.file}:
-            self.last_live_input_id = target.id
-            self.program_bus = ProgramBus.live
-        else:
-            self.program_bus = ProgramBus.replay
-        self._apply_program()
+            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id)
+        panel.program_input_id = target.id
+        if panel.id == self.panels[0].id:
+            self.program_input_id = target.id
+            if target.kind not in {InputKind.replay, InputKind.file}:
+                self.last_live_input_id = target.id
+                self.program_bus = ProgramBus.live
+            else:
+                self.program_bus = ProgramBus.replay
+            self._apply_program()
         return self.status()
 
-    def set_preview(self, input_id: str) -> MixerStatus:
-        self._require_running()
+    def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
+        if self.state != MixerState.running:
+            self.start(MixerStartRequest(preview_input_id=input_id, program_input_id=self._default_program_id()))
         self.get_input(input_id)
-        self.preview_input_id = input_id
+        panel = self.get_panel(panel_id)
+        panel.preview_input_id = input_id
+        if panel.id == self.panels[0].id:
+            self.preview_input_id = input_id
         return self.status()
 
     def load_clip(self, input_id: str, file_path: str) -> LogicalInput:
@@ -367,11 +547,11 @@ class VisionMixer:
             raise MixerError("load a clip onto the replay input first")
         if self.last_live_input_id is None:
             self.last_live_input_id = self.program_input_id
-        return self.play_stinger(stinger_id, replay_id, direction="to_replay")
+        return self.play_stinger(stinger_id or self._stinger_for("to_replay"), replay_id, direction="to_replay")
 
     def return_live(self, stinger_id: str, input_id: str | None = None) -> MixerStatus:
         live_id = input_id or self.last_live_input_id or self._default_program_id()
-        return self.play_stinger(stinger_id, live_id, direction="to_live")
+        return self.play_stinger(stinger_id or self._stinger_for("to_live"), live_id, direction="to_live")
 
     def play_stinger(self, stinger_id: str, target_input_id: str, direction: str | None = None) -> MixerStatus:
         self._require_running()
@@ -409,6 +589,15 @@ class VisionMixer:
 
     def set_overlay(self, **kwargs) -> MixerStatus:
         self.overlay.update(**kwargs)
+        if self.keyers:
+            if kwargs.get("enabled") is not None:
+                self.keyers[0].enabled = kwargs["enabled"]
+            if kwargs.get("url") is not None:
+                self.keyers[0].url = kwargs["url"]
+            if kwargs.get("title") is not None:
+                self.keyers[0].title = kwargs["title"]
+            if kwargs.get("subtitle") is not None:
+                self.keyers[0].subtitle = kwargs["subtitle"]
         self._apply_overlay_alpha()
         return self.status()
 
@@ -463,6 +652,11 @@ class VisionMixer:
             audio_format=self.settings.audio_media_type,
             pipeline=self.pipeline,
             error=self.error,
+            workspace=self.workspace.model_dump(),
+            panels=[panel.model_dump() for panel in self.panels],
+            keyers=[keyer.model_dump() for keyer in self.keyers],
+            stinger_slots=[slot.model_dump() for slot in self.stinger_slots],
+            webrtc_enabled=webrtc_available(),
         )
 
     def domain_flows(self):

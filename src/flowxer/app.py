@@ -49,8 +49,8 @@ OPENAPI_TAGS = [
         "description": "Load a stored clip and stinger in/out of replay.",
     },
     {
-        "name": "stinger",
-        "description": "Play a TGA sequence; the mixer cuts at the fully-opaque frame.",
+        "name": "gui",
+        "description": "Operator console layout, container resources, JPEG/WebRTC monitors.",
     },
 ]
 

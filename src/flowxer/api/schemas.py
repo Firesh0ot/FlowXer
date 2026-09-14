@@ -122,6 +122,7 @@ class LogicalInput(LogicalInputCreate):
 
 class LogicalInputUpdate(BaseModel):
     label: str | None = None
+    kind: InputKind | None = None
     video: VideoEssence | None = None
     audio: AudioEssence | None = None
     file_path: str | None = None
@@ -145,10 +146,12 @@ class TakeRequest(BaseModel):
     transition: TransitionType = TransitionType.cut
     duration_ms: int = Field(default=0, ge=0, le=10000)
     stinger_id: str | None = None
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME) to cut to program")
 
 
 class PreviewRequest(BaseModel):
     input_id: str
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME) to arm on preview")
 
 
 class OverlayUpdate(BaseModel):
@@ -258,6 +261,11 @@ class MixerStatus(BaseModel):
     audio_format: str
     pipeline: str | None = None
     error: str | None = None
+    workspace: dict[str, Any] | None = None
+    panels: list[dict[str, Any]] = Field(default_factory=list)
+    keyers: list[dict[str, Any]] = Field(default_factory=list)
+    stinger_slots: list[dict[str, Any]] = Field(default_factory=list)
+    webrtc_enabled: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -273,3 +281,73 @@ class HealthResponse(BaseModel):
 class MixerCommandResponse(BaseModel):
     status: str
     mixer: MixerStatus
+
+
+class MixerPanel(BaseModel):
+    id: str
+    label: str
+    program_input_id: str | None = None
+    preview_input_id: str | None = None
+
+
+class DownstreamKeyer(BaseModel):
+    id: str
+    label: str
+    enabled: bool = False
+    url: str = ""
+    title: str = "FLOWXER"
+    subtitle: str = "DMF Vision Mixer"
+
+
+class StingerSlot(BaseModel):
+    id: str
+    role: str = Field(description="shared, in, or out")
+    label: str
+    stinger_id: str = "replay-wipe"
+
+
+class WorkspaceConfig(BaseModel):
+    format_id: str = "1080p50"
+    logical_source_count: int = Field(default=8, ge=1, le=24)
+    mixer_panel_count: int = Field(default=1, ge=1, le=4)
+    stinger_mode: str = Field(
+        default="shared",
+        description="shared = one TGA sequence for in and out; separate = dedicated in/out stingers",
+    )
+    stinger_count: int = Field(default=1, ge=1, le=8)
+    downstream_keyer_count: int = Field(default=1, ge=0, le=8)
+
+
+class WorkspaceUpdate(BaseModel):
+    format_id: str | None = None
+    logical_source_count: int | None = Field(default=None, ge=1, le=24)
+    mixer_panel_count: int | None = Field(default=None, ge=1, le=4)
+    stinger_mode: str | None = None
+    stinger_count: int | None = Field(default=None, ge=1, le=8)
+    downstream_keyer_count: int | None = Field(default=None, ge=0, le=8)
+
+
+class KeyerUpdate(BaseModel):
+    enabled: bool | None = None
+    url: str | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    label: str | None = None
+
+
+class StingerSlotUpdate(BaseModel):
+    stinger_id: str
+
+
+class ConsoleState(BaseModel):
+    workspace: WorkspaceConfig
+    formats: list[dict]
+    inputs: list[LogicalInput]
+    panels: list[MixerPanel]
+    keyers: list[DownstreamKeyer]
+    stinger_slots: list[StingerSlot]
+    mixer: MixerStatus
+    resources: dict
+    webrtc: dict
+    clips: list[StorageClip]
+    stingers: list[StingerInfo]
