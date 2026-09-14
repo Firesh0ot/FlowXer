@@ -57,6 +57,10 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   border: 1px solid var(--line); background: #151b26; border-radius: 6px;
 }
 .aux-row button.on, .me-tabs button.active { outline: 2px solid var(--accent); }
+.stinger-chip { display: flex; align-items: center; gap: 2px; }
+.stinger-chip button:first-child {
+  border: 1px solid var(--line); background: #151b26; border-radius: 6px 0 0 6px;
+}
 .source-strip {
   display: grid; grid-auto-flow: column; grid-auto-columns: minmax(160px, 1fr);
   gap: 8px; padding: 10px; overflow-x: auto;

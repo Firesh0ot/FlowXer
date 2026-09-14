@@ -23,6 +23,7 @@ export function SettingsModal({
         <h2>Settings</h2>
         <p className="hint">
           Mixer must be off-air to change format, source count, MEs, stingers or downstream keyers.
+          Per-stinger media and cut time are on the ⚙ next to each stinger.
         </p>
         <label>
           Format

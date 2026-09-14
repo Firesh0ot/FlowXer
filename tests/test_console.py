@@ -72,6 +72,50 @@ def test_keyer_and_stinger_slot_api(client: TestClient) -> None:
     assert slot.status_code == 200
 
 
+def test_stinger_slot_cut_time_and_video(mixer: VisionMixer) -> None:
+    from flowxer.api.schemas import StingerSlotUpdate
+
+    info = mixer.get_stinger("replay-wipe")
+    assert info.kind == "sequence"
+    assert info.cut_ms > 0
+    mixer.configure_stinger_slot(
+        "shared-1",
+        StingerSlotUpdate(stinger_id="replay-wipe", cut_ms=40),
+    )
+    slot = mixer.stinger_slots[0]
+    assert slot.cut_ms == 40
+    assert slot.cut_frame == mixer.stinger_slots[0].cut_frame
+    updated = mixer.get_stinger("replay-wipe")
+    assert updated.cut_ms == 40
+
+    clip = mixer.settings.clips_dir / "sting.webm"
+    clip.write_bytes(b"fake-video")
+    video_slot = mixer.configure_stinger_slot(
+        "shared-1",
+        StingerSlotUpdate(kind="video", media_path="sting.webm", cut_ms=200, duration_ms=800),
+    )
+    assert video_slot.kind == "video"
+    assert video_slot.stinger_id == "sting"
+    bound = mixer.get_stinger("sting")
+    assert bound.kind == "video"
+    assert bound.cut_ms == 200
+    assert "sting.webm" in bound.media_path
+
+
+def test_cut_uses_configured_cut_time(mixer: VisionMixer) -> None:
+    from flowxer.api.schemas import MixerStartRequest, StingerSlotUpdate
+
+    mixer.configure_stinger_slot("shared-1", StingerSlotUpdate(cut_ms=40))
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.set_wipe()
+    mixer.cut()
+    assert mixer.stinger_player is not None
+    # 40ms at 50 fps is frame 2; play_stinger already advanced 1 frame.
+    mixer.advance_stinger(1)
+    assert mixer.program_input_id == "cam-2"
+
+
 def test_cut_flip_flops_preview_and_program(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")

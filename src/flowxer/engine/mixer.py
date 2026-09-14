@@ -23,6 +23,7 @@ from flowxer.api.schemas import (
     TransitionType,
     WorkspaceConfig,
     WorkspaceUpdate,
+    StingerSlotUpdate,
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
@@ -31,7 +32,16 @@ from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
 from flowxer.engine.pipeline import build_pipeline_description
-from flowxer.engine.stinger import StingerPlayer, generate_replay_wipe, inspect_stinger, list_stingers
+from flowxer.engine.stinger import (
+    StingerPlayer,
+    cut_frame_from_ms,
+    cut_ms_from_frame,
+    generate_replay_wipe,
+    inspect_stinger,
+    list_stingers,
+    register_video_stinger,
+    update_stinger_cut,
+)
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
 
@@ -169,27 +179,30 @@ class VisionMixer:
             self.overlay.enabled = first.enabled
 
     def _sync_stinger_slots(self) -> None:
+        previous = {slot.id: slot for slot in self.stinger_slots}
+        default = self.settings.default_stinger
+        default_info = inspect_stinger(self.settings.stingers_dir, default, fps=self.settings.fps)
         slots: list[StingerSlot] = []
         count = self.workspace.stinger_count
-        default = self.settings.default_stinger
+
+        def _make(slot_id: str, role: str, label: str) -> StingerSlot:
+            if slot_id in previous:
+                return previous[slot_id]
+            slot = StingerSlot(id=slot_id, role=role, label=label, stinger_id=default)
+            if default_info:
+                slot.kind = default_info.kind
+                slot.media_path = default_info.media_path
+                slot.cut_ms = default_info.cut_ms
+                slot.cut_frame = default_info.cut_frame
+            return slot
+
         if self.workspace.stinger_mode == "separate":
             for n in range(1, count + 1):
-                slots.append(
-                    StingerSlot(id=f"in-{n}", role="in", label=f"Stinger IN {n}", stinger_id=default)
-                )
-                slots.append(
-                    StingerSlot(id=f"out-{n}", role="out", label=f"Stinger OUT {n}", stinger_id=default)
-                )
+                slots.append(_make(f"in-{n}", "in", f"Stinger IN {n}"))
+                slots.append(_make(f"out-{n}", "out", f"Stinger OUT {n}"))
         else:
             for n in range(1, count + 1):
-                slots.append(
-                    StingerSlot(
-                        id=f"shared-{n}",
-                        role="shared",
-                        label=f"Stinger {n}",
-                        stinger_id=default,
-                    )
-                )
+                slots.append(_make(f"shared-{n}", "shared", f"Stinger {n}"))
         self.stinger_slots = slots
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
@@ -241,19 +254,117 @@ class VisionMixer:
         return keyer
 
     def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
-        self.get_stinger(stinger_id)
-        for slot in self.stinger_slots:
-            if slot.id == slot_id:
-                slot.stinger_id = stinger_id
-                return slot
-        raise MixerError(f"unknown stinger slot {slot_id}")
+        return self.configure_stinger_slot(slot_id, StingerSlotUpdate(stinger_id=stinger_id))
 
-    def _stinger_for(self, direction: str) -> str:
+    def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
+        slot = None
+        for item in self.stinger_slots:
+            if item.id == slot_id:
+                slot = item
+                break
+        if slot is None:
+            raise MixerError(f"unknown stinger slot {slot_id}")
+        kind = payload.kind or slot.kind or "sequence"
+        if kind not in {"sequence", "video"}:
+            raise MixerError("stinger kind must be sequence or video")
+        if payload.label is not None:
+            slot.label = payload.label
+        slot.kind = kind
+
+        if kind == "video" and payload.media_path:
+            video = Path(payload.media_path)
+            if not video.is_absolute():
+                clip = self.settings.clips_dir / video.name
+                sting = self.settings.stingers_dir / video.name
+                if clip.exists():
+                    video = clip
+                elif sting.exists():
+                    video = sting
+                else:
+                    raise MixerError(f"video not found: {payload.media_path}")
+            stinger_id = payload.stinger_id or slot.stinger_id or video.stem
+            if stinger_id == self.settings.default_stinger:
+                stinger_id = video.stem
+            info = register_video_stinger(
+                self.settings.stingers_dir,
+                stinger_id,
+                video,
+                fps=self.settings.fps,
+                cut_ms=payload.cut_ms,
+                duration_ms=payload.duration_ms,
+                width=self.settings.width,
+                height=self.settings.height,
+            )
+            slot.stinger_id = info.id
+            slot.media_path = info.media_path
+            slot.cut_ms = info.cut_ms
+            slot.cut_frame = info.cut_frame
+            slot.kind = "video"
+            return slot
+
+        if payload.stinger_id:
+            info = self.get_stinger(payload.stinger_id)
+            slot.stinger_id = info.id
+            slot.media_path = info.media_path
+            if payload.cut_ms is None and payload.cut_frame is None:
+                slot.cut_ms = info.cut_ms
+                slot.cut_frame = info.cut_frame
+                slot.kind = info.kind
+        else:
+            info = self.get_stinger(slot.stinger_id)
+
+        if payload.cut_ms is not None or payload.cut_frame is not None:
+            info = update_stinger_cut(
+                self.settings.stingers_dir,
+                slot.stinger_id,
+                fps=self.settings.fps,
+                cut_ms=payload.cut_ms,
+                cut_frame=payload.cut_frame,
+            )
+            slot.cut_ms = info.cut_ms
+            slot.cut_frame = info.cut_frame
+        elif slot.cut_ms is None:
+            slot.cut_ms = info.cut_ms
+            slot.cut_frame = info.cut_frame
+        if payload.media_path and kind == "sequence":
+            slot.media_path = info.media_path
+        return slot
+
+    def _slot_for(self, direction: str) -> StingerSlot | None:
         role = "in" if direction == "to_replay" else "out"
         for slot in self.stinger_slots:
             if slot.role in {role, "shared"}:
-                return slot.stinger_id
+                return slot
+        return self.stinger_slots[0] if self.stinger_slots else None
+
+    def _stinger_for(self, direction: str) -> str:
+        slot = self._slot_for(direction)
+        if slot is not None:
+            return slot.stinger_id
         return self.settings.default_stinger
+
+    def _info_for_slot(self, slot: StingerSlot | None, stinger_id: str | None = None) -> StingerInfo:
+        info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
+        if slot is None:
+            return info
+        fps = info.fps or self.settings.fps
+        cut_ms = slot.cut_ms if slot.cut_ms is not None else info.cut_ms
+        cut_frame = (
+            cut_frame_from_ms(cut_ms, fps, info.frame_count)
+            if slot.cut_ms is not None
+            else (slot.cut_frame if slot.cut_frame is not None else info.cut_frame)
+        )
+        if slot.cut_frame is not None and slot.cut_ms is None:
+            cut_frame = slot.cut_frame
+            cut_ms = cut_ms_from_frame(cut_frame, fps)
+        return info.model_copy(
+            update={
+                "kind": slot.kind or info.kind,
+                "media_path": slot.media_path or info.media_path,
+                "cut_ms": cut_ms,
+                "cut_frame": cut_frame,
+            }
+        )
 
     def _seed_default_inputs(self) -> None:
         self._sync_sources()
@@ -351,7 +462,7 @@ class VisionMixer:
         return list_stingers(self.settings.stingers_dir)
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
-        info = inspect_stinger(self.settings.stingers_dir, stinger_id)
+        info = inspect_stinger(self.settings.stingers_dir, stinger_id, fps=self.settings.fps)
         if info is None or not info.frame_count:
             raise MixerError(f"unknown stinger {stinger_id}")
         return info
@@ -407,7 +518,8 @@ class VisionMixer:
         capabilities = probe_backend()
         use_mxl = bool(capabilities["mxl_plugins"])
         use_cef = bool(capabilities["cefsrc"])
-        stinger = self.get_stinger(self.settings.default_stinger).model_dump()
+        slot = self.stinger_slots[0] if self.stinger_slots else None
+        stinger = self._info_for_slot(slot).model_dump()
         description = build_pipeline_description(
             settings=self.settings,
             inputs=self.list_inputs(),
@@ -641,10 +753,16 @@ class VisionMixer:
         if self.stinger_player and not self.stinger_player.done:
             remaining = self.stinger_player.info.frame_count - self.stinger_player.frame + 1
             self.advance_stinger(max(remaining, 1))
-        info = self.get_stinger(stinger_id)
-        self.get_input(target_input_id)
         if direction is None:
             direction = "to_replay" if self._is_replay(target_input_id) else "to_live"
+        slot = self._slot_for(direction)
+        if slot is not None and stinger_id and slot.stinger_id != stinger_id:
+            for item in self.stinger_slots:
+                if item.stinger_id == stinger_id:
+                    slot = item
+                    break
+        info = self._info_for_slot(slot, stinger_id)
+        self.get_input(target_input_id)
         panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
         outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
         self.last_transition = "stinger"

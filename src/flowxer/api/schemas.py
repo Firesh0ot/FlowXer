@@ -235,10 +235,15 @@ class StingerInfo(BaseModel):
     path: str
     frame_count: int
     cut_frame: int
-    pattern: str
+    pattern: str = "frame_%05d.tga"
     width: int
     height: int
     has_alpha: bool = True
+    kind: str = Field(default="sequence", description="sequence (TGA) or video")
+    media_path: str = ""
+    cut_ms: int = 0
+    duration_ms: int = 0
+    fps: float = 50.0
 
 
 class OverlayStatus(BaseModel):
@@ -322,6 +327,17 @@ class StingerSlot(BaseModel):
     role: str = Field(description="shared, in, or out")
     label: str
     stinger_id: str = "replay-wipe"
+    kind: str = Field(default="sequence", description="sequence (TGA) or video")
+    media_path: str | None = Field(
+        default=None,
+        description="TGA sequence directory or video file used by this slot",
+    )
+    cut_ms: int | None = Field(
+        default=None,
+        ge=0,
+        description="Time in the stinger when program cuts. None uses the asset default.",
+    )
+    cut_frame: int | None = Field(default=None, ge=0)
 
 
 class WorkspaceConfig(BaseModel):
@@ -354,7 +370,16 @@ class KeyerUpdate(BaseModel):
 
 
 class StingerSlotUpdate(BaseModel):
-    stinger_id: str
+    stinger_id: str | None = None
+    kind: str | None = Field(default=None, description="sequence or video")
+    media_path: str | None = Field(
+        default=None,
+        description="TGA sequence id/directory or video clip filename",
+    )
+    cut_ms: int | None = Field(default=None, ge=0, description="Program cut time in milliseconds")
+    cut_frame: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=1, description="Video duration when ffprobe is unavailable")
+    label: str | None = None
 
 
 class ConsoleState(BaseModel):

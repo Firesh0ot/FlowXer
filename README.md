@@ -165,16 +165,20 @@ FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/m
 
 ## Stinger convention
 
+Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut time** — the moment program switches while the sting covers the picture.
+
 Place sequences under `storage/stingers/<id>/`:
 
 ```
 frame_00000.tga
 frame_00001.tga
 ...
-stinger.json   # { "frame_count", "cut_frame", "pattern": "frame_%05d.tga" }
+stinger.json   # { "kind": "sequence", "frame_count", "cut_frame", "cut_ms", "pattern": "frame_%05d.tga" }
 ```
 
-`cut_frame` is the first fully opaque frame — that is when program switches from live to replay (or back). Generate the bundled wipe with:
+Video stingers live in the same tree (`kind: "video"` plus `media_path`). In the GUI, open the stinger ⚙: pick Sequence or Video, then set **Cut at (seconds)**.
+
+`cut_ms` / `cut_frame` is when program switches from live to replay (or back). Generate the bundled wipe with:
 
 ```bash
 python scripts/generate_stinger.py --dest storage/stingers/replay-wipe

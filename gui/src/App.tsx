@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
+import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
 export default function App() {
@@ -11,6 +12,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sourceEdit, setSourceEdit] = useState<LogicalInput | null>(null);
+  const [stingerEdit, setStingerEdit] = useState<StingerSlot | null>(null);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
 
@@ -162,22 +164,27 @@ export default function App() {
             </button>
           ))}
           {snapshot.stinger_slots.map((slot) => (
-            <button
-              key={slot.id}
-              onClick={() => {
-                const target =
-                  slot.role === "out"
-                    ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
-                    : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
-                      snapshot.inputs[0]?.id;
-                if (!target) return;
-                void api
-                  .stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay")
-                  .then(refresh);
-              }}
-            >
-              {slot.label}
-            </button>
+            <div key={slot.id} className="stinger-chip">
+              <button
+                onClick={() => {
+                  const target =
+                    slot.role === "out"
+                      ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
+                      : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
+                        snapshot.inputs[0]?.id;
+                  if (!target) return;
+                  void command(() =>
+                    api.stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay"),
+                  );
+                }}
+              >
+                {slot.label}
+                {slot.cut_ms != null ? ` · ${(slot.cut_ms / 1000).toFixed(2)}s` : ""}
+              </button>
+              <button className="gear" title="Stinger parameters" onClick={() => setStingerEdit(slot)}>
+                ⚙
+              </button>
+            </div>
           ))}
         </div>
       </section>
@@ -226,6 +233,17 @@ export default function App() {
           onClose={() => setSourceEdit(null)}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);
+            await refresh();
+          }}
+        />
+      ) : null}
+      {stingerEdit ? (
+        <StingerSettingsModal
+          slot={stingerEdit}
+          console={snapshot}
+          onClose={() => setStingerEdit(null)}
+          onSave={async (payload) => {
+            await api.patchStingerSlot(stingerEdit.id, payload);
             await refresh();
           }}
         />
