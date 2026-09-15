@@ -43,6 +43,22 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     assert "cefsrc" in description
     assert "input-selector name=vsel" in description
     assert "multifilesrc name=stinger" in description
+    video = mixer.get_stinger("replay-wipe").model_dump()
+    video["kind"] = "video"
+    video["media_path"] = "/tmp/sting.webm"
+    video_description = build_pipeline_description(
+        settings=mixer.settings,
+        inputs=mixer.list_inputs(),
+        overlay_url=mixer.overlay.url,
+        overlay_enabled=False,
+        stinger=video,
+        output_video_flow_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        output_audio_flow_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        domain="/mxl-domain",
+        use_mxl_sink=False,
+        use_cefsrc=False,
+    )
+    assert 'filesrc name=stinger location="/tmp/sting.webm"' in video_description
     assert "video/x-raw,format=v210" in description
 
 
