@@ -1,0 +1,16 @@
+{
+  "name": "FlowXer Vision Mixer",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "mixer-api",
+      "command": "source .venv/bin/activate && FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/mxl-domain uvicorn flowxer.app:create_app --factory --host 0.0.0.0 --port 9610"
+    },
+    {
+      "name": "gui",
+      "command": "cd gui && npm run dev"
+    }
+  ],
+  "ports": [9610, 9620]
+}
