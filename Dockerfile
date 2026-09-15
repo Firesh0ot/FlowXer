@@ -1,6 +1,8 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG FLOWXER_VERSION=0.1.0
+LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
@@ -27,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md LICENSE /app/
+COPY pyproject.toml README.md LICENSE VERSION /app/
 COPY src /app/src
 COPY configs /app/configs
 COPY docker/entrypoint.sh /entrypoint.sh

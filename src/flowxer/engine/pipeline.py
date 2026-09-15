@@ -119,10 +119,24 @@ def build_pipeline_description(
     v210 = _v210(settings)
     audio = _audio(settings)
     overlay_alpha = "1.0" if overlay_enabled else "0.0"
-    stinger_location = (
-        f"{stinger['path']}/{stinger['pattern']}" if stinger else "/dev/null/frame_%05d.tga"
-    )
-    stinger_stop = (stinger["frame_count"] - 1) if stinger else 0
+    kind = (stinger or {}).get("kind") or "sequence"
+    if stinger and kind == "video":
+        stinger_bin = (
+            f'filesrc name=stinger location="{stinger.get("media_path") or stinger["path"]}" '
+            f"! decodebin name=stingerdec ! videoconvert ! videoscale ! {bgra} "
+            f"! queue name=stingerq ! comp.sink_2"
+        )
+    else:
+        stinger_location = (
+            f"{stinger['path']}/{stinger['pattern']}" if stinger else "/dev/null/frame_%05d.tga"
+        )
+        stinger_stop = (stinger["frame_count"] - 1) if stinger else 0
+        stinger_bin = (
+            f"multifilesrc name=stinger location={stinger_location} index=0 "
+            f"stop-index={stinger_stop} loop=false caps=image/x-tga "
+            f"! decodebin ! videoconvert ! videoscale ! {bgra} "
+            f"! queue name=stingerq ! comp.sink_2"
+        )
 
     video_sources = "\n".join(_video_source_bin(i, settings, domain) for i in inputs)
     audio_sources = "\n".join(_audio_source_bin(i, settings, domain) for i in inputs)
@@ -167,9 +181,7 @@ vsel. ! videoconvert ! {bgra} ! queue ! comp.sink_0
 
 {overlay_bin}
 
-multifilesrc name=stinger location={stinger_location} index=0 stop-index={stinger_stop} loop=false caps=image/x-tga
-  ! decodebin ! videoconvert ! videoscale ! {bgra}
-  ! queue name=stingerq ! comp.sink_2
+{stinger_bin}
 
 comp. ! identity name=ptsfix ! {video_sink}
 

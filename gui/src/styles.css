@@ -57,10 +57,34 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   border: 1px solid var(--line); background: #151b26; border-radius: 6px;
 }
 .aux-row button.on, .me-tabs button.active { outline: 2px solid var(--accent); }
-.source-strip {
-  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(180px, 1fr);
-  gap: 8px; padding: 10px; border-top: 1px solid var(--line); background: #0b0e14; overflow-x: auto;
+.stinger-chip { display: flex; align-items: center; gap: 2px; }
+.stinger-chip button:first-child {
+  border: 1px solid var(--line); background: #151b26; border-radius: 6px 0 0 6px;
 }
+.source-strip {
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(160px, 1fr);
+  gap: 8px; padding: 10px; overflow-x: auto;
+}
+.deck {
+  display: grid; grid-template-columns: 2fr 1fr; align-items: stretch;
+  border-top: 1px solid var(--line); background: #0b0e14;
+}
+.transition-bank {
+  display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  gap: 8px; padding: 10px; border-left: 1px solid var(--line);
+}
+.transition-bank button {
+  font: inherit; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text); cursor: pointer; border-radius: 8px; min-height: 64px;
+  border: 1px solid var(--line); background: #151b26;
+}
+.transition-bank .cut { background: #3a1518; border-color: #6a2a30; }
+.transition-bank .fade { background: #15243a; border-color: #2a4a6a; }
+.transition-bank .ftb { background: #121212; border-color: #444; }
+.transition-bank .wipe { background: #2a2410; border-color: #6a5a20; }
+.transition-bank .wipe.armed { outline: 2px solid #e0b025; background: #4a3a12; }
+.transition-bank .wipe.playing, .transition-bank .cut.sting { outline: 2px solid #2ec4ff; }
+.transition-bank button:hover { filter: brightness(1.15); }
 .source-tile { background: var(--panel); border: 1px solid var(--line); min-width: 180px; }
 .source-tile header {
   display: grid; grid-template-columns: 1fr auto auto; gap: 6px; align-items: center;
@@ -97,4 +121,6 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 @media (max-width: 900px) {
   .monitors { grid-template-columns: 1fr; }
+  .deck { grid-template-columns: 1fr; }
+  .transition-bank { border-left: 0; border-top: 1px solid var(--line); min-height: 140px; }
 }

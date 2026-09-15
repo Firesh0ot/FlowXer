@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from flowxer import __version__
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -19,7 +20,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 9610
     title: str = "FlowXer Vision Mixer"
-    version: str = "0.1.0"
+    version: str = __version__
 
     mxl_domain: Path = Path("./data/mxl-domain")
     storage_root: Path = Path("./storage")
@@ -41,6 +42,7 @@ class Settings(BaseSettings):
     overlay_url: str = "http://127.0.0.1:9610/graphics/lower-third.html"
     default_stinger: str = "replay-wipe"
     stinger_frame_count: int = 24
+    stinger_auto_tick: bool = True
 
     @property
     def clips_dir(self) -> Path:
