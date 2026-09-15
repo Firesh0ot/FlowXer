@@ -33,6 +33,25 @@ jobs:
         with:
           part: minor
 
+  sync-dev:
+    needs: [version]
+    if: ${{ needs.version.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Merge stage into dev
+        uses: ./.github/actions/merge-back
+        with:
+          source: stage
+          target: dev
+
   test:
     needs: [version]
     if: ${{ always() && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
@@ -87,8 +106,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${CURSOR_API_KEY:-}" ]; then
-            echo "CURSOR_API_KEY is not set. Skipping Cursor environment test."
-            echo "Add the secret, or create a Cursor Automation on Push to branch: stage."
+            echo "::warning::CURSOR_API_KEY is not set. Skipping Cursor environment test."
+            echo "Add the GitHub Actions secret CURSOR_API_KEY, or create a Cursor Automation on Push to branch: stage."
             echo "See .cursor/automations/stage-test.md"
             exit 0
           fi
