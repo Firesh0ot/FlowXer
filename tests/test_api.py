@@ -62,6 +62,10 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
         "/api/v1/replay/take",
         "/api/v1/replay/return",
         "/api/v1/stinger/play",
+        "/api/v1/mixer/cut",
+        "/api/v1/mixer/fade",
+        "/api/v1/mixer/fade-to-black",
+        "/api/v1/mixer/wipe",
     ):
         assert path in paths, path
     assert spec["info"]["title"] == "FlowXer Vision Mixer"

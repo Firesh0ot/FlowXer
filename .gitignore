@@ -9,6 +9,9 @@ htmlcov/
 .venv/
 venv/
 env/
+node_modules/
+gui/dist/
+*.egg-info/
 *.egg-info/
 dist/
 build/
