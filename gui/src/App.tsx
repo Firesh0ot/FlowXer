@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
+import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
 export default function App() {
@@ -11,6 +12,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sourceEdit, setSourceEdit] = useState<LogicalInput | null>(null);
+  const [stingerEdit, setStingerEdit] = useState<StingerSlot | null>(null);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
 
@@ -27,11 +29,22 @@ export default function App() {
     }
   };
 
+  const command = async (fn: () => Promise<unknown>) => {
+    try {
+      await fn();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "command failed");
+    }
+  };
+
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 1000);
+    const stinging =
+      snapshot?.mixer.stinger.phase === "playing" || snapshot?.mixer.stinger.phase === "cut";
+    const timer = window.setInterval(() => void refresh(), stinging ? 200 : 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [snapshot?.mixer.stinger.phase]);
 
   if (!snapshot) {
     return <div className="boot">{error ?? "Connecting to vision mixer…"}</div>;
@@ -151,22 +164,27 @@ export default function App() {
             </button>
           ))}
           {snapshot.stinger_slots.map((slot) => (
-            <button
-              key={slot.id}
-              onClick={() => {
-                const target =
-                  slot.role === "out"
-                    ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
-                    : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
-                      snapshot.inputs[0]?.id;
-                if (!target) return;
-                void api
-                  .stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay")
-                  .then(refresh);
-              }}
-            >
-              {slot.label}
-            </button>
+            <div key={slot.id} className="stinger-chip">
+              <button
+                onClick={() => {
+                  const target =
+                    slot.role === "out"
+                      ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
+                      : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
+                        snapshot.inputs[0]?.id;
+                  if (!target) return;
+                  void command(() =>
+                    api.stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay"),
+                  );
+                }}
+              >
+                {slot.label}
+                {slot.cut_ms != null ? ` · ${(slot.cut_ms / 1000).toFixed(2)}s` : ""}
+              </button>
+              <button className="gear" title="Stinger parameters" onClick={() => setStingerEdit(slot)}>
+                ⚙
+              </button>
+            </div>
           ))}
         </div>
       </section>
@@ -179,18 +197,19 @@ export default function App() {
               input={input}
               panel={panel}
               webrtc={webrtc}
-              onPreview={() => void api.preview(input.id, panel.id).then(refresh)}
-              onProgram={() => void api.take(input.id, panel.id).then(refresh)}
+              onPreview={() => void command(() => api.preview(input.id, panel.id))}
+              onProgram={() => void command(() => api.take(input.id, panel.id))}
               onSettings={() => setSourceEdit(input)}
             />
           ))}
         </div>
         <TransitionBank
           panel={panel}
-          onCut={() => void api.cut(panel.id).then(refresh)}
-          onFade={() => void api.fade(panel.id).then(refresh)}
-          onFadeToBlack={() => void api.fadeToBlack(panel.id).then(refresh)}
-          onWipe={() => void api.wipe(panel.id).then(refresh)}
+          stingerPhase={snapshot.mixer.stinger.phase}
+          onCut={() => void command(() => api.cut(panel.id))}
+          onFade={() => void command(() => api.fade(panel.id))}
+          onFadeToBlack={() => void command(() => api.fadeToBlack(panel.id))}
+          onWipe={() => void command(() => api.wipe(panel.id))}
         />
       </section>
 
@@ -214,6 +233,17 @@ export default function App() {
           onClose={() => setSourceEdit(null)}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);
+            await refresh();
+          }}
+        />
+      ) : null}
+      {stingerEdit ? (
+        <StingerSettingsModal
+          slot={stingerEdit}
+          console={snapshot}
+          onClose={() => setStingerEdit(null)}
+          onSave={async (payload) => {
+            await api.patchStingerSlot(stingerEdit.id, payload);
             await refresh();
           }}
         />

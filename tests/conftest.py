@@ -22,6 +22,7 @@ def settings(tmp_path: Path) -> Settings:
         stinger_frame_count=8,
         overlay_url="http://127.0.0.1:9610/graphics/lower-third.html",
         group_hint="FlowXerTest",
+        stinger_auto_tick=False,
     )
 
 

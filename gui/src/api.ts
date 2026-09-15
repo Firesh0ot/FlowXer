@@ -34,6 +34,22 @@ export interface StingerSlot {
   role: string;
   label: string;
   stinger_id: string;
+  kind?: "sequence" | "video";
+  media_path?: string | null;
+  cut_ms?: number | null;
+  cut_frame?: number | null;
+}
+
+export interface StingerInfo {
+  id: string;
+  path: string;
+  kind?: "sequence" | "video";
+  media_path?: string;
+  frame_count: number;
+  cut_frame: number;
+  cut_ms?: number;
+  duration_ms?: number;
+  fps?: number;
 }
 
 export interface WorkspaceConfig {
@@ -82,7 +98,7 @@ export interface ConsoleState {
   resources: ResourceInfo;
   webrtc: { enabled: boolean; protocol: string };
   clips: { name: string; path: string }[];
-  stingers: { id: string; frame_count: number; cut_frame: number }[];
+  stingers: StingerInfo[];
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -156,11 +172,11 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload),
     }).then((r) => parse<DownstreamKeyer>(r)),
-  patchStingerSlot: (id: string, stinger_id: string) =>
+  patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",
       headers: jsonHeaders,
-      body: JSON.stringify({ stinger_id }),
+      body: JSON.stringify(payload),
     }).then((r) => parse<StingerSlot>(r)),
   replayLoad: (file_path: string, input_id: string) =>
     fetch("/api/v1/replay/load", {

@@ -529,13 +529,13 @@ def patch_keyer(
     "/stinger-slots/{slot_id}",
     response_model=StingerSlot,
     tags=["stinger"],
-    summary="Assign a TGA sequence to an IN, OUT or shared stinger slot",
+    summary="Set stinger media (TGA sequence or video) and the cut time for a slot",
 )
 def patch_stinger_slot(
     slot_id: str, payload: StingerSlotUpdate, mixer: VisionMixer = Depends(get_mixer)
 ) -> StingerSlot:
     try:
-        return mixer.assign_stinger_slot(slot_id, payload.stinger_id)
+        return mixer.configure_stinger_slot(slot_id, payload)
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND)
 
