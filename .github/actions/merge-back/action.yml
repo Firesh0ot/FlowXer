@@ -45,5 +45,22 @@ runs:
           fi
         fi
 
-        git pull --rebase origin "$TARGET"
+        # Do not rebase: version-bump commits on the target replay as conflicts.
+        git fetch origin "$TARGET"
+        if ! git merge-base --is-ancestor "origin/$TARGET" HEAD; then
+          set +e
+          git merge "origin/$TARGET" --no-edit -m "chore: merge latest ${TARGET} [skip version]"
+          catchup_status=$?
+          set -e
+          if [ "$catchup_status" -ne 0 ]; then
+            python3 scripts/bump_version.py reconcile-refs
+            git add VERSION pyproject.toml src/flowxer/__init__.py
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "Unresolved conflicts remain while catching up ${TARGET}:"
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+            git commit --no-edit || git commit -m "chore: merge latest ${TARGET} [skip version]"
+          fi
+        fi
         git push origin "HEAD:${TARGET}"
