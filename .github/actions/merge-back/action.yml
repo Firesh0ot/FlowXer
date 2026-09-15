@@ -1,0 +1,49 @@
+name: Merge back
+description: Merge a source branch into a target and reconcile VERSION to the component-wise max
+inputs:
+  source:
+    description: Branch to merge from (e.g. main)
+    required: true
+  target:
+    description: Branch to update (e.g. stage)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Merge ${{ inputs.source }} into ${{ inputs.target }}
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git fetch origin "$SOURCE" "$TARGET" main stage dev || git fetch origin "$SOURCE" "$TARGET"
+
+        git checkout -B "$TARGET" "origin/$TARGET"
+
+        set +e
+        git merge "origin/$SOURCE" --no-edit -m "chore: merge ${SOURCE} into ${TARGET} [skip version]"
+        merge_status=$?
+        set -e
+
+        if [ "$merge_status" -ne 0 ]; then
+          python3 scripts/bump_version.py reconcile-refs
+          git add VERSION pyproject.toml src/flowxer/__init__.py
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Unresolved conflicts remain after version reconcile:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git commit --no-edit || git commit -m "chore: merge ${SOURCE} into ${TARGET} [skip version]"
+        else
+          python3 scripts/bump_version.py reconcile-refs
+          if ! git diff --quiet -- VERSION pyproject.toml src/flowxer/__init__.py; then
+            git add VERSION pyproject.toml src/flowxer/__init__.py
+            git commit -m "chore(version): reconcile after merging ${SOURCE} into ${TARGET} [skip version]"
+          fi
+        fi
+
+        git pull --rebase origin "$TARGET"
+        git push origin "HEAD:${TARGET}"

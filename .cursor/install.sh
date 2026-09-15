@@ -13,13 +13,14 @@ if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
 fi
 
 # Python control plane (FastAPI + engine) with dev/test extras.
-python3 -m venv .venv
+if [ ! -x .venv/bin/python ]; then
+  python3 -m venv .venv
+fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
-pip install --upgrade pip
-pip install -e '.[dev]'
+python -m pip install -e '.[dev]'
 
-# Operator GUI (Vite + React).
-(cd gui && npm install)
+# Operator GUI (Vite + React). Use the lockfile so Cloud Agent installs stay deterministic.
+(cd gui && npm ci)
 
 echo "FlowXer environment ready."

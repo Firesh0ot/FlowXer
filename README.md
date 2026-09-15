@@ -200,18 +200,34 @@ code     test       container
 | Branch | What you do | Automation |
 |--------|-------------|------------|
 | **dev** | Write code. Open PRs into `dev`. | Push increments the **patch** (code) counter. Tests run on the PR (`ci.yml`). |
-| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. |
-| **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, and publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`. |
+| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. Then merges `stage` back into `dev` so `VERSION` stays aligned. |
+| **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`, then merges `main` → `stage` → `dev`. |
 
 Example: `1.4.12` means 1 production release, 4 stage promotions, 12 coding pushes since the counters started.
 
+Before bumping, each version job **reconciles** `VERSION` to the component-wise max of `origin/main`, `origin/stage`, and `origin/dev`, then increments the counter for that branch. That keeps the triple monotonic even if a branch was behind.
+
+Do not merge `dev` straight to `main`. Stage is the test gate; main is the container release.
+
+### Branch protection (required)
+
+This repository has no GitHub branch protection yet. Configure it under **Settings → Rules → Rulesets** (or **Settings → Branches**) so the workflow cannot be skipped:
+
+| Branch | Rules |
+|--------|--------|
+| **main** | Require a pull request. Require the `CI / Pytest` check. Do not allow force pushes or deletions. Restrict who can push to admins / the merge queue. |
+| **stage** | Same as `main`. PRs should come from `dev`. |
+| **dev** | Require a pull request. Require `CI / Pytest`. Do not allow force pushes or deletions. |
+
+Without these rules, a direct push to `main` still publishes GHCR images.
+
 ### Cursor environment on stage
 
-Two options (both are valid):
+Cloud Agent setup lives in `.cursor/environment.json` (install script + mixer/GUI terminals). Commit that file; do not rely on a personal dashboard environment.
 
-1. **GitHub secret `CURSOR_API_KEY`** — `stage.yml` calls `https://api.cursor.com/v1/agents` with `startingRef: stage`.
+Two options for the **stage test agent** (pick one; both are valid):
+
+1. **GitHub Actions secret `CURSOR_API_KEY`** — Settings → Secrets and variables → Actions. `stage.yml` calls `https://api.cursor.com/v1/agents` with `startingRef: stage`. Create the key at [cursor.com/dashboard](https://cursor.com/dashboard) → Integrations / Cloud Agents API.
 2. **Cursor Automation** — [cursor.com/automations](https://cursor.com/automations), trigger **Push to branch: `stage`**. Prompt is in `.cursor/automations/stage-test.md`.
 
 Rebuilding a Cursor *environment snapshot* on every stage push is the wrong lever (that snapshot is for agent VM setup). The automation/agent **uses** that environment to run the tests.
-
-Do not merge `dev` straight to `main`. Stage is the test gate; main is the container release.
