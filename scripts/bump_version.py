@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,16 @@ def write_version(major: int, minor: int, patch: int, root: Path = ROOT) -> str:
     return version
 
 
+def max_components(*versions: tuple[int, int, int]) -> tuple[int, int, int]:
+    if not versions:
+        raise ValueError("at least one version is required")
+    return (
+        max(v[0] for v in versions),
+        max(v[1] for v in versions),
+        max(v[2] for v in versions),
+    )
+
+
 def bump(part: str, root: Path = ROOT, count: int = 1) -> str:
     if count < 1:
         raise ValueError("count must be >= 1")
@@ -67,14 +78,81 @@ def bump(part: str, root: Path = ROOT, count: int = 1) -> str:
     return write_version(major, minor, patch, root)
 
 
+def version_from_git_ref(ref: str, root: Path = ROOT) -> tuple[int, int, int] | None:
+    try:
+        text = subprocess.check_output(
+            ["git", "show", f"{ref}:VERSION"],
+            cwd=root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    try:
+        return parse_version(text)
+    except ValueError:
+        return None
+
+
+def reconcile(root: Path, versions: list[tuple[int, int, int]]) -> str:
+    found = list(versions)
+    if (root / "VERSION").exists():
+        found.append(read_version(root))
+    if not found:
+        raise ValueError("no versions to reconcile")
+    major, minor, patch = max_components(*found)
+    return write_version(major, minor, patch, root)
+
+
+def reconcile_refs(root: Path, refs: list[str]) -> str:
+    found: list[tuple[int, int, int]] = []
+    if (root / "VERSION").exists():
+        found.append(read_version(root))
+    for ref in refs:
+        parsed = version_from_git_ref(ref, root)
+        if parsed is not None:
+            found.append(parsed)
+    if not found:
+        raise ValueError("no versions to reconcile")
+    major, minor, patch = max_components(*found)
+    return write_version(major, minor, patch, root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("part", choices=["major", "minor", "patch", "show"])
+    parser.add_argument(
+        "part",
+        choices=["major", "minor", "patch", "show", "set", "reconcile", "reconcile-refs"],
+    )
+    parser.add_argument(
+        "version",
+        nargs="?",
+        help="X.Y.Z for 'set', or extra version strings for 'reconcile'",
+    )
+    parser.add_argument("extra", nargs="*", help="Additional X.Y.Z values for 'reconcile'")
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--refs",
+        nargs="+",
+        default=["origin/main", "origin/stage", "origin/dev"],
+        help="Git refs whose VERSION files are included in reconcile-refs",
+    )
     args = parser.parse_args()
     if args.part == "show":
         print(format_version(*read_version(args.root)))
+        return
+    if args.part == "set":
+        if not args.version:
+            raise SystemExit("set requires a version, e.g. bump_version.py set 1.3.2")
+        print(write_version(*parse_version(args.version), root=args.root))
+        return
+    if args.part == "reconcile":
+        strings = [value for value in [args.version, *args.extra] if value]
+        print(reconcile(args.root, [parse_version(value) for value in strings]))
+        return
+    if args.part == "reconcile-refs":
+        print(reconcile_refs(args.root, args.refs))
         return
     print(bump(args.part, args.root, args.count))
 

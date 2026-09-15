@@ -22,6 +22,12 @@ runs:
         PART: ${{ inputs.part }}
       run: |
         set -euo pipefail
+        git fetch origin main stage dev || true
+        before="$(python3 scripts/bump_version.py show)"
+        reconciled="$(python3 scripts/bump_version.py reconcile-refs)"
+        if [ "$reconciled" != "$before" ]; then
+          echo "Reconciled VERSION $before → $reconciled from origin/main|stage|dev"
+        fi
         version="$(python3 scripts/bump_version.py "$PART")"
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "Bumped $PART → $version"
