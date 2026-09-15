@@ -1,0 +1,48 @@
+name: Bump version
+description: Increment (main).(stage).(code) and push the version commit
+inputs:
+  part:
+    description: major (main), minor (stage), or patch (code)
+    required: true
+  tag:
+    description: Create and push a vX.Y.Z tag
+    required: false
+    default: "false"
+outputs:
+  version:
+    description: New version string
+    value: ${{ steps.bump.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Bump version
+      id: bump
+      shell: bash
+      env:
+        PART: ${{ inputs.part }}
+      run: |
+        set -euo pipefail
+        version="$(python3 scripts/bump_version.py "$PART")"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "Bumped $PART → $version"
+    - name: Commit version
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add VERSION pyproject.toml src/flowxer/__init__.py
+        if git diff --cached --quiet; then
+          echo "No version files changed"
+          exit 0
+        fi
+        version="$(python3 scripts/bump_version.py show)"
+        git commit -m "chore(version): ${version} [skip version]"
+        git pull --rebase origin "${GITHUB_REF_NAME}"
+        git push origin "HEAD:${GITHUB_REF_NAME}"
+        if [ "$TAG" = "true" ]; then
+          git tag "v${version}"
+          git push origin "v${version}"
+        fi

@@ -1,6 +1,8 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG FLOWXER_VERSION=0.1.0
+LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
@@ -18,18 +20,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-libav \
         libgdk-pixbuf2.0-0 \
         fonts-dejavu-core \
+        ffmpeg \
+        libopus0 \
+        libvpx9 \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY pyproject.toml README.md LICENSE /app/
+COPY pyproject.toml README.md LICENSE VERSION /app/
 COPY src /app/src
 COPY configs /app/configs
 COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN pip3 install --no-cache-dir --break-system-packages /app \
+    && pip3 install --no-cache-dir --break-system-packages 'aiortc==1.9.0' \
     && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
     && mkdir -p /mxl-domain /storage/clips /storage/stingers /storage/graphics \
