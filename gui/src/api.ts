@@ -59,6 +59,7 @@ export interface WorkspaceConfig {
   stinger_mode: string;
   stinger_count: number;
   downstream_keyer_count: number;
+  source_tile_aspect?: "16:9" | "9:16";
 }
 
 export interface MixerStatus {

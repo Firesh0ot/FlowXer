@@ -350,6 +350,10 @@ class WorkspaceConfig(BaseModel):
     )
     stinger_count: int = Field(default=1, ge=1, le=8)
     downstream_keyer_count: int = Field(default=1, ge=0, le=8)
+    source_tile_aspect: str = Field(
+        default="16:9",
+        description="Operator source-tile picture ratio: 16:9 (landscape) or 9:16 (portrait).",
+    )
 
 
 class WorkspaceUpdate(BaseModel):
@@ -359,6 +363,10 @@ class WorkspaceUpdate(BaseModel):
     stinger_mode: str | None = None
     stinger_count: int | None = Field(default=None, ge=1, le=8)
     downstream_keyer_count: int | None = Field(default=None, ge=0, le=8)
+    source_tile_aspect: str | None = Field(
+        default=None,
+        description="16:9 or 9:16 source tiles on the operator deck",
+    )
 
 
 class KeyerUpdate(BaseModel):

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput, type StingerSlot } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot, type WorkspaceConfig } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
@@ -199,6 +199,7 @@ export default function App() {
       <section className="deck">
         <div
           className="source-strip"
+          data-aspect={snapshot.workspace.source_tile_aspect ?? "16:9"}
           style={{ gridTemplateColumns: `repeat(${sourceStripColumns(snapshot.inputs.length)}, minmax(0, 1fr))` }}
         >
           {snapshot.inputs.map((input) => (
@@ -230,8 +231,16 @@ export default function App() {
           console={snapshot}
           onClose={() => setSettingsOpen(false)}
           onApply={async (payload) => {
-            if (snapshot.mixer.state === "running") await api.stop();
-            await api.workspace(payload);
+            const patch: Partial<WorkspaceConfig> = {};
+            (Object.keys(payload) as (keyof WorkspaceConfig)[]).forEach((key) => {
+              if (payload[key] !== snapshot.workspace[key]) {
+                (patch as Record<string, unknown>)[key] = payload[key];
+              }
+            });
+            if (Object.keys(patch).length === 0) return;
+            const displayOnly = Object.keys(patch).every((key) => key === "source_tile_aspect");
+            if (snapshot.mixer.state === "running" && !displayOnly) await api.stop();
+            await api.workspace(patch);
             await refresh();
           }}
         />

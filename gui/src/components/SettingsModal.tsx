@@ -23,7 +23,8 @@ export function SettingsModal({
         <h2>Settings</h2>
         <p className="hint">
           Mixer must be off-air to change format, source count, MEs, stingers or downstream keyers.
-          Per-stinger media and cut time are on the ⚙ next to each stinger.
+          Source tile aspect can change while on-air. Per-stinger media and cut time are on the ⚙
+          next to each stinger.
         </p>
         <label>
           Format
@@ -33,6 +34,16 @@ export function SettingsModal({
                 {fmt.label}
               </option>
             ))}
+          </select>
+        </label>
+        <label>
+          Source tiles
+          <select
+            value={form.source_tile_aspect ?? "16:9"}
+            onChange={(e) => set("source_tile_aspect", e.target.value)}
+          >
+            <option value="16:9">16:9 landscape</option>
+            <option value="9:16">9:16 portrait</option>
           </select>
         </label>
         <label>
