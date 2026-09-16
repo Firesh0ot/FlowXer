@@ -9,7 +9,7 @@ The mixer is controlled over HTTP, publishes **OpenAPI** at `/docs`, and keeps m
 | Video (VP210 / v210) | `video/v210` | `video/x-raw,format=v210` |
 | Audio | `audio/float32` | `audio/x-raw,format=F32LE,rate=48000` |
 
-Architecture follows [MXL hands-on Exercise 4](https://github.com/cbcrc/mxl-hands-on/blob/main/Exercises/Exercise4.md): FastAPI control plane, GStreamer media plane, logical sources, HTML5 keyer, file player, and MXL `mxlsrc` / `mxlsink` when the SDK plugin is present.
+The media plane is **GStreamer**. FastAPI is the control plane; logical sources, HTML5 keyer, file player, and MXL `mxlsrc` / `mxlsink` when the SDK plugin is present.
 
 ```mermaid
 flowchart LR
@@ -146,9 +146,9 @@ Services:
 
 ### Real MXL I/O
 
-Build or copy the [MXL SDK](https://github.com/dmf-mxl/mxl) GStreamer plugin (`libgstmxl.so` + `libmxl.so`) into `/opt/mxl` and the mixer will switch `fakesink` for `mxlsink` / `mxlsrc` automatically. That is the same plugin used by the Exercise 4 portable apps (`test-generator`, `file-player`, `html5-keyer`).
+Build or copy the [MXL SDK](https://github.com/dmf-mxl/mxl) GStreamer plugin (`libgstmxl.so` + `libmxl.so`) into `/opt/mxl` and the mixer will switch `fakesink` for `mxlsink` / `mxlsrc` automatically.
 
-You can share one domain with those apps by pointing `FLOWXER_MXL_DOMAIN` at the same host directory they use (for example `/Volumes/mxl/domain_1`).
+Point `FLOWXER_MXL_DOMAIN` at the host directory that holds the domain (for example `/Volumes/mxl/domain_1`) to share it with other GStreamer processes.
 
 HTML5 keying in production uses [`gstcefsrc`](https://github.com/centricular/gstcefsrc). Without it, FlowXer still keys a generated lower-third PNG and will load any URL you set once `cefsrc` is on `GST_PLUGIN_PATH`.
 
@@ -200,18 +200,34 @@ code     test       container
 | Branch | What you do | Automation |
 |--------|-------------|------------|
 | **dev** | Write code. Open PRs into `dev`. | Push increments the **patch** (code) counter. Tests run on the PR (`ci.yml`). |
-| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. |
-| **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, and publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`. |
+| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. Then merges `stage` back into `dev` so `VERSION` stays aligned. |
+| **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`, then merges `main` → `stage` → `dev`. |
 
 Example: `1.4.12` means 1 production release, 4 stage promotions, 12 coding pushes since the counters started.
 
+Before bumping, each version job **reconciles** `VERSION` to the component-wise max of `origin/main`, `origin/stage`, and `origin/dev`, then increments the counter for that branch. That keeps the triple monotonic even if a branch was behind.
+
+Do not merge `dev` straight to `main`. Stage is the test gate; main is the container release.
+
+### Branch protection (required)
+
+This repository has no GitHub branch protection yet. Configure it under **Settings → Rules → Rulesets** (or **Settings → Branches**) so the workflow cannot be skipped:
+
+| Branch | Rules |
+|--------|--------|
+| **main** | Require a pull request. Require the `CI / Pytest` check. Do not allow force pushes or deletions. Restrict who can push to admins / the merge queue. |
+| **stage** | Same as `main`. PRs should come from `dev`. |
+| **dev** | Require a pull request. Require `CI / Pytest`. Do not allow force pushes or deletions. |
+
+Without these rules, a direct push to `main` still publishes GHCR images.
+
 ### Cursor environment on stage
 
-Two options (both are valid):
+Cloud Agent setup lives in `.cursor/environment.json` (install script + mixer/GUI terminals). Commit that file; do not rely on a personal dashboard environment.
 
-1. **GitHub secret `CURSOR_API_KEY`** — `stage.yml` calls `https://api.cursor.com/v1/agents` with `startingRef: stage`.
+Two options for the **stage test agent** (pick one; both are valid):
+
+1. **GitHub Actions secret `CURSOR_API_KEY`** — Settings → Secrets and variables → Actions. `stage.yml` calls `https://api.cursor.com/v1/agents` with `startingRef: stage`. Create the key at [cursor.com/dashboard](https://cursor.com/dashboard) → Integrations / Cloud Agents API.
 2. **Cursor Automation** — [cursor.com/automations](https://cursor.com/automations), trigger **Push to branch: `stage`**. Prompt is in `.cursor/automations/stage-test.md`.
 
 Rebuilding a Cursor *environment snapshot* on every stage push is the wrong lever (that snapshot is for agent VM setup). The automation/agent **uses** that environment to run the tests.
-
-Do not merge `dev` straight to `main`. Stage is the test gate; main is the container release.

@@ -18,8 +18,9 @@ export function SourceTile({
 }) {
   const isPgm = panel.program_input_id === input.id;
   const isPvw = panel.preview_input_id === input.id;
+  const tally = isPgm ? "pgm" : isPvw ? "pvw" : "off";
   return (
-    <article className={`source-tile ${isPgm ? "is-pgm" : ""} ${isPvw ? "is-pvw" : ""}`}>
+    <article className={`source-tile ${isPgm ? "is-pgm" : ""} ${isPvw && !isPgm ? "is-pvw" : ""}`}>
       <header>
         <strong>{input.label}</strong>
         <span className="kind">{input.kind}</span>
@@ -32,7 +33,7 @@ export function SourceTile({
           streamId={`source:${input.id}`}
           webrtc={webrtc}
           label=""
-          tally={isPgm ? "pgm" : isPvw ? "pvw" : "off"}
+          tally={tally}
         />
         <button className="hit left" onClick={onPreview} title="Cut to Preview">
           PVW

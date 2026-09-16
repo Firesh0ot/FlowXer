@@ -22,5 +22,10 @@ storage/clips/*
 !storage/clips/.gitkeep
 storage/stingers/**/*.tga
 !storage/stingers/**/.gitkeep
+
+# Runtime-generated media/domain state
+data/
+storage/graphics/*.png
+storage/stingers/*/stinger.json
 .idea/
 .vscode/

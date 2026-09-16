@@ -490,7 +490,7 @@ def get_workspace(mixer: VisionMixer = Depends(get_mixer)) -> WorkspaceConfig:
     "/workspace",
     response_model=WorkspaceConfig,
     tags=["gui"],
-    summary="Apply Settings: raster, logical sources, mixer panels, stingers, downstream keyers",
+    summary="Apply Settings: raster, source tiles, logical sources, mixer panels, stingers, downstream keyers",
 )
 def put_workspace(
     payload: WorkspaceUpdate, mixer: VisionMixer = Depends(get_mixer)

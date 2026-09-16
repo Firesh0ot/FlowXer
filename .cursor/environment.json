@@ -1,0 +1,21 @@
+{
+  "name": "FlowXer Vision Mixer",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "mixer-api",
+      "command": "source .venv/bin/activate && FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/mxl-domain uvicorn flowxer.app:create_app --factory --host 0.0.0.0 --port 9610",
+      "description": "FastAPI mixer in simulate mode on port 9610"
+    },
+    {
+      "name": "gui",
+      "command": "cd gui && npm run dev",
+      "description": "Operator GUI (Vite) on port 9620, proxying /api to the mixer"
+    }
+  ],
+  "ports": [
+    { "name": "mixer-api", "port": 9610 },
+    { "name": "operator-gui", "port": 9620 }
+  ]
+}

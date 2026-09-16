@@ -65,3 +65,27 @@ jobs:
           tags: |
             ghcr.io/${{ steps.image.outputs.owner }}/flowxer-gui:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.image.outputs.owner }}/flowxer-gui:latest
+
+  sync-downstream:
+    needs: [release]
+    if: ${{ github.event_name == 'push' && needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Merge main into stage
+        uses: ./.github/actions/merge-back
+        with:
+          source: main
+          target: stage
+      - name: Merge stage into dev
+        uses: ./.github/actions/merge-back
+        with:
+          source: stage
+          target: dev
