@@ -1,12 +1,14 @@
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from flowxer.api.schemas import MixerStartRequest, WorkspaceUpdate
-from flowxer.engine.mixer import VisionMixer
+from flowxer.engine.mixer import MixerError, VisionMixer
 
 
 def test_default_console_has_sources_panel_and_dsk(mixer: VisionMixer) -> None:
+    assert mixer.workspace.source_tile_aspect == "16:9"
     assert mixer.workspace.logical_source_count == 8
     assert len(mixer.list_inputs()) == 8
     assert mixer.panels[0].id == "me-1"
@@ -35,6 +37,16 @@ def test_workspace_settings_resize_console(mixer: VisionMixer) -> None:
     assert len(mixer.keyers) == 2
 
 
+def test_source_tile_aspect_while_running(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.apply_workspace(WorkspaceUpdate(source_tile_aspect="9:16"))
+    assert mixer.workspace.source_tile_aspect == "9:16"
+    with pytest.raises(MixerError, match="stop the mixer"):
+        mixer.apply_workspace(WorkspaceUpdate(format_id="720p50"))
+    with pytest.raises(MixerError, match="16:9 or 9:16"):
+        mixer.apply_workspace(WorkspaceUpdate(source_tile_aspect="4:3"))
+
+
 def test_left_preview_right_program_on_panel(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2", panel_id="me-1")
@@ -48,6 +60,7 @@ def test_left_preview_right_program_on_panel(mixer: VisionMixer) -> None:
 def test_console_and_jpeg_and_resources_api(client: TestClient) -> None:
     console = client.get("/api/v1/console").json()
     assert console["workspace"]["format_id"] == "1080p50"
+    assert console["workspace"]["source_tile_aspect"] == "16:9"
     assert len(console["formats"]) >= 4
     assert console["resources"]["cpu_count"] >= 1
     jpeg = client.get("/api/v1/preview/jpeg/source:cam-1")

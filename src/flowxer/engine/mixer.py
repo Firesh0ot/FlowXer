@@ -206,12 +206,16 @@ class VisionMixer:
         self.stinger_slots = slots
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
-        if self.state == MixerState.running:
+        patch = payload.model_dump(exclude_unset=True)
+        display_only = set(patch) <= {"source_tile_aspect"}
+        if self.state == MixerState.running and not display_only:
             raise MixerError("stop the mixer before changing console layout")
         data = self.workspace.model_dump()
-        patch = payload.model_dump(exclude_unset=True)
         if patch.get("stinger_mode") not in {None, "shared", "separate"}:
             raise MixerError("stinger_mode must be shared or separate")
+        aspect = patch.get("source_tile_aspect")
+        if aspect not in {None, "16:9", "9:16"}:
+            raise MixerError("source_tile_aspect must be 16:9 or 9:16")
         data.update(patch)
         if data["format_id"] != self.workspace.format_id:
             fmt = format_by_id(data["format_id"])

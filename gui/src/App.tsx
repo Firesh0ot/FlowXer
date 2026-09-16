@@ -1,11 +1,20 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput, type StingerSlot } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot, type WorkspaceConfig } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
+
+/** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
+function sourceStripColumns(count: number, aspect: string = "16:9"): number {
+  if (aspect === "9:16") return Math.max(count, 1);
+  if (count <= 2) return Math.max(count, 1);
+  if (count <= 4) return 2;
+  if (count <= 6) return 3;
+  return 4;
+}
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<ConsoleState | null>(null);
@@ -179,7 +188,6 @@ export default function App() {
                 }}
               >
                 {slot.label}
-                {slot.cut_ms != null ? ` · ${(slot.cut_ms / 1000).toFixed(2)}s` : ""}
               </button>
               <button className="gear" title="Stinger parameters" onClick={() => setStingerEdit(slot)}>
                 ⚙
@@ -190,7 +198,16 @@ export default function App() {
       </section>
 
       <section className="deck">
-        <div className="source-strip">
+        <div
+          className="source-strip"
+          data-aspect={snapshot.workspace.source_tile_aspect ?? "16:9"}
+          style={{
+            gridTemplateColumns: `repeat(${sourceStripColumns(
+              snapshot.inputs.length,
+              snapshot.workspace.source_tile_aspect ?? "16:9",
+            )}, minmax(0, 1fr))`,
+          }}
+        >
           {snapshot.inputs.map((input) => (
             <SourceTile
               key={input.id}
@@ -220,8 +237,16 @@ export default function App() {
           console={snapshot}
           onClose={() => setSettingsOpen(false)}
           onApply={async (payload) => {
-            if (snapshot.mixer.state === "running") await api.stop();
-            await api.workspace(payload);
+            const patch: Partial<WorkspaceConfig> = {};
+            (Object.keys(payload) as (keyof WorkspaceConfig)[]).forEach((key) => {
+              if (payload[key] !== snapshot.workspace[key]) {
+                (patch as Record<string, unknown>)[key] = payload[key];
+              }
+            });
+            if (Object.keys(patch).length === 0) return;
+            const displayOnly = Object.keys(patch).every((key) => key === "source_tile_aspect");
+            if (snapshot.mixer.state === "running" && !displayOnly) await api.stop();
+            await api.workspace(patch);
             await refresh();
           }}
         />
