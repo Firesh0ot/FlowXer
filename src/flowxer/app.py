@@ -67,10 +67,9 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "It is controlled entirely over HTTP, documents itself with OpenAPI, and "
             "exchanges uncompressed media on an MXL domain: **video/v210 (VP210)** plus "
             "**audio/float32** at 48 kHz.\n\n"
-            "Architecture follows the CBC/Radio-Canada "
-            "[MXL hands-on Exercise 4](https://github.com/cbcrc/mxl-hands-on/blob/main/Exercises/Exercise4.md) "
-            "pattern: FastAPI control plane, GStreamer media plane, `mxlsrc`/`mxlsink` "
-            "for MXL, an HTML5 keyer, and a file player with storage access. "
+            "The media plane is GStreamer. FastAPI is the control plane; "
+            "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
+            "keyer and a file player with storage access. "
             "A TGA-sequence stinger covers the cut when going to replay and when "
             "returning to live."
         ),

@@ -12,7 +12,7 @@ class Html5Overlay:
     """
     HTML5 graphics keyer.
 
-    Production path (Exercise 4): GStreamer `cefsrc` renders a live URL with alpha
+    Production path: GStreamer `cefsrc` renders a live URL with alpha
     and the compositor keys it over program.
 
     Fallback: a Pillow BGRA lower-third written next to the mixer so gdkpixbufoverlay
