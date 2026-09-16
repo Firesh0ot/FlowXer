@@ -71,8 +71,9 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   background: #151b26; font-size: 11px;
 }
 .source-strip {
-  display: flex; gap: 10px; padding: 10px;
-  overflow: visible; min-width: 0; align-items: stretch;
+  display: grid; gap: 10px; padding: 10px;
+  min-width: 0; min-height: 0; align-content: stretch;
+  grid-auto-rows: 1fr;
 }
 .deck {
   display: grid; grid-template-columns: minmax(0, 2fr) minmax(168px, 1fr); align-items: stretch;
@@ -94,7 +95,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .transition-bank .wipe.armed { outline: 2px solid #e0b025; background: #4a3a12; }
 .transition-bank .wipe.playing, .transition-bank .cut.sting { outline: 2px solid #2ec4ff; }
 .transition-bank button:hover { filter: brightness(1.15); }
-.source-tile { background: var(--panel); border: 2px solid var(--line); flex: 1 1 0; min-width: 0; }
+.source-tile { background: var(--panel); border: 2px solid var(--line); min-width: 0; min-height: 0; display: grid; grid-template-rows: auto 1fr; }
 .source-tile header {
   display: grid; grid-template-columns: 1fr auto auto; gap: 4px; align-items: center;
   padding: 4px 6px; font-size: 12px; min-width: 0;
@@ -108,8 +109,8 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .source-tile.is-pgm header { background: var(--pgm); color: #fff; }
 .source-tile.is-pgm .kind, .source-tile.is-pgm .gear { color: #ffd6d6; }
 .gear { width: 28px; height: 24px; border: 0; background: transparent; color: var(--text); cursor: pointer; }
-.source-picture { position: relative; }
-.source-picture .monitor { aspect-ratio: 16/9; border: 0; }
+.source-picture { position: relative; min-height: 0; }
+.source-picture .monitor { height: 100%; min-height: 0; aspect-ratio: auto; border: 0; }
 .hit {
   position: absolute; top: 0; bottom: 0; width: 50%; border: 0; background: transparent;
   color: transparent; cursor: pointer; font-size: 11px; letter-spacing: 0.12em;

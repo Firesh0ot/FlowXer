@@ -7,6 +7,14 @@ import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
+/** How many tiles per row: 2 | 2×2 | 3+3 | 4+4. */
+function sourceStripColumns(count: number): number {
+  if (count <= 2) return Math.max(count, 1);
+  if (count <= 4) return 2;
+  if (count <= 6) return 3;
+  return 4;
+}
+
 export default function App() {
   const [snapshot, setSnapshot] = useState<ConsoleState | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -189,7 +197,10 @@ export default function App() {
       </section>
 
       <section className="deck">
-        <div className="source-strip">
+        <div
+          className="source-strip"
+          style={{ gridTemplateColumns: `repeat(${sourceStripColumns(snapshot.inputs.length)}, minmax(0, 1fr))` }}
+        >
           {snapshot.inputs.map((input) => (
             <SourceTile
               key={input.id}
