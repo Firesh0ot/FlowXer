@@ -3,8 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-# Stable namespace so output flow UUIDs are deterministic for a given group hint,
-# matching the MXL hands-on apps (restarting the mixer reuses the same flow dirs).
+# Stable namespace so output flow UUIDs are deterministic for a given group hint
+# (restarting the mixer reuses the same flow dirs).
 FLOWXER_NAMESPACE = uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 
 VIDEO_MEDIA_TYPE = "video/v210"

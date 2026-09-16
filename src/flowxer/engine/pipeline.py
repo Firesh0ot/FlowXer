@@ -107,7 +107,7 @@ def build_pipeline_description(
     use_cefsrc: bool,
 ) -> str:
     """
-    Build a gst-launch-style description matching Exercise 4:
+    Build a GStreamer gst-launch-style description:
 
       sources → input-selector → compositor (HTML5 + TGA stinger) → v210 mxlsink
       sources → input-selector → float32 mxlsink
