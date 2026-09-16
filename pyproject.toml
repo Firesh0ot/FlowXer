@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowxer"
-version = "1.4.4"
+version = "1.5.5"
 description = "DMF Vision Mixer microservice for uncompressed MXL (v210 + float32) workflows"
 readme = "README.md"
 license = { text = "Apache-2.0" }
