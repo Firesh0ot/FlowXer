@@ -73,8 +73,8 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .source-strip {
   --tile-aspect: 16 / 9;
   display: grid; gap: 10px; padding: 10px;
-  min-width: 0; min-height: 0; align-content: stretch;
-  grid-auto-rows: 1fr;
+  min-width: 0; min-height: 0; align-content: start;
+  grid-auto-rows: auto;
 }
 .source-strip[data-aspect="9:16"] { --tile-aspect: 9 / 16; }
 .deck {
@@ -111,20 +111,14 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .source-tile.is-pgm header { background: var(--pgm); color: #fff; }
 .source-tile.is-pgm .kind, .source-tile.is-pgm .gear { color: #ffd6d6; }
 .gear { width: 28px; height: 24px; border: 0; background: transparent; color: var(--text); cursor: pointer; }
-.source-picture {
-  position: relative; min-height: 0;
-  display: grid; place-items: center;
-  container-type: size;
-}
+.source-picture { position: relative; min-height: 0; }
 .source-picture .monitor {
-  position: absolute; top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  border: 0;
-  aspect-ratio: var(--tile-aspect);
-  width: min(100cqw, calc(100cqh * var(--tile-aspect)));
+  width: min(100%, calc(32vh * var(--tile-aspect)));
   height: auto;
-  max-width: 100%;
-  max-height: 100%;
+  max-height: 32vh;
+  aspect-ratio: var(--tile-aspect);
+  border: 0;
+  margin-inline: auto;
 }
 .hit {
   position: absolute; top: 0; bottom: 0; width: 50%; border: 0; background: transparent;

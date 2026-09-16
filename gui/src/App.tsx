@@ -7,8 +7,9 @@ import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
-/** How many tiles per row: 2 | 2×2 | 3+3 | 4+4. */
-function sourceStripColumns(count: number): number {
+/** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
+function sourceStripColumns(count: number, aspect: string = "16:9"): number {
+  if (aspect === "9:16") return Math.max(count, 1);
   if (count <= 2) return Math.max(count, 1);
   if (count <= 4) return 2;
   if (count <= 6) return 3;
@@ -200,7 +201,12 @@ export default function App() {
         <div
           className="source-strip"
           data-aspect={snapshot.workspace.source_tile_aspect ?? "16:9"}
-          style={{ gridTemplateColumns: `repeat(${sourceStripColumns(snapshot.inputs.length)}, minmax(0, 1fr))` }}
+          style={{
+            gridTemplateColumns: `repeat(${sourceStripColumns(
+              snapshot.inputs.length,
+              snapshot.workspace.source_tile_aspect ?? "16:9",
+            )}, minmax(0, 1fr))`,
+          }}
         >
           {snapshot.inputs.map((input) => (
             <SourceTile
