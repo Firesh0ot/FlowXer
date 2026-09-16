@@ -52,21 +52,30 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 .tally-pgm { border-color: var(--pgm); }
 .tally-pvw { border-color: var(--pvw); }
-.aux-row, .me-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.aux-row, .me-tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .aux-row button, .me-tabs button, .modal-actions button:last-child {
-  border: 1px solid var(--line); background: #151b26; border-radius: 6px;
+  border: 1px solid var(--line); background: #151b26; border-radius: 4px;
+}
+.aux-row button {
+  padding: 3px 8px; font-size: 11px; letter-spacing: 0.04em; line-height: 1.2;
 }
 .aux-row button.on, .me-tabs button.active { outline: 2px solid var(--accent); }
-.stinger-chip { display: flex; align-items: center; gap: 2px; }
+.stinger-chip { display: flex; align-items: stretch; gap: 0; }
 .stinger-chip button:first-child {
-  border: 1px solid var(--line); background: #151b26; border-radius: 6px 0 0 6px;
+  border: 1px solid var(--line); background: #151b26; border-radius: 4px 0 0 4px;
+  padding: 3px 8px;
+}
+.stinger-chip .gear {
+  width: 22px; height: auto; padding: 0;
+  border: 1px solid var(--line); border-left: 0; border-radius: 0 4px 4px 0;
+  background: #151b26; font-size: 11px;
 }
 .source-strip {
-  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(160px, 1fr);
-  gap: 8px; padding: 10px; overflow-x: auto;
+  display: flex; gap: 10px; padding: 10px;
+  overflow: hidden; min-width: 0; align-items: stretch;
 }
 .deck {
-  display: grid; grid-template-columns: 2fr 1fr; align-items: stretch;
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(168px, 1fr); align-items: stretch;
   border-top: 1px solid var(--line); background: #0b0e14;
 }
 .transition-bank {
@@ -85,11 +94,12 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .transition-bank .wipe.armed { outline: 2px solid #e0b025; background: #4a3a12; }
 .transition-bank .wipe.playing, .transition-bank .cut.sting { outline: 2px solid #2ec4ff; }
 .transition-bank button:hover { filter: brightness(1.15); }
-.source-tile { background: var(--panel); border: 1px solid var(--line); min-width: 180px; }
+.source-tile { background: var(--panel); border: 1px solid var(--line); flex: 1 1 0; min-width: 0; }
 .source-tile header {
-  display: grid; grid-template-columns: 1fr auto auto; gap: 6px; align-items: center;
-  padding: 6px 8px; font-size: 13px;
+  display: grid; grid-template-columns: 1fr auto auto; gap: 4px; align-items: center;
+  padding: 4px 6px; font-size: 12px; min-width: 0;
 }
+.source-tile header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .source-tile .kind { color: var(--muted); font-size: 11px; }
 .gear { width: 28px; height: 24px; border: 0; background: transparent; color: var(--text); cursor: pointer; }
 .source-picture { position: relative; }
@@ -101,8 +111,8 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .hit:hover { color: #fff; background: #ffffff14; }
 .hit.left { left: 0; }
 .hit.right { right: 0; }
-.is-pgm { outline: 2px solid var(--pgm); }
 .is-pvw { outline: 2px solid var(--pvw); }
+.is-pgm { outline: 2px solid var(--pgm); }
 .modal-backdrop {
   position: fixed; inset: 0; background: #0008; display: grid; place-items: center; z-index: 30;
 }

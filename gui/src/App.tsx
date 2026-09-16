@@ -179,7 +179,6 @@ export default function App() {
                 }}
               >
                 {slot.label}
-                {slot.cut_ms != null ? ` · ${(slot.cut_ms / 1000).toFixed(2)}s` : ""}
               </button>
               <button className="gear" title="Stinger parameters" onClick={() => setStingerEdit(slot)}>
                 ⚙
