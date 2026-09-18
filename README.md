@@ -51,6 +51,7 @@ flowchart LR
 - **Storage access** plays files from `storage/clips` (`.mp4`, `.ts`, `.mov`, `.mxf`, …) as uncompressed v210 + float32.
 - **HTML5 graphics overlay** keys a page over program (`cefsrc` when installed, Pillow fallback otherwise). A sample lower-third is served at `/graphics/lower-third.html`.
 - **Stingers** play a **TGA sequence with alpha** or a **video file**. At the cut frame the mixer switches Program, then finishes the sting. A source can be assigned an auto-stinger so Take/Cut plays that slot; otherwise Wipe arms the next Cut.
+- **Tally / UMD** sends TSL UMD Protocol 5.0 (UDP, or TCP with DLE/STX) to receivers such as Bitfocus Companion, Lawo VSM, BFE Commander, and Riedel HI. Program = right-hand red, Preview = left-hand green, label = source name.
 - Runs in **Docker** (`vision-mixer` + `gui` services) with a shared MXL domain volume.
 
 ## Operator GUI
@@ -58,7 +59,7 @@ flowchart LR
 The GUI is a **separate React service** (Vite + TypeScript) so the mixer container stays a media function. It talks to the mixer API and shows live pictures over **WebRTC WHEP** (JPEG snapshots if WebRTC is unavailable). Every control on the console is an HTTP call; there is no hidden GUI-only mixer path.
 
 ```
-┌─ File  Settings  Help ──────── [CPU% RAM% format] ──────────┐
+┌─ File  Settings  Tally  Help ─ [CPU% RAM% format] ──────────┐
 │  PREVIEW (WebRTC)          PROGRAM (WebRTC)                 │
 │  DSK 1 ON/OFF   Stinger ⚙                                   │
 │                                                             │
@@ -80,6 +81,8 @@ The GUI is a **separate React service** (Vite + TypeScript) so the mixer contain
 The gear on each **source** (`PATCH /inputs/{id}`) sets name, kind, MXL flow UUIDs, clip, and **Auto stinger** — which slot plays when that source is taken to Program or Cut from Preview. Other sources stay hard cuts.
 
 The gear on each **stinger** (`PATCH /stinger-slots/{id}`) picks a TGA sequence or video and **Cut at (frame)**. Pressing the stinger chip plays that slot with `flip_flop` so Preview becomes Program (`POST /stinger/play`).
+
+**Tally → Receivers…** (`PUT /tally/receivers`) adds TSL UMD 5.0 listeners: **Bitfocus Companion**, **Lawo VSM**, **BFE Commander**, **Riedel HI**, or a custom host. Program lights the right-hand lamp red, Preview the left-hand lamp green, and the source name is the UMD label. Display INDEX is the source slot plus an optional offset. Receivers can be changed while on-air.
 
 **Cut / Fade / Fade to Black / Wipe** on the transition bank map to `/mixer/cut`, `/mixer/fade`, `/mixer/fade-to-black`, and `/mixer/wipe`. Wipe arms the next Cut when the Preview source has no auto-stinger.
 
@@ -120,6 +123,8 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 | Stinger chip (Preview → Program) | `POST /stinger/play` (`flip_flop: true`, `panel_id`) |
 | Stinger ⚙ (media, cut frame) | `PATCH /stinger-slots/{id}` (`cut_frame`) |
 | Cut / Fade / Fade to Black / Wipe | `POST /mixer/cut`, `/fade`, `/fade-to-black`, `/wipe` |
+| Tally → Receivers… | `PUT /tally/receivers` |
+| Tally send now | `POST /tally/refresh` |
 | Preview pictures | `POST /webrtc/whep/{stream_id}` or `GET /preview/jpeg/{stream_id}` |
 
 API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
@@ -161,6 +166,11 @@ curl -X POST http://localhost:9610/api/v1/replay/take \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
 curl -X POST http://localhost:9610/api/v1/replay/return \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
+
+# TSL 5.0 tally/UMD to Riedel HI (same shape for Companion, VSM, BFE)
+curl -X PUT http://localhost:9610/api/v1/tally/receivers \
+  -H 'content-type: application/json' \
+  -d '{"receivers":[{"id":"hi-1","kind":"hi","label":"Riedel HI","host":"10.0.0.40","port":8900,"transport":"udp","enabled":true,"screen":0,"index_offset":0}]}'
 ```
 
 Register live MXL inputs **before** starting the mixer. Essence `media_type` is constrained to `video/v210` (or `video/v210a`) and `audio/float32`.
@@ -177,7 +187,7 @@ docker compose up --build
 
 Services:
 
-- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, transitions, settings)
+- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, transitions, tally, settings)
 - **vision-mixer** on port **9610** — control API, OpenAPI, WHEP previews
 - tmpfs MXL domain at `/mxl-domain`
 - bind-mount `./storage` for clips, TGA stingers, overlay cache
@@ -228,6 +238,24 @@ Generate the bundled wipe with:
 ```bash
 python scripts/generate_stinger.py --dest storage/stingers/replay-wipe
 ```
+
+## Tally and UMD (TSL 5.0)
+
+FlowXer is a TSL UMD Protocol 5.0 **sender**. Each configured receiver gets one packet per bus or label change:
+
+- **UDP** (default, TSL port **8900**) — raw packet
+- **TCP** — DLE `0xFE` / STX `0x02` wrapper with DLE stuffing
+
+| TSL field | FlowXer |
+|-----------|---------|
+| SCREEN | per-receiver `screen` (default 0) |
+| INDEX | logical source `slot` + `index_offset` |
+| TEXT | source label (ASCII UMD) |
+| RH tally | Program = red |
+| LH tally | Preview = green |
+| Text tally | Program red, Preview green, both amber |
+
+Presets: Bitfocus Companion, Lawo VSM, BFE Commander, Riedel HI (human interface Broadcast Controller), or Custom.
 
 ## License
 

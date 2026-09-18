@@ -181,6 +181,17 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   width: min(520px, 92vw); background: var(--panel); border: 1px solid var(--line);
   padding: 20px; display: grid; gap: 10px;
 }
+.modal.tally-modal { width: min(680px, 94vw); max-height: 88vh; overflow: auto; }
+.tally-receiver {
+  border: 1px solid var(--line); padding: 10px; display: grid; gap: 8px; margin: 0;
+}
+.tally-receiver legend {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%;
+  padding: 0 4px; color: var(--text);
+}
+.tally-enable { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; }
+.tally-grid { display: grid; grid-template-columns: 1fr 90px 120px; gap: 8px; }
+.tally-grid label:nth-child(4), .tally-grid label:nth-child(5) { grid-column: span 1; }
 .modal h2 { margin: 0; }
 .modal label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
 .modal input, .modal select { background: #0b1220; color: var(--text); border: 1px solid var(--line); padding: 8px; }

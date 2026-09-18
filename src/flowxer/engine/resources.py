@@ -49,6 +49,14 @@ def collect_resources(mixer) -> dict[str, Any]:
         issues.append({"level": "warning", "message": f"MXL domain missing at {domain}"})
     if mixer.state.value == "error":
         issues.append({"level": "error", "message": "Mixer is in error state"})
+    for receiver in getattr(getattr(mixer, "tally", None), "status", lambda: [])():
+        if receiver.enabled and receiver.last_error:
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": f"Tally {receiver.label} ({receiver.host}:{receiver.port}): {receiver.last_error}",
+                }
+            )
     for keyer in getattr(mixer, "keyers", []):
         if keyer.enabled and not keyer.url:
             issues.append({"level": "warning", "message": f"{keyer.label} has no HTML URL"})

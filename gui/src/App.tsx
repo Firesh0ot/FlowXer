@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput, type StingerSlot, type WorkspaceConfig } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { StatusChip } from "./components/StatusChip";
+import { TallySettingsModal } from "./components/TallySettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
 /** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
@@ -23,6 +24,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sourceEdit, setSourceEdit] = useState<LogicalInput | null>(null);
   const [stingerEdit, setStingerEdit] = useState<StingerSlot | null>(null);
+  const [tallyOpen, setTallyOpen] = useState(false);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
 
@@ -71,7 +73,7 @@ export default function App() {
           <strong>FlowXer</strong>
         </div>
         <nav>
-          {["File", "Settings", "Help"].map((name) => (
+          {["File", "Settings", "Tally", "Help"].map((name) => (
             <div key={name} className="menu">
               <button onClick={() => setMenu(menu === name ? null : name)}>{name}</button>
               {menu === name ? (
@@ -96,6 +98,16 @@ export default function App() {
                       }}
                     >
                       Console layout…
+                    </button>
+                  ) : null}
+                  {name === "Tally" ? (
+                    <button
+                      onClick={() => {
+                        setTallyOpen(true);
+                        setMenu(null);
+                      }}
+                    >
+                      Receivers…
                     </button>
                   ) : null}
                   {name === "Help" ? (
@@ -267,6 +279,26 @@ export default function App() {
           onSave={async (payload) => {
             await api.patchStingerSlot(stingerEdit.id, payload);
             setStingerEdit(null);
+            await refresh();
+          }}
+        />
+      ) : null}
+      {tallyOpen ? (
+        <TallySettingsModal
+          tally={
+            snapshot.tally ?? {
+              protocol: "TSL UMD 5.0",
+              receivers: [],
+              presets: [],
+            }
+          }
+          onClose={() => setTallyOpen(false)}
+          onSave={async (receivers: TallyReceiver[]) => {
+            await api.tallyReceivers(receivers);
+            await refresh();
+          }}
+          onRefresh={async () => {
+            await api.tallyRefresh();
             await refresh();
           }}
         />
