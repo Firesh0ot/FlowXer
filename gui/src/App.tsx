@@ -5,6 +5,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
+import { StatusChip } from "./components/StatusChip";
 import { TransitionBank } from "./components/TransitionBank";
 
 /** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
@@ -61,7 +62,6 @@ export default function App() {
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
   const webrtc = snapshot.webrtc.enabled;
-  const issue = snapshot.resources.issues[0];
 
   return (
     <div className="console">
@@ -113,19 +113,11 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <div className={`resource-band status-${snapshot.resources.status}`}>
-          <span>CPU {snapshot.resources.cpu_percent.toFixed(0)}%</span>
-          <span>
-            RAM {snapshot.resources.memory_percent.toFixed(0)}% (
-            {(snapshot.resources.memory_bytes / 1024 / 1024).toFixed(0)} MB)
-          </span>
-          <span>
-            {snapshot.mixer.raster} · {snapshot.mixer.frame_rate} · {snapshot.mixer.video_format}
-          </span>
-          <span className="issue">
-            {issue ? `${issue.level}: ${issue.message}` : "No issues"}
-          </span>
-        </div>
+        <StatusChip
+          resources={snapshot.resources}
+          mixer={snapshot.mixer}
+          formatId={snapshot.workspace.format_id}
+        />
       </header>
 
       <section className="me-row">

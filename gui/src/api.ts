@@ -86,6 +86,9 @@ export interface ResourceInfo {
   memory_percent: number;
   status: string;
   issues: { level: string; message: string }[];
+  load?: { m1: number; m5: number; m15: number };
+  uptime_s?: number;
+  pid?: number;
 }
 
 export interface ConsoleState {
