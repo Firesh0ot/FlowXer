@@ -15,6 +15,7 @@ def test_default_console_has_sources_panel_and_dsk(mixer: VisionMixer) -> None:
     assert mixer.keyers[0].id == "dsk-1"
     assert mixer.stinger_slots[0].role == "shared"
     assert mixer.get_input("cam-1").kind.value == "test"
+    assert mixer.get_input("black").kind.value == "black"
     assert mixer.get_input("replay").kind.value == "replay"
 
 
