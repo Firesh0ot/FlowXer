@@ -29,6 +29,8 @@ from flowxer.api.schemas import (
     StingerSlotUpdate,
     StorageClip,
     TakeRequest,
+    TallyConfig,
+    TallyReceiversUpdate,
     WorkspaceConfig,
     WorkspaceUpdate,
 )
@@ -38,6 +40,7 @@ from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.engine.preview import render_jpeg
 from flowxer.engine.resources import collect_resources
+from flowxer.engine.tally import TALLY_PRESETS
 from flowxer.engine.webrtc import create_whep_answer, webrtc_available
 from flowxer.settings import Settings, get_settings
 
@@ -483,7 +486,44 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
+        tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
     )
+
+
+@router.get(
+    "/tally",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="TSL 5.0 tally/UMD receivers, send status, and device presets",
+)
+def tally_state(mixer: VisionMixer = Depends(get_mixer)) -> TallyConfig:
+    return TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS)
+
+
+@router.put(
+    "/tally/receivers",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="Replace the TSL 5.0 tally receiver list (Companion, VSM, BFE, Riedel HI, custom)",
+)
+def put_tally_receivers(
+    payload: TallyReceiversUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> TallyConfig:
+    try:
+        receivers = mixer.replace_tally_receivers(payload.receivers)
+    except MixerError as exc:
+        raise _http(exc)
+    return TallyConfig(receivers=receivers, presets=TALLY_PRESETS)
+
+
+@router.post(
+    "/tally/refresh",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="Re-send Program/Preview tally and UMD labels to every enabled TSL receiver",
+)
+def tally_refresh(mixer: VisionMixer = Depends(get_mixer)) -> TallyConfig:
+    return TallyConfig(receivers=mixer.publish_tally(), presets=TALLY_PRESETS)
 
 
 @router.get(

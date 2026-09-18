@@ -71,11 +71,15 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
         "/api/v1/workspace",
         "/api/v1/resources",
         "/api/v1/keyers/{keyer_id}",
+        "/api/v1/tally",
+        "/api/v1/tally/receivers",
+        "/api/v1/tally/refresh",
     ):
         assert path in paths, path
     tags = {tag["name"] for tag in spec["tags"]}
     assert "stinger" in tags
     assert "gui" in tags
+    assert "tally" in tags
     components = spec["components"]["schemas"]
     assert "StingerPlayRequest" in components
     assert "flip_flop" in components["StingerPlayRequest"]["properties"]
@@ -83,6 +87,7 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
     assert "stinger_slot_id" in components["LogicalInput"]["properties"]
     assert "cut_frame" in components["StingerSlotUpdate"]["properties"]
     assert "ResourceInfo" in components
+    assert "TallyReceiver" in components
     assert spec["info"]["title"] == "FlowXer Vision Mixer"
     assert spec["openapi"].startswith("3.")
 

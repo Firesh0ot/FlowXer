@@ -59,6 +59,14 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "tally",
+        "description": (
+            "TSL UMD Protocol 5.0 tally lamps and under-monitor labels. "
+            "Receivers include Bitfocus Companion, Lawo VSM, BFE Commander, "
+            "Riedel HI, and any custom TSL 5.0 listener."
+        ),
+    },
+    {
         "name": "gui",
         "description": (
             "Operator console snapshot, workspace layout (including source-tile aspect), "
@@ -84,7 +92,9 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
             "keyer and a file player with storage access. "
             "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
-            "The operator GUI on port 9620 is a thin client of this API."
+            "The operator GUI on port 9620 is a thin client of this API. "
+            "TSL UMD 5.0 carries Program/Preview tally and source labels to "
+            "Companion, VSM, BFE, Riedel HI, and other listeners."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},

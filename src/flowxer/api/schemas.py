@@ -414,6 +414,66 @@ class StingerSlotUpdate(BaseModel):
     label: str | None = None
 
 
+class TallyKind(str, Enum):
+    companion = "companion"
+    vsm = "vsm"
+    bfe = "bfe"
+    hi = "hi"
+    custom = "custom"
+
+
+class TallyPreset(BaseModel):
+    kind: TallyKind
+    label: str
+    port: int = 8900
+    transport: str = "udp"
+    hint: str = ""
+
+
+class TallyReceiver(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    kind: TallyKind = TallyKind.custom
+    label: str = Field(..., min_length=1, max_length=128)
+    host: str = Field(..., min_length=1, max_length=253, description="IPv4 or hostname of the TSL listener")
+    port: int = Field(default=8900, ge=1, le=65535)
+    transport: str = Field(default="udp", description="udp (TSL default) or tcp (DLE/STX framed)")
+    enabled: bool = True
+    screen: int = Field(default=0, ge=0, le=65534, description="TSL SCREEN address")
+    index_offset: int = Field(
+        default=0,
+        ge=0,
+        le=65534,
+        description="Added to each logical source slot to form the TSL display INDEX",
+    )
+    dle_stx: bool | None = Field(
+        default=None,
+        description="Force DLE/STX wrapping. None = wrap TCP only (TSL 5.0 spec).",
+    )
+
+    @field_validator("transport")
+    @classmethod
+    def validate_transport(cls, value: str) -> str:
+        transport = value.lower()
+        if transport not in {"udp", "tcp"}:
+            raise ValueError("transport must be udp or tcp")
+        return transport
+
+
+class TallyReceiverStatus(TallyReceiver):
+    last_error: str | None = None
+    last_sent_at: float | None = None
+
+
+class TallyConfig(BaseModel):
+    protocol: str = "TSL UMD 5.0"
+    receivers: list[TallyReceiverStatus] = Field(default_factory=list)
+    presets: list[TallyPreset] = Field(default_factory=list)
+
+
+class TallyReceiversUpdate(BaseModel):
+    receivers: list[TallyReceiver]
+
+
 class ResourceIssue(BaseModel):
     level: str
     message: str
@@ -444,3 +504,4 @@ class ConsoleState(BaseModel):
     webrtc: dict
     clips: list[StorageClip]
     stingers: list[StingerInfo]
+    tally: TallyConfig = Field(default_factory=TallyConfig)

@@ -24,6 +24,8 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
     StingerSlotUpdate,
+    TallyReceiver,
+    TallyReceiverStatus,
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
@@ -42,6 +44,7 @@ from flowxer.engine.stinger import (
     register_video_stinger,
     update_stinger_cut,
 )
+from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
 
@@ -79,6 +82,7 @@ class VisionMixer:
         self.last_transition: str = "cut"
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
+        self.tally = TallyService()
         self.overlay = Html5Overlay(
             url=settings.overlay_url,
             cache_dir=settings.graphics_dir,
@@ -236,6 +240,7 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        self._publish_tally()
         return self.workspace
 
     def get_panel(self, panel_id: str) -> MixerPanel:
@@ -417,6 +422,7 @@ class VisionMixer:
                     data[field] = patch[field]
             updated = LogicalInput(**data)
             self.inputs[input_id] = updated
+            self._publish_tally()
             return updated
         if self.state == MixerState.running and payload.file_path is not None:
             if current.kind not in {InputKind.file, InputKind.replay}:
@@ -428,6 +434,7 @@ class VisionMixer:
         if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
             updated.file_path = self._resolve_clip(updated.file_path)
         self.inputs[input_id] = updated
+        self._publish_tally()
         return updated
 
     def delete_input(self, input_id: str) -> None:
@@ -571,6 +578,7 @@ class VisionMixer:
             self.panels[0].preview_input_id = self.preview_input_id
         self._apply_program()
         self._apply_overlay_alpha()
+        self._publish_tally()
         return self.status()
 
     def stop(self) -> MixerStatus:
@@ -580,6 +588,7 @@ class VisionMixer:
         self.state = MixerState.idle
         self.backend = "idle"
         self.stinger_player = None
+        self._publish_tally()
         return self.status()
 
     def _default_program_id(self) -> str:
@@ -753,6 +762,7 @@ class VisionMixer:
                 self.program_bus = ProgramBus.replay
             self._apply_program()
         _ = duration_ms  # mix duration is recorded; GST input-selector is a hard switch
+        self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
         if self.state != MixerState.running:
@@ -762,6 +772,7 @@ class VisionMixer:
         panel.preview_input_id = input_id
         if panel.id == self.panels[0].id:
             self.preview_input_id = input_id
+        self._publish_tally()
         return self.status()
 
     def load_clip(self, input_id: str, file_path: str) -> LogicalInput:
@@ -858,6 +869,7 @@ class VisionMixer:
             else:
                 self.program_bus = ProgramBus.replay
             self._apply_program()
+            self._publish_tally()
         if "complete" in snapshot["events"]:
             if self.gst is not None:
                 self.gst.set_compositor_alpha("sink_2", 0.0)
@@ -907,6 +919,23 @@ class VisionMixer:
     def _require_running(self) -> None:
         if self.state != MixerState.running:
             raise MixerError("mixer is not running")
+
+    def replace_tally_receivers(self, receivers: list[TallyReceiver]) -> list[TallyReceiverStatus]:
+        try:
+            self.tally.replace(receivers)
+        except ValueError as exc:
+            raise MixerError(str(exc)) from exc
+        return self.publish_tally()
+
+    def publish_tally(self) -> list[TallyReceiverStatus]:
+        return self._publish_tally()
+
+    def _publish_tally(self) -> list[TallyReceiverStatus]:
+        try:
+            return self.tally.publish(self)
+        except Exception as exc:
+            log.warning("tally publish failed: %s", exc)
+            return self.tally.status()
 
     def status(self) -> MixerStatus:
         capabilities = probe_backend()
