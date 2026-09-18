@@ -103,6 +103,10 @@ class LogicalInputCreate(BaseModel):
         default=None,
         description="Optional NMOS grouphint used to auto-discover matching video/audio flows.",
     )
+    stinger_slot_id: str | None = Field(
+        default=None,
+        description="Stinger slot played when this source is taken to Program or Cut from Preview.",
+    )
 
     @model_validator(mode="after")
     def validate_kind_payload(self) -> LogicalInputCreate:
@@ -127,6 +131,7 @@ class LogicalInputUpdate(BaseModel):
     audio: AudioEssence | None = None
     file_path: str | None = None
     group_hint: str | None = None
+    stinger_slot_id: str | None = None
 
 
 class MixerStartRequest(BaseModel):
@@ -197,6 +202,11 @@ class StingerPlayRequest(BaseModel):
     direction: str = Field(
         default="to_replay",
         description="to_replay or to_live — recorded for operator status only.",
+    )
+    panel_id: str = Field(default="me-1")
+    flip_flop: bool = Field(
+        default=False,
+        description="If true, swap Preview and Program at the cut like a Cut through the stinger.",
     )
 
 

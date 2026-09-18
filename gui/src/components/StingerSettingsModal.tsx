@@ -29,30 +29,26 @@ export function StingerSettingsModal({
   );
   const [stingerId, setStingerId] = useState(slot.stinger_id);
   const [videoPath, setVideoPath] = useState(slot.media_path?.split("/").pop() ?? "");
-  const [cutSeconds, setCutSeconds] = useState(() => {
-    const ms = slot.cut_ms ?? asset?.cut_ms ?? 0;
-    return (ms / 1000).toFixed(3);
-  });
-  const [durationSeconds, setDurationSeconds] = useState(() => {
+  const [cutFrame, setCutFrame] = useState(slot.cut_frame ?? asset?.cut_frame ?? 0);
+  const [durationFrames, setDurationFrames] = useState(() => {
+    if (asset?.frame_count) return asset.frame_count;
     const ms = asset?.duration_ms ?? 0;
-    return ms ? (ms / 1000).toFixed(3) : "1.000";
+    return ms ? Math.max(1, Math.round((ms / 1000) * fps)) : Math.round(fps);
   });
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selected = snapshot.stingers.find((item) => item.id === stingerId) ?? asset;
-  const durationMs =
-    kind === "video"
-      ? Math.max(1, Math.round(Number(durationSeconds) * 1000))
-      : selected?.duration_ms || Math.round(((selected?.frame_count ?? 1) / fps) * 1000);
-  const cutMs = Math.max(0, Math.round(Number(cutSeconds) * 1000));
-  const cutFrame = Math.round((cutMs / 1000) * fps);
+  const frameCount =
+    kind === "video" ? Math.max(1, Number(durationFrames) || 1) : Math.max(1, selected?.frame_count ?? 1);
+  const cut = Math.max(0, Math.min(Number(cutFrame) || 0, Math.max(frameCount - 1, 0)));
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <h2>{slot.label}</h2>
         <p className="hint">
-          Choose a TGA sequence or a video, then set the time when program cuts under the sting.
+          Choose a TGA sequence or a video, then set the frame when program cuts under the sting.
         </p>
         <label>
           Name
@@ -73,7 +69,7 @@ export function StingerSettingsModal({
               onChange={(e) => {
                 const next = snapshot.stingers.find((item) => item.id === e.target.value);
                 setStingerId(e.target.value);
-                if (next) setCutSeconds(((next.cut_ms ?? 0) / 1000).toFixed(3));
+                if (next) setCutFrame(next.cut_frame ?? 0);
               }}
             >
               {snapshot.stingers
@@ -99,39 +95,38 @@ export function StingerSettingsModal({
               </select>
             </label>
             <label>
-              Duration (seconds)
+              Duration (frames)
               <input
                 type="number"
-                min={0.04}
-                step={0.001}
-                value={durationSeconds}
-                onChange={(e) => setDurationSeconds(e.target.value)}
+                min={1}
+                step={1}
+                value={durationFrames}
+                onChange={(e) => setDurationFrames(Number(e.target.value))}
               />
             </label>
           </>
         )}
         <label>
-          Cut at (seconds)
+          Cut at (frame)
           <input
             type="number"
             min={0}
-            step={0.001}
-            max={Math.max(durationMs / 1000, 0)}
-            value={cutSeconds}
-            onChange={(e) => setCutSeconds(e.target.value)}
+            step={1}
+            max={Math.max(frameCount - 1, 0)}
+            value={cut}
+            onChange={(e) => setCutFrame(Number(e.target.value))}
           />
         </label>
         <input
           type="range"
           min={0}
-          max={Math.max(durationMs, 1)}
-          value={Math.min(cutMs, durationMs)}
-          onChange={(e) => setCutSeconds((Number(e.target.value) / 1000).toFixed(3))}
+          step={1}
+          max={Math.max(frameCount - 1, 0)}
+          value={cut}
+          onChange={(e) => setCutFrame(Number(e.target.value))}
         />
         <p className="hint">
-          Program switches at {cutSeconds}s — frame {cutFrame} of{" "}
-          {kind === "sequence" ? selected?.frame_count ?? "?" : Math.round((durationMs / 1000) * fps)} @{" "}
-          {fps.toFixed(0)} fps ({cutMs} ms).
+          Program switches at frame {cut} of {frameCount} @ {fps.toFixed(0)} fps.
         </p>
         {error ? <p className="error">{error}</p> : null}
         <div className="modal-actions">
@@ -139,20 +134,25 @@ export function StingerSettingsModal({
             Cancel
           </button>
           <button
+            disabled={busy}
             onClick={async () => {
+              setBusy(true);
+              setError(null);
               try {
-                const payload: Record<string, unknown> = { label, kind, cut_ms: cutMs };
+                const payload: Record<string, unknown> = { label, kind, cut_frame: cut };
                 if (kind === "sequence") {
                   payload.stinger_id = stingerId;
                 } else {
                   if (!videoPath) throw new Error("Select a video file");
                   payload.media_path = videoPath;
-                  payload.duration_ms = durationMs;
+                  payload.duration_ms = Math.max(1, Math.round((frameCount / fps) * 1000));
                 }
                 await onSave(payload);
                 onClose();
               } catch (err) {
                 setError(err instanceof Error ? err.message : "Save failed");
+              } finally {
+                setBusy(false);
               }
             }}
           >

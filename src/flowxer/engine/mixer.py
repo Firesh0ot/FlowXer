@@ -136,6 +136,10 @@ class VisionMixer:
             slot += 1
         for slot, item in enumerate(self.list_inputs()):
             item.slot = slot
+        valid_slots = {item.id for item in self.stinger_slots}
+        for item in self.inputs.values():
+            if item.stinger_slot_id and item.stinger_slot_id not in valid_slots:
+                item.stinger_slot_id = None
 
     def _sync_panels(self) -> None:
         desired = self.workspace.mixer_panel_count
@@ -204,6 +208,10 @@ class VisionMixer:
             for n in range(1, count + 1):
                 slots.append(_make(f"shared-{n}", "shared", f"Stinger {n}"))
         self.stinger_slots = slots
+        valid = {item.id for item in slots}
+        for source in self.inputs.values():
+            if source.stinger_slot_id and source.stinger_slot_id not in valid:
+                source.stinger_slot_id = None
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
         patch = payload.model_dump(exclude_unset=True)
@@ -260,14 +268,14 @@ class VisionMixer:
     def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
         return self.configure_stinger_slot(slot_id, StingerSlotUpdate(stinger_id=stinger_id))
 
-    def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
-        slot = None
+    def get_stinger_slot(self, slot_id: str) -> StingerSlot:
         for item in self.stinger_slots:
             if item.id == slot_id:
-                slot = item
-                break
-        if slot is None:
-            raise MixerError(f"unknown stinger slot {slot_id}")
+                return item
+        raise MixerError(f"unknown stinger slot {slot_id}")
+
+    def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
+        slot = self.get_stinger_slot(slot_id)
         kind = payload.kind or slot.kind or "sequence"
         if kind not in {"sequence", "video"}:
             raise MixerError("stinger kind must be sequence or video")
@@ -304,6 +312,16 @@ class VisionMixer:
             slot.cut_ms = info.cut_ms
             slot.cut_frame = info.cut_frame
             slot.kind = "video"
+            if payload.cut_frame is not None or payload.cut_ms is not None:
+                info = update_stinger_cut(
+                    self.settings.stingers_dir,
+                    slot.stinger_id,
+                    fps=self.settings.fps,
+                    cut_ms=payload.cut_ms,
+                    cut_frame=payload.cut_frame,
+                )
+                slot.cut_ms = info.cut_ms
+                slot.cut_frame = info.cut_frame
             return slot
 
         if payload.stinger_id:
@@ -385,19 +403,18 @@ class VisionMixer:
 
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
         current = self.get_input(input_id)
+        patch = payload.model_dump(exclude_unset=True)
+        if "stinger_slot_id" in patch:
+            slot_id = patch["stinger_slot_id"] or None
+            if slot_id:
+                self.get_stinger_slot(slot_id)
+            patch["stinger_slot_id"] = slot_id
         if self.state == MixerState.running and payload.file_path is None:
             # Live metadata updates are allowed; topology changes are not.
             data = current.model_dump()
-            if payload.label is not None:
-                data["label"] = payload.label
-            if payload.kind is not None:
-                data["kind"] = payload.kind
-            if payload.video is not None:
-                data["video"] = payload.video
-            if payload.audio is not None:
-                data["audio"] = payload.audio
-            if payload.group_hint is not None:
-                data["group_hint"] = payload.group_hint
+            for field in ("label", "kind", "video", "audio", "group_hint", "stinger_slot_id"):
+                if field in patch:
+                    data[field] = patch[field]
             updated = LogicalInput(**data)
             self.inputs[input_id] = updated
             return updated
@@ -406,7 +423,6 @@ class VisionMixer:
                 raise MixerError("only file/replay inputs can change clip while on-air")
             return self.load_clip(input_id, payload.file_path)
         data = current.model_dump()
-        patch = payload.model_dump(exclude_unset=True)
         data.update(patch)
         updated = LogicalInput(**data)
         if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
@@ -623,7 +639,16 @@ class VisionMixer:
         target = self.get_input(input_id)
         panel = self.get_panel(panel_id)
         if transition == TransitionType.stinger:
-            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id)
+            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id, panel_id=panel_id)
+        if transition == TransitionType.cut:
+            auto = self._auto_stinger_for(target.id)
+            if auto is not None:
+                return self.play_stinger(
+                    auto.stinger_id,
+                    input_id,
+                    direction="to_replay" if self._is_replay(input_id) else "to_live",
+                    panel_id=panel.id,
+                )
         self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False)
         return self.status()
 
@@ -631,6 +656,17 @@ class VisionMixer:
         """Flip Preview onto Program. If Wipe is armed, play the TGA stinger instead."""
         panel = self._ensure_running_panel(panel_id)
         incoming = self._preview_id(panel)
+        auto = self._auto_stinger_for(incoming)
+        if auto is not None:
+            outgoing = panel.program_input_id
+            return self.play_stinger(
+                auto.stinger_id,
+                incoming,
+                direction="to_replay" if self._is_replay(incoming) else "to_live",
+                outgoing_input_id=outgoing,
+                flip_flop=True,
+                panel_id=panel.id,
+            )
         if panel.wipe_armed:
             outgoing = panel.program_input_id
             stinger_id = self._stinger_for("to_replay" if self._is_replay(incoming) else "to_live")
@@ -671,6 +707,12 @@ class VisionMixer:
         panel = self._ensure_running_panel(panel_id)
         panel.wipe_armed = (not panel.wipe_armed) if armed is None else armed
         return self.status()
+
+    def _auto_stinger_for(self, input_id: str) -> StingerSlot | None:
+        source = self.get_input(input_id)
+        if not source.stinger_slot_id:
+            return None
+        return self.get_stinger_slot(source.stinger_slot_id)
 
     def _ensure_running_panel(self, panel_id: str) -> MixerPanel:
         if self.state != MixerState.running:

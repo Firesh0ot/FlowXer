@@ -7,6 +7,7 @@ export interface LogicalInput {
   slot: number;
   file_path?: string | null;
   group_hint?: string | null;
+  stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;
   audio?: { flow_id?: string | null; media_type: string; channels: number } | null;
 }
@@ -185,10 +186,15 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ file_path, input_id }),
     }).then((r) => parse(r)),
-  stingerPlay: (stinger_id: string, target_input_id: string, direction: string) =>
+  stingerPlay: (
+    stinger_id: string,
+    target_input_id: string,
+    direction: string,
+    extra?: { flip_flop?: boolean; panel_id?: string },
+  ) =>
     fetch("/api/v1/stinger/play", {
       method: "POST",
       headers: jsonHeaders,
-      body: JSON.stringify({ stinger_id, target_input_id, direction }),
+      body: JSON.stringify({ stinger_id, target_input_id, direction, ...extra }),
     }).then((r) => parse(r)),
 };

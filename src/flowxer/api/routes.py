@@ -426,7 +426,13 @@ def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
-        body = mixer.play_stinger(payload.stinger_id, payload.target_input_id, payload.direction)
+        body = mixer.play_stinger(
+            payload.stinger_id,
+            payload.target_input_id,
+            payload.direction,
+            flip_flop=payload.flip_flop,
+            panel_id=payload.panel_id,
+        )
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="stinger", mixer=body)
