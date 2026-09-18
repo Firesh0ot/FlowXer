@@ -167,15 +167,18 @@ export default function App() {
           {snapshot.stinger_slots.map((slot) => (
             <div key={slot.id} className="stinger-chip">
               <button
+                title="Sting Preview to Program"
                 onClick={() => {
-                  const target =
-                    slot.role === "out"
-                      ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
-                      : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
-                        snapshot.inputs[0]?.id;
+                  const target = panel.preview_input_id;
                   if (!target) return;
+                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "replay"
+                    ? "to_replay"
+                    : "to_live";
                   void command(() =>
-                    api.stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay"),
+                    api.stingerPlay(slot.stinger_id, target, direction, {
+                      flip_flop: true,
+                      panel_id: panel.id,
+                    }),
                   );
                 }}
               >
@@ -247,9 +250,11 @@ export default function App() {
         <SourceSettingsModal
           input={sourceEdit}
           clips={snapshot.clips}
+          stingerSlots={snapshot.stinger_slots}
           onClose={() => setSourceEdit(null)}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);
+            setSourceEdit(null);
             await refresh();
           }}
         />
@@ -261,6 +266,7 @@ export default function App() {
           onClose={() => setStingerEdit(null)}
           onSave={async (payload) => {
             await api.patchStingerSlot(stingerEdit.id, payload);
+            setStingerEdit(null);
             await refresh();
           }}
         />

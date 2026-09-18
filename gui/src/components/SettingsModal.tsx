@@ -23,8 +23,8 @@ export function SettingsModal({
         <h2>Settings</h2>
         <p className="hint">
           Mixer must be off-air to change format, source count, MEs, stingers or downstream keyers.
-          Source tile aspect can change while on-air. Per-stinger media and cut time are on the ⚙
-          next to each stinger.
+          Source tile aspect can change while on-air. Per-stinger media and cut frame are on the ⚙
+          next to each stinger. Auto-stinger for a source is on that source’s ⚙.
         </p>
         <label>
           Format

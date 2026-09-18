@@ -93,6 +93,14 @@ def test_stinger_slot_cut_time_and_video(mixer: VisionMixer) -> None:
     assert info.cut_ms > 0
     mixer.configure_stinger_slot(
         "shared-1",
+        StingerSlotUpdate(stinger_id="replay-wipe", cut_frame=5),
+    )
+    slot = mixer.stinger_slots[0]
+    assert slot.cut_frame == 5
+    assert mixer.get_stinger("replay-wipe").cut_frame == 5
+
+    mixer.configure_stinger_slot(
+        "shared-1",
         StingerSlotUpdate(stinger_id="replay-wipe", cut_ms=40),
     )
     slot = mixer.stinger_slots[0]
@@ -206,3 +214,44 @@ def test_transition_bank_api(client: TestClient) -> None:
     assert ftb.json()["mixer"]["program_input_id"] == "black"
     cut = client.post("/api/v1/mixer/cut", json={"panel_id": "me-1"})
     assert cut.status_code == 200
+
+
+def test_stinger_play_flip_flops_preview_to_program(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.play_stinger("replay-wipe", "cam-2", direction="to_live", flip_flop=True, panel_id="me-1")
+    assert mixer.stinger_player is not None
+    stinger = mixer.get_stinger("replay-wipe")
+    remaining = stinger.cut_frame - mixer.stinger_player.frame
+    mixer.advance_stinger(max(remaining, 0))
+    assert mixer.program_input_id == "cam-2"
+    assert mixer.preview_input_id == "cam-1"
+
+
+def test_source_auto_stinger_on_take_and_cut(mixer: VisionMixer) -> None:
+    from flowxer.api.schemas import LogicalInputUpdate
+
+    mixer.update_input("cam-2", LogicalInputUpdate(stinger_slot_id="shared-1"))
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.take("cam-2")
+    assert mixer.stinger_player is not None
+    assert mixer.stinger_player.target_input_id == "cam-2"
+    remaining = mixer.stinger_player.info.frame_count - mixer.stinger_player.frame + 1
+    mixer.advance_stinger(max(remaining, 1))
+    assert mixer.stinger_player is None
+    assert mixer.program_input_id == "cam-2"
+
+    mixer.set_preview("cam-3")
+    mixer.cut()
+    assert mixer.stinger_player is None
+    assert mixer.program_input_id == "cam-3"
+    assert mixer.preview_input_id == "cam-2"
+
+    mixer.set_preview("cam-2")
+    mixer.cut()
+    assert mixer.stinger_player is not None
+    assert mixer.stinger_player.target_input_id == "cam-2"
+    stinger = mixer.get_stinger("replay-wipe")
+    mixer.advance_stinger(max(stinger.cut_frame - mixer.stinger_player.frame, 0))
+    assert mixer.program_input_id == "cam-2"
+    assert mixer.preview_input_id == "cam-3"
