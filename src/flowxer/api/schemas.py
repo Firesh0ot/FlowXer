@@ -131,7 +131,13 @@ class LogicalInputUpdate(BaseModel):
     audio: AudioEssence | None = None
     file_path: str | None = None
     group_hint: str | None = None
-    stinger_slot_id: str | None = None
+    stinger_slot_id: str | None = Field(
+        default=None,
+        description=(
+            "Stinger slot played when this source is taken to Program or Cut from Preview. "
+            "Null disables auto-stinger."
+        ),
+    )
 
 
 class MixerStartRequest(BaseModel):
@@ -347,7 +353,11 @@ class StingerSlot(BaseModel):
         ge=0,
         description="Time in the stinger when program cuts. None uses the asset default.",
     )
-    cut_frame: int | None = Field(default=None, ge=0)
+    cut_frame: int | None = Field(
+        default=None,
+        ge=0,
+        description="Frame index when Program switches under the sting. Preferred over cut_ms in the GUI.",
+    )
 
 
 class WorkspaceConfig(BaseModel):
@@ -395,9 +405,31 @@ class StingerSlotUpdate(BaseModel):
         description="TGA sequence id/directory or video clip filename",
     )
     cut_ms: int | None = Field(default=None, ge=0, description="Program cut time in milliseconds")
-    cut_frame: int | None = Field(default=None, ge=0)
+    cut_frame: int | None = Field(
+        default=None,
+        ge=0,
+        description="Program cut frame (operator GUI uses this; mixer stores cut_ms as well)",
+    )
     duration_ms: int | None = Field(default=None, ge=1, description="Video duration when ffprobe is unavailable")
     label: str | None = None
+
+
+class ResourceIssue(BaseModel):
+    level: str
+    message: str
+
+
+class ResourceInfo(BaseModel):
+    cpu_percent: float
+    cpu_count: int
+    load: dict[str, float] | None = None
+    memory_bytes: int
+    memory_limit_bytes: int
+    memory_percent: float
+    uptime_s: float | None = None
+    pid: int | None = None
+    status: str
+    issues: list[ResourceIssue] = Field(default_factory=list)
 
 
 class ConsoleState(BaseModel):
@@ -408,7 +440,7 @@ class ConsoleState(BaseModel):
     keyers: list[DownstreamKeyer]
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
-    resources: dict
+    resources: ResourceInfo
     webrtc: dict
     clips: list[StorageClip]
     stingers: list[StingerInfo]

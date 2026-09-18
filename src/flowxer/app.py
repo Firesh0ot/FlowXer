@@ -34,7 +34,10 @@ OPENAPI_TAGS = [
     },
     {
         "name": "mixer",
-        "description": "Start/stop the GStreamer vision mixer and take sources to program/preview.",
+        "description": (
+            "Start/stop the GStreamer vision mixer, arm Preview, take sources to Program, "
+            "and run Cut / Fade / Fade to Black / Wipe on a mixer panel (ME)."
+        ),
     },
     {
         "name": "overlay",
@@ -42,15 +45,25 @@ OPENAPI_TAGS = [
     },
     {
         "name": "storage",
-        "description": "Clip store and TGA-sequence stingers used for live ↔ replay transitions.",
+        "description": "Clip store plus TGA-sequence and video stingers.",
     },
     {
         "name": "replay",
         "description": "Load a stored clip and stinger in/out of replay.",
     },
     {
+        "name": "stinger",
+        "description": (
+            "Play a TGA sequence or video stinger, cut Program at the chosen frame, "
+            "and configure per-slot media. flip_flop swaps Preview and Program like Cut."
+        ),
+    },
+    {
         "name": "gui",
-        "description": "Operator console layout, container resources, JPEG/WebRTC monitors.",
+        "description": (
+            "Operator console snapshot, workspace layout (including source-tile aspect), "
+            "container resources for the status chip, JPEG/WebRTC monitors."
+        ),
     },
 ]
 
@@ -70,8 +83,8 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "The media plane is GStreamer. FastAPI is the control plane; "
             "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
             "keyer and a file player with storage access. "
-            "A TGA-sequence stinger covers the cut when going to replay and when "
-            "returning to live."
+            "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
+            "The operator GUI on port 9620 is a thin client of this API."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},
