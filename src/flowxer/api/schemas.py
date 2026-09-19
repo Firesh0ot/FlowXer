@@ -103,6 +103,10 @@ class LogicalInputCreate(BaseModel):
         default=None,
         description="Optional NMOS grouphint used to auto-discover matching video/audio flows.",
     )
+    stinger_slot_id: str | None = Field(
+        default=None,
+        description="Stinger slot played when this source is taken to Program or Cut from Preview.",
+    )
 
     @model_validator(mode="after")
     def validate_kind_payload(self) -> LogicalInputCreate:
@@ -127,6 +131,13 @@ class LogicalInputUpdate(BaseModel):
     audio: AudioEssence | None = None
     file_path: str | None = None
     group_hint: str | None = None
+    stinger_slot_id: str | None = Field(
+        default=None,
+        description=(
+            "Stinger slot played when this source is taken to Program or Cut from Preview. "
+            "Null disables auto-stinger."
+        ),
+    )
 
 
 class MixerStartRequest(BaseModel):
@@ -197,6 +208,11 @@ class StingerPlayRequest(BaseModel):
     direction: str = Field(
         default="to_replay",
         description="to_replay or to_live — recorded for operator status only.",
+    )
+    panel_id: str = Field(default="me-1")
+    flip_flop: bool = Field(
+        default=False,
+        description="If true, swap Preview and Program at the cut like a Cut through the stinger.",
     )
 
 
@@ -337,7 +353,11 @@ class StingerSlot(BaseModel):
         ge=0,
         description="Time in the stinger when program cuts. None uses the asset default.",
     )
-    cut_frame: int | None = Field(default=None, ge=0)
+    cut_frame: int | None = Field(
+        default=None,
+        ge=0,
+        description="Frame index when Program switches under the sting. Preferred over cut_ms in the GUI.",
+    )
 
 
 class WorkspaceConfig(BaseModel):
@@ -385,9 +405,91 @@ class StingerSlotUpdate(BaseModel):
         description="TGA sequence id/directory or video clip filename",
     )
     cut_ms: int | None = Field(default=None, ge=0, description="Program cut time in milliseconds")
-    cut_frame: int | None = Field(default=None, ge=0)
+    cut_frame: int | None = Field(
+        default=None,
+        ge=0,
+        description="Program cut frame (operator GUI uses this; mixer stores cut_ms as well)",
+    )
     duration_ms: int | None = Field(default=None, ge=1, description="Video duration when ffprobe is unavailable")
     label: str | None = None
+
+
+class TallyKind(str, Enum):
+    companion = "companion"
+    vsm = "vsm"
+    bfe = "bfe"
+    hi = "hi"
+    custom = "custom"
+
+
+class TallyPreset(BaseModel):
+    kind: TallyKind
+    label: str
+    port: int = 8900
+    transport: str = "udp"
+    hint: str = ""
+
+
+class TallyReceiver(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    kind: TallyKind = TallyKind.custom
+    label: str = Field(..., min_length=1, max_length=128)
+    host: str = Field(..., min_length=1, max_length=253, description="IPv4 or hostname of the TSL listener")
+    port: int = Field(default=8900, ge=1, le=65535)
+    transport: str = Field(default="udp", description="udp (TSL default) or tcp (DLE/STX framed)")
+    enabled: bool = True
+    screen: int = Field(default=0, ge=0, le=65534, description="TSL SCREEN address")
+    index_offset: int = Field(
+        default=0,
+        ge=0,
+        le=65534,
+        description="Added to each logical source slot to form the TSL display INDEX",
+    )
+    dle_stx: bool | None = Field(
+        default=None,
+        description="Force DLE/STX wrapping. None = wrap TCP only (TSL 5.0 spec).",
+    )
+
+    @field_validator("transport")
+    @classmethod
+    def validate_transport(cls, value: str) -> str:
+        transport = value.lower()
+        if transport not in {"udp", "tcp"}:
+            raise ValueError("transport must be udp or tcp")
+        return transport
+
+
+class TallyReceiverStatus(TallyReceiver):
+    last_error: str | None = None
+    last_sent_at: float | None = None
+
+
+class TallyConfig(BaseModel):
+    protocol: str = "TSL UMD 5.0"
+    receivers: list[TallyReceiverStatus] = Field(default_factory=list)
+    presets: list[TallyPreset] = Field(default_factory=list)
+
+
+class TallyReceiversUpdate(BaseModel):
+    receivers: list[TallyReceiver]
+
+
+class ResourceIssue(BaseModel):
+    level: str
+    message: str
+
+
+class ResourceInfo(BaseModel):
+    cpu_percent: float
+    cpu_count: int
+    load: dict[str, float] | None = None
+    memory_bytes: int
+    memory_limit_bytes: int
+    memory_percent: float
+    uptime_s: float | None = None
+    pid: int | None = None
+    status: str
+    issues: list[ResourceIssue] = Field(default_factory=list)
 
 
 class ConsoleState(BaseModel):
@@ -398,7 +500,8 @@ class ConsoleState(BaseModel):
     keyers: list[DownstreamKeyer]
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
-    resources: dict
+    resources: ResourceInfo
     webrtc: dict
     clips: list[StorageClip]
     stingers: list[StingerInfo]
+    tally: TallyConfig = Field(default_factory=TallyConfig)

@@ -40,7 +40,8 @@ def _video_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str
         )
     if inp.kind == InputKind.black:
         return (
-            f"videotestsrc name=vsrc_{inp.id} pattern=black is-live=true "
+            f"videotestsrc name=vsrc_{inp.id} pattern=black "
+            f"foreground-color=0xFF000000 background-color=0xFF000000 is-live=true "
             f"! {caps} ! queue ! vsel.sink_{inp.slot}"
         )
     if inp.kind == InputKind.test:
@@ -143,7 +144,7 @@ def build_pipeline_description(
 
     if use_cefsrc:
         overlay_bin = (
-            f"cefsrc name=html5 url={overlay_url} "
+            f'cefsrc name=html5 url="{overlay_url}" '
             f"! {bgra} ! videorate ! {bgra} ! queue name=html5q "
             f"! comp.sink_1"
         )

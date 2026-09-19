@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { api, type ConsoleState, type LogicalInput, type StingerSlot, type WorkspaceConfig } from "./api";
+import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
+import { StatusChip } from "./components/StatusChip";
+import { TallySettingsModal } from "./components/TallySettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
 
 /** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
@@ -22,6 +24,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sourceEdit, setSourceEdit] = useState<LogicalInput | null>(null);
   const [stingerEdit, setStingerEdit] = useState<StingerSlot | null>(null);
+  const [tallyOpen, setTallyOpen] = useState(false);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
 
@@ -61,7 +64,6 @@ export default function App() {
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
   const webrtc = snapshot.webrtc.enabled;
-  const issue = snapshot.resources.issues[0];
 
   return (
     <div className="console">
@@ -71,7 +73,7 @@ export default function App() {
           <strong>FlowXer</strong>
         </div>
         <nav>
-          {["File", "Settings", "Help"].map((name) => (
+          {["File", "Settings", "Tally", "Help"].map((name) => (
             <div key={name} className="menu">
               <button onClick={() => setMenu(menu === name ? null : name)}>{name}</button>
               {menu === name ? (
@@ -98,6 +100,16 @@ export default function App() {
                       Console layout…
                     </button>
                   ) : null}
+                  {name === "Tally" ? (
+                    <button
+                      onClick={() => {
+                        setTallyOpen(true);
+                        setMenu(null);
+                      }}
+                    >
+                      Receivers…
+                    </button>
+                  ) : null}
                   {name === "Help" ? (
                     <>
                       <a href="/docs" target="_blank" rel="noreferrer">
@@ -113,19 +125,11 @@ export default function App() {
             </div>
           ))}
         </nav>
-        <div className={`resource-band status-${snapshot.resources.status}`}>
-          <span>CPU {snapshot.resources.cpu_percent.toFixed(0)}%</span>
-          <span>
-            RAM {snapshot.resources.memory_percent.toFixed(0)}% (
-            {(snapshot.resources.memory_bytes / 1024 / 1024).toFixed(0)} MB)
-          </span>
-          <span>
-            {snapshot.mixer.raster} · {snapshot.mixer.frame_rate} · {snapshot.mixer.video_format}
-          </span>
-          <span className="issue">
-            {issue ? `${issue.level}: ${issue.message}` : "No issues"}
-          </span>
-        </div>
+        <StatusChip
+          resources={snapshot.resources}
+          mixer={snapshot.mixer}
+          formatId={snapshot.workspace.format_id}
+        />
       </header>
 
       <section className="me-row">
@@ -175,15 +179,18 @@ export default function App() {
           {snapshot.stinger_slots.map((slot) => (
             <div key={slot.id} className="stinger-chip">
               <button
+                title="Sting Preview to Program"
                 onClick={() => {
-                  const target =
-                    slot.role === "out"
-                      ? snapshot.mixer.preview_input_id ?? snapshot.inputs[0]?.id
-                      : snapshot.inputs.find((item) => item.kind === "replay")?.id ??
-                        snapshot.inputs[0]?.id;
+                  const target = panel.preview_input_id;
                   if (!target) return;
+                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "replay"
+                    ? "to_replay"
+                    : "to_live";
                   void command(() =>
-                    api.stingerPlay(slot.stinger_id, target, slot.role === "out" ? "to_live" : "to_replay"),
+                    api.stingerPlay(slot.stinger_id, target, direction, {
+                      flip_flop: true,
+                      panel_id: panel.id,
+                    }),
                   );
                 }}
               >
@@ -255,9 +262,11 @@ export default function App() {
         <SourceSettingsModal
           input={sourceEdit}
           clips={snapshot.clips}
+          stingerSlots={snapshot.stinger_slots}
           onClose={() => setSourceEdit(null)}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);
+            setSourceEdit(null);
             await refresh();
           }}
         />
@@ -269,6 +278,27 @@ export default function App() {
           onClose={() => setStingerEdit(null)}
           onSave={async (payload) => {
             await api.patchStingerSlot(stingerEdit.id, payload);
+            setStingerEdit(null);
+            await refresh();
+          }}
+        />
+      ) : null}
+      {tallyOpen ? (
+        <TallySettingsModal
+          tally={
+            snapshot.tally ?? {
+              protocol: "TSL UMD 5.0",
+              receivers: [],
+              presets: [],
+            }
+          }
+          onClose={() => setTallyOpen(false)}
+          onSave={async (receivers: TallyReceiver[]) => {
+            await api.tallyReceivers(receivers);
+            await refresh();
+          }}
+          onRefresh={async () => {
+            await api.tallyRefresh();
             await refresh();
           }}
         />

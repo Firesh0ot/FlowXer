@@ -7,6 +7,7 @@ export interface LogicalInput {
   slot: number;
   file_path?: string | null;
   group_hint?: string | null;
+  stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;
   audio?: { flow_id?: string | null; media_type: string; channels: number } | null;
 }
@@ -86,6 +87,38 @@ export interface ResourceInfo {
   memory_percent: number;
   status: string;
   issues: { level: string; message: string }[];
+  load?: { m1: number; m5: number; m15: number };
+  uptime_s?: number;
+  pid?: number;
+}
+
+export interface TallyReceiver {
+  id: string;
+  kind: "companion" | "vsm" | "bfe" | "hi" | "custom";
+  label: string;
+  host: string;
+  port: number;
+  transport: "udp" | "tcp";
+  enabled: boolean;
+  screen: number;
+  index_offset: number;
+  dle_stx?: boolean | null;
+  last_error?: string | null;
+  last_sent_at?: number | null;
+}
+
+export interface TallyPreset {
+  kind: TallyReceiver["kind"];
+  label: string;
+  port: number;
+  transport: "udp" | "tcp";
+  hint: string;
+}
+
+export interface TallyConfig {
+  protocol: string;
+  receivers: TallyReceiver[];
+  presets: TallyPreset[];
 }
 
 export interface ConsoleState {
@@ -100,6 +133,7 @@ export interface ConsoleState {
   webrtc: { enabled: boolean; protocol: string };
   clips: { name: string; path: string }[];
   stingers: StingerInfo[];
+  tally?: TallyConfig;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -185,10 +219,24 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ file_path, input_id }),
     }).then((r) => parse(r)),
-  stingerPlay: (stinger_id: string, target_input_id: string, direction: string) =>
+  stingerPlay: (
+    stinger_id: string,
+    target_input_id: string,
+    direction: string,
+    extra?: { flip_flop?: boolean; panel_id?: string },
+  ) =>
     fetch("/api/v1/stinger/play", {
       method: "POST",
       headers: jsonHeaders,
-      body: JSON.stringify({ stinger_id, target_input_id, direction }),
+      body: JSON.stringify({ stinger_id, target_input_id, direction, ...extra }),
     }).then((r) => parse(r)),
+  tally: () => fetch("/api/v1/tally").then((r) => parse<TallyConfig>(r)),
+  tallyReceivers: (receivers: TallyReceiver[]) =>
+    fetch("/api/v1/tally/receivers", {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify({ receivers }),
+    }).then((r) => parse<TallyConfig>(r)),
+  tallyRefresh: () =>
+    fetch("/api/v1/tally/refresh", { method: "POST" }).then((r) => parse<TallyConfig>(r)),
 };

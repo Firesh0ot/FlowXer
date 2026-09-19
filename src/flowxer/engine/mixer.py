@@ -24,6 +24,8 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
     StingerSlotUpdate,
+    TallyReceiver,
+    TallyReceiverStatus,
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
@@ -32,6 +34,13 @@ from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
 from flowxer.engine.pipeline import build_pipeline_description
+from flowxer.engine.security import (
+    SecurityError,
+    assert_http_url,
+    contained_path,
+    require_safe_id,
+    resolve_under,
+)
 from flowxer.engine.stinger import (
     StingerPlayer,
     cut_frame_from_ms,
@@ -42,6 +51,7 @@ from flowxer.engine.stinger import (
     register_video_stinger,
     update_stinger_cut,
 )
+from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
 
@@ -79,6 +89,7 @@ class VisionMixer:
         self.last_transition: str = "cut"
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
+        self.tally = TallyService()
         self.overlay = Html5Overlay(
             url=settings.overlay_url,
             cache_dir=settings.graphics_dir,
@@ -136,6 +147,10 @@ class VisionMixer:
             slot += 1
         for slot, item in enumerate(self.list_inputs()):
             item.slot = slot
+        valid_slots = {item.id for item in self.stinger_slots}
+        for item in self.inputs.values():
+            if item.stinger_slot_id and item.stinger_slot_id not in valid_slots:
+                item.stinger_slot_id = None
 
     def _sync_panels(self) -> None:
         desired = self.workspace.mixer_panel_count
@@ -204,6 +219,10 @@ class VisionMixer:
             for n in range(1, count + 1):
                 slots.append(_make(f"shared-{n}", "shared", f"Stinger {n}"))
         self.stinger_slots = slots
+        valid = {item.id for item in slots}
+        for source in self.inputs.values():
+            if source.stinger_slot_id and source.stinger_slot_id not in valid:
+                source.stinger_slot_id = None
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
         patch = payload.model_dump(exclude_unset=True)
@@ -228,6 +247,7 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        self._publish_tally()
         return self.workspace
 
     def get_panel(self, panel_id: str) -> MixerPanel:
@@ -243,6 +263,11 @@ class VisionMixer:
         raise MixerError(f"unknown downstream keyer {keyer_id}")
 
     def update_keyer(self, keyer_id: str, **kwargs) -> DownstreamKeyer:
+        if kwargs.get("url"):
+            try:
+                kwargs["url"] = assert_http_url(kwargs["url"], what="keyer URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         keyer = self.get_keyer(keyer_id)
         for field, value in kwargs.items():
             if value is not None:
@@ -260,14 +285,14 @@ class VisionMixer:
     def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
         return self.configure_stinger_slot(slot_id, StingerSlotUpdate(stinger_id=stinger_id))
 
-    def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
-        slot = None
+    def get_stinger_slot(self, slot_id: str) -> StingerSlot:
         for item in self.stinger_slots:
             if item.id == slot_id:
-                slot = item
-                break
-        if slot is None:
-            raise MixerError(f"unknown stinger slot {slot_id}")
+                return item
+        raise MixerError(f"unknown stinger slot {slot_id}")
+
+    def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
+        slot = self.get_stinger_slot(slot_id)
         kind = payload.kind or slot.kind or "sequence"
         if kind not in {"sequence", "video"}:
             raise MixerError("stinger kind must be sequence or video")
@@ -277,15 +302,25 @@ class VisionMixer:
 
         if kind == "video" and payload.media_path:
             video = Path(payload.media_path)
-            if not video.is_absolute():
-                clip = self.settings.clips_dir / video.name
-                sting = self.settings.stingers_dir / video.name
-                if clip.exists():
-                    video = clip
-                elif sting.exists():
-                    video = sting
+            try:
+                if video.is_absolute():
+                    video = contained_path(
+                        video, self.settings.clips_dir, self.settings.stingers_dir
+                    )
                 else:
-                    raise MixerError(f"video not found: {payload.media_path}")
+                    clip = self.settings.clips_dir / video.name
+                    sting = self.settings.stingers_dir / video.name
+                    if clip.exists():
+                        video = clip.resolve()
+                    elif sting.exists():
+                        video = sting.resolve()
+                    else:
+                        raise MixerError(f"video not found: {payload.media_path}")
+                    contained_path(
+                        video, self.settings.clips_dir, self.settings.stingers_dir
+                    )
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
             stinger_id = payload.stinger_id or slot.stinger_id or video.stem
             if stinger_id == self.settings.default_stinger:
                 stinger_id = video.stem
@@ -304,6 +339,16 @@ class VisionMixer:
             slot.cut_ms = info.cut_ms
             slot.cut_frame = info.cut_frame
             slot.kind = "video"
+            if payload.cut_frame is not None or payload.cut_ms is not None:
+                info = update_stinger_cut(
+                    self.settings.stingers_dir,
+                    slot.stinger_id,
+                    fps=self.settings.fps,
+                    cut_ms=payload.cut_ms,
+                    cut_frame=payload.cut_frame,
+                )
+                slot.cut_ms = info.cut_ms
+                slot.cut_frame = info.cut_frame
             return slot
 
         if payload.stinger_id:
@@ -385,33 +430,33 @@ class VisionMixer:
 
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
         current = self.get_input(input_id)
+        patch = payload.model_dump(exclude_unset=True)
+        if "stinger_slot_id" in patch:
+            slot_id = patch["stinger_slot_id"] or None
+            if slot_id:
+                self.get_stinger_slot(slot_id)
+            patch["stinger_slot_id"] = slot_id
         if self.state == MixerState.running and payload.file_path is None:
             # Live metadata updates are allowed; topology changes are not.
             data = current.model_dump()
-            if payload.label is not None:
-                data["label"] = payload.label
-            if payload.kind is not None:
-                data["kind"] = payload.kind
-            if payload.video is not None:
-                data["video"] = payload.video
-            if payload.audio is not None:
-                data["audio"] = payload.audio
-            if payload.group_hint is not None:
-                data["group_hint"] = payload.group_hint
+            for field in ("label", "kind", "video", "audio", "group_hint", "stinger_slot_id"):
+                if field in patch:
+                    data[field] = patch[field]
             updated = LogicalInput(**data)
             self.inputs[input_id] = updated
+            self._publish_tally()
             return updated
         if self.state == MixerState.running and payload.file_path is not None:
             if current.kind not in {InputKind.file, InputKind.replay}:
                 raise MixerError("only file/replay inputs can change clip while on-air")
             return self.load_clip(input_id, payload.file_path)
         data = current.model_dump()
-        patch = payload.model_dump(exclude_unset=True)
         data.update(patch)
         updated = LogicalInput(**data)
         if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
             updated.file_path = self._resolve_clip(updated.file_path)
         self.inputs[input_id] = updated
+        self._publish_tally()
         return updated
 
     def delete_input(self, input_id: str) -> None:
@@ -439,12 +484,13 @@ class VisionMixer:
         return payload
 
     def _resolve_clip(self, file_path: str) -> str:
-        candidate = Path(file_path)
-        if not candidate.is_absolute():
-            candidate = self.settings.clips_dir / candidate
+        try:
+            candidate = resolve_under(self.settings.clips_dir, file_path)
+        except SecurityError as exc:
+            raise MixerError(str(exc)) from exc
         if not candidate.exists():
             raise MixerError(f"clip not found: {file_path}")
-        return str(candidate.resolve())
+        return str(candidate)
 
     # ── storage ──────────────────────────────────────────────────────────────
 
@@ -466,6 +512,10 @@ class VisionMixer:
         return list_stingers(self.settings.stingers_dir)
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
+        try:
+            require_safe_id(stinger_id, what="stinger id")
+        except SecurityError as exc:
+            raise MixerError(str(exc)) from exc
         info = inspect_stinger(self.settings.stingers_dir, stinger_id, fps=self.settings.fps)
         if info is None or not info.frame_count:
             raise MixerError(f"unknown stinger {stinger_id}")
@@ -480,11 +530,18 @@ class VisionMixer:
         if not self.inputs:
             raise MixerError("register at least one logical input")
 
-        domain = Path(request.domain) if request.domain else self.settings.mxl_domain
+        domain = self.settings.mxl_domain.resolve()
+        if request.domain:
+            requested = Path(request.domain).expanduser().resolve()
+            if requested != domain:
+                raise MixerError("MXL domain path override is not allowed")
         domain.mkdir(parents=True, exist_ok=True)
         group_hint = request.group_hint or self.settings.group_hint
         if request.overlay_url:
-            self.overlay.url = request.overlay_url
+            try:
+                self.overlay.url = assert_http_url(request.overlay_url, what="overlay URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         if request.overlay_enabled:
             self.overlay.enabled = True
 
@@ -555,6 +612,7 @@ class VisionMixer:
             self.panels[0].preview_input_id = self.preview_input_id
         self._apply_program()
         self._apply_overlay_alpha()
+        self._publish_tally()
         return self.status()
 
     def stop(self) -> MixerStatus:
@@ -564,6 +622,7 @@ class VisionMixer:
         self.state = MixerState.idle
         self.backend = "idle"
         self.stinger_player = None
+        self._publish_tally()
         return self.status()
 
     def _default_program_id(self) -> str:
@@ -623,7 +682,16 @@ class VisionMixer:
         target = self.get_input(input_id)
         panel = self.get_panel(panel_id)
         if transition == TransitionType.stinger:
-            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id)
+            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id, panel_id=panel_id)
+        if transition == TransitionType.cut:
+            auto = self._auto_stinger_for(target.id)
+            if auto is not None:
+                return self.play_stinger(
+                    auto.stinger_id,
+                    input_id,
+                    direction="to_replay" if self._is_replay(input_id) else "to_live",
+                    panel_id=panel.id,
+                )
         self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False)
         return self.status()
 
@@ -631,6 +699,17 @@ class VisionMixer:
         """Flip Preview onto Program. If Wipe is armed, play the TGA stinger instead."""
         panel = self._ensure_running_panel(panel_id)
         incoming = self._preview_id(panel)
+        auto = self._auto_stinger_for(incoming)
+        if auto is not None:
+            outgoing = panel.program_input_id
+            return self.play_stinger(
+                auto.stinger_id,
+                incoming,
+                direction="to_replay" if self._is_replay(incoming) else "to_live",
+                outgoing_input_id=outgoing,
+                flip_flop=True,
+                panel_id=panel.id,
+            )
         if panel.wipe_armed:
             outgoing = panel.program_input_id
             stinger_id = self._stinger_for("to_replay" if self._is_replay(incoming) else "to_live")
@@ -672,6 +751,12 @@ class VisionMixer:
         panel.wipe_armed = (not panel.wipe_armed) if armed is None else armed
         return self.status()
 
+    def _auto_stinger_for(self, input_id: str) -> StingerSlot | None:
+        source = self.get_input(input_id)
+        if not source.stinger_slot_id:
+            return None
+        return self.get_stinger_slot(source.stinger_slot_id)
+
     def _ensure_running_panel(self, panel_id: str) -> MixerPanel:
         if self.state != MixerState.running:
             self.start(MixerStartRequest())
@@ -711,6 +796,7 @@ class VisionMixer:
                 self.program_bus = ProgramBus.replay
             self._apply_program()
         _ = duration_ms  # mix duration is recorded; GST input-selector is a hard switch
+        self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
         if self.state != MixerState.running:
@@ -720,6 +806,7 @@ class VisionMixer:
         panel.preview_input_id = input_id
         if panel.id == self.panels[0].id:
             self.preview_input_id = input_id
+        self._publish_tally()
         return self.status()
 
     def load_clip(self, input_id: str, file_path: str) -> LogicalInput:
@@ -816,6 +903,7 @@ class VisionMixer:
             else:
                 self.program_bus = ProgramBus.replay
             self._apply_program()
+            self._publish_tally()
         if "complete" in snapshot["events"]:
             if self.gst is not None:
                 self.gst.set_compositor_alpha("sink_2", 0.0)
@@ -843,6 +931,11 @@ class VisionMixer:
         self._stinger_clock.start()
 
     def set_overlay(self, **kwargs) -> MixerStatus:
+        if kwargs.get("url"):
+            try:
+                kwargs["url"] = assert_http_url(kwargs["url"], what="overlay URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         self.overlay.update(**kwargs)
         if self.keyers:
             if kwargs.get("enabled") is not None:
@@ -865,6 +958,23 @@ class VisionMixer:
     def _require_running(self) -> None:
         if self.state != MixerState.running:
             raise MixerError("mixer is not running")
+
+    def replace_tally_receivers(self, receivers: list[TallyReceiver]) -> list[TallyReceiverStatus]:
+        try:
+            self.tally.replace(receivers)
+        except ValueError as exc:
+            raise MixerError(str(exc)) from exc
+        return self.publish_tally()
+
+    def publish_tally(self) -> list[TallyReceiverStatus]:
+        return self._publish_tally()
+
+    def _publish_tally(self) -> list[TallyReceiverStatus]:
+        try:
+            return self.tally.publish(self)
+        except Exception as exc:
+            log.warning("tally publish failed: %s", exc)
+            return self.tally.status()
 
     def status(self) -> MixerStatus:
         capabilities = probe_backend()
