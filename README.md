@@ -282,9 +282,6 @@ an unauthenticated mixer on a public address.
 3. Optional: set `FLOWXER_CORS_ORIGINS` to the GUI origin if a browser talks
    to the mixer port directly.
 
-Making the **GitHub repository** public is a GitHub setting
-(Settings → General → Danger zone). This tree does not change visibility.
-
 ## Branches and releases
 
 FlowXer uses three long-lived branches. Version numbers are **(merges to main).(promotions to stage).(pushes to dev)** and live in `VERSION`.
