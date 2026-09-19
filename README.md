@@ -2,7 +2,7 @@
 
 DMF **Vision Mixer** microservice for the [EBU Dynamic Media Facility](https://tech.ebu.ch/dmf/ra) Media eXchange Layer ([dmf-mxl/mxl](https://github.com/dmf-mxl/mxl)).
 
-The mixer is controlled over HTTP, publishes **OpenAPI** at `/docs`, and keeps media **uncompressed** on the MXL domain:
+The mixer is controlled over HTTP. OpenAPI lives at `/docs` on the **GUI origin** (port **9620**). Media stays **uncompressed** on the MXL domain:
 
 | Essence | MXL media type | GStreamer caps |
 |---------|----------------|----------------|
@@ -88,26 +88,31 @@ The gear on each **stinger** (`PATCH /stinger-slots/{id}`) picks a TGA sequence 
 
 The top-right **status chip** is a compact CPU / RAM / format pill. Click it for mixer state, load averages, memory, raster, WebRTC, uptime, PID, and issues (`GET /console` or `GET /resources`).
 
-**Help** opens Mixer OpenAPI (`/docs`, proxied from the GUI) and the EBU MXL SDK.
+**Help** opens Mixer OpenAPI (`/docs` on the GUI origin) and the EBU MXL SDK.
 
 | | |
 |--|--|
 | Operator GUI | http://localhost:9620 |
-| Mixer API / OpenAPI | http://localhost:9610/docs |
+| Mixer API / OpenAPI | http://localhost:9620/docs |
 
 ```bash
-cd gui && npm install && npm run dev   # proxies /api, /docs, /openapi.json to :9610
+cd gui && npm install && npm run dev   # proxies /api, /docs, /openapi.json to the mixer on loopback :9610
 ```
 
 ## API
 
+Compose and staging publish **one** HTTP port: the operator GUI on **9620**. Nginx there proxies `/api`, `/docs`, `/redoc`, and `/openapi.json` to the mixer. The mixer listens on **9610** on the Docker network and on **127.0.0.1:9610** on the host — not on a public interface.
+
 | | |
 |--|--|
 | Operator GUI | http://localhost:9620 |
-| Mixer landing | http://localhost:9610 |
-| Swagger UI | http://localhost:9610/docs |
-| ReDoc | http://localhost:9610/redoc |
-| OpenAPI JSON | http://localhost:9610/openapi.json |
+| Swagger UI | http://localhost:9620/docs |
+| ReDoc | http://localhost:9620/redoc |
+| OpenAPI JSON | http://localhost:9620/openapi.json |
+| Mixer API | http://localhost:9620/api/v1/… |
+| Mixer on the host (loopback) | http://127.0.0.1:9610 |
+
+If `FLOWXER_API_TOKEN` is set, calls to **9610** need `Authorization: Bearer …` or `X-FlowXer-Token`. Calls through **9620** do not: nginx (and the Vite dev proxy) inject the token. `/api/v1/health` stays unauthenticated on both.
 
 The operator GUI is a client of `/api/v1`. Every console action has a matching route:
 
@@ -129,16 +134,19 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 
 API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
-Useful calls:
+Useful calls (through the GUI proxy on **9620**; mixer `:9610` is loopback-only):
 
 ```bash
+curl http://localhost:9620/api/v1/health
+# OpenAPI: http://localhost:9620/docs
+
 # Start the mixer (publishes deterministic PGM flow UUIDs)
-curl -X POST http://localhost:9610/api/v1/mixer/start \
+curl -X POST http://localhost:9620/api/v1/mixer/start \
   -H 'content-type: application/json' \
   -d '{"program_input_id":"cam-1","overlay_enabled":true}'
 
 # Bundle a live MXL camera as one logical input
-curl -X POST http://localhost:9610/api/v1/inputs \
+curl -X POST http://localhost:9620/api/v1/inputs \
   -H 'content-type: application/json' \
   -d '{
     "id":"studio-a",
@@ -149,26 +157,26 @@ curl -X POST http://localhost:9610/api/v1/inputs \
   }'
 
 # 9:16 source tiles (works while on-air); auto-stinger on a camera
-curl -X PUT http://localhost:9610/api/v1/workspace \
+curl -X PUT http://localhost:9620/api/v1/workspace \
   -H 'content-type: application/json' -d '{"source_tile_aspect":"9:16"}'
-curl -X PATCH http://localhost:9610/api/v1/inputs/cam-1 \
+curl -X PATCH http://localhost:9620/api/v1/inputs/cam-1 \
   -H 'content-type: application/json' -d '{"stinger_slot_id":"shared-1"}'
 
 # Cut Preview to Program through a stinger (same as pressing a stinger chip)
-curl -X POST http://localhost:9610/api/v1/stinger/play \
+curl -X POST http://localhost:9620/api/v1/stinger/play \
   -H 'content-type: application/json' \
   -d '{"stinger_id":"replay-wipe","target_input_id":"cam-2","direction":"to_live","flip_flop":true,"panel_id":"me-1"}'
 
 # Load a clip and stinger into replay, then return to live
-curl -X POST http://localhost:9610/api/v1/replay/load \
+curl -X POST http://localhost:9620/api/v1/replay/load \
   -H 'content-type: application/json' -d '{"file_path":"sizzle.ts"}'
-curl -X POST http://localhost:9610/api/v1/replay/take \
+curl -X POST http://localhost:9620/api/v1/replay/take \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
-curl -X POST http://localhost:9610/api/v1/replay/return \
+curl -X POST http://localhost:9620/api/v1/replay/return \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
 
 # TSL 5.0 tally/UMD to Riedel HI (same shape for Companion, VSM, BFE)
-curl -X PUT http://localhost:9610/api/v1/tally/receivers \
+curl -X PUT http://localhost:9620/api/v1/tally/receivers \
   -H 'content-type: application/json' \
   -d '{"receivers":[{"id":"hi-1","kind":"hi","label":"Riedel HI","host":"10.0.0.40","port":8900,"transport":"udp","enabled":true,"screen":0,"index_offset":0}]}'
 ```
@@ -187,8 +195,8 @@ docker compose up --build
 
 Services:
 
-- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, transitions, tally, settings)
-- **vision-mixer** on port **9610** — control API, OpenAPI, WHEP previews
+- **gui** on port **9620** — operator console, mixer API (`/api/v1`), and OpenAPI (`/docs`, `/redoc`, `/openapi.json`)
+- **vision-mixer** on **127.0.0.1:9610** — mixer process (Docker network + host loopback only)
 - tmpfs MXL domain at `/mxl-domain`
 - bind-mount `./storage` for clips, TGA stingers, overlay cache
 - GStreamer path: `videotestsrc` / `filesrc` → `input-selector` → compositor → **v210** / **F32LE**
@@ -210,6 +218,12 @@ pip install -e '.[dev]'
 pytest
 FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/mxl-domain \
   uvicorn flowxer.app:create_app --factory --port 9610
+```
+
+Mixer OpenAPI on that process is `http://127.0.0.1:9610/docs`. Start the GUI in another terminal so the browser uses **9620** (console, `/docs`, and `/api` proxied to the mixer):
+
+```bash
+cd gui && npm run dev
 ```
 
 ## Stinger convention
@@ -274,13 +288,12 @@ The operator GUI (`gui/`) is also Apache-2.0; React and Vite are MIT.
 The HTTP control plane can start, stop, and take sources on-air. Do not put
 an unauthenticated mixer on a public address.
 
-1. Set `FLOWXER_API_TOKEN` in `.env` (see `.env.example`). Health checks stay
-   open; `/docs`, OpenAPI, and `/api/v1/*` require `Authorization: Bearer …`
-   or `X-FlowXer-Token`.
-2. Publish only the GUI (`9620`). Compose binds the mixer API to
-   `127.0.0.1:9610`. The GUI nginx (and Vite dev proxy) inject the token.
-3. Optional: set `FLOWXER_CORS_ORIGINS` to the GUI origin if a browser talks
-   to the mixer port directly.
+1. Set `FLOWXER_API_TOKEN` in `.env` (see `.env.example`).
+2. Open the console at `http://<host>:9620` and docs at `http://<host>:9620/docs`.
+   API calls are `http://<host>:9620/api/v1/…`. Compose binds the mixer to
+   `127.0.0.1:9610` only; nginx injects the token so the browser does not send it.
+3. Health stays open at `/api/v1/health`. Direct calls to loopback **9610** still
+   need `Authorization: Bearer …` (or `X-FlowXer-Token`) when the token is set.
 
 ## Branches and releases
 
