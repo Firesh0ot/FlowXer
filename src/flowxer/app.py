@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from flowxer import __version__
+from flowxer.api.auth import ApiTokenMiddleware
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.engine.mixer import VisionMixer
 from flowxer.settings import Settings, get_settings
@@ -106,16 +107,26 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
         redoc_url="/redoc",
         openapi_url="/openapi.json",
     )
+    # Auth is inner; CORS is added last so it is outermost (preflight stays unauthenticated).
+    app.add_middleware(ApiTokenMiddleware)
+    origins = settings.cors_origin_list
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_credentials=origins != ["*"],
     )
     app.state.settings = settings
     app.state.mixer = mixer
     app.dependency_overrides[get_mixer] = lambda: app.state.mixer
+    app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router, prefix="/api/v1")
+    if not (settings.api_token or "").strip():
+        log.warning(
+            "FLOWXER_API_TOKEN is unset; the HTTP control plane is unauthenticated. "
+            "Set a token before exposing FlowXer on a public or staging network."
+        )
 
     static_dir = Path(__file__).parent / "static"
     graphics_dir = Path(__file__).parent / "graphics"

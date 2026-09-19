@@ -347,12 +347,15 @@ def overlay_status(mixer: VisionMixer = Depends(get_mixer)) -> OverlayStatus:
 def overlay_update(
     payload: OverlayUpdate, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
-    body = mixer.set_overlay(
-        enabled=payload.enabled,
-        url=payload.url,
-        title=payload.title,
-        subtitle=payload.subtitle,
-    )
+    try:
+        body = mixer.set_overlay(
+            enabled=payload.enabled,
+            url=payload.url,
+            title=payload.title,
+            subtitle=payload.subtitle,
+        )
+    except MixerError as exc:
+        raise _http(exc)
     return MixerCommandResponse(status="overlay", mixer=body)
 
 
@@ -573,7 +576,12 @@ def patch_keyer(
     try:
         return mixer.update_keyer(keyer_id, **payload.model_dump(exclude_unset=True))
     except MixerError as exc:
-        raise _http(exc, status.HTTP_404_NOT_FOUND)
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if str(exc).startswith("unknown")
+            else status.HTTP_409_CONFLICT
+        )
+        raise _http(exc, code)
 
 
 @router.patch(
@@ -619,6 +627,10 @@ async def webrtc_whep(
         raise HTTPException(status_code=400, detail="SDP offer required")
     try:
         answer = await create_whep_answer(mixer, stream_id, offer)
+    except RuntimeError as exc:
+        if "too many WebRTC" in str(exc):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
     return Response(content=answer, media_type="application/sdp")

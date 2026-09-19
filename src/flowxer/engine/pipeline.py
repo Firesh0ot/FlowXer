@@ -144,7 +144,7 @@ def build_pipeline_description(
 
     if use_cefsrc:
         overlay_bin = (
-            f"cefsrc name=html5 url={overlay_url} "
+            f'cefsrc name=html5 url="{overlay_url}" '
             f"! {bgra} ! videorate ! {bgra} ! queue name=html5q "
             f"! comp.sink_1"
         )

@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md LICENSE VERSION /app/
+COPY pyproject.toml README.md LICENSE NOTICE VERSION /app/
 COPY src /app/src
 COPY configs /app/configs
 COPY docker/entrypoint.sh /entrypoint.sh

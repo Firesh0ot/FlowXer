@@ -34,6 +34,13 @@ from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
 from flowxer.engine.pipeline import build_pipeline_description
+from flowxer.engine.security import (
+    SecurityError,
+    assert_http_url,
+    contained_path,
+    require_safe_id,
+    resolve_under,
+)
 from flowxer.engine.stinger import (
     StingerPlayer,
     cut_frame_from_ms,
@@ -256,6 +263,11 @@ class VisionMixer:
         raise MixerError(f"unknown downstream keyer {keyer_id}")
 
     def update_keyer(self, keyer_id: str, **kwargs) -> DownstreamKeyer:
+        if kwargs.get("url"):
+            try:
+                kwargs["url"] = assert_http_url(kwargs["url"], what="keyer URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         keyer = self.get_keyer(keyer_id)
         for field, value in kwargs.items():
             if value is not None:
@@ -290,15 +302,25 @@ class VisionMixer:
 
         if kind == "video" and payload.media_path:
             video = Path(payload.media_path)
-            if not video.is_absolute():
-                clip = self.settings.clips_dir / video.name
-                sting = self.settings.stingers_dir / video.name
-                if clip.exists():
-                    video = clip
-                elif sting.exists():
-                    video = sting
+            try:
+                if video.is_absolute():
+                    video = contained_path(
+                        video, self.settings.clips_dir, self.settings.stingers_dir
+                    )
                 else:
-                    raise MixerError(f"video not found: {payload.media_path}")
+                    clip = self.settings.clips_dir / video.name
+                    sting = self.settings.stingers_dir / video.name
+                    if clip.exists():
+                        video = clip.resolve()
+                    elif sting.exists():
+                        video = sting.resolve()
+                    else:
+                        raise MixerError(f"video not found: {payload.media_path}")
+                    contained_path(
+                        video, self.settings.clips_dir, self.settings.stingers_dir
+                    )
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
             stinger_id = payload.stinger_id or slot.stinger_id or video.stem
             if stinger_id == self.settings.default_stinger:
                 stinger_id = video.stem
@@ -462,12 +484,13 @@ class VisionMixer:
         return payload
 
     def _resolve_clip(self, file_path: str) -> str:
-        candidate = Path(file_path)
-        if not candidate.is_absolute():
-            candidate = self.settings.clips_dir / candidate
+        try:
+            candidate = resolve_under(self.settings.clips_dir, file_path)
+        except SecurityError as exc:
+            raise MixerError(str(exc)) from exc
         if not candidate.exists():
             raise MixerError(f"clip not found: {file_path}")
-        return str(candidate.resolve())
+        return str(candidate)
 
     # ── storage ──────────────────────────────────────────────────────────────
 
@@ -489,6 +512,10 @@ class VisionMixer:
         return list_stingers(self.settings.stingers_dir)
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
+        try:
+            require_safe_id(stinger_id, what="stinger id")
+        except SecurityError as exc:
+            raise MixerError(str(exc)) from exc
         info = inspect_stinger(self.settings.stingers_dir, stinger_id, fps=self.settings.fps)
         if info is None or not info.frame_count:
             raise MixerError(f"unknown stinger {stinger_id}")
@@ -503,11 +530,18 @@ class VisionMixer:
         if not self.inputs:
             raise MixerError("register at least one logical input")
 
-        domain = Path(request.domain) if request.domain else self.settings.mxl_domain
+        domain = self.settings.mxl_domain.resolve()
+        if request.domain:
+            requested = Path(request.domain).expanduser().resolve()
+            if requested != domain:
+                raise MixerError("MXL domain path override is not allowed")
         domain.mkdir(parents=True, exist_ok=True)
         group_hint = request.group_hint or self.settings.group_hint
         if request.overlay_url:
-            self.overlay.url = request.overlay_url
+            try:
+                self.overlay.url = assert_http_url(request.overlay_url, what="overlay URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         if request.overlay_enabled:
             self.overlay.enabled = True
 
@@ -897,6 +931,11 @@ class VisionMixer:
         self._stinger_clock.start()
 
     def set_overlay(self, **kwargs) -> MixerStatus:
+        if kwargs.get("url"):
+            try:
+                kwargs["url"] = assert_http_url(kwargs["url"], what="overlay URL")
+            except SecurityError as exc:
+                raise MixerError(str(exc)) from exc
         self.overlay.update(**kwargs)
         if self.keyers:
             if kwargs.get("enabled") is not None:

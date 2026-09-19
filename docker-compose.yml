@@ -17,7 +17,9 @@ services:
     container_name: flowxer-vision-mixer
     hostname: flowxer
     ports:
-      - "9610:9610"
+      # Loopback only: do not publish the mixer API on a public interface.
+      # The operator GUI on 9620 proxies /api (and injects FLOWXER_API_TOKEN).
+      - "127.0.0.1:9610:9610"
     environment:
       FLOWXER_MXL_DOMAIN: /mxl-domain
       FLOWXER_STORAGE_ROOT: /storage
@@ -28,6 +30,8 @@ services:
       FLOWXER_FRAME_RATE_DEN: "1"
       FLOWXER_GST_MODE: auto
       FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
+      FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:-}
+      FLOWXER_CORS_ORIGINS: ${FLOWXER_CORS_ORIGINS:-*}
     volumes:
       - type: volume
         source: mxl-domain
@@ -55,6 +59,8 @@ services:
     hostname: flowxer-gui
     ports:
       - "9620:9620"
+    environment:
+      FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:-}
     depends_on:
       - vision-mixer
 
