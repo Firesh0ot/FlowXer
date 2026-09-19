@@ -1,0 +1,33 @@
+FlowXer
+Copyright 2026 FlowXer contributors
+
+This product includes software developed by the FlowXer contributors.
+Licensed under the Apache License, Version 2.0.
+See the LICENSE file in the source tree.
+
+The FlowXer source code in this repository is Apache-2.0. That matches the
+Media eXchange Layer (MXL) project it integrates with. The published Docker
+images additionally bundle third-party media libraries that remain under their
+own licenses; shipping those binaries does not relicense FlowXer itself.
+
+
+Third-party components
+======================
+
+Apache-2.0
+  Media eXchange Layer (MXL) — https://github.com/dmf-mxl/mxl
+  FastAPI, Starlette, Pydantic, Uvicorn
+
+MIT
+  React, React DOM, Vite (operator GUI)
+
+LGPL-2.1+
+  GStreamer and gst-plugins-base / gst-plugins-good (runtime in the mixer image)
+  FFmpeg / libav via Ubuntu packages ffmpeg and gstreamer1.0-libav
+
+Other / mixed
+  gst-plugins-bad — mixed licenses; see the Ubuntu package copyright files
+  nginx (gui image) — 2-clause BSD
+
+Source for the packaged libraries is available from the Ubuntu archive and from
+the upstream projects listed above.

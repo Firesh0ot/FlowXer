@@ -26,6 +26,17 @@ async def create_whep_answer(mixer, stream_id: str, offer_sdp: str) -> str:
 
     from flowxer.engine.preview import render_monitor
 
+    max_peers = int(getattr(mixer.settings, "max_webrtc_peers", 16) or 16)
+    stale = {
+        peer
+        for peer in list(_PEERS)
+        if getattr(peer, "connectionState", "") in {"failed", "closed", "disconnected"}
+    }
+    for peer in stale:
+        _PEERS.discard(peer)
+    if len(_PEERS) >= max_peers:
+        raise RuntimeError("too many WebRTC preview peers")
+
     try:
         from aiortc import VideoStreamTrack
     except ImportError:  # pragma: no cover

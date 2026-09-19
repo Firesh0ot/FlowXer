@@ -259,7 +259,31 @@ Presets: Bitfocus Companion, Lawo VSM, BFE Commander, Riedel HI (human interface
 
 ## License
 
-Apache-2.0. MXL is Apache-2.0; GStreamer plugins remain under their upstream licenses.
+Apache-2.0 for the FlowXer source (same family as MXL). See `LICENSE` and the
+copyright appendix, plus `NOTICE` for third-party attribution.
+
+The mixer **source** stays Apache-2.0. Docker images install GStreamer and
+FFmpeg/libav, which remain LGPL (and, for some `gst-plugins-bad` bits, mixed
+upstream licenses). Shipping the container does **not** turn FlowXer into GPL.
+Keep `LICENSE` and `NOTICE` with any binary or image distribution.
+
+The operator GUI (`gui/`) is also Apache-2.0; React and Vite are MIT.
+
+## Public / staging access
+
+The HTTP control plane can start, stop, and take sources on-air. Do not put
+an unauthenticated mixer on a public address.
+
+1. Set `FLOWXER_API_TOKEN` in `.env` (see `.env.example`). Health checks stay
+   open; `/docs`, OpenAPI, and `/api/v1/*` require `Authorization: Bearer …`
+   or `X-FlowXer-Token`.
+2. Publish only the GUI (`9620`). Compose binds the mixer API to
+   `127.0.0.1:9610`. The GUI nginx (and Vite dev proxy) inject the token.
+3. Optional: set `FLOWXER_CORS_ORIGINS` to the GUI origin if a browser talks
+   to the mixer port directly.
+
+Making the **GitHub repository** public is a GitHub setting
+(Settings → General → Danger zone). This tree does not change visibility.
 
 ## Branches and releases
 

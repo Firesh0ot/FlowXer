@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 from flowxer.api.schemas import MixerState, TallyKind, TallyPreset, TallyReceiver, TallyReceiverStatus
+from flowxer.engine.security import SecurityError, assert_egress_host_allowed
 from flowxer.engine.tsl import DisplayMessage, encode_packet, lamps_for, wrap_tcp
 
 if TYPE_CHECKING:
@@ -81,6 +82,10 @@ class TallyService:
             if item.id in seen:
                 raise ValueError(f"duplicate tally receiver id {item.id}")
             seen.add(item.id)
+            try:
+                assert_egress_host_allowed(item.host, what="tally host")
+            except SecurityError as exc:
+                raise ValueError(str(exc)) from exc
             cleaned.append(item)
         self.receivers = cleaned
         keep = {item.id for item in cleaned}
@@ -146,6 +151,7 @@ class TallyService:
         return messages
 
     def _send(self, receiver: TallyReceiver, packet: bytes) -> None:
+        assert_egress_host_allowed(receiver.host, what="tally host")
         use_tcp = receiver.transport == "tcp"
         framed = wrap_tcp(packet) if (receiver.dle_stx if receiver.dle_stx is not None else use_tcp) else packet
         if use_tcp:
