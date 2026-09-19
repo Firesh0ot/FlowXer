@@ -134,9 +134,12 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 
 API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
-Useful calls:
+Useful calls (through the GUI proxy on **9620**; mixer `:9610` is loopback-only):
 
 ```bash
+curl http://localhost:9620/api/v1/health
+# OpenAPI: http://localhost:9620/docs
+
 # Start the mixer (publishes deterministic PGM flow UUIDs)
 curl -X POST http://localhost:9620/api/v1/mixer/start \
   -H 'content-type: application/json' \
