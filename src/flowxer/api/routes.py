@@ -22,12 +22,15 @@ from flowxer.api.schemas import (
     PreviewRequest,
     ReplayLoadRequest,
     ReplayTransitionRequest,
+    ResourceInfo,
     StingerInfo,
     StingerPlayRequest,
     StingerSlot,
     StingerSlotUpdate,
     StorageClip,
     TakeRequest,
+    TallyConfig,
+    TallyReceiversUpdate,
     WorkspaceConfig,
     WorkspaceUpdate,
 )
@@ -37,6 +40,7 @@ from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.engine.preview import render_jpeg
 from flowxer.engine.resources import collect_resources
+from flowxer.engine.tally import TALLY_PRESETS
 from flowxer.engine.webrtc import create_whep_answer, webrtc_available
 from flowxer.settings import Settings, get_settings
 
@@ -148,6 +152,7 @@ def create_input(
     "/inputs/{input_id}",
     response_model=LogicalInput,
     tags=["inputs"],
+    summary="Read one logical input",
     responses={404: {"model": ErrorBody}},
 )
 def get_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> LogicalInput:
@@ -161,7 +166,7 @@ def get_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Logical
     "/inputs/{input_id}",
     response_model=LogicalInput,
     tags=["inputs"],
-    summary="Update essence mapping or clip path on a logical input",
+    summary="Update label, kind, essences, clip path, or auto-stinger on a logical input",
 )
 def patch_input(
     input_id: str, payload: LogicalInputUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -177,6 +182,7 @@ def patch_input(
     "/inputs/{input_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["inputs"],
+    summary="Unregister a logical input (mixer must be off-air)",
 )
 def delete_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> None:
     try:
@@ -216,6 +222,7 @@ def mixer_start(
     "/mixer/stop",
     response_model=MixerCommandResponse,
     tags=["mixer"],
+    summary="Stop the GStreamer pipeline and take the mixer off-air",
 )
 def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     return MixerCommandResponse(status="stopped", mixer=mixer.stop())
@@ -257,7 +264,7 @@ def mixer_preview(
     "/mixer/cut",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Cut Preview to Program. If Wipe is armed, play the TGA stinger instead.",
+    summary="Cut Preview to Program. Auto-stinger on the Preview source, or an armed Wipe, plays a stinger instead.",
 )
 def mixer_cut(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -308,7 +315,7 @@ def mixer_fade_to_black(
     "/mixer/wipe",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Arm Wipe so the next Cut plays the TGA stinger (toggle if armed is omitted)",
+    summary="Arm Wipe so the next Cut plays the default stinger (toggle if armed is omitted)",
 )
 def mixer_wipe(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -340,12 +347,15 @@ def overlay_status(mixer: VisionMixer = Depends(get_mixer)) -> OverlayStatus:
 def overlay_update(
     payload: OverlayUpdate, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
-    body = mixer.set_overlay(
-        enabled=payload.enabled,
-        url=payload.url,
-        title=payload.title,
-        subtitle=payload.subtitle,
-    )
+    try:
+        body = mixer.set_overlay(
+            enabled=payload.enabled,
+            url=payload.url,
+            title=payload.title,
+            subtitle=payload.subtitle,
+        )
+    except MixerError as exc:
+        raise _http(exc)
     return MixerCommandResponse(status="overlay", mixer=body)
 
 
@@ -363,7 +373,7 @@ def storage_clips(mixer: VisionMixer = Depends(get_mixer)) -> list[StorageClip]:
     "/storage/stingers",
     response_model=list[StingerInfo],
     tags=["storage"],
-    summary="List TGA-sequence stingers (live ↔ replay)",
+    summary="List TGA-sequence and video stingers",
 )
 def storage_stingers(mixer: VisionMixer = Depends(get_mixer)) -> list[StingerInfo]:
     return mixer.list_stingers()
@@ -420,13 +430,19 @@ def replay_return(
     "/stinger/play",
     response_model=MixerCommandResponse,
     tags=["stinger"],
-    summary="Play a TGA sequence stinger and cut program at the opaque frame",
+    summary="Play a TGA or video stinger and cut Program at the cut frame; flip_flop swaps Preview/Program",
 )
 def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
-        body = mixer.play_stinger(payload.stinger_id, payload.target_input_id, payload.direction)
+        body = mixer.play_stinger(
+            payload.stinger_id,
+            payload.target_input_id,
+            payload.direction,
+            flip_flop=payload.flip_flop,
+            panel_id=payload.panel_id,
+        )
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="stinger", mixer=body)
@@ -448,7 +464,7 @@ def stinger_tick(
     "/console",
     response_model=ConsoleState,
     tags=["gui"],
-    summary="One-shot operator console snapshot (layout, buses, resources, WebRTC)",
+    summary="One-shot operator console snapshot (workspace, buses, resources, WebRTC)",
 )
 def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
     mixer_status = mixer.status()
@@ -469,18 +485,55 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         keyers=mixer.keyers,
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
-        resources=collect_resources(mixer),
+        resources=ResourceInfo.model_validate(collect_resources(mixer)),
         webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
+        tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
     )
+
+
+@router.get(
+    "/tally",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="TSL 5.0 tally/UMD receivers, send status, and device presets",
+)
+def tally_state(mixer: VisionMixer = Depends(get_mixer)) -> TallyConfig:
+    return TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS)
+
+
+@router.put(
+    "/tally/receivers",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="Replace the TSL 5.0 tally receiver list (Companion, VSM, BFE, Riedel HI, custom)",
+)
+def put_tally_receivers(
+    payload: TallyReceiversUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> TallyConfig:
+    try:
+        receivers = mixer.replace_tally_receivers(payload.receivers)
+    except MixerError as exc:
+        raise _http(exc)
+    return TallyConfig(receivers=receivers, presets=TALLY_PRESETS)
+
+
+@router.post(
+    "/tally/refresh",
+    response_model=TallyConfig,
+    tags=["tally"],
+    summary="Re-send Program/Preview tally and UMD labels to every enabled TSL receiver",
+)
+def tally_refresh(mixer: VisionMixer = Depends(get_mixer)) -> TallyConfig:
+    return TallyConfig(receivers=mixer.publish_tally(), presets=TALLY_PRESETS)
 
 
 @router.get(
     "/workspace",
     response_model=WorkspaceConfig,
     tags=["gui"],
-    summary="Read console layout: format, source count, MEs, stingers, DSKs",
+    summary="Read console layout: format, source-tile aspect, source count, MEs, stingers, DSKs",
 )
 def get_workspace(mixer: VisionMixer = Depends(get_mixer)) -> WorkspaceConfig:
     return mixer.workspace
@@ -503,11 +556,12 @@ def put_workspace(
 
 @router.get(
     "/resources",
+    response_model=ResourceInfo,
     tags=["gui"],
-    summary="Container CPU/memory and mixer issues for the top status band",
+    summary="Container CPU/memory and mixer issues for the operator status chip",
 )
-def resources(mixer: VisionMixer = Depends(get_mixer)) -> dict:
-    return collect_resources(mixer)
+def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
+    return ResourceInfo.model_validate(collect_resources(mixer))
 
 
 @router.patch(
@@ -522,14 +576,19 @@ def patch_keyer(
     try:
         return mixer.update_keyer(keyer_id, **payload.model_dump(exclude_unset=True))
     except MixerError as exc:
-        raise _http(exc, status.HTTP_404_NOT_FOUND)
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if str(exc).startswith("unknown")
+            else status.HTTP_409_CONFLICT
+        )
+        raise _http(exc, code)
 
 
 @router.patch(
     "/stinger-slots/{slot_id}",
     response_model=StingerSlot,
     tags=["stinger"],
-    summary="Set stinger media (TGA sequence or video) and the cut time for a slot",
+    summary="Set stinger media (TGA sequence or video) and the Program cut frame for a slot",
 )
 def patch_stinger_slot(
     slot_id: str, payload: StingerSlotUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -568,6 +627,10 @@ async def webrtc_whep(
         raise HTTPException(status_code=400, detail="SDP offer required")
     try:
         answer = await create_whep_answer(mixer, stream_id, offer)
+    except RuntimeError as exc:
+        if "too many WebRTC" in str(exc):
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
     return Response(content=answer, media_type="application/sdp")

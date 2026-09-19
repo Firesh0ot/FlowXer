@@ -8,12 +8,19 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from flowxer.api.schemas import StingerInfo
+from flowxer.engine.security import SecurityError, require_safe_id
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 
 
 def stinger_dir(root: Path, stinger_id: str) -> Path:
-    return root / stinger_id
+    require_safe_id(stinger_id, what="stinger id")
+    dest = (Path(root) / stinger_id).resolve()
+    root_resolved = Path(root).resolve()
+    root_resolved.mkdir(parents=True, exist_ok=True)
+    if not dest.is_relative_to(root_resolved):
+        raise SecurityError("invalid stinger id")
+    return dest
 
 
 def cut_frame_from_ms(cut_ms: int, fps: float, frame_count: int) -> int:
@@ -100,7 +107,10 @@ def _video_files(directory: Path) -> list[Path]:
 
 
 def inspect_stinger(root: Path, stinger_id: str, fps: float = 50.0) -> StingerInfo | None:
-    directory = stinger_dir(root, stinger_id)
+    try:
+        directory = stinger_dir(root, stinger_id)
+    except SecurityError:
+        return None
     if not directory.is_dir():
         return None
     frames = sorted(directory.glob("frame_*.tga"))

@@ -50,32 +50,45 @@ flowchart LR
 - **Logical inputs** virtually bundle a video essence and an audio essence into one mixer source (camera, clip, replay, test, black).
 - **Storage access** plays files from `storage/clips` (`.mp4`, `.ts`, `.mov`, `.mxf`, …) as uncompressed v210 + float32.
 - **HTML5 graphics overlay** keys a page over program (`cefsrc` when installed, Pillow fallback otherwise). A sample lower-third is served at `/graphics/lower-third.html`.
-- **Replay stinger** plays a **TGA sequence with alpha**. At the fully opaque frame the mixer cuts program to replay (or back to live), then finishes the sequence.
+- **Stingers** play a **TGA sequence with alpha** or a **video file**. At the cut frame the mixer switches Program, then finishes the sting. A source can be assigned an auto-stinger so Take/Cut plays that slot; otherwise Wipe arms the next Cut.
+- **Tally / UMD** sends TSL UMD Protocol 5.0 (UDP, or TCP with DLE/STX) to receivers such as Bitfocus Companion, Lawo VSM, BFE Commander, and Riedel HI. Program = right-hand red, Preview = left-hand green, label = source name.
 - Runs in **Docker** (`vision-mixer` + `gui` services) with a shared MXL domain volume.
 
 ## Operator GUI
 
-The GUI is a **separate React service** (Vite + TypeScript) so the mixer container stays a media function. It talks to the mixer API and shows live pictures over **WebRTC WHEP** (JPEG snapshots if WebRTC is unavailable).
+The GUI is a **separate React service** (Vite + TypeScript) so the mixer container stays a media function. It talks to the mixer API and shows live pictures over **WebRTC WHEP** (JPEG snapshots if WebRTC is unavailable). Source tiles, Preview, and Program show the **same logical source picture** (the DMF essence on that bus) — not three separate generators. **Black** is a black frame. Every control on the console is an HTTP call; there is no hidden GUI-only mixer path.
 
 ```
-┌─ File  Settings  Help ──────── CPU · RAM · raster · issues ─┐
+┌─ File  Settings  Tally  Help ─ [CPU% RAM% format] ──────────┐
 │  PREVIEW (WebRTC)          PROGRAM (WebRTC)                 │
-│  DSK 1  Stinger IN/OUT                                      │
+│  DSK 1 ON/OFF   Stinger ⚙                                   │
 │                                                             │
-│  [Name ⚙] [Name ⚙] …   logical sources along the bottom     │
-│  left click picture = PVW · right click picture = PGM       │
+│  [Name ⚙] [Name ⚙] …     source tiles (16:9 or 9:16)        │
+│  left of picture = PVW · right of picture = PGM             │
+│                          Cut  Fade  Fade to Black  Wipe     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Settings** (classic menu) configure:
+**File** takes the mixer on-air (`POST /mixer/start`) or off-air (`POST /mixer/stop`).
 
-- video format (1080p50, 720p50, 2160p50, … uncompressed v210)
-- how many logical sources
-- how many mixer panels (MEs)
-- stingers: same TGA for in and out, or separate in/out, and how many
-- how many downstream keyers for HTML5 graphics
+**Settings → Console layout…** (`PUT /workspace`) configure:
 
-The gear on each source opens source-specific setup (name, kind, MXL flow UUIDs, clip).
+- video format (1080p50, 720p50, 2160p50, … uncompressed v210) — mixer must be off-air
+- **source tiles** 16:9 landscape or 9:16 portrait (display only; can change while on-air; does not change the mixer raster)
+- how many logical sources, mixer panels (MEs), stinger slots, and downstream keyers
+- stingers: same media for in and out, or separate in/out
+
+The gear on each **source** (`PATCH /inputs/{id}`) sets name, kind, MXL flow UUIDs, clip, and **Auto stinger** — which slot plays when that source is taken to Program or Cut from Preview. Other sources stay hard cuts. Kind **black** is a black video frame (not a test card).
+
+The gear on each **stinger** (`PATCH /stinger-slots/{id}`) picks a TGA sequence or video and **Cut at (frame)**. Pressing the stinger chip plays that slot with `flip_flop` so Preview becomes Program (`POST /stinger/play`).
+
+**Tally → Receivers…** (`PUT /tally/receivers`) adds TSL UMD 5.0 listeners: **Bitfocus Companion**, **Lawo VSM**, **BFE Commander**, **Riedel HI**, or a custom host. Program lights the right-hand lamp red, Preview the left-hand lamp green, and the source name is the UMD label. Display INDEX is the source slot plus an optional offset. Receivers can be changed while on-air.
+
+**Cut / Fade / Fade to Black / Wipe** on the transition bank map to `/mixer/cut`, `/mixer/fade`, `/mixer/fade-to-black`, and `/mixer/wipe`. Wipe arms the next Cut when the Preview source has no auto-stinger.
+
+The top-right **status chip** is a compact CPU / RAM / format pill. Click it for mixer state, load averages, memory, raster, WebRTC, uptime, PID, and issues (`GET /console` or `GET /resources`).
+
+**Help** opens Mixer OpenAPI (`/docs`, proxied from the GUI) and the EBU MXL SDK.
 
 | | |
 |--|--|
@@ -83,7 +96,7 @@ The gear on each source opens source-specific setup (name, kind, MXL flow UUIDs,
 | Mixer API / OpenAPI | http://localhost:9610/docs |
 
 ```bash
-cd gui && npm install && npm run dev   # proxies /api to :9610
+cd gui && npm install && npm run dev   # proxies /api, /docs, /openapi.json to :9610
 ```
 
 ## API
@@ -95,6 +108,26 @@ cd gui && npm install && npm run dev   # proxies /api to :9610
 | Swagger UI | http://localhost:9610/docs |
 | ReDoc | http://localhost:9610/redoc |
 | OpenAPI JSON | http://localhost:9610/openapi.json |
+
+The operator GUI is a client of `/api/v1`. Every console action has a matching route:
+
+| Console action | API |
+|----------------|-----|
+| Poll layout, buses, resources | `GET /console` |
+| File → mixer on-air / off-air | `POST /mixer/start`, `POST /mixer/stop` |
+| Settings → Console layout… | `PUT /workspace` (`source_tile_aspect` is display-only and may change on-air) |
+| Source left click (PVW) | `POST /mixer/preview` |
+| Source right click (PGM) | `POST /mixer/take` |
+| Source ⚙ (name, kind, clip, auto-stinger) | `PATCH /inputs/{id}` (`stinger_slot_id`) |
+| DSK ON/OFF | `PATCH /keyers/{id}` (`enabled`) |
+| Stinger chip (Preview → Program) | `POST /stinger/play` (`flip_flop: true`, `panel_id`) |
+| Stinger ⚙ (media, cut frame) | `PATCH /stinger-slots/{id}` (`cut_frame`) |
+| Cut / Fade / Fade to Black / Wipe | `POST /mixer/cut`, `/fade`, `/fade-to-black`, `/wipe` |
+| Tally → Receivers… | `PUT /tally/receivers` |
+| Tally send now | `POST /tally/refresh` |
+| Preview pictures | `POST /webrtc/whep/{stream_id}` or `GET /preview/jpeg/{stream_id}` |
+
+API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
 Useful calls:
 
@@ -115,6 +148,17 @@ curl -X POST http://localhost:9610/api/v1/inputs \
     "audio":{"flow_id":"b3bb5be7-9fe9-4324-a5bb-4c70e1084449","media_type":"audio/float32","channels":2}
   }'
 
+# 9:16 source tiles (works while on-air); auto-stinger on a camera
+curl -X PUT http://localhost:9610/api/v1/workspace \
+  -H 'content-type: application/json' -d '{"source_tile_aspect":"9:16"}'
+curl -X PATCH http://localhost:9610/api/v1/inputs/cam-1 \
+  -H 'content-type: application/json' -d '{"stinger_slot_id":"shared-1"}'
+
+# Cut Preview to Program through a stinger (same as pressing a stinger chip)
+curl -X POST http://localhost:9610/api/v1/stinger/play \
+  -H 'content-type: application/json' \
+  -d '{"stinger_id":"replay-wipe","target_input_id":"cam-2","direction":"to_live","flip_flop":true,"panel_id":"me-1"}'
+
 # Load a clip and stinger into replay, then return to live
 curl -X POST http://localhost:9610/api/v1/replay/load \
   -H 'content-type: application/json' -d '{"file_path":"sizzle.ts"}'
@@ -122,6 +166,11 @@ curl -X POST http://localhost:9610/api/v1/replay/take \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
 curl -X POST http://localhost:9610/api/v1/replay/return \
   -H 'content-type: application/json' -d '{"stinger_id":"replay-wipe"}'
+
+# TSL 5.0 tally/UMD to Riedel HI (same shape for Companion, VSM, BFE)
+curl -X PUT http://localhost:9610/api/v1/tally/receivers \
+  -H 'content-type: application/json' \
+  -d '{"receivers":[{"id":"hi-1","kind":"hi","label":"Riedel HI","host":"10.0.0.40","port":8900,"transport":"udp","enabled":true,"screen":0,"index_offset":0}]}'
 ```
 
 Register live MXL inputs **before** starting the mixer. Essence `media_type` is constrained to `video/v210` (or `video/v210a`) and `audio/float32`.
@@ -138,7 +187,7 @@ docker compose up --build
 
 Services:
 
-- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, settings)
+- **gui** on port **9620** — operator console (WebRTC monitors, PVW/PGM, transitions, tally, settings)
 - **vision-mixer** on port **9610** — control API, OpenAPI, WHEP previews
 - tmpfs MXL domain at `/mxl-domain`
 - bind-mount `./storage` for clips, TGA stingers, overlay cache
@@ -165,7 +214,7 @@ FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/m
 
 ## Stinger convention
 
-Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut time** — the moment program switches while the sting covers the picture.
+Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut frame** — the moment Program switches while the sting covers the picture. The GUI field is **Cut at (frame)** (`cut_frame`); `cut_ms` is stored alongside for the mixer clock.
 
 Place sequences under `storage/stingers/<id>/`:
 
@@ -176,17 +225,62 @@ frame_00001.tga
 stinger.json   # { "kind": "sequence", "frame_count", "cut_frame", "cut_ms", "pattern": "frame_%05d.tga" }
 ```
 
-Video stingers live in the same tree (`kind: "video"` plus `media_path`). In the GUI, open the stinger ⚙: pick Sequence or Video, then set **Cut at (seconds)**.
+Video stingers live in the same tree (`kind: "video"` plus `media_path`).
 
-`cut_ms` / `cut_frame` is when program switches from live to replay (or back). Generate the bundled wipe with:
+Triggering:
+
+- **Stinger chip** — `POST /stinger/play` with `flip_flop: true` so Preview becomes Program at the cut frame.
+- **Auto stinger** — set `stinger_slot_id` on a logical input. Take to Program (or Cut while that source is on Preview) plays that slot.
+- **Wipe then Cut** — arms the default stinger for the next Cut when the Preview source has no auto-stinger.
+
+Generate the bundled wipe with:
 
 ```bash
 python scripts/generate_stinger.py --dest storage/stingers/replay-wipe
 ```
 
+## Tally and UMD (TSL 5.0)
+
+FlowXer is a TSL UMD Protocol 5.0 **sender**. Each configured receiver gets one packet per bus or label change:
+
+- **UDP** (default, TSL port **8900**) — raw packet
+- **TCP** — DLE `0xFE` / STX `0x02` wrapper with DLE stuffing
+
+| TSL field | FlowXer |
+|-----------|---------|
+| SCREEN | per-receiver `screen` (default 0) |
+| INDEX | logical source `slot` + `index_offset` |
+| TEXT | source label (ASCII UMD) |
+| RH tally | Program = red |
+| LH tally | Preview = green |
+| Text tally | Program red, Preview green, both amber |
+
+Presets: Bitfocus Companion, Lawo VSM, BFE Commander, Riedel HI (human interface Broadcast Controller), or Custom.
+
 ## License
 
-Apache-2.0. MXL is Apache-2.0; GStreamer plugins remain under their upstream licenses.
+Apache-2.0 for the FlowXer source (same family as MXL). See `LICENSE` and the
+copyright appendix, plus `NOTICE` for third-party attribution.
+
+The mixer **source** stays Apache-2.0. Docker images install GStreamer and
+FFmpeg/libav, which remain LGPL (and, for some `gst-plugins-bad` bits, mixed
+upstream licenses). Shipping the container does **not** turn FlowXer into GPL.
+Keep `LICENSE` and `NOTICE` with any binary or image distribution.
+
+The operator GUI (`gui/`) is also Apache-2.0; React and Vite are MIT.
+
+## Public / staging access
+
+The HTTP control plane can start, stop, and take sources on-air. Do not put
+an unauthenticated mixer on a public address.
+
+1. Set `FLOWXER_API_TOKEN` in `.env` (see `.env.example`). Health checks stay
+   open; `/docs`, OpenAPI, and `/api/v1/*` require `Authorization: Bearer …`
+   or `X-FlowXer-Token`.
+2. Publish only the GUI (`9620`). Compose binds the mixer API to
+   `127.0.0.1:9610`. The GUI nginx (and Vite dev proxy) inject the token.
+3. Optional: set `FLOWXER_CORS_ORIGINS` to the GUI origin if a browser talks
+   to the mixer port directly.
 
 ## Branches and releases
 

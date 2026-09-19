@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from flowxer import __version__
+from flowxer.api.auth import ApiTokenMiddleware
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.engine.mixer import VisionMixer
 from flowxer.settings import Settings, get_settings
@@ -34,7 +35,10 @@ OPENAPI_TAGS = [
     },
     {
         "name": "mixer",
-        "description": "Start/stop the GStreamer vision mixer and take sources to program/preview.",
+        "description": (
+            "Start/stop the GStreamer vision mixer, arm Preview, take sources to Program, "
+            "and run Cut / Fade / Fade to Black / Wipe on a mixer panel (ME)."
+        ),
     },
     {
         "name": "overlay",
@@ -42,15 +46,33 @@ OPENAPI_TAGS = [
     },
     {
         "name": "storage",
-        "description": "Clip store and TGA-sequence stingers used for live ↔ replay transitions.",
+        "description": "Clip store plus TGA-sequence and video stingers.",
     },
     {
         "name": "replay",
         "description": "Load a stored clip and stinger in/out of replay.",
     },
     {
+        "name": "stinger",
+        "description": (
+            "Play a TGA sequence or video stinger, cut Program at the chosen frame, "
+            "and configure per-slot media. flip_flop swaps Preview and Program like Cut."
+        ),
+    },
+    {
+        "name": "tally",
+        "description": (
+            "TSL UMD Protocol 5.0 tally lamps and under-monitor labels. "
+            "Receivers include Bitfocus Companion, Lawo VSM, BFE Commander, "
+            "Riedel HI, and any custom TSL 5.0 listener."
+        ),
+    },
+    {
         "name": "gui",
-        "description": "Operator console layout, container resources, JPEG/WebRTC monitors.",
+        "description": (
+            "Operator console snapshot, workspace layout (including source-tile aspect), "
+            "container resources for the status chip, JPEG/WebRTC monitors."
+        ),
     },
 ]
 
@@ -70,8 +92,10 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "The media plane is GStreamer. FastAPI is the control plane; "
             "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
             "keyer and a file player with storage access. "
-            "A TGA-sequence stinger covers the cut when going to replay and when "
-            "returning to live."
+            "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
+            "The operator GUI on port 9620 is a thin client of this API. "
+            "TSL UMD 5.0 carries Program/Preview tally and source labels to "
+            "Companion, VSM, BFE, Riedel HI, and other listeners."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},
@@ -83,16 +107,26 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
         redoc_url="/redoc",
         openapi_url="/openapi.json",
     )
+    # Auth is inner; CORS is added last so it is outermost (preflight stays unauthenticated).
+    app.add_middleware(ApiTokenMiddleware)
+    origins = settings.cors_origin_list
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_credentials=origins != ["*"],
     )
     app.state.settings = settings
     app.state.mixer = mixer
     app.dependency_overrides[get_mixer] = lambda: app.state.mixer
+    app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router, prefix="/api/v1")
+    if not (settings.api_token or "").strip():
+        log.warning(
+            "FLOWXER_API_TOKEN is unset; the HTTP control plane is unauthenticated. "
+            "Set a token before exposing FlowXer on a public or staging network."
+        )
 
     static_dir = Path(__file__).parent / "static"
     graphics_dir = Path(__file__).parent / "graphics"

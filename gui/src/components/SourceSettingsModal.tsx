@@ -1,16 +1,18 @@
 import { useState } from "react";
-import type { LogicalInput } from "../api";
+import type { LogicalInput, StingerSlot } from "../api";
 
 const KINDS = ["test", "black", "mxl_live", "file", "replay"] as const;
 
 export function SourceSettingsModal({
   input,
   clips,
+  stingerSlots,
   onClose,
   onSave,
 }: {
   input: LogicalInput;
   clips: { name: string }[];
+  stingerSlots: StingerSlot[];
   onClose: () => void;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
 }) {
@@ -20,6 +22,7 @@ export function SourceSettingsModal({
   const [videoFlow, setVideoFlow] = useState(input.video?.flow_id ?? "");
   const [audioFlow, setAudioFlow] = useState(input.audio?.flow_id ?? "");
   const [filePath, setFilePath] = useState(input.file_path ?? clips[0]?.name ?? "");
+  const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
 
   return (
@@ -69,6 +72,21 @@ export function SourceSettingsModal({
             </select>
           </label>
         ) : null}
+        <label>
+          Auto stinger
+          <select value={stingerSlotId} onChange={(e) => setStingerSlotId(e.target.value)}>
+            <option value="">None — hard cut</option>
+            {stingerSlots.map((slot) => (
+              <option key={slot.id} value={slot.id}>
+                {slot.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <p className="hint">
+          When this source is taken to Program, or Cut while it is on Preview, play the selected
+          stinger. Other sources stay hard cuts.
+        </p>
         {error ? <p className="error">{error}</p> : null}
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>
@@ -77,7 +95,11 @@ export function SourceSettingsModal({
           <button
             onClick={async () => {
               try {
-                const payload: Record<string, unknown> = { label, kind };
+                const payload: Record<string, unknown> = {
+                  label,
+                  kind,
+                  stinger_slot_id: stingerSlotId || null,
+                };
                 if (kind === "mxl_live") {
                   payload.group_hint = groupHint || null;
                   payload.video = videoFlow ? { flow_id: videoFlow } : null;
