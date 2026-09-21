@@ -31,6 +31,10 @@ def test_compose_keeps_mixer_api_on_loopback() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "127.0.0.1:9610:9610" in compose
     assert "FLOWXER_API_TOKEN" in compose
+    assert "ghcr.io/firesh0ot/flowxer-vision-mixer" in compose
+    assert "ghcr.io/firesh0ot/flowxer-gui" in compose
+    assert "dockerfile:" not in compose
+    assert "build:" not in compose
 
 
 def test_api_token_protects_control_plane(settings: Settings, mixer: VisionMixer) -> None:

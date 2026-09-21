@@ -185,13 +185,23 @@ Register live MXL inputs **before** starting the mixer. Essence `media_type` is 
 
 ## Docker
 
+Compose pulls the images published from `main` to GHCR (`latest`, or set `FLOWXER_IMAGE_TAG`).
+
 ```bash
 mkdir -p storage/clips
 # optional: copy a clip next to the mixer
 # cp /path/to/sizzle.ts storage/clips/
 
-docker compose up --build
+docker compose pull
+docker compose up
 ```
+
+Images:
+
+- `ghcr.io/firesh0ot/flowxer-vision-mixer`
+- `ghcr.io/firesh0ot/flowxer-gui`
+
+If a pull is denied, `docker login ghcr.io` (or make those GHCR packages public). To run a source tree instead of the published images, `docker build` the Dockerfiles yourself — Compose no longer builds.
 
 Services:
 
