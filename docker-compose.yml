@@ -10,10 +10,8 @@ volumes:
 
 services:
   vision-mixer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: flowxer-vision-mixer:latest
+    image: ghcr.io/firesh0ot/flowxer-vision-mixer:${FLOWXER_IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: flowxer-vision-mixer
     hostname: flowxer
     ports:
@@ -51,10 +49,8 @@ services:
       retries: 8
 
   gui:
-    build:
-      context: .
-      dockerfile: gui/Dockerfile
-    image: flowxer-gui:latest
+    image: ghcr.io/firesh0ot/flowxer-gui:${FLOWXER_IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: flowxer-gui
     hostname: flowxer-gui
     ports:
