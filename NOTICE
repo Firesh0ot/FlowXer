@@ -15,14 +15,19 @@ Third-party components
 ======================
 
 Apache-2.0
-  Media eXchange Layer (MXL) — https://github.com/dmf-mxl/mxl
+  Media eXchange Layer (MXL) v1.1.0 — https://github.com/dmf-mxl/mxl
+    Built into the mixer image (libmxl, mxlsrc, mxlsink).
   FastAPI, Starlette, Pydantic, Uvicorn
 
 MIT
   React, React DOM, Vite (operator GUI)
 
+BSD
+  Chromium Embedded Framework (CEF), bundled with gstcefsrc in the mixer image
+
 LGPL-2.1+
   GStreamer and gst-plugins-base / gst-plugins-good (runtime in the mixer image)
+  gstcefsrc — https://github.com/centricular/gstcefsrc
   FFmpeg / libav via Ubuntu packages ffmpeg and gstreamer1.0-libav
 
 Other / mixed

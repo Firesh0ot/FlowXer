@@ -1,8 +1,41 @@
-FROM ubuntu:24.04
+# syntax=docker/dockerfile:1
+
+# Mixer image. MXL (libmxl + mxlsrc/mxlsink) and the HTML keyer (gstcefsrc)
+# are compiled in this build. No separate SDK checkout is required.
+
+ARG UBUNTU=ubuntu:24.04
+ARG MXL_REPO=https://github.com/dmf-mxl/mxl.git
+ARG MXL_REF=v1.1.0
+ARG RUST_TOOLCHAIN=1.92
+ARG GSTCEFSRC_REPO=https://github.com/centricular/gstcefsrc.git
+ARG GSTCEFSRC_REF=b63340852fc93b0ab67b07200e1ff44f59ba6769
+
+FROM ${UBUNTU} AS mxl-builder
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MXL_REPO
+ARG MXL_REF
+ARG RUST_TOOLCHAIN
+ENV MXL_REPO=${MXL_REPO} \
+    MXL_REF=${MXL_REF} \
+    RUST_TOOLCHAIN=${RUST_TOOLCHAIN}
+COPY docker/build-mxl.sh /tmp/build-mxl.sh
+RUN chmod +x /tmp/build-mxl.sh && /tmp/build-mxl.sh
+
+FROM ${UBUNTU} AS cef-builder
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GSTCEFSRC_REPO
+ARG GSTCEFSRC_REF
+ENV GSTCEFSRC_REPO=${GSTCEFSRC_REPO} \
+    GSTCEFSRC_REF=${GSTCEFSRC_REF}
+COPY docker/build-cef.sh /tmp/build-cef.sh
+RUN chmod +x /tmp/build-cef.sh && /tmp/build-cef.sh
+
+FROM ${UBUNTU}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLOWXER_VERSION=0.1.0
 LABEL org.opencontainers.image.version=$FLOWXER_VERSION
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
@@ -25,7 +58,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libvpx9 \
         curl \
         ca-certificates \
+        libnss3 \
+        libnspr4 \
+        libatk1.0-0t64 \
+        libatk-bridge2.0-0t64 \
+        libcups2t64 \
+        libdrm2 \
+        libgbm1 \
+        libgtk-3-0t64 \
+        libpango-1.0-0 \
+        libcairo2 \
+        libasound2t64 \
+        libx11-6 \
+        libx11-xcb1 \
+        libxcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxext6 \
+        libxfixes3 \
+        libxkbcommon0 \
+        libxrandr2 \
+        libxshmfence1 \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mxl-builder /opt/mxl /opt/mxl
+COPY --from=cef-builder /opt/gstcef /opt/gstcef
+RUN printf '/opt/mxl/lib\n/opt/gstcef\n' > /etc/ld.so.conf.d/flowxer-media.conf \
+    && ldconfig \
+    && test -f /opt/mxl/gst/libgstmxl.so \
+    && test -f /opt/gstcef/libgstcef.so
 
 WORKDIR /app
 
@@ -38,14 +100,13 @@ RUN pip3 install --no-cache-dir --break-system-packages /app \
     && pip3 install --no-cache-dir --break-system-packages 'aiortc==1.9.0' \
     && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
-    && mkdir -p /mxl-domain /storage/clips /storage/stingers /storage/graphics \
+    && mkdir -p /mxl-domain /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache \
     && cp /app/configs/domain_def.json /mxl-domain/domain_def.json
 
-# Optional: copy a pre-built MXL GStreamer plugin into the image.
-#   docker build --build-context mxlplugins=/path/to/gst-mxl ...
-# libgstmxl.so and libmxl.so can also be bind-mounted at runtime.
-ENV LD_LIBRARY_PATH=/opt/mxl/lib
-ENV GST_PLUGIN_PATH=/usr/lib/x86_64-linux-gnu/gstreamer-1.0:/opt/mxl/gst
+ENV LD_LIBRARY_PATH=/opt/mxl/lib:/opt/gstcef
+ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer-1.0
+ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader
+ENV GST_CEF_CACHE_LOCATION=/tmp/cef-cache
 ENV FLOWXER_HOST=0.0.0.0
 ENV FLOWXER_PORT=9610
 ENV FLOWXER_MXL_DOMAIN=/mxl-domain

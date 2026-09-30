@@ -21,6 +21,14 @@ def test_apache_license_and_notice_are_complete() -> None:
     assert "Apache-2.0" in notice
     assert "GStreamer" in notice
     assert "FFmpeg" in notice
+    assert "gstcefsrc" in notice
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "mxl-builder" in dockerfile
+    assert "cef-builder" in dockerfile
+    assert "ARG MXL_REF=v1.1.0" in dockerfile
+    assert "docker/build-mxl.sh" in dockerfile
+    assert "docker/build-cef.sh" in dockerfile
+    assert "pre-built" not in dockerfile
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'license = { text = "Apache-2.0" }' in pyproject
     gui_pkg = (ROOT / "gui" / "package.json").read_text(encoding="utf-8")
