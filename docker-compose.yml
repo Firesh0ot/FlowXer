@@ -37,8 +37,6 @@ services:
       - type: bind
         source: ./storage
         target: /storage
-      # Drop a built MXL SDK + gst-mxl plugin here to publish real flows:
-      # - ./opt/mxl:/opt/mxl:ro
     shm_size: "2gb"
     extra_hosts:
       - "host.docker.internal:host-gateway"
