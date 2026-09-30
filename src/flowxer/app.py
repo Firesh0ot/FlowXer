@@ -42,7 +42,7 @@ OPENAPI_TAGS = [
     },
     {
         "name": "overlay",
-        "description": "HTML5 graphics keyer (cefsrc in production, Pillow fallback in the container).",
+        "description": "HTML5 graphics keyer (cefsrc when the plugin is in the image, Pillow fallback otherwise).",
     },
     {
         "name": "storage",
