@@ -220,6 +220,8 @@ The mixer image builds these from source. You do not compile them yourself:
 
 When those plugins load, Program is published as MXL `video/v210` and `audio/float32`, and the HTML overlay uses `cefsrc`. If a plugin is missing, the mixer falls back to `fakesink` and a Pillow lower-third.
 
+`mxlsink` writes the on-disk `flow_def.json` from v210 / F32LE caps plus NMOS `label`, `description`, and `urn:x-nmos:tag:grouphint/v1.0` (`FlowXer:Video` / `FlowXer:Audio` by default). Live inputs use `mxlsrc` with exactly one of `video-flow-id` or `audio-flow-id`, plus `domain` — the same gst-mxl-rs properties as MXL `v1.1.0`. The mixer does not consume ancillary `data-flow-id` (`video/smpte291`) flows.
+
 Point `FLOWXER_MXL_DOMAIN` at the host directory that holds the domain (for example `/Volumes/mxl/domain_1`) to share it with other GStreamer processes. The domain must be a RAM filesystem (`tmpfs` / `/dev/shm`); Compose already mounts one at `/mxl-domain`.
 
 `cefsrc` starts a private Xvfb when `DISPLAY` is unset, with the sandbox off (`GST_CEF_CHROME_EXTRA_FLAGS`).

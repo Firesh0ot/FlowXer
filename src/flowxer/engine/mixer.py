@@ -592,6 +592,12 @@ class VisionMixer:
             domain=str(domain),
             use_mxl_sink=use_mxl,
             use_cefsrc=use_cef,
+            output_video_label=str(self.outputs.nmos_video.get("label") or ""),
+            output_video_description=str(self.outputs.nmos_video.get("description") or ""),
+            output_video_group_hint=f"{group_hint}:Video",
+            output_audio_label=str(self.outputs.nmos_audio.get("label") or ""),
+            output_audio_description=str(self.outputs.nmos_audio.get("description") or ""),
+            output_audio_group_hint=f"{group_hint}:Audio",
         )
         self.pipeline = description
 

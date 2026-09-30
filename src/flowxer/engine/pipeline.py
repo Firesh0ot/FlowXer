@@ -12,6 +12,17 @@ BGRA_CAPS = "video/x-raw,format=BGRA,width={width},height={height},framerate={fp
 AUDIO_CAPS = "audio/x-raw,format=F32LE,layout=interleaved,rate={rate},channels={channels}"
 
 
+def _gst_string(value: str) -> str:
+    """Quote a GStreamer property that may contain spaces or punctuation."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _optional_gst_props(**props: str) -> str:
+    parts = [f"{name}={_gst_string(value)}" for name, value in props.items() if value]
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def _v210(settings: Settings) -> str:
     return V210_CAPS.format(
         width=settings.width, height=settings.height, fps=settings.frame_rate
@@ -34,7 +45,8 @@ def _video_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else "UNBOUND"
         return (
-            f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} domain={domain} "
+            f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} "
+            f"domain={_gst_string(domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
             f"! videoconvert ! {caps} ! queue ! vsel.sink_{inp.slot}"
         )
@@ -70,7 +82,8 @@ def _audio_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else "UNBOUND"
         return (
-            f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} domain={domain} "
+            f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "
+            f"domain={_gst_string(domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
             f"! audioconvert ! audioresample ! {caps} ! queue ! asel.sink_{inp.slot}"
         )
@@ -106,6 +119,12 @@ def build_pipeline_description(
     domain: str,
     use_mxl_sink: bool,
     use_cefsrc: bool,
+    output_video_label: str = "",
+    output_video_description: str = "",
+    output_video_group_hint: str = "",
+    output_audio_label: str = "",
+    output_audio_description: str = "",
+    output_audio_group_hint: str = "",
 ) -> str:
     """
     Build a GStreamer gst-launch-style description:
@@ -156,13 +175,31 @@ def build_pipeline_description(
         )
 
     if use_mxl_sink:
+        # mxlsink writes flow_def.json from caps plus these NMOS fields.
+        # Empty label/description/group-hint keep the plugin's built-in defaults.
+        video_meta = _optional_gst_props(
+            **{
+                "label": output_video_label,
+                "description": output_video_description,
+                "group-hint": output_video_group_hint,
+            }
+        )
+        audio_meta = _optional_gst_props(
+            **{
+                "label": output_audio_label,
+                "description": output_audio_description,
+                "group-hint": output_audio_group_hint,
+            }
+        )
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout flow-id={output_video_flow_id} domain={domain}"
+            f"mxlsink name=vout flow-id={output_video_flow_id} "
+            f"domain={_gst_string(domain)}{video_meta}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
-            f"mxlsink name=aout flow-id={output_audio_flow_id} domain={domain}"
+            f"mxlsink name=aout flow-id={output_audio_flow_id} "
+            f"domain={_gst_string(domain)}{audio_meta}"
         )
     else:
         video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"
