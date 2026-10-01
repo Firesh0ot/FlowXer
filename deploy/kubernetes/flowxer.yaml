@@ -1,0 +1,166 @@
+# FlowXer on an MXL host (hostNetwork). Edit nodeSelector, registry URL, and IPs
+# before apply. Mixer binds loopback :9610; GUI :9620; Node API :3252.
+# Both containers share the host netns so nginx can proxy 127.0.0.1:9610.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flowxer
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: flowxer-api-token
+  namespace: flowxer
+type: Opaque
+stringData:
+  FLOWXER_API_TOKEN: "replace-me"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowxer
+  namespace: flowxer
+data:
+  FLOWXER_HOST: "127.0.0.1"
+  FLOWXER_PORT: "9610"
+  FLOWXER_MIXER_URL: "http://127.0.0.1:9610"
+  FLOWXER_GUI_PORT: "9620"
+  FLOWXER_MXL_ROOT: "/Volumes/mxl"
+  FLOWXER_STORAGE_ROOT: "/storage"
+  FLOWXER_GROUP_HINT: "FlowXer"
+  FLOWXER_GST_MODE: "auto"
+  FLOWXER_NMOS_ENABLE: "true"
+  FLOWXER_NMOS_DNS_SD: "false"
+  FLOWXER_NMOS_PORT: "3252"
+  FLOWXER_NMOS_REGISTRY_URL: "http://10.0.0.5:3210"
+  FLOWXER_NMOS_HOST_IP: "10.0.0.20"
+  FLOWXER_WEBRTC_PUBLIC_IP: "10.0.0.20"
+  FLOWXER_WEBRTC_UDP_PORT_MIN: "32600"
+  FLOWXER_WEBRTC_UDP_PORT_MAX: "32631"
+  FLOWXER_OVERLAY_URL: "http://127.0.0.1:9610/graphics/lower-third.html"
+  FLOWXER_CORS_ORIGINS: "*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowxer
+  namespace: flowxer
+  labels:
+    app: flowxer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flowxer
+  template:
+    metadata:
+      labels:
+        app: flowxer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9610"
+        prometheus.io/path: "/metrics"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_WITH_MXL_HOST
+      tolerations:
+        - key: mxl.srf.ch/media
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: mixer
+          image: ghcr.io/firesh0ot/flowxer-vision-mixer:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: flowxer
+            - secretRef:
+                name: flowxer-api-token
+          ports:
+            - name: mixer
+              containerPort: 9610
+            - name: nmos
+              containerPort: 3252
+            - name: nmos-ws
+              containerPort: 3253
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9610
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9610
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: mxl
+              mountPath: /Volumes/mxl
+            - name: storage
+              mountPath: /storage
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1000
+            runAsGroup: 1000
+        - name: gui
+          image: ghcr.io/firesh0ot/flowxer-gui:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: flowxer
+            - secretRef:
+                name: flowxer-api-token
+          ports:
+            - name: gui
+              containerPort: 9620
+          livenessProbe:
+            tcpSocket:
+              port: 9620
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1000
+            runAsGroup: 1000
+      volumes:
+        - name: mxl
+          hostPath:
+            path: /Volumes/mxl
+            type: Directory
+        - name: storage
+          hostPath:
+            path: /var/lib/flowxer/storage
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowxer
+  namespace: flowxer
+  labels:
+    app: flowxer
+spec:
+  selector:
+    matchLabels:
+      app: flowxer
+  ports:
+    - name: mixer
+      port: 9610
+      targetPort: 9610
+    - name: gui
+      port: 9620
+      targetPort: 9620
+    - name: nmos
+      port: 3252
+      targetPort: 3252

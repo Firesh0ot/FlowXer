@@ -361,3 +361,4 @@ integration and AMWA script in PR 8).
 - **PR 4** (`cursor/image-nonroot-85ef`): mixer/GUI `USER 1000:1000`, `MXL_REF=218ddaa`, label `io.dmf.mxl.revision`, health `mxl_revision`, `git-<sha>` GHCR tags, CEF flags that skip component updates. GHCR public still a GitHub UI step.
 - **PR 5** (`cursor/network-bind-85ef`): `FLOWXER_HOST` default 127.0.0.1 (bridge Compose overrides 0.0.0.0), GUI `FLOWXER_MIXER_URL` / `FLOWXER_GUI_PORT`, WebRTC host ICE IP + UDP range wrap.
 - **PR 6** (`cursor/metrics-probes-85ef`): Prometheus `flowxer_*` at `/metrics` and `/api/v1/metrics`, `/livez` `/readyz` (registry blip does not fail ready), Grafana `deploy/grafana/flowxer.json`.
+- **PR 7** (`cursor/k8s-amwa-85ef`): `deploy/kubernetes/flowxer.yaml`, `docker-compose.host.yml`, README platform section, `scripts/nmos-testing.sh` + workflow_dispatch CI job for AMWA IS-04-01 / IS-05-01 / IS-05-02.

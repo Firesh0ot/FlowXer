@@ -109,3 +109,21 @@ heartbeats every 5 s. An empty URL still serves the Node API locally;
 The operator status panel shows registry reachability, node id, and each
 live-input receiver state. `GET /api/v1/console` includes a top-level `nmos`
 object (also nested under `mixer.nmos`).
+
+## AMWA testing tool
+
+`scripts/nmos-testing.sh` runs the published `amwa/nmos-testing` image in
+non-interactive mode against the Node API (default
+`http://127.0.0.1:3252`):
+
+- **IS-04-01** Node API v1.3
+- **IS-05-01** Connection API v1.2
+- **IS-05-02** IS-05 ↔ IS-04 (Node v1.3 + Connection v1.2)
+- **BCP-007-03-01** (optional via `NMOS_TESTING_SUITES`)
+
+The image entrypoint starts the web UI; the script overrides it with
+`python3 nmos-test.py suite …` and mounts `scripts/nmos-testing-userconfig.py`
+(`ENABLE_DNS_SD = False`). Dispatch the `nmos-testing` job from **Actions → CI**.
+Expected gaps: DNS-SD registry discovery and the IS-04 events WebSocket
+(reserved port 3253, not implemented). Revisit nvnmosd only if those suites
+fail for Node/Connection API gaps Option C cannot fix.

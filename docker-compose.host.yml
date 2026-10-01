@@ -1,0 +1,56 @@
+# Host-network Compose for a real MXL host (not the local bridge demo).
+# Both containers share the host network: GUI proxies to 127.0.0.1:9610.
+# Requires FLOWXER_API_TOKEN. Mount /Volumes/mxl must be writable by uid 1000.
+name: flowxer-host
+
+services:
+  vision-mixer:
+    image: ghcr.io/firesh0ot/flowxer-vision-mixer:${FLOWXER_IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: flowxer-vision-mixer
+    network_mode: host
+    user: "1000:1000"
+    init: true
+    environment:
+      FLOWXER_HOST: "127.0.0.1"
+      FLOWXER_PORT: "9610"
+      FLOWXER_MXL_ROOT: /Volumes/mxl
+      FLOWXER_STORAGE_ROOT: /storage
+      FLOWXER_GROUP_HINT: ${FLOWXER_GROUP_HINT:-FlowXer}
+      FLOWXER_GST_MODE: auto
+      FLOWXER_NMOS_ENABLE: "true"
+      FLOWXER_NMOS_DNS_SD: "false"
+      FLOWXER_NMOS_PORT: "3252"
+      FLOWXER_NMOS_REGISTRY_URL: ${FLOWXER_NMOS_REGISTRY_URL:-}
+      FLOWXER_NMOS_HOST_IP: ${FLOWXER_NMOS_HOST_IP:-}
+      FLOWXER_NMOS_SEED: ${FLOWXER_NMOS_SEED:-}
+      FLOWXER_WEBRTC_PUBLIC_IP: ${FLOWXER_WEBRTC_PUBLIC_IP:-}
+      FLOWXER_WEBRTC_UDP_PORT_MIN: "32600"
+      FLOWXER_WEBRTC_UDP_PORT_MAX: "32631"
+      FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
+      FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:?set FLOWXER_API_TOKEN}
+      FLOWXER_CORS_ORIGINS: ${FLOWXER_CORS_ORIGINS:-*}
+    volumes:
+      - /Volumes/mxl:/Volumes/mxl
+      - ./storage:/storage
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9610/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 20s
+
+  gui:
+    image: ghcr.io/firesh0ot/flowxer-gui:${FLOWXER_IMAGE_TAG:-latest}
+    pull_policy: always
+    container_name: flowxer-gui
+    network_mode: host
+    user: "1000:1000"
+    environment:
+      FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:?set FLOWXER_API_TOKEN}
+      FLOWXER_MIXER_URL: http://127.0.0.1:9610
+      FLOWXER_GUI_PORT: "9620"
+    depends_on:
+      vision-mixer:
+        condition: service_healthy

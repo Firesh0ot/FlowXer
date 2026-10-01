@@ -229,6 +229,101 @@ Point `FLOWXER_MXL_ROOT` at the host tmpfs that holds one directory per domain (
 
 `cefsrc` starts a private Xvfb when `DISPLAY` is unset, with the sandbox off (`GST_CEF_CHROME_EXTRA_FLAGS`).
 
+## Running on an MXL platform
+
+On a host-network MXL node (RKE2 / Ubuntu 24.04), FlowXer is one NMOS media function: mixer **9610** (loopback), GUI **9620**, Node API **3252**. `FLOWXER_API_TOKEN` is **required**.
+
+Kubernetes (edit the nodeSelector, registry URL, and management IP):
+
+```bash
+kubectl apply -f deploy/kubernetes/flowxer.yaml
+# optional, needs Prometheus Operator CRDs:
+kubectl apply -f deploy/kubernetes/servicemonitor.yaml
+```
+
+Host Compose: `docker compose -f docker-compose.host.yml up` with `/Volumes/mxl` mounted and `FLOWXER_API_TOKEN` set. Both files use **host networking**, uid **1000**, and GUI upstream `http://127.0.0.1:9610`.
+
+### Ports
+
+| Port | Use |
+|---|---|
+| 9610 | Mixer HTTP (`/api/v1`, `/metrics`, `/livez`, `/readyz`) — bind `127.0.0.1` |
+| 9620 | Operator GUI (proxies `/api` to the mixer) |
+| 3252 | NMOS Node + Connection API (not behind the API token) |
+| 3253 | Reserved (nmos-cpp style WebSocket) |
+| 32600–32631 | WebRTC ICE host UDP |
+
+Do not use 8080, 8090, 8095, 8100, 8888/8889, 9100, 3212/3213, 3232/3233, 3242/3243, or 23500–23599 (other media functions).
+
+### Configuration
+
+| Variable | Default | Notes |
+|---|---|---|
+| `FLOWXER_HOST` | `127.0.0.1` | Mixer bind. Bridge Compose uses `0.0.0.0`. |
+| `FLOWXER_PORT` | `9610` | |
+| `FLOWXER_MIXER_URL` | `http://127.0.0.1:9610` | GUI nginx/Vite upstream |
+| `FLOWXER_GUI_PORT` | `9620` | |
+| `FLOWXER_MXL_ROOT` | `/Volumes/mxl` | Scan for `domain_def.json` |
+| `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` | `<root>/flowxer-<seed-short>` | PGM write path; never `mirror-*` |
+| `FLOWXER_MXL_OUTPUT_DOMAIN_ID` | UUIDv5(seed) | |
+| `FLOWXER_NMOS_ENABLE` | `true` | `false` keeps REST-only behaviour |
+| `FLOWXER_NMOS_SEED` | `{hostname}-flowxer` | Stable UUIDv5 IDs |
+| `FLOWXER_NMOS_PORT` | `3252` | |
+| `FLOWXER_NMOS_HOST_IP` | first non-loopback | Node `href` / `api.endpoints` |
+| `FLOWXER_NMOS_REGISTRY_URL` | empty | e.g. `http://10.0.0.5:3210` |
+| `FLOWXER_NMOS_DNS_SD` | `false` | Not implemented |
+| `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
+| `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
+| `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
+| `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |
+
+See [docs/nmos.md](docs/nmos.md) for receivers/senders and REST ↔ IS-05.
+
+### Route a camera to input 1, take it to program, route program out
+
+Patch a live input so it has NMOS receivers, then IS-05-activate. Replace UUIDs with values from `GET http://<host>:3252/x-nmos/node/v1.3/receivers` and `.../senders`.
+
+```bash
+# Make Camera 1 an MXL live input (creates two BCP-007-03 receivers).
+curl -sS -X PATCH http://127.0.0.1:9620/api/v1/inputs/cam-1 \
+  -H 'content-type: application/json' \
+  -d '{"kind":"mxl_live","label":"Camera 1","group_hint":"cam-1"}'
+
+# List receivers (video + audio).
+curl -sS http://127.0.0.1:3252/x-nmos/node/v1.3/receivers
+
+# Route an mxl-decklink sender onto Camera 1 video (Qvest does this over IS-05;
+# curl equivalent). Accept even if the flow is not on disk yet (state waiting).
+RX=$(curl -sS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers | python3 -c "import json,sys; print(json.load(sys.stdin)[0])")
+curl -sS -X PATCH "http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers/${RX}/staged" \
+  -H 'content-type: application/json' \
+  -d '{"sender_id":"<DECKLINK_SENDER_UUID>","master_enable":true,"activation":{"mode":"activate_immediate"},"transport_params":[{"mxl_domain_id":"<DOMAIN_UUID>","mxl_flow_id":"<FLOW_UUID>"}]}'
+
+curl -sS -X POST http://127.0.0.1:9620/api/v1/mixer/start \
+  -H 'content-type: application/json' \
+  -d '{"program_input_id":"cam-1"}'
+
+# Take Camera 1 to Program (already on PGM if started that way).
+curl -sS -X POST http://127.0.0.1:9620/api/v1/mixer/take \
+  -H 'content-type: application/json' \
+  -d '{"input_id":"cam-1","panel_id":"me-1","transition":"cut"}'
+
+# Route FlowXer PGM to an mxl-decklink output receiver: set that receiver's
+# IS-05 active params to FlowXer's sender mxl_domain_id / mxl_flow_id.
+curl -sS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/senders
+```
+
+AMWA NMOS Testing Tool (non-interactive, `amwa/nmos-testing` image):
+
+```bash
+bash scripts/nmos-testing.sh http://127.0.0.1:3252
+# optional MXL suite:
+NMOS_TESTING_SUITES=IS-04-01,IS-05-01,IS-05-02,BCP-007-03-01 \
+  bash scripts/nmos-testing.sh http://127.0.0.1:3252
+```
+
+GitHub Actions: **Actions → CI → Run workflow** runs the `nmos-testing` job (`continue-on-error`; IS-04-01 DNS-SD / events WebSocket are expected gaps). Grafana: `deploy/grafana/flowxer.json`.
+
 ## Local development
 
 ```bash
