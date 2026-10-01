@@ -112,7 +112,7 @@ ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer
 ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader,disable-background-networking,disable-component-update,disable-sync,no-first-run,disable-default-apps,disable-extensions,disable-breakpad
 ENV GST_CEF_CACHE_LOCATION=/tmp/cef-cache
 ENV HOME=/tmp
-ENV FLOWXER_HOST=0.0.0.0
+ENV FLOWXER_HOST=127.0.0.1
 ENV FLOWXER_PORT=9610
 ENV FLOWXER_MXL_ROOT=/Volumes/mxl
 ENV FLOWXER_STORAGE_ROOT=/storage
