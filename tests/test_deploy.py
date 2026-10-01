@@ -44,3 +44,24 @@ def test_nmos_testing_script_invokes_amwa_cli() -> None:
     assert "amwa/nmos-testing" in text
     userconfig = (ROOT / "scripts" / "nmos-testing-userconfig.py").read_text(encoding="utf-8")
     assert "ENABLE_DNS_SD = False" in userconfig
+
+
+def test_ci_runs_amwa_on_stage_and_main_prs() -> None:
+    text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "github.base_ref == 'stage'" in text
+    assert "github.base_ref == 'main'" in text
+    assert "workflow_dispatch" in text
+    assert "if: github.event_name == 'workflow_dispatch'\n" not in text
+    assert "./.github/actions/nmos-testing" in text
+    stage = (ROOT / ".github" / "workflows" / "stage.yml").read_text(encoding="utf-8")
+    assert "nmos-testing:" in stage
+    assert "./.github/actions/nmos-testing" in stage
+
+
+def test_mxl_build_fetches_short_sha_via_release_branch() -> None:
+    script = (ROOT / "docker" / "build-mxl.sh").read_text(encoding="utf-8")
+    assert 'git fetch --depth 1 origin "${MXL_REF}"' in script
+    assert "release/v1.1" in script
+    assert "couldn't find remote ref" in script
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7" in dockerfile

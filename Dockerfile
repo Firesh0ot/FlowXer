@@ -5,7 +5,7 @@
 
 ARG UBUNTU=ubuntu:24.04
 ARG MXL_REPO=https://github.com/dmf-mxl/mxl.git
-ARG MXL_REF=218ddaa
+ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
 ARG RUST_TOOLCHAIN=1.92
 ARG GSTCEFSRC_REPO=https://github.com/centricular/gstcefsrc.git
 ARG GSTCEFSRC_REF=b63340852fc93b0ab67b07200e1ff44f59ba6769
@@ -34,7 +34,7 @@ FROM ${UBUNTU}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLOWXER_VERSION=0.1.0
-ARG MXL_REF=218ddaa
+ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
 LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL io.dmf.mxl.revision=$MXL_REF
