@@ -5,12 +5,16 @@ import threading
 import time
 from pathlib import Path
 
+from uuid import UUID
+
 from flowxer.api.schemas import (
+    AudioEssence,
     DownstreamKeyer,
     InputKind,
     LogicalInput,
     LogicalInputCreate,
     LogicalInputUpdate,
+    VideoEssence,
     MixerPanel,
     MixerStartRequest,
     MixerState,
@@ -96,6 +100,9 @@ class VisionMixer:
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
         self.tally = TallyService()
+        from flowxer.nmos.service import NmosNode
+
+        self.nmos = NmosNode(self)
         self.overlay = Html5Overlay(
             url=settings.overlay_url,
             cache_dir=settings.graphics_dir,
@@ -253,6 +260,7 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        self.nmos.reconcile_inputs()
         self._publish_tally()
         return self.workspace
 
@@ -431,7 +439,9 @@ class VisionMixer:
             raise MixerError(f"input {payload.id} already exists")
         resolved = self._resolve_file_path(payload)
         logical = LogicalInput(slot=len(self.inputs), **resolved.model_dump())
+        self._apply_default_domain(logical)
         self.inputs[logical.id] = logical
+        self.nmos.sync_from_rest(logical.id)
         return logical
 
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
@@ -449,7 +459,9 @@ class VisionMixer:
                 if field in patch:
                     data[field] = patch[field]
             updated = LogicalInput(**data)
+            self._apply_default_domain(updated)
             self.inputs[input_id] = updated
+            self.nmos.sync_from_rest(input_id)
             self._publish_tally()
             return updated
         if self.state == MixerState.running and payload.file_path is not None:
@@ -461,7 +473,9 @@ class VisionMixer:
         updated = LogicalInput(**data)
         if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
             updated.file_path = self._resolve_clip(updated.file_path)
+        self._apply_default_domain(updated)
         self.inputs[input_id] = updated
+        self.nmos.sync_from_rest(input_id)
         self._publish_tally()
         return updated
 
@@ -473,6 +487,7 @@ class VisionMixer:
         del self.inputs[input_id]
         for slot, item in enumerate(self.inputs.values()):
             item.slot = slot
+        self.nmos.reconcile_inputs()
 
     def get_input(self, input_id: str) -> LogicalInput:
         try:
@@ -482,6 +497,76 @@ class VisionMixer:
 
     def list_inputs(self) -> list[LogicalInput]:
         return sorted(self.inputs.values(), key=lambda item: item.slot)
+
+    def _apply_default_domain(self, item: LogicalInput) -> None:
+        if item.kind != InputKind.mxl_live:
+            return
+        default = self.settings.resolved_output_domain_id
+        if item.video is not None and not item.video.domain_id:
+            item.video = item.video.model_copy(update={"domain_id": default})
+        if item.audio is not None and not item.audio.domain_id:
+            item.audio = item.audio.model_copy(update={"domain_id": default})
+
+    def apply_nmos_receiver(
+        self,
+        input_id: str,
+        role: str,
+        domain_id: str | None,
+        flow_id: str | None,
+        enabled: bool,
+    ) -> None:
+        """IS-05 activation → logical input essence. Must not stop Program."""
+        item = self.get_input(input_id)
+        default_domain = self.settings.resolved_output_domain_id
+        resolved_domain = domain_id or default_domain
+        parsed_flow: UUID | None = None
+        if flow_id:
+            try:
+                parsed_flow = UUID(str(flow_id))
+            except ValueError as exc:
+                raise MixerError(f"invalid flow id {flow_id}") from exc
+        if role == "video":
+            data = item.video.model_dump() if item.video else {"media_type": self.settings.video_media_type}
+            if enabled and parsed_flow:
+                data["flow_id"] = parsed_flow
+                data["domain_id"] = resolved_domain
+            elif not enabled:
+                data["flow_id"] = parsed_flow or data.get("flow_id")
+                data["domain_id"] = resolved_domain
+            else:
+                data["flow_id"] = None
+                data["domain_id"] = resolved_domain
+            item.video = VideoEssence(**data)
+        else:
+            data = item.audio.model_dump() if item.audio else {"media_type": self.settings.audio_media_type}
+            if enabled and parsed_flow:
+                data["flow_id"] = parsed_flow
+                data["domain_id"] = resolved_domain
+            elif not enabled:
+                data["flow_id"] = parsed_flow or data.get("flow_id")
+                data["domain_id"] = resolved_domain
+            else:
+                data["flow_id"] = None
+                data["domain_id"] = resolved_domain
+            item.audio = AudioEssence(**data)
+        if self.gst is None:
+            return
+        src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
+        path = None
+        if resolved_domain:
+            found = resolve_domain_path(self.settings.mxl_root, str(resolved_domain))
+            path = str(found) if found else str((self.settings.mxl_root / str(resolved_domain)).resolve())
+        try:
+            if not enabled or parsed_flow is None:
+                self.gst.retarget_mxl_source(src_name, None, path, role)
+            else:
+                self.gst.retarget_mxl_source(src_name, str(parsed_flow), path, role)
+        except Exception as exc:
+            log.warning(
+                "on-air NMOS retarget of %s failed (program continues): %s",
+                src_name,
+                exc,
+            )
 
     def _resolve_file_path(self, payload: LogicalInputCreate) -> LogicalInputCreate:
         if payload.kind in {InputKind.file, InputKind.replay} and payload.file_path:
@@ -568,8 +653,22 @@ class VisionMixer:
 
         self._bind_group_hints()
 
-        video_id = nmos.flow_uuid(group_hint, "video")
-        audio_id = nmos.flow_uuid(group_hint, "audio")
+        video_id = nmos.flow_uuid(
+            group_hint,
+            "video",
+            width=self.settings.width,
+            height=self.settings.height,
+            frame_rate_num=self.settings.frame_rate_num,
+            frame_rate_den=self.settings.frame_rate_den,
+        )
+        audio_id = nmos.flow_uuid(
+            group_hint,
+            "audio",
+            width=self.settings.width,
+            height=self.settings.height,
+            frame_rate_num=self.settings.frame_rate_num,
+            frame_rate_den=self.settings.frame_rate_den,
+        )
         self.outputs = OutputFlows(
             video_flow_id=video_id,
             audio_flow_id=audio_id,
@@ -634,6 +733,7 @@ class VisionMixer:
             self.panels[0].preview_input_id = self.preview_input_id
         self._apply_program()
         self._apply_overlay_alpha()
+        self.nmos.sync_senders_from_outputs()
         self._publish_tally()
         return self.status()
 
@@ -1077,6 +1177,7 @@ class VisionMixer:
             webrtc_enabled=webrtc_available(),
             wipe_armed=bool(self.panels[0].wipe_armed) if self.panels else False,
             last_transition=self.last_transition,
+            nmos=self.nmos.status(),
         )
 
     def domain_flows(self):

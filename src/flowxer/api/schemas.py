@@ -316,6 +316,7 @@ class MixerStatus(BaseModel):
     webrtc_enabled: bool = False
     wipe_armed: bool = False
     last_transition: str = "cut"
+    nmos: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
@@ -520,3 +521,7 @@ class ConsoleState(BaseModel):
     clips: list[StorageClip]
     stingers: list[StingerInfo]
     tally: TallyConfig = Field(default_factory=TallyConfig)
+    nmos: dict[str, Any] = Field(
+        default_factory=dict,
+        description="IS-04/IS-05 node status: registry, node id, per-input receivers.",
+    )

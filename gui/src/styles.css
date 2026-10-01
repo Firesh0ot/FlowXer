@@ -73,6 +73,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 .status-overlay dt { color: var(--muted); }
 .status-overlay dd { margin: 0; overflow-wrap: anywhere; }
+.nmos-receivers { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 12px; }
 .status-issues { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 13px; }
 .status-issues .issue-error { color: #ff8b8b; }
 .status-issues .issue-warning { color: #e0b025; }

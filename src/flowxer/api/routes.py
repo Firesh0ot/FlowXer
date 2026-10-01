@@ -507,6 +507,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
+        nmos=mixer.nmos.status(),
     )
 
 

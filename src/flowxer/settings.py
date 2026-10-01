@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # gst-mxl-rs mxlsrc has no offset property; kept for the platform env table.
     read_offset_grains: int = Field(default=2, ge=0)
     nmos_seed: str = ""
+    nmos_enable: bool = True
+    nmos_registry_url: str = ""
+    nmos_dns_sd: bool = False
+    nmos_port: int = 3252
+    nmos_host_ip: str = ""
+    # Bind the Node/Connection APIs. Tests set this false and use TestClient.
+    nmos_bind: bool = True
     storage_root: Path = Path("./storage")
 
     group_hint: str = "FlowXer"
