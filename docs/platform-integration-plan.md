@@ -354,3 +354,4 @@ integration and AMWA script in PR 8).
 - **PR 1** (`cursor/platform-integration-plan-85ef`): this file.
 - **PR 2** (`cursor/mxl-multi-domain-85ef`): `FLOWXER_MXL_ROOT` scan, output domain create, `domain_id` on essences, refuse mirrors, stop baking `domain_def.json`, deprecate `FLOWXER_MXL_DOMAIN`. `FLOWXER_READ_OFFSET_GRAINS` logged as ignored.
 - **PR 3** (`cursor/nmos-node-85ef`): in-process IS-04 v1.3 / IS-05 v1.2 / BCP-007-03 node (Option C). Live-input receivers, PGM senders, REST↔IS-05, waiting retry, GUI status, `docs/nmos.md`. NvNmos evaluated and not used (cannot ACK missing-domain activations).
+- **PR 4** (`cursor/image-nonroot-85ef`): mixer/GUI `USER 1000:1000`, `MXL_REF=218ddaa`, label `io.dmf.mxl.revision`, health `mxl_revision`, `git-<sha>` GHCR tags, CEF flags that skip component updates. GHCR public still a GitHub UI step.

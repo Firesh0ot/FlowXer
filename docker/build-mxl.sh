@@ -86,3 +86,5 @@ fi
 
 test -f /opt/mxl/gst/libgstmxl.so
 find /opt/mxl/lib -name 'libmxl.so*' | grep -q .
+git -C /mxl rev-parse HEAD > /opt/mxl/SHA
+printf '%s\n' "${MXL_REF}" > /opt/mxl/REF

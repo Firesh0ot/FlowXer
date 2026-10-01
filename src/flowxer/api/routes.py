@@ -76,6 +76,7 @@ def health(
         gstreamer=bool(caps["gstreamer"]),
         mxl_plugins=bool(caps["mxl_plugins"]),
         simulate=mixer.backend == "simulate" or settings.simulate,
+        mxl_revision=settings.resolved_mxl_revision,
     )
 
 

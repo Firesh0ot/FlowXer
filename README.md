@@ -202,7 +202,9 @@ Images:
 - `ghcr.io/firesh0ot/flowxer-vision-mixer`
 - `ghcr.io/firesh0ot/flowxer-gui`
 
-If a pull is denied, `docker login ghcr.io` (or make those GHCR packages public). To run a source tree instead of the published images, `docker build` the Dockerfiles yourself — Compose no longer builds.
+Tags: `{version}`, `latest`, and immutable `git-<sha>` (full commit). Packages should be **public** (GitHub → Packages → package → Package settings → Change visibility → Public). If a pull is still denied, `docker login ghcr.io`. To run a source tree instead of the published images, `docker build` the Dockerfiles yourself — Compose no longer builds.
+
+The mixer and GUI images run as **uid/gid 1000**. Host mounts (`/Volumes/mxl`, `./storage`) must be writable by that user.
 
 Services:
 
@@ -216,7 +218,7 @@ Services:
 
 The mixer image builds these from source. You do not compile them yourself:
 
-- [MXL](https://github.com/dmf-mxl/mxl) `v1.1.0` — `libmxl` plus `mxlsrc` / `mxlsink` (`/opt/mxl`)
+- [MXL](https://github.com/dmf-mxl/mxl) `release/v1.1` at commit `218ddaa` (same pin as mxl-fabrics-agent; gst-mxl-rs is compatible with tag `v1.1.0`) — `libmxl` plus `mxlsrc` / `mxlsink` (`/opt/mxl`). Image label `io.dmf.mxl.revision` and `GET /api/v1/health` `mxl_revision` record the pin.
 - [`gstcefsrc`](https://github.com/centricular/gstcefsrc) — `cefsrc` HTML keyer and the CEF runtime (`/opt/gstcef`)
 
 When those plugins load, Program is published as MXL `video/v210` and `audio/float32`, and the HTML overlay uses `cefsrc`. If a plugin is missing, the mixer falls back to `fakesink` and a Pillow lower-third.

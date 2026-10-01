@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     # Bind the Node/Connection APIs. Tests set this false and use TestClient.
     nmos_bind: bool = True
     storage_root: Path = Path("./storage")
+    # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
+    mxl_revision: str = ""
 
     group_hint: str = "FlowXer"
     width: int = 1920
@@ -148,6 +150,20 @@ class Settings(BaseSettings):
     @property
     def fps(self) -> float:
         return self.frame_rate_num / self.frame_rate_den
+
+    @property
+    def resolved_mxl_revision(self) -> str:
+        configured = (self.mxl_revision or "").strip()
+        if configured:
+            return configured
+        for path in (Path("/opt/mxl/REF"), Path("/opt/mxl/SHA")):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                return text
+        return ""
 
 
 @lru_cache
