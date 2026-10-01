@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from flowxer import __version__
 from flowxer.api.auth import ApiTokenMiddleware
+from flowxer.api.metrics import ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.engine.mixer import VisionMixer
 from flowxer.settings import Settings, get_settings
@@ -42,7 +44,7 @@ OPENAPI_TAGS = [
     },
     {
         "name": "overlay",
-        "description": "HTML5 graphics keyer (cefsrc in production, Pillow fallback in the container).",
+        "description": "HTML5 graphics keyer (cefsrc when the plugin is in the image, Pillow fallback otherwise).",
     },
     {
         "name": "storage",
@@ -81,9 +83,16 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
     settings = settings or get_settings()
     mixer = mixer or VisionMixer(settings)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        mixer.nmos.boot()
+        yield
+        mixer.nmos.shutdown()
+
     app = FastAPI(
         title=settings.title,
         version=settings.version,
+        lifespan=lifespan,
         description=(
             "FlowXer is a Dynamic Media Facility (DMF) vision mixer media function. "
             "It is controlled entirely over HTTP, documents itself with OpenAPI, and "
@@ -95,7 +104,10 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
             "The operator GUI on port 9620 is a thin client of this API. "
             "TSL UMD 5.0 carries Program/Preview tally and source labels to "
-            "Companion, VSM, BFE, Riedel HI, and other listeners."
+            "Companion, VSM, BFE, Riedel HI, and other listeners. "
+            "When FLOWXER_NMOS_ENABLE is true, an IS-04/IS-05 node on "
+            "FLOWXER_NMOS_PORT (default 3252) advertises live-input receivers "
+            "and program senders for BCP-007-03 MXL routing."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},
@@ -122,6 +134,22 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
     app.dependency_overrides[get_mixer] = lambda: app.state.mixer
     app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router, prefix="/api/v1")
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics_root() -> PlainTextResponse:
+        return PlainTextResponse(
+            render_prometheus(mixer),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/livez", include_in_schema=False)
+    def livez() -> dict:
+        return {"status": "live"}
+
+    @app.get("/readyz", include_in_schema=False)
+    def readyz():
+        code, body = ready_payload(mixer)
+        return JSONResponse(status_code=code, content=body)
     if not (settings.api_token or "").strip():
         log.warning(
             "FLOWXER_API_TOKEN is unset; the HTTP control plane is unauthenticated. "

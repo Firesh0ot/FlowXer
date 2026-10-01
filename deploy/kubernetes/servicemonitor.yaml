@@ -1,0 +1,18 @@
+# Optional. Requires the Prometheus Operator CRDs.
+# kubectl apply -f deploy/kubernetes/servicemonitor.yaml
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flowxer
+  namespace: flowxer
+  labels:
+    app: flowxer
+spec:
+  selector:
+    matchLabels:
+      app: flowxer
+  endpoints:
+    - port: mixer
+      path: /metrics
+      interval: 15s

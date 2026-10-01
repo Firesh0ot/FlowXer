@@ -49,7 +49,7 @@ flowchart LR
 
 - **Logical inputs** virtually bundle a video essence and an audio essence into one mixer source (camera, clip, replay, test, black).
 - **Storage access** plays files from `storage/clips` (`.mp4`, `.ts`, `.mov`, `.mxf`, …) as uncompressed v210 + float32.
-- **HTML5 graphics overlay** keys a page over program (`cefsrc` when installed, Pillow fallback otherwise). A sample lower-third is served at `/graphics/lower-third.html`.
+- **HTML5 graphics overlay** keys a page over program (`cefsrc` in the mixer image, Pillow fallback if that plugin did not load). A sample lower-third is served at `/graphics/lower-third.html`.
 - **Stingers** play a **TGA sequence with alpha** or a **video file**. At the cut frame the mixer switches Program, then finishes the sting. A source can be assigned an auto-stinger so Take/Cut plays that slot; otherwise Wipe arms the next Cut.
 - **Tally / UMD** sends TSL UMD Protocol 5.0 (UDP, or TCP with DLE/STX) to receivers such as Bitfocus Companion, Lawo VSM, BFE Commander, and Riedel HI. Program = right-hand red, Preview = left-hand green, label = source name.
 - Runs in **Docker** (`vision-mixer` + `gui` services) with a shared MXL domain volume.
@@ -131,6 +131,7 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 | Tally → Receivers… | `PUT /tally/receivers` |
 | Tally send now | `POST /tally/refresh` |
 | Preview pictures | `POST /webrtc/whep/{stream_id}` or `GET /preview/jpeg/{stream_id}` |
+| NMOS (IS-04/IS-05) | Node API on **3252** — see [docs/nmos.md](docs/nmos.md) |
 
 API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
@@ -201,23 +202,127 @@ Images:
 - `ghcr.io/firesh0ot/flowxer-vision-mixer`
 - `ghcr.io/firesh0ot/flowxer-gui`
 
-If a pull is denied, `docker login ghcr.io` (or make those GHCR packages public). To run a source tree instead of the published images, `docker build` the Dockerfiles yourself — Compose no longer builds.
+Tags: `{version}`, `latest`, and immutable `git-<sha>` (full commit). Packages should be **public** (GitHub → Packages → package → Package settings → Change visibility → Public). If a pull is still denied, `docker login ghcr.io`. To run a source tree instead of the published images, `docker build` the Dockerfiles yourself — Compose no longer builds.
+
+The mixer and GUI images run as **uid/gid 1000**. Host mounts (`/Volumes/mxl`, `./storage`) must be writable by that user.
 
 Services:
 
-- **gui** on port **9620** — operator console, mixer API (`/api/v1`), and OpenAPI (`/docs`, `/redoc`, `/openapi.json`)
-- **vision-mixer** on **127.0.0.1:9610** — mixer process (Docker network + host loopback only)
-- tmpfs MXL domain at `/mxl-domain`
+- **gui** on port **9620** — operator console, mixer API (`/api/v1`), and OpenAPI (`/docs`, `/redoc`, `/openapi.json`). Upstream is `FLOWXER_MIXER_URL` (Compose default `http://vision-mixer:9610`; host-network / Kubernetes `http://127.0.0.1:9610`).
+- **vision-mixer** on **127.0.0.1:9610** — mixer process. `FLOWXER_HOST` defaults to `127.0.0.1` (safe under `hostNetwork`); bridge Compose sets `0.0.0.0` so the GUI container can reach it.
+- tmpfs MXL root (Compose still mounts `/mxl-domain` and sets the deprecated `FLOWXER_MXL_DOMAIN` alias so local demos keep a single-domain layout)
 - bind-mount `./storage` for clips, TGA stingers, overlay cache
 - GStreamer path: `videotestsrc` / `filesrc` → `input-selector` → compositor → **v210** / **F32LE**
 
-### Real MXL I/O
+### Real MXL I/O and HTML keyer
 
-Build or copy the [MXL SDK](https://github.com/dmf-mxl/mxl) GStreamer plugin (`libgstmxl.so` + `libmxl.so`) into `/opt/mxl` and the mixer will switch `fakesink` for `mxlsink` / `mxlsrc` automatically.
+The mixer image builds these from source. You do not compile them yourself:
 
-Point `FLOWXER_MXL_DOMAIN` at the host directory that holds the domain (for example `/Volumes/mxl/domain_1`) to share it with other GStreamer processes.
+- [MXL](https://github.com/dmf-mxl/mxl) `release/v1.1` at commit `218ddaa` (same pin as mxl-fabrics-agent; gst-mxl-rs is compatible with tag `v1.1.0`) — `libmxl` plus `mxlsrc` / `mxlsink` (`/opt/mxl`). Image label `io.dmf.mxl.revision` and `GET /api/v1/health` `mxl_revision` record the pin.
+- [`gstcefsrc`](https://github.com/centricular/gstcefsrc) — `cefsrc` HTML keyer and the CEF runtime (`/opt/gstcef`)
 
-HTML5 keying in production uses [`gstcefsrc`](https://github.com/centricular/gstcefsrc). Without it, FlowXer still keys a generated lower-third PNG and will load any URL you set once `cefsrc` is on `GST_PLUGIN_PATH`.
+When those plugins load, Program is published as MXL `video/v210` and `audio/float32`, and the HTML overlay uses `cefsrc`. If a plugin is missing, the mixer falls back to `fakesink` and a Pillow lower-third.
+
+Point `FLOWXER_MXL_ROOT` at the host tmpfs that holds one directory per domain (for example `/Volumes/mxl`). FlowXer writes Program into `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` (default `<root>/flowxer-<seed-short>`) and **never** into `mirror-*` directories. `mxlsrc` `domain=` is a filesystem path: the mixer scans `domain_def.json` `id` fields on every resolve, including fabrics mirrors.
+
+`FLOWXER_MXL_DOMAIN` remains a deprecated alias that restores the old single-domain layout (Compose still uses it for local demos). The mixer image no longer bakes a fixed `domain_def.json` id. `FLOWXER_READ_OFFSET_GRAINS` is accepted but ignored: gst-mxl-rs `mxlsrc` has no read-offset property and sits at the live edge.
+
+`cefsrc` starts a private Xvfb when `DISPLAY` is unset, with the sandbox off (`GST_CEF_CHROME_EXTRA_FLAGS`).
+
+## Running on an MXL platform
+
+On a host-network MXL node (RKE2 / Ubuntu 24.04), FlowXer is one NMOS media function: mixer **9610** (loopback), GUI **9620**, Node API **3252**. `FLOWXER_API_TOKEN` is **required**.
+
+Kubernetes (edit the nodeSelector, registry URL, and management IP):
+
+```bash
+kubectl apply -f deploy/kubernetes/flowxer.yaml
+# optional, needs Prometheus Operator CRDs:
+kubectl apply -f deploy/kubernetes/servicemonitor.yaml
+```
+
+Host Compose: `docker compose -f docker-compose.host.yml up` with `/Volumes/mxl` mounted and `FLOWXER_API_TOKEN` set. Both files use **host networking**, uid **1000**, and GUI upstream `http://127.0.0.1:9610`.
+
+### Ports
+
+| Port | Use |
+|---|---|
+| 9610 | Mixer HTTP (`/api/v1`, `/metrics`, `/livez`, `/readyz`) — bind `127.0.0.1` |
+| 9620 | Operator GUI (proxies `/api` to the mixer) |
+| 3252 | NMOS Node + Connection API (not behind the API token) |
+| 3253 | Reserved (nmos-cpp style WebSocket) |
+| 32600–32631 | WebRTC ICE host UDP |
+
+Do not use 8080, 8090, 8095, 8100, 8888/8889, 9100, 3212/3213, 3232/3233, 3242/3243, or 23500–23599 (other media functions).
+
+### Configuration
+
+| Variable | Default | Notes |
+|---|---|---|
+| `FLOWXER_HOST` | `127.0.0.1` | Mixer bind. Bridge Compose uses `0.0.0.0`. |
+| `FLOWXER_PORT` | `9610` | |
+| `FLOWXER_MIXER_URL` | `http://127.0.0.1:9610` | GUI nginx/Vite upstream |
+| `FLOWXER_GUI_PORT` | `9620` | |
+| `FLOWXER_MXL_ROOT` | `/Volumes/mxl` | Scan for `domain_def.json` |
+| `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` | `<root>/flowxer-<seed-short>` | PGM write path; never `mirror-*` |
+| `FLOWXER_MXL_OUTPUT_DOMAIN_ID` | UUIDv5(seed) | |
+| `FLOWXER_NMOS_ENABLE` | `true` | `false` keeps REST-only behaviour |
+| `FLOWXER_NMOS_SEED` | `{hostname}-flowxer` | Stable UUIDv5 IDs |
+| `FLOWXER_NMOS_PORT` | `3252` | |
+| `FLOWXER_NMOS_HOST_IP` | first non-loopback | Node `href` / `api.endpoints` |
+| `FLOWXER_NMOS_REGISTRY_URL` | empty | e.g. `http://10.0.0.5:3210` |
+| `FLOWXER_NMOS_DNS_SD` | `false` | Not implemented |
+| `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
+| `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
+| `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
+| `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |
+
+See [docs/nmos.md](docs/nmos.md) for receivers/senders and REST ↔ IS-05.
+
+### Route a camera to input 1, take it to program, route program out
+
+Patch a live input so it has NMOS receivers, then IS-05-activate. Replace UUIDs with values from `GET http://<host>:3252/x-nmos/node/v1.3/receivers` and `.../senders`.
+
+```bash
+# Make Camera 1 an MXL live input (creates two BCP-007-03 receivers).
+curl -sS -X PATCH http://127.0.0.1:9620/api/v1/inputs/cam-1 \
+  -H 'content-type: application/json' \
+  -d '{"kind":"mxl_live","label":"Camera 1","group_hint":"cam-1"}'
+
+# List receivers (video + audio).
+curl -sS http://127.0.0.1:3252/x-nmos/node/v1.3/receivers
+
+# Route an mxl-decklink sender onto Camera 1 video (Qvest does this over IS-05;
+# curl equivalent). Accept even if the flow is not on disk yet (state waiting).
+RX=$(curl -sS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers | python3 -c "import json,sys; print(json.load(sys.stdin)[0])")
+curl -sS -X PATCH "http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers/${RX}/staged" \
+  -H 'content-type: application/json' \
+  -d '{"sender_id":"<DECKLINK_SENDER_UUID>","master_enable":true,"activation":{"mode":"activate_immediate"},"transport_params":[{"mxl_domain_id":"<DOMAIN_UUID>","mxl_flow_id":"<FLOW_UUID>"}]}'
+
+curl -sS -X POST http://127.0.0.1:9620/api/v1/mixer/start \
+  -H 'content-type: application/json' \
+  -d '{"program_input_id":"cam-1"}'
+
+# Take Camera 1 to Program (already on PGM if started that way).
+curl -sS -X POST http://127.0.0.1:9620/api/v1/mixer/take \
+  -H 'content-type: application/json' \
+  -d '{"input_id":"cam-1","panel_id":"me-1","transition":"cut"}'
+
+# Route FlowXer PGM to an mxl-decklink output receiver: set that receiver's
+# IS-05 active params to FlowXer's sender mxl_domain_id / mxl_flow_id.
+curl -sS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/senders
+```
+
+AMWA NMOS Testing Tool (non-interactive, `amwa/nmos-testing` image):
+
+```bash
+bash scripts/nmos-testing.sh http://127.0.0.1:3252
+# optional MXL suite:
+NMOS_TESTING_SUITES=IS-04-01,IS-05-01,IS-05-02,BCP-007-03-01 \
+  bash scripts/nmos-testing.sh http://127.0.0.1:3252
+```
+
+GitHub Actions: **Actions → CI → Run workflow** runs the `nmos-testing` job (`continue-on-error`; IS-04-01 DNS-SD / events WebSocket are expected gaps). Grafana: `deploy/grafana/flowxer.json`.
 
 ## Local development
 
@@ -226,7 +331,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
-FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_DOMAIN=./data/mxl-domain \
+FLOWXER_SIMULATE=true FLOWXER_STORAGE_ROOT=./storage FLOWXER_MXL_ROOT=./data/mxl-domain \
   uvicorn flowxer.app:create_app --factory --port 9610
 ```
 

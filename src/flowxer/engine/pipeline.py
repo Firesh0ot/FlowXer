@@ -12,7 +12,15 @@ BGRA_CAPS = "video/x-raw,format=BGRA,width={width},height={height},framerate={fp
 AUDIO_CAPS = "audio/x-raw,format=F32LE,layout=interleaved,rate={rate},channels={channels}"
 
 
+def _gst_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _v210(settings: Settings) -> str:
+    return V210_CAPS.format(
+        width=settings.width, height=settings.height, fps=settings.frame_rate
+    )
     return V210_CAPS.format(
         width=settings.width, height=settings.height, fps=settings.frame_rate
     )
@@ -28,13 +36,20 @@ def _audio(settings: Settings) -> str:
     return AUDIO_CAPS.format(rate=settings.audio_rate, channels=settings.audio_channels)
 
 
-def _video_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str:
+def _video_source_bin(
+    inp: LogicalInput,
+    settings: Settings,
+    domain: str,
+    domain_paths: dict[str, str],
+) -> str:
     caps = _v210(settings)
     bgra = _bgra(settings)
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else "UNBOUND"
+        src_domain = domain_paths.get(f"{inp.id}:video", domain)
         return (
-            f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} domain={domain} "
+            f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} "
+            f"domain={_gst_string(src_domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
             f"! videoconvert ! {caps} ! queue ! vsel.sink_{inp.slot}"
         )
@@ -65,12 +80,19 @@ def _video_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str
     )
 
 
-def _audio_source_bin(inp: LogicalInput, settings: Settings, domain: str) -> str:
+def _audio_source_bin(
+    inp: LogicalInput,
+    settings: Settings,
+    domain: str,
+    domain_paths: dict[str, str],
+) -> str:
     caps = _audio(settings)
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else "UNBOUND"
+        src_domain = domain_paths.get(f"{inp.id}:audio", domain)
         return (
-            f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} domain={domain} "
+            f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "
+            f"domain={_gst_string(src_domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
             f"! audioconvert ! audioresample ! {caps} ! queue ! asel.sink_{inp.slot}"
         )
@@ -106,6 +128,7 @@ def build_pipeline_description(
     domain: str,
     use_mxl_sink: bool,
     use_cefsrc: bool,
+    domain_paths: dict[str, str] | None = None,
 ) -> str:
     """
     Build a GStreamer gst-launch-style description:
@@ -139,8 +162,12 @@ def build_pipeline_description(
             f"! queue name=stingerq ! comp.sink_2"
         )
 
-    video_sources = "\n".join(_video_source_bin(i, settings, domain) for i in inputs)
-    audio_sources = "\n".join(_audio_source_bin(i, settings, domain) for i in inputs)
+    video_sources = "\n".join(
+        _video_source_bin(i, settings, domain, domain_paths or {}) for i in inputs
+    )
+    audio_sources = "\n".join(
+        _audio_source_bin(i, settings, domain, domain_paths or {}) for i in inputs
+    )
 
     if use_cefsrc:
         overlay_bin = (
@@ -158,11 +185,11 @@ def build_pipeline_description(
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout flow-id={output_video_flow_id} domain={domain}"
+            f"mxlsink name=vout flow-id={output_video_flow_id} domain={_gst_string(domain)}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
-            f"mxlsink name=aout flow-id={output_audio_flow_id} domain={domain}"
+            f"mxlsink name=aout flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
         )
     else:
         video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"

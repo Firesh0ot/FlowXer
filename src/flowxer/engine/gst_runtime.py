@@ -84,6 +84,34 @@ class GstRuntime:
         if overlay is not None:
             overlay.set_property("location", str(path))
 
+    def retarget_mxl_source(
+        self,
+        element_name: str,
+        flow_id: str | None,
+        domain: str | None,
+        role: str,
+    ) -> bool:
+        """Retarget one mxlsrc without restarting the mixer pipeline.
+
+        Properties are mutable_ready: the element is taken to NULL, updated,
+        then PLAYING again. Program continues on the other selector sinks.
+        """
+        if self.pipeline is None or self._gst is None:
+            return False
+        element = self.pipeline.get_by_name(element_name)
+        if element is None:
+            return False
+        Gst = self._gst
+        element.set_state(Gst.State.NULL)
+        if role == "video":
+            element.set_property("video-flow-id", flow_id or "")
+        else:
+            element.set_property("audio-flow-id", flow_id or "")
+        if domain:
+            element.set_property("domain", domain)
+        element.set_state(Gst.State.PLAYING)
+        return True
+
 
 def try_start_gst(description: str) -> GstRuntime | None:
     try:

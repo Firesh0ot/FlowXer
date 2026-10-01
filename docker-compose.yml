@@ -27,6 +27,7 @@ services:
       FLOWXER_FRAME_RATE_NUM: "50"
       FLOWXER_FRAME_RATE_DEN: "1"
       FLOWXER_GST_MODE: auto
+      FLOWXER_HOST: "0.0.0.0"
       FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
       FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:-}
       FLOWXER_CORS_ORIGINS: ${FLOWXER_CORS_ORIGINS:-*}
@@ -37,8 +38,6 @@ services:
       - type: bind
         source: ./storage
         target: /storage
-      # Drop a built MXL SDK + gst-mxl plugin here to publish real flows:
-      # - ./opt/mxl:/opt/mxl:ro
     shm_size: "2gb"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -57,6 +56,8 @@ services:
       - "9620:9620"
     environment:
       FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:-}
+      FLOWXER_MIXER_URL: ${FLOWXER_MIXER_URL:-http://vision-mixer:9610}
+      FLOWXER_GUI_PORT: ${FLOWXER_GUI_PORT:-9620}
     depends_on:
       - vision-mixer
 
