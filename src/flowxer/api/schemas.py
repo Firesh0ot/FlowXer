@@ -329,6 +329,7 @@ class HealthResponse(BaseModel):
     gstreamer: bool
     mxl_plugins: bool
     simulate: bool
+    mxl_revision: str = ""
 
 
 class MixerCommandResponse(BaseModel):

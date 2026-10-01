@@ -5,7 +5,7 @@
 
 ARG UBUNTU=ubuntu:24.04
 ARG MXL_REPO=https://github.com/dmf-mxl/mxl.git
-ARG MXL_REF=v1.1.0
+ARG MXL_REF=218ddaa
 ARG RUST_TOOLCHAIN=1.92
 ARG GSTCEFSRC_REPO=https://github.com/centricular/gstcefsrc.git
 ARG GSTCEFSRC_REF=b63340852fc93b0ab67b07200e1ff44f59ba6769
@@ -34,8 +34,10 @@ FROM ${UBUNTU}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLOWXER_VERSION=0.1.0
+ARG MXL_REF=218ddaa
 LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL io.dmf.mxl.revision=$MXL_REF
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
@@ -100,19 +102,25 @@ RUN pip3 install --no-cache-dir --break-system-packages /app \
     && pip3 install --no-cache-dir --break-system-packages 'aiortc==1.9.0' \
     && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
-    && mkdir -p /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache
+    && mkdir -p /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache \
+    && printf '%s\n' "$MXL_REF" > /opt/mxl/REF \
+    && chown -R 1000:1000 /storage /tmp/cef-cache
 
 ENV LD_LIBRARY_PATH=/opt/mxl/lib:/opt/gstcef
 ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer-1.0
-ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader
+# no-sandbox: CEF in a container. disable-*-update: no runtime downloads (lab proxy).
+ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader,disable-background-networking,disable-component-update,disable-sync,no-first-run,disable-default-apps,disable-extensions,disable-breakpad
 ENV GST_CEF_CACHE_LOCATION=/tmp/cef-cache
+ENV HOME=/tmp
 ENV FLOWXER_HOST=0.0.0.0
 ENV FLOWXER_PORT=9610
-ENV FLOWXER_MXL_DOMAIN=/mxl-domain
+ENV FLOWXER_MXL_ROOT=/Volumes/mxl
 ENV FLOWXER_STORAGE_ROOT=/storage
+ENV FLOWXER_MXL_REVISION=$MXL_REF
 ENV FLOWXER_OVERLAY_URL=http://127.0.0.1:9610/graphics/lower-third.html
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 9610
-VOLUME ["/mxl-domain", "/storage"]
+EXPOSE 9610 3252 3253
+VOLUME ["/Volumes/mxl", "/storage"]
+USER 1000:1000
 ENTRYPOINT ["/entrypoint.sh"]
