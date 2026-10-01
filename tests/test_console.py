@@ -62,6 +62,7 @@ def test_console_and_jpeg_and_resources_api(client: TestClient) -> None:
     console = client.get("/api/v1/console").json()
     assert console["workspace"]["format_id"] == "1080p50"
     assert console["workspace"]["source_tile_aspect"] == "16:9"
+    assert console["nmos"]["enabled"] is False
     assert len(console["formats"]) >= 4
     assert console["resources"]["cpu_count"] >= 1
     jpeg = client.get("/api/v1/preview/jpeg/source:cam-1")

@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 function mixerProxy() {
   const token = process.env.FLOWXER_API_TOKEN || "";
   return {
-    target: "http://127.0.0.1:9610",
+    target: process.env.FLOWXER_MIXER_URL || "http://127.0.0.1:9610",
     configure(proxy: { on: (event: string, fn: (...args: any[]) => void) => void }) {
       if (!token) {
         return;
@@ -16,11 +16,13 @@ function mixerProxy() {
   };
 }
 
+const guiPort = Number(process.env.FLOWXER_GUI_PORT || 9620);
+
 export default defineConfig({
   plugins: [react()],
   server: {
     host: "0.0.0.0",
-    port: 9620,
+    port: guiPort,
     proxy: {
       "/api": mixerProxy(),
       "/docs": mixerProxy(),
@@ -31,6 +33,6 @@ export default defineConfig({
   },
   preview: {
     host: "0.0.0.0",
-    port: 9620,
+    port: guiPort,
   },
 });

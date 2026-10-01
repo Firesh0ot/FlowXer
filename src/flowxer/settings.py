@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
+import socket
 from functools import lru_cache
 from pathlib import Path
 
 from flowxer import __version__
-from pydantic import Field, field_validator
+from flowxer.domain.nmos import output_domain_uuid, seed_short
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -17,13 +22,31 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 9610
     title: str = "FlowXer Vision Mixer"
     version: str = __version__
 
-    mxl_domain: Path = Path("./data/mxl-domain")
+    # MXL root is scanned for domain_def.json (including mirror-* siblings).
+    mxl_root: Path = Path("/Volumes/mxl")
+    mxl_output_domain_dir: Path | None = None
+    mxl_output_domain_id: str = ""
+    # Deprecated: when set, used as both root and output domain (single-domain layout).
+    mxl_domain: Path | None = None
+    mxl_history_duration_ns: int = Field(default=200_000_000, ge=1)
+    # gst-mxl-rs mxlsrc has no offset property; kept for the platform env table.
+    read_offset_grains: int = Field(default=2, ge=0)
+    nmos_seed: str = ""
+    nmos_enable: bool = True
+    nmos_registry_url: str = ""
+    nmos_dns_sd: bool = False
+    nmos_port: int = 3252
+    nmos_host_ip: str = ""
+    # Bind the Node/Connection APIs. Tests set this false and use TestClient.
+    nmos_bind: bool = True
     storage_root: Path = Path("./storage")
+    # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
+    mxl_revision: str = ""
 
     group_hint: str = "FlowXer"
     width: int = 1920
@@ -48,6 +71,11 @@ class Settings(BaseSettings):
     api_token: str = ""
     cors_origins: str = "*"
     max_webrtc_peers: int = Field(default=16, ge=1, le=256)
+    webrtc_public_ip: str = ""
+    webrtc_udp_port_min: int = Field(default=32600, ge=1, le=65535)
+    webrtc_udp_port_max: int = Field(default=32631, ge=1, le=65535)
+
+    mxl_domain_deprecated: bool = False
 
     @field_validator("api_token")
     @classmethod
@@ -62,6 +90,40 @@ class Settings(BaseSettings):
                 "FLOWXER_API_TOKEN must be 8-128 characters in [A-Za-z0-9._~-]"
             )
         return token
+
+    @model_validator(mode="after")
+    def resolve_mxl_layout(self) -> Settings:
+        if self.mxl_domain is not None:
+            log.warning(
+                "FLOWXER_MXL_DOMAIN is deprecated; using %s as both MXL root and "
+                "output domain (single-domain layout)",
+                self.mxl_domain,
+            )
+            self.mxl_root = self.mxl_domain
+            self.mxl_output_domain_dir = self.mxl_domain
+            self.mxl_domain_deprecated = True
+        elif self.mxl_output_domain_dir is None:
+            self.mxl_output_domain_dir = self.mxl_root / f"flowxer-{self.seed_short}"
+        return self
+
+    @property
+    def resolved_nmos_seed(self) -> str:
+        return (self.nmos_seed or "").strip() or f"{socket.gethostname()}-flowxer"
+
+    @property
+    def seed_short(self) -> str:
+        return seed_short(self.resolved_nmos_seed)
+
+    @property
+    def resolved_output_domain_id(self) -> str:
+        configured = (self.mxl_output_domain_id or "").strip()
+        if configured:
+            return configured
+        return output_domain_uuid(self.resolved_nmos_seed)
+
+    @property
+    def output_domain(self) -> Path:
+        return (self.mxl_output_domain_dir or self.mxl_root).expanduser()
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -92,6 +154,20 @@ class Settings(BaseSettings):
     def fps(self) -> float:
         return self.frame_rate_num / self.frame_rate_den
 
+    @property
+    def resolved_mxl_revision(self) -> str:
+        configured = (self.mxl_revision or "").strip()
+        if configured:
+            return configured
+        for path in (Path("/opt/mxl/REF"), Path("/opt/mxl/SHA")):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                return text
+        return ""
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -99,18 +175,22 @@ def get_settings() -> Settings:
 
 
 def ensure_storage(settings: Settings) -> Settings:
+    from flowxer.domain.mxl_domain import DomainError, ensure_output_domain
+
     for path in (
         settings.clips_dir,
         settings.stingers_dir,
         settings.graphics_dir,
-        settings.mxl_domain,
     ):
         path.mkdir(parents=True, exist_ok=True)
-    domain_def = settings.mxl_domain / "domain_def.json"
-    if not domain_def.exists():
-        domain_def.write_text(
-            '{"id":"flowxer-domain","label":"FlowXer MXL domain",'
-            '"description":"Uncompressed v210 video and float32 audio essences"}\n',
-            encoding="utf-8",
+    try:
+        ensure_output_domain(
+            settings.output_domain,
+            domain_id=settings.resolved_output_domain_id,
+            label="FlowXer MXL domain",
+            description="Uncompressed v210 video and float32 audio essences for the FlowXer vision mixer",
+            history_duration_ns=settings.mxl_history_duration_ns,
         )
+    except DomainError:
+        raise
     return settings

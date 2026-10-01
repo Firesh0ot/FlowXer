@@ -25,19 +25,36 @@ def test_apache_license_and_notice_are_complete() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "mxl-builder" in dockerfile
     assert "cef-builder" in dockerfile
-    assert "ARG MXL_REF=v1.1.0" in dockerfile
+    assert "ARG MXL_REF=218ddaa" in dockerfile
+    assert "USER 1000:1000" in dockerfile
+    assert "io.dmf.mxl.revision" in dockerfile
+    assert "FLOWXER_MXL_ROOT=/Volumes/mxl" in dockerfile
     assert "docker/build-mxl.sh" in dockerfile
     assert "docker/build-cef.sh" in dockerfile
     assert "pre-built" not in dockerfile
+    assert "cp /app/configs/domain_def.json /mxl-domain/domain_def.json" not in dockerfile
+    entrypoint = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert "domain_def.json" not in entrypoint
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'license = { text = "Apache-2.0" }' in pyproject
     gui_pkg = (ROOT / "gui" / "package.json").read_text(encoding="utf-8")
     assert '"license": "Apache-2.0"' in gui_pkg
+    gui_df = (ROOT / "gui" / "Dockerfile").read_text(encoding="utf-8")
+    assert "USER 1000:1000" in gui_df
+    assert "FLOWXER_MIXER_URL" in gui_df
+    nginx = (ROOT / "gui" / "nginx.conf").read_text(encoding="utf-8")
+    assert "${FLOWXER_MIXER_URL}" in nginx
+    assert "${FLOWXER_GUI_PORT}" in nginx
+    assert "vision-mixer:9610" not in nginx
+    workflow = (ROOT / ".github" / "workflows" / "main.yml").read_text(encoding="utf-8")
+    assert "git-${{ github.sha }}" in workflow
 
 
 def test_compose_keeps_mixer_api_on_loopback() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "127.0.0.1:9610:9610" in compose
+    assert "FLOWXER_HOST" in compose
+    assert "FLOWXER_MIXER_URL" in compose
     assert "FLOWXER_API_TOKEN" in compose
     assert "ghcr.io/firesh0ot/flowxer-vision-mixer" in compose
     assert "ghcr.io/firesh0ot/flowxer-gui" in compose
@@ -135,7 +152,7 @@ def test_start_rejects_domain_override(mixer: VisionMixer, tmp_path: Path) -> No
         mixer.start(MixerStartRequest(domain=str(tmp_path / "other-domain"), program_input_id="cam-1"))
     mixer.start(
         MixerStartRequest(
-            domain=str(mixer.settings.mxl_domain.resolve()),
+            domain=str(mixer.settings.output_domain.resolve()),
             program_input_id="cam-1",
         )
     )

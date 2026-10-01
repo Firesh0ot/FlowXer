@@ -53,6 +53,11 @@ class VideoEssence(BaseModel):
         default=None,
         description="MXL video flow UUID. Required for mxl_live inputs when the mixer is on-air.",
     )
+    domain_id: str | None = Field(
+        default=None,
+        description="MXL domain UUID from domain_def.json `id` (IS-05 mxl_domain_id). "
+        "Omitted on REST defaults to FlowXer's output domain.",
+    )
     width: int | None = Field(default=None, ge=1)
     height: int | None = Field(default=None, ge=1)
     frame_rate_num: int | None = Field(default=None, ge=1)
@@ -75,6 +80,11 @@ class AudioEssence(BaseModel):
     flow_id: UUID | None = Field(
         default=None,
         description="MXL audio flow UUID bundled with the video essence on this logical input.",
+    )
+    domain_id: str | None = Field(
+        default=None,
+        description="MXL domain UUID from domain_def.json `id` (IS-05 mxl_domain_id). "
+        "Omitted on REST defaults to FlowXer's output domain.",
     )
     channels: int = Field(default=2, ge=1, le=64)
     sample_rate: int = Field(default=48000, ge=8000)
@@ -228,6 +238,7 @@ class FlowDescriptor(BaseModel):
     format: str
     group_hint: str = ""
     path: str | None = None
+    domain_id: str = ""
     active: bool = True
     extra: dict[str, Any] = Field(default_factory=dict)
 
@@ -237,6 +248,8 @@ class DomainInfo(BaseModel):
     exists: bool
     flow_count: int = 0
     domain_def: dict[str, Any] | None = None
+    id: str = ""
+    mirror: bool = False
 
 
 class StorageClip(BaseModel):
@@ -303,6 +316,7 @@ class MixerStatus(BaseModel):
     webrtc_enabled: bool = False
     wipe_armed: bool = False
     last_transition: str = "cut"
+    nmos: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
@@ -310,9 +324,12 @@ class HealthResponse(BaseModel):
     service: str
     version: str
     mxl_domain: str
+    mxl_root: str = ""
+    mxl_output_domain_id: str = ""
     gstreamer: bool
     mxl_plugins: bool
     simulate: bool
+    mxl_revision: str = ""
 
 
 class MixerCommandResponse(BaseModel):
@@ -505,3 +522,7 @@ class ConsoleState(BaseModel):
     clips: list[StorageClip]
     stingers: list[StingerInfo]
     tally: TallyConfig = Field(default_factory=TallyConfig)
+    nmos: dict[str, Any] = Field(
+        default_factory=dict,
+        description="IS-04/IS-05 node status: registry, node id, per-input receivers.",
+    )

@@ -61,6 +61,7 @@ class TallyService:
         self._last_error: dict[str, str | None] = {}
         self._last_sent_at: dict[str, float] = {}
         self._tcp: dict[tuple[str, int], socket.socket] = {}
+        self.send_errors = 0
 
     def list(self) -> list[TallyReceiver]:
         return list(self.receivers)
@@ -122,6 +123,7 @@ class TallyService:
                 self._last_sent_at[receiver.id] = time.time()
             except OSError as exc:
                 self._last_error[receiver.id] = str(exc)
+                self.send_errors += 1
                 log.warning("tally send to %s (%s:%s) failed: %s", receiver.id, receiver.host, receiver.port, exc)
         return self.status()
 

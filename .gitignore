@@ -29,3 +29,4 @@ storage/graphics/*.png
 storage/stingers/*/stinger.json
 .idea/
 .vscode/
+nmos-testing-results/
