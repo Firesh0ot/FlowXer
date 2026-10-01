@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from flowxer.nmos.service import NmosActivationError, NmosNode
 
@@ -31,9 +32,17 @@ def create_nmos_app(node: NmosNode) -> FastAPI:
         response.headers.setdefault("Cache-Control", "no-cache")
         return response
 
+    @app.exception_handler(StarletteHTTPException)
+    async def nmos_http_error(_request: Request, exc: StarletteHTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else "error"
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"code": exc.status_code, "error": detail, "debug": ""},
+        )
+
     @app.get("/")
-    def root() -> dict:
-        return {"x-nmos/": {}}
+    def root() -> list[str]:
+        return ["x-nmos/"]
 
     @app.get("/x-nmos")
     @app.get("/x-nmos/")
@@ -98,7 +107,34 @@ def create_nmos_app(node: NmosNode) -> FastAPI:
     @app.get("/x-nmos/connection/v1.2")
     @app.get("/x-nmos/connection/v1.2/")
     def conn_v12() -> list[str]:
-        return ["single/"]
+        return ["single/", "bulk/"]
+
+    @app.get("/x-nmos/connection/v1.2/bulk")
+    @app.get("/x-nmos/connection/v1.2/bulk/")
+    def conn_bulk() -> list[str]:
+        return ["senders/", "receivers/"]
+
+    @app.api_route(
+        "/x-nmos/connection/v1.2/bulk/{side}",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    )
+    @app.api_route(
+        "/x-nmos/connection/v1.2/bulk/{side}/",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+    )
+    def conn_bulk_side(side: str):
+        name = side.rstrip("/")
+        if name not in {"senders", "receivers"}:
+            raise HTTPException(404, detail="Not Found")
+        return JSONResponse(
+            status_code=405,
+            headers={"Allow": "POST"},
+            content={
+                "code": 405,
+                "error": "bulk activations are not implemented",
+                "debug": name,
+            },
+        )
 
     @app.get("/x-nmos/connection/v1.2/single")
     @app.get("/x-nmos/connection/v1.2/single/")

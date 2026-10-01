@@ -322,3 +322,31 @@ def test_console_and_mixer_status_include_nmos(tmp_path: Path) -> None:
     assert any(item["input_id"] == "cam-1" for item in console["nmos"]["receivers"])
     status = client.get("/api/v1/mixer").json()
     assert status["nmos"]["enabled"] is True
+
+
+def test_connection_id_list_has_trailing_slashes(tmp_path: Path) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    assert client.get("/").json() == ["x-nmos/"]
+    assert "bulk/" in client.get("/x-nmos/connection/v1.2/").json()
+    ids_list = client.get("/x-nmos/connection/v1.2/single/senders/").json()
+    assert ids_list
+    assert all(item.endswith("/") for item in ids_list)
+    sid = ids_list[0].rstrip("/")
+    constraints = client.get(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/constraints/"
+    )
+    assert constraints.status_code == 200
+    bulk = client.get("/x-nmos/connection/v1.2/bulk/senders")
+    assert bulk.status_code == 405
+    missing = client.get("/x-nmos/connection/v1.2/single/senders/not-a-sender/active")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == 404
+    source = client.get("/x-nmos/node/v1.3/sources/").json()[0]
+    assert "caps" in source
+    assert "grain_rate" in source
+    audio = next(item for item in client.get("/x-nmos/node/v1.3/sources/").json() if item["format"].endswith("audio"))
+    assert audio["channels"]
+    flow = next(item for item in client.get("/x-nmos/node/v1.3/flows/").json() if item["format"].endswith("video"))
+    assert flow["grain_rate"]["numerator"] == 50
+    assert flow["components"]

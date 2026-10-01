@@ -285,10 +285,12 @@ class NmosNode:
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/node/v1.3/",
                     "type": "urn:x-nmos:service:node/v1.3",
+                    "authorization": False,
                 },
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/connection/v1.2/",
                     "type": "urn:x-nmos:service:connection/v1.2",
+                    "authorization": False,
                 },
             ],
             "clocks": [{"name": "clk0", "ref_type": "internal"}],
@@ -307,6 +309,7 @@ class NmosNode:
                         "host": self.host_ip,
                         "port": self.settings.nmos_port,
                         "protocol": "http",
+                        "authorization": False,
                     }
                 ],
             },
@@ -329,6 +332,7 @@ class NmosNode:
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/connection/v1.2/",
                     "type": "urn:x-nmos:control:sr-ctrl/v1.2",
+                    "authorization": False,
                 }
             ],
         }
@@ -428,26 +432,54 @@ class NmosNode:
 
     def sources(self) -> list[dict[str, Any]]:
         out = []
+        grain = {
+            "numerator": self.settings.frame_rate_num,
+            "denominator": self.settings.frame_rate_den,
+        }
+        channels = [
+            {"label": f"Channel {index + 1}", "symbol": f"NSC{index + 1:03d}"}
+            for index in range(max(1, self.settings.audio_channels))
+        ]
         for panel in self.mixer.panels or []:
-            for role, fmt in (("video", FORMAT_VIDEO), ("audio", FORMAT_AUDIO)):
-                out.append(
-                    {
-                        "id": ids.source_id(self.seed, panel.id, role),
-                        "version": nmos_version(),
-                        "label": f"{panel.label} PGM {role.title()} source",
-                        "description": "",
-                        "tags": {GROUPHINT: [f"{panel.id}:Pgm{role.title()}"]},
-                        "device_id": self.device_uuid,
-                        "parents": [],
-                        "clock_name": "clk0",
-                        "format": fmt,
-                    }
-                )
+            video = {
+                "id": ids.source_id(self.seed, panel.id, "video"),
+                "version": nmos_version(),
+                "label": f"{panel.label} PGM Video source",
+                "description": "",
+                "tags": {GROUPHINT: [f"{panel.id}:PgmVideo"]},
+                "device_id": self.device_uuid,
+                "parents": [],
+                "clock_name": "clk0",
+                "caps": {},
+                "format": FORMAT_VIDEO,
+                "grain_rate": dict(grain),
+            }
+            audio = {
+                "id": ids.source_id(self.seed, panel.id, "audio"),
+                "version": nmos_version(),
+                "label": f"{panel.label} PGM Audio source",
+                "description": "",
+                "tags": {GROUPHINT: [f"{panel.id}:PgmAudio"]},
+                "device_id": self.device_uuid,
+                "parents": [],
+                "clock_name": "clk0",
+                "caps": {},
+                "format": FORMAT_AUDIO,
+                "grain_rate": dict(grain),
+                "channels": channels,
+            }
+            out.extend([video, audio])
         return out
 
     def flows(self) -> list[dict[str, Any]]:
         out = []
         outputs = self.mixer.outputs
+        grain = {
+            "numerator": self.settings.frame_rate_num,
+            "denominator": self.settings.frame_rate_den,
+        }
+        width = self.settings.width
+        height = self.settings.height
         for panel in self.mixer.panels or []:
             video = {
                 "id": ids.flow_id(self.seed, panel.id, "video"),
@@ -460,10 +492,16 @@ class NmosNode:
                 "parents": [],
                 "format": FORMAT_VIDEO,
                 "media_type": self.settings.video_media_type,
-                "frame_width": self.settings.width,
-                "frame_height": self.settings.height,
+                "grain_rate": dict(grain),
+                "frame_width": width,
+                "frame_height": height,
                 "colorspace": "BT709",
                 "interlace_mode": "progressive",
+                "components": [
+                    {"name": "Y", "width": width, "height": height, "bit_depth": 10},
+                    {"name": "Cb", "width": width // 2, "height": height, "bit_depth": 10},
+                    {"name": "Cr", "width": width // 2, "height": height, "bit_depth": 10},
+                ],
             }
             audio = {
                 "id": ids.flow_id(self.seed, panel.id, "audio"),
@@ -476,6 +514,7 @@ class NmosNode:
                 "parents": [],
                 "format": FORMAT_AUDIO,
                 "media_type": self.settings.audio_media_type,
+                "grain_rate": dict(grain),
                 "sample_rate": {"numerator": self.settings.audio_rate, "denominator": 1},
                 "bit_depth": 32,
             }
@@ -495,9 +534,11 @@ class NmosNode:
         }
         if collection not in mapping:
             return []
-        return [item["id"] for item in mapping[collection]()]
+        return [f"{item['id']}/" for item in mapping[collection]()]
 
     def get_resource(self, collection: str, resource_id: str) -> dict[str, Any] | None:
+        collection = collection.rstrip("/")
+        resource_id = resource_id.rstrip("/")
         if collection == "devices" and resource_id == self.device_uuid:
             return self.device_resource()
         mapping = {
@@ -521,6 +562,8 @@ class NmosNode:
         return None
 
     def constraints(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if side == "receivers":
             return {
                 "mxl_domain_id": {},
@@ -540,11 +583,15 @@ class NmosNode:
         }
 
     def staged(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if resource_id in self._staged:
             return self._staged[resource_id]
         return self.active(resource_id, side)
 
     def active(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if resource_id in self._active:
             return self._active[resource_id]
         if side == "receivers":
@@ -560,6 +607,8 @@ class NmosNode:
         return self._empty_sender_active(domain_id, flow)
 
     def patch_staged(self, resource_id: str, side: str, body: dict[str, Any]) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         with self.lock:
             current = dict(self.staged(resource_id, side))
             if "master_enable" in body:

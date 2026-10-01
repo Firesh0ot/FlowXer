@@ -42,6 +42,8 @@ def test_nmos_testing_script_invokes_amwa_cli() -> None:
     assert "nmos-test.py" in text
     assert "--entrypoint python3" in text
     assert "amwa/nmos-testing" in text
+    assert "test_04" in text
+    assert "--ignore" in text
     userconfig = (ROOT / "scripts" / "nmos-testing-userconfig.py").read_text(encoding="utf-8")
     assert "ENABLE_DNS_SD = False" in userconfig
 

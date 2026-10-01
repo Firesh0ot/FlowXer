@@ -125,7 +125,7 @@ The image entrypoint starts the web UI; the script overrides it with
 `python3 nmos-test.py suite …` and mounts `scripts/nmos-testing-userconfig.py`
 (`ENABLE_DNS_SD = False`). GitHub Actions runs this on **PRs into `stage` or
 `main`** and on the **Stage** workflow (not on every PR into `dev`). You can
-also dispatch **Actions → CI**. Expected gaps: DNS-SD registry discovery and
-the IS-04 events WebSocket (reserved port 3253, not implemented). Revisit
-nvnmosd only if those suites fail for Node/Connection API gaps Option C
-cannot fix.
+also dispatch **Actions → CI**. IS-04-01 mock-registry discovery tests
+(`test_04`, `test_07`–`test_10`) are `--ignore`d: FlowXer uses
+`FLOWXER_NMOS_REGISTRY_URL`, not DNS-SD. Revisit nvnmosd only if those suites
+fail for Node/Connection API gaps Option C cannot fix.
