@@ -100,8 +100,7 @@ RUN pip3 install --no-cache-dir --break-system-packages /app \
     && pip3 install --no-cache-dir --break-system-packages 'aiortc==1.9.0' \
     && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
-    && mkdir -p /mxl-domain /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache \
-    && cp /app/configs/domain_def.json /mxl-domain/domain_def.json
+    && mkdir -p /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache
 
 ENV LD_LIBRARY_PATH=/opt/mxl/lib:/opt/gstcef
 ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer-1.0

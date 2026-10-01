@@ -15,6 +15,14 @@ def flow_uuid(group_hint: str, role: str) -> str:
     return str(uuid.uuid5(FLOWXER_NAMESPACE, f"{group_hint}:{role}"))
 
 
+def output_domain_uuid(seed: str) -> str:
+    return str(uuid.uuid5(FLOWXER_NAMESPACE, f"{seed}:mxl-output-domain"))
+
+
+def seed_short(seed: str) -> str:
+    return uuid.uuid5(FLOWXER_NAMESPACE, seed).hex[:8]
+
+
 def video_flow_def(
     *,
     flow_id: str,

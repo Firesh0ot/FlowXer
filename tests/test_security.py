@@ -29,6 +29,9 @@ def test_apache_license_and_notice_are_complete() -> None:
     assert "docker/build-mxl.sh" in dockerfile
     assert "docker/build-cef.sh" in dockerfile
     assert "pre-built" not in dockerfile
+    assert "cp /app/configs/domain_def.json /mxl-domain/domain_def.json" not in dockerfile
+    entrypoint = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert "domain_def.json" not in entrypoint
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'license = { text = "Apache-2.0" }' in pyproject
     gui_pkg = (ROOT / "gui" / "package.json").read_text(encoding="utf-8")
@@ -135,7 +138,7 @@ def test_start_rejects_domain_override(mixer: VisionMixer, tmp_path: Path) -> No
         mixer.start(MixerStartRequest(domain=str(tmp_path / "other-domain"), program_input_id="cam-1"))
     mixer.start(
         MixerStartRequest(
-            domain=str(mixer.settings.mxl_domain.resolve()),
+            domain=str(mixer.settings.output_domain.resolve()),
             program_input_id="cam-1",
         )
     )

@@ -34,7 +34,7 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
-from flowxer.domain.mxl_domain import load_domain_info
+from flowxer.domain.mxl_domain import load_domain_info, scan_domains
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
@@ -70,7 +70,9 @@ def health(
         status="ok",
         service="flowxer-vision-mixer",
         version=settings.version,
-        mxl_domain=str(settings.mxl_domain),
+        mxl_domain=str(settings.output_domain),
+        mxl_root=str(settings.mxl_root),
+        mxl_output_domain_id=settings.resolved_output_domain_id,
         gstreamer=bool(caps["gstreamer"]),
         mxl_plugins=bool(caps["mxl_plugins"]),
         simulate=mixer.backend == "simulate" or settings.simulate,
@@ -90,7 +92,9 @@ def config(settings: Settings = Depends(get_settings)) -> dict:
         "audio_media_type": settings.audio_media_type,
         "audio_rate": settings.audio_rate,
         "audio_channels": settings.audio_channels,
-        "mxl_domain": str(settings.mxl_domain),
+        "mxl_domain": str(settings.output_domain),
+        "mxl_root": str(settings.mxl_root),
+        "mxl_output_domain_id": settings.resolved_output_domain_id,
         "storage_root": str(settings.storage_root),
         "group_hint": settings.group_hint,
         "default_stinger": settings.default_stinger,
@@ -102,20 +106,33 @@ def config(settings: Settings = Depends(get_settings)) -> dict:
     "/domain",
     response_model=DomainInfo,
     tags=["mxl"],
-    summary="Inspect the mounted MXL domain",
+    summary="Inspect FlowXer's output MXL domain",
 )
 def domain(
     mixer: VisionMixer = Depends(get_mixer),
     settings: Settings = Depends(get_settings),
 ) -> DomainInfo:
-    return load_domain_info(settings.mxl_domain)
+    return load_domain_info(settings.output_domain)
+
+
+@router.get(
+    "/domains",
+    response_model=list[DomainInfo],
+    tags=["mxl"],
+    summary="List MXL domains under FLOWXER_MXL_ROOT (including mirror domains)",
+)
+def domains(
+    mixer: VisionMixer = Depends(get_mixer),
+    settings: Settings = Depends(get_settings),
+) -> list[DomainInfo]:
+    return scan_domains(settings.mxl_root)
 
 
 @router.get(
     "/domain/flows",
     response_model=list[FlowDescriptor],
     tags=["mxl"],
-    summary="List MXL essences (video/v210 and audio/float32 flows)",
+    summary="List MXL essences (video/v210 and audio/float32 flows) in every scanned domain",
 )
 def domain_flows(mixer: VisionMixer = Depends(get_mixer)) -> list[FlowDescriptor]:
     return mixer.domain_flows()

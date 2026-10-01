@@ -44,9 +44,9 @@ def collect_resources(mixer) -> dict[str, Any]:
                 "message": "GStreamer/MXL plugins not on-air — WebRTC monitors are generated previews",
             }
         )
-    domain = mixer.settings.mxl_domain
+    domain = mixer.settings.output_domain
     if not (domain / "domain_def.json").exists():
-        issues.append({"level": "warning", "message": f"MXL domain missing at {domain}"})
+        issues.append({"level": "warning", "message": f"MXL output domain missing at {domain}"})
     if mixer.state.value == "error":
         issues.append({"level": "error", "message": "Mixer is in error state"})
     for receiver in getattr(getattr(mixer, "tally", None), "status", lambda: [])():
