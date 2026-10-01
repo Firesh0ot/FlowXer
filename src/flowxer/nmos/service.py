@@ -21,6 +21,14 @@ FORMAT_VIDEO = "urn:x-nmos:format:video"
 FORMAT_AUDIO = "urn:x-nmos:format:audio"
 GROUPHINT = "urn:x-nmos:tag:grouphint/v1.0"
 NULL_ACTIVATION = {"mode": None, "requested_time": None, "activation_time": None}
+STAGED_PATCH_FIELDS = {
+    "sender_id",
+    "receiver_id",
+    "master_enable",
+    "activation",
+    "transport_params",
+    "transport_file",
+}
 
 
 def nmos_version() -> str:
@@ -101,6 +109,7 @@ class NmosNode:
         self.activations_error = 0
         self._staged: dict[str, dict[str, Any]] = {}
         self._active: dict[str, dict[str, Any]] = {}
+        self._scheduled: dict[str, threading.Timer] = {}
         self._input_states: dict[str, dict[str, str]] = {}
         self._stop = threading.Event()
         self._server = None
@@ -299,7 +308,6 @@ class NmosNode:
                     "chassis_id": None,
                     "port_id": "00-00-00-00-00-00",
                     "name": "mgmt",
-                    "attached_network_device": None,
                 }
             ],
             "api": {
@@ -385,7 +393,7 @@ class NmosNode:
                         "tags": {GROUPHINT: [f"{item.id}:{role.title()}"]},
                         "device_id": self.device_uuid,
                         "transport": TRANSPORT_MXL,
-                        "interface_bindings": ["mgmt"],
+                        "interface_bindings": [],
                         "subscription": {
                             "sender_id": active.get("sender_id"),
                             "active": bool(active.get("master_enable")),
@@ -416,7 +424,7 @@ class NmosNode:
                         "device_id": self.device_uuid,
                         "manifest_href": None,
                         "transport": TRANSPORT_MXL,
-                        "interface_bindings": ["mgmt"],
+                        "interface_bindings": [],
                         "subscription": {
                             "receiver_id": None,
                             "active": bool(outputs),
@@ -436,10 +444,17 @@ class NmosNode:
             "numerator": self.settings.frame_rate_num,
             "denominator": self.settings.frame_rate_den,
         }
-        channels = [
-            {"label": f"Channel {index + 1}", "symbol": f"NSC{index + 1:03d}"}
-            for index in range(max(1, self.settings.audio_channels))
-        ]
+        count = max(1, self.settings.audio_channels)
+        if count == 2:
+            channels = [
+                {"label": "Left Channel", "symbol": "L"},
+                {"label": "Right Channel", "symbol": "R"},
+            ]
+        else:
+            channels = [
+                {"label": f"Channel {index + 1}", "symbol": f"NSC{index + 1:03d}"}
+                for index in range(count)
+            ]
         for panel in self.mixer.panels or []:
             video = {
                 "id": ids.source_id(self.seed, panel.id, "video"),
@@ -497,6 +512,7 @@ class NmosNode:
                 "frame_height": height,
                 "colorspace": "BT709",
                 "interlace_mode": "progressive",
+                "transfer_characteristic": "SDR",
                 "components": [
                     {"name": "Y", "width": width, "height": height, "bit_depth": 10},
                     {"name": "Cb", "width": width // 2, "height": height, "bit_depth": 10},
@@ -570,13 +586,7 @@ class NmosNode:
                 "mxl_flow_id": {},
             }
         domain_id = self.settings.resolved_output_domain_id
-        outputs = self.mixer.outputs
-        flow = None
-        for panel in self.mixer.panels or []:
-            if ids.sender_id(self.seed, panel.id, "video") == resource_id and outputs:
-                flow = outputs.video_flow_id
-            if ids.sender_id(self.seed, panel.id, "audio") == resource_id and outputs:
-                flow = outputs.audio_flow_id
+        flow = self._sender_mxl_flow(resource_id)
         return {
             "mxl_domain_id": {"enum": [domain_id]},
             "mxl_flow_id": {"enum": [flow]} if flow else {},
@@ -597,18 +607,25 @@ class NmosNode:
         if side == "receivers":
             return self._empty_receiver_active()
         domain_id = self.settings.resolved_output_domain_id
-        flow = None
+        return self._empty_sender_active(domain_id, self._sender_mxl_flow(resource_id))
+
+    def _sender_mxl_flow(self, resource_id: str) -> str | None:
         outputs = self.mixer.outputs
+        if not outputs:
+            return None
         for panel in self.mixer.panels or []:
-            if ids.sender_id(self.seed, panel.id, "video") == resource_id and outputs:
-                flow = outputs.video_flow_id
-            if ids.sender_id(self.seed, panel.id, "audio") == resource_id and outputs:
-                flow = outputs.audio_flow_id
-        return self._empty_sender_active(domain_id, flow)
+            if ids.sender_id(self.seed, panel.id, "video") == resource_id:
+                return outputs.video_flow_id
+            if ids.sender_id(self.seed, panel.id, "audio") == resource_id:
+                return outputs.audio_flow_id
+        return None
 
     def patch_staged(self, resource_id: str, side: str, body: dict[str, Any]) -> dict[str, Any]:
         resource_id = resource_id.rstrip("/")
         side = side.rstrip("/")
+        unknown = sorted(set(body) - STAGED_PATCH_FIELDS)
+        if unknown:
+            raise NmosActivationError(f"unknown fields: {', '.join(unknown)}")
         with self.lock:
             current = dict(self.staged(resource_id, side))
             if "master_enable" in body:
@@ -643,11 +660,11 @@ class NmosNode:
             activation = (body.get("activation") or {}).get("mode")
             if activation in {None, ""}:
                 return current
-            if activation != "activate_immediate":
-                raise NmosActivationError(
-                    "only activate_immediate is supported (scheduled activations are not)"
-                )
-            return self.activate(resource_id, side)
+            if activation == "activate_immediate":
+                return self.activate(resource_id, side)
+            if activation in {"activate_scheduled_relative", "activate_scheduled_absolute"}:
+                return self._schedule_activation(resource_id, side, current["activation"])
+            raise NmosActivationError(f"unsupported activation mode {activation!r}")
 
     def _validate_params(
         self,
@@ -675,17 +692,30 @@ class NmosNode:
             raise NmosActivationError("receiver mxl_flow_id must not be auto")
         if domain_id == "auto":
             domain_id = self.settings.resolved_output_domain_id
+        if side == "senders" and flow_id == "auto":
+            flow_id = self._sender_mxl_flow(resource_id)
         return [{"mxl_domain_id": domain_id, "mxl_flow_id": flow_id}]
 
     def activate(self, resource_id: str, side: str) -> dict[str, Any]:
         staged = dict(self.staged(resource_id, side))
         now = nmos_version()
+        pending = staged.get("activation") or {}
+        mode = pending.get("mode")
+        if mode in {"activate_scheduled_relative", "activate_scheduled_absolute"}:
+            activation = {
+                "mode": mode,
+                "requested_time": pending.get("requested_time"),
+                "activation_time": pending.get("activation_time") or now,
+            }
+        else:
+            activation = {
+                "mode": "activate_immediate",
+                "requested_time": None,
+                "activation_time": now,
+            }
         active = dict(staged)
-        active["activation"] = {
-            "mode": "activate_immediate",
-            "requested_time": None,
-            "activation_time": now,
-        }
+        active["activation"] = activation
+        self._cancel_scheduled(resource_id)
         self._active[resource_id] = active
         staged_reset = dict(active)
         staged_reset["activation"] = dict(NULL_ACTIVATION)
@@ -697,7 +727,63 @@ class NmosNode:
         except NmosActivationError:
             self.activations_error += 1
             raise
-        return staged_reset
+        return active
+
+    def _cancel_scheduled(self, resource_id: str) -> None:
+        timer = self._scheduled.pop(resource_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_activation(
+        self, resource_id: str, side: str, activation: dict[str, Any]
+    ) -> dict[str, Any]:
+        mode = activation.get("mode")
+        requested = activation.get("requested_time")
+        if not isinstance(requested, str) or ":" not in requested:
+            raise NmosActivationError(
+                "scheduled activation requires requested_time as seconds:nanoseconds"
+            )
+        try:
+            seconds_s, nanos_s = requested.split(":", 1)
+            seconds = int(seconds_s)
+            nanos = int(nanos_s)
+        except ValueError as exc:
+            raise NmosActivationError("invalid requested_time") from exc
+        if mode == "activate_scheduled_relative":
+            delay = max(0.0, seconds + nanos / 1_000_000_000)
+            fire_at = time.time_ns() + TAI_OFFSET_NS + int(delay * 1_000_000_000)
+        else:
+            fire_at = seconds * 1_000_000_000 + nanos
+            now = time.time_ns() + TAI_OFFSET_NS
+            delay = max(0.0, (fire_at - now) / 1_000_000_000)
+        activation_time = f"{fire_at // 10**9}:{fire_at % 10**9}"
+        current = dict(self._staged[resource_id])
+        current["activation"] = {
+            "mode": mode,
+            "requested_time": requested,
+            "activation_time": activation_time,
+        }
+        self._staged[resource_id] = current
+        self._cancel_scheduled(resource_id)
+
+        def _fire() -> None:
+            with self.lock:
+                staged = self._staged.get(resource_id)
+                if not staged:
+                    return
+                pending = staged.get("activation") or {}
+                if pending.get("activation_time") != activation_time:
+                    return
+                try:
+                    self.activate(resource_id, side)
+                except NmosActivationError:
+                    log.debug("scheduled activation failed for %s", resource_id, exc_info=True)
+
+        timer = threading.Timer(delay, _fire)
+        timer.daemon = True
+        self._scheduled[resource_id] = timer
+        timer.start()
+        return current
 
     def _apply_receiver(self, resource_id: str, active: dict[str, Any]) -> None:
         found = self._lookup_receiver(resource_id)
