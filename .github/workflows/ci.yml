@@ -25,12 +25,9 @@ jobs:
 
   nmos-testing:
     name: AMWA NMOS testing tool
-    # Skip ordinary PRs into dev (pytest is the gate). Run on the release path:
-    # workflow_dispatch, and PRs into stage (dev→stage) or main (stage→main).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       (github.base_ref == 'stage' || github.base_ref == 'main'))
+    # Run on every PR (including into dev) so Node/Connection API gaps fail
+    # on the feature PR instead of the first promotion to stage.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 45
