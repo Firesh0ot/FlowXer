@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { MixerStatus, ResourceInfo } from "../api";
+import type { MixerStatus, NmosStatus, ResourceInfo } from "../api";
 
 function mb(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
@@ -14,16 +14,26 @@ function uptime(seconds: number): string {
   return `${s}s`;
 }
 
+function nmosChip(nmos?: NmosStatus): string | null {
+  if (!nmos) return null;
+  if (!nmos.enabled) return "NMOS off";
+  if (!nmos.registry_url) return "NMOS";
+  return nmos.registry_up ? "NMOS up" : "NMOS down";
+}
+
 export function StatusChip({
   resources,
   mixer,
   formatId,
+  nmos,
 }: {
   resources: ResourceInfo;
   mixer: MixerStatus;
   formatId: string;
+  nmos?: NmosStatus;
 }) {
   const [open, setOpen] = useState(false);
+  const nmosState = nmos ?? mixer.nmos;
 
   useEffect(() => {
     if (!open) return;
@@ -35,6 +45,7 @@ export function StatusChip({
   }, [open]);
 
   const issueCount = resources.issues.length;
+  const nmosLabel = nmosChip(nmosState);
   return (
     <div className="status-menu">
       <button
@@ -49,6 +60,7 @@ export function StatusChip({
         <span>CPU {resources.cpu_percent.toFixed(0)}%</span>
         <span>RAM {resources.memory_percent.toFixed(0)}%</span>
         <span>{formatId}</span>
+        {nmosLabel ? <span>{nmosLabel}</span> : null}
       </button>
       {open ? (
         <>
@@ -98,6 +110,45 @@ export function StatusChip({
                 </>
               ) : null}
             </dl>
+            <h3>NMOS</h3>
+            {nmosState ? (
+              <dl>
+                <dt>Node</dt>
+                <dd>{nmosState.enabled ? nmosState.node_id : "disabled"}</dd>
+                {nmosState.enabled ? (
+                  <>
+                    <dt>Registry</dt>
+                    <dd>
+                      {nmosState.registry_url || "(none)"}
+                      {nmosState.registry_url
+                        ? nmosState.registry_up
+                          ? " · up"
+                          : " · down"
+                        : ""}
+                    </dd>
+                    <dt>API</dt>
+                    <dd>{nmosState.href}</dd>
+                  </>
+                ) : null}
+              </dl>
+            ) : (
+              <p className="hint">NMOS disabled</p>
+            )}
+            {nmosState?.enabled && nmosState.receivers.length ? (
+              <ul className="status-issues nmos-receivers">
+                {nmosState.receivers.map((item) => (
+                  <li key={item.receiver_id}>
+                    <strong>
+                      {item.input_id} {item.role}
+                    </strong>{" "}
+                    {item.state}
+                    {item.mxl_flow_id ? ` · ${item.mxl_flow_id.slice(0, 8)}` : ""}
+                  </li>
+                ))}
+              </ul>
+            ) : nmosState?.enabled ? (
+              <p className="hint">No live-input receivers (test/black/file/replay have none)</p>
+            ) : null}
             <h3>Issues {issueCount ? `(${issueCount})` : ""}</h3>
             {issueCount ? (
               <ul className="status-issues">

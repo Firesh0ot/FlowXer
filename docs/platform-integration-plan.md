@@ -129,34 +129,36 @@ the activation, state `waiting`, retry scan.
 
 ## 3. Decisions
 
-### 3.1 NMOS implementation — **Option A, `nvnmosd` + Python gRPC**
+### 3.1 NMOS implementation — **Option C (in-process FastAPI node)**
 
 Evaluate order required Option A first.
 
 | Option | Verdict |
 |---|---|
-| **A: NvNmos `nvnmosd`** | **Chosen.** Apache-2.0, BCP-007-03 already implemented, nmos-cpp Node API for Qvest / AMWA tests, static registry, host IP, seed-based IDs. FlowXer remains the data plane: gRPC activations update logical inputs. |
-| A: `gst-nmos-rs` | **Rejected.** `nmossrc`/`nmossink` own 1:1 pipelines. FlowXer needs `input-selector` + compositor + CEF overlay + stinger. Replacing mxlsrc with nmossrc would break the mixer. |
-| B: nmos-cpp sidecar | **Rejected.** Same C++ stack as NvNmos without the MXL transport file / BCP-007-03 wiring. mxl-decklink embeds nmos-cpp because it is C++; we are Python. |
-| C: FastAPI IS-04/IS-05 | **Fallback only.** Use if nvnmosd cannot be built in the mixer image, cannot advertise `FLOWXER_NMOS_HOST_IP`, cannot disable DNS-SD, or cannot ACK an activation whose domain/flow is not on disk yet. Record the switch here. |
+| A: NvNmos `nvnmosd` | Evaluated first. Apache-2.0, BCP-007-03, seed IDs, static registry. **Not used:** `AckActivation` NACK becomes HTTP 500, so a missing domain/flow cannot ACK-then-wait. Building nmos-cpp + gRPC into the mixer image is a large extra toolchain. |
+| A: `gst-nmos-rs` | **Rejected.** `nmossrc`/`nmossink` own 1:1 pipelines. FlowXer needs `input-selector` + compositor + CEF overlay + stinger. |
+| B: nmos-cpp sidecar | **Rejected.** Same C++ stack as NvNmos without a Python control-plane API. |
+| **C: FastAPI IS-04/IS-05** | **Chosen.** Same process as the mixer. Immediate activations ACK when params are well-formed; the input goes to `waiting` and retries. Node API on 3252, Connection API IS-05 v1.2, BCP-007-03 `mxl_domain_id` / `mxl_flow_id`. Must still pass AMWA IS-04-01 / IS-05-01 / IS-05-02 (work item 9). Revisit nvnmosd if those suites fail for reasons Option C cannot fix. |
 
 **Ack vs waiting:** NvNmos NACKs become HTTP 500. The prompt requires accepting
-activations for missing domains. FlowXer will **ACK success** as soon as
-parameters are well-formed, put the input in `waiting`, and retry attach.
-Malformed UUIDs still NACK with a standard IS-05 error.
+activations for missing domains. FlowXer **ACK success** as soon as
+parameters are well-formed, puts the input in `waiting`, and retries attach.
+Malformed UUIDs still return a standard IS-05 400.
 
-**Process layout:** mixer entrypoint starts `nvnmosd` as a child when
-`FLOWXER_NMOS_ENABLE=true` (Unix socket `/tmp/nvnmosd.sock`). Kubernetes stay
-at two containers (mixer, GUI). `FLOWXER_NMOS_ENABLE=false` (tests / local
-simulate without a registry) keeps today’s behaviour and does not bind 3252.
+**Process layout:** when `FLOWXER_NMOS_ENABLE=true`, `create_app` lifespan
+starts the Node API (uvicorn thread, bind `0.0.0.0:3252`) plus a waiting-retry
+thread and, if `FLOWXER_NMOS_REGISTRY_URL` is set, a registration heartbeat.
+`FLOWXER_NMOS_BIND=false` skips the listen socket (pytest). Kubernetes stay
+at two containers (mixer, GUI). `FLOWXER_NMOS_ENABLE=false` keeps today’s
+behaviour and does not bind 3252.
 
 **IDs:**
 
 - Seed: `FLOWXER_NMOS_SEED` (default `{hostname}-flowxer`).
 - Device label: `FlowXer Vision Mixer`.
-- Receiver names: `{input_id}-video`, `{input_id}-audio` (stable).
+- Receiver names: `{input_id}-video`, `{input_id}-audio` (UUIDv5 from seed + those parts).
 - Sender names: `{panel_id}-pgm-video`, `{panel_id}-pgm-audio`.
-- NvNmos derives Node/Device/Source/Flow/Sender/Receiver UUIDs from seed + name.
+- IS-04 Flow UUID ≠ MXL `mxl_flow_id` (copied into sender active params).
 
 ### 3.2 Multi-domain MXL
 
@@ -252,12 +254,12 @@ Node that cannot resolve domains would fail the fabrics agent.
 |---|---|
 | **1** | This plan (`docs/platform-integration-plan.md`) |
 | **2** | Work item 2: multi-domain scan, output domain, `domain_id` on REST, deprecate `FLOWXER_MXL_DOMAIN`, stop baking `domain_def.json` |
-| **3** | Work item 1: nvnmosd + gRPC, receivers/senders, REST↔IS-05, input states, GUI status, `/console` |
+| **3** | Work item 1: in-process IS-04/IS-05 node (Option C), receivers/senders, REST↔IS-05, input states, GUI status, `/console`, `docs/nmos.md` |
 | **4** | Work item 3: `MXL_REF=218ddaa`, non-root, image label, `git-<sha>` tags, health `mxl_revision` |
 | **5** | Work item 4: bind `127.0.0.1`, `FLOWXER_MIXER_URL`, WebRTC ICE/ports |
 | **6** | Work item 5: metrics, `/livez` `/readyz`, Grafana |
 | **7** | Work item 6: `deploy/kubernetes/flowxer.yaml`, `docker-compose.host.yml`, README platform section |
-| **8** | Work item 8–9: `docs/nmos.md`, AMWA testing script/CI, remaining OpenAPI / `.env.example` |
+| **8** | Work item 8–9: AMWA testing script/CI, remaining OpenAPI / `.env.example` |
 | later | Work item 7 GPU |
 
 Smaller slices inside 2–3 are allowed if a PR grows past review size.
@@ -274,14 +276,14 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
   48 kHz, configured channel counts (BCP-004-01).
 - `test`, `black`, `file`, `replay`: **no** receivers.
 - Creating/deleting inputs or changing `logical_source_count` adds/removes
-  receivers via NvNmos `AddReceiver` / `RemoveResource`.
+  receivers.
 
 ### Program senders
 
 - Per mixer panel PGM: video + audio sender, IS-04 Source + Flow, active
   `mxl_domain_id` = output domain id, `mxl_flow_id` = PGM flow UUIDs.
 - Raster / group-hint change mints new PGM flow UUIDs (existing UUIDv5 scheme)
-  and `SyncResourceState` on the senders. Crosspoint follows `mxl_flow_id`.
+  and `sync_senders_from_outputs` on the senders. Crosspoint follows `mxl_flow_id`.
 
 ### Activation state machine (per essence)
 
@@ -291,15 +293,14 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
 - Flow present, no new grains: `no_signal`.
 - `master_enable: false`: black, stop mxlsrc, `not_routed`.
 - IS-04 receiver `subscription` (`sender_id`, `active`) updated on every
-  activation — fabrics agent depends on it (NvNmos does this when we ACK /
-  Sync).
+  activation — fabrics agent depends on it.
 - Video and audio of one input may come from different senders / domains.
 
 ### REST ↔ IS-05
 
 - IS-05 activation ≡ `PATCH /inputs/{id}` for that essence (`flow_id`,
   `domain_id`, enable).
-- REST PATCH ≡ `SyncResourceState` on the matching receiver.
+- REST PATCH ≡ IS-05 active + IS-04 `subscription` on the matching receiver.
 
 ---
 
@@ -311,10 +312,9 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
 2. **`/readyz` vs registry down** — prefer “Node up + output domain writable”
    so a registry blip does not kill the mixer; expose `nmos_registry_up` in
    metrics. Confirm against lab ops.
-3. **nvnmosd in the mixer image** — extra nmos-cpp/Avahi build. If image build
-   time or size is unacceptable, fallback Option C or a third container.
-   Avahi libs may be linked even with DNS-SD off; install them, do not run
-   `avahi-daemon` by default.
+3. **nvnmosd vs Option C** — Option C shipped in PR 3 because ACK-then-wait
+   cannot be expressed as an NvNmos NACK. Revisit if AMWA IS-04-01 / IS-05-01
+   fail for Node/Connection API gaps (events WebSocket, scheduled activations).
 4. **GHCR visibility** — needs a human in GitHub package settings.
 5. **Multiple ME program buses** — today one PGM compositor. Senders are
    created per panel; extra MEs still share one program bus until a future
@@ -330,7 +330,8 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
 |---|---|
 | Work-item order 1 then 2 | Item **2 before 1** so `mxl_domain_id` resolves. |
 | `FLOWXER_READ_OFFSET_GRAINS` default 2 applied to the reader | **No-op** on mxlsrc; documented. |
-| Option A includes evaluating gst-nmos-rs as a data plane | **Not used** for media; nvnmosd only. |
+| Option A includes evaluating gst-nmos-rs as a data plane | **Not used** for media. |
+| Option A nvnmosd | **Option C** in-process FastAPI node so missing-domain activations ACK. |
 | Bake nothing / copy domain into `/mxl-domain` | Stop copying; create output domain at runtime. |
 | `FLOWXER_HOST` 0.0.0.0 today | Default **127.0.0.1**; bridge Compose overrides. |
 | Make GHCR public in-repo | Document the GitHub UI step; cannot toggle from git. |
@@ -352,3 +353,4 @@ integration and AMWA script in PR 8).
 
 - **PR 1** (`cursor/platform-integration-plan-85ef`): this file.
 - **PR 2** (`cursor/mxl-multi-domain-85ef`): `FLOWXER_MXL_ROOT` scan, output domain create, `domain_id` on essences, refuse mirrors, stop baking `domain_def.json`, deprecate `FLOWXER_MXL_DOMAIN`. `FLOWXER_READ_OFFSET_GRAINS` logged as ignored.
+- **PR 3** (`cursor/nmos-node-85ef`): in-process IS-04 v1.3 / IS-05 v1.2 / BCP-007-03 node (Option C). Live-input receivers, PGM senders, REST↔IS-05, waiting retry, GUI status, `docs/nmos.md`. NvNmos evaluated and not used (cannot ACK missing-domain activations).

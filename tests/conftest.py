@@ -15,7 +15,6 @@ def settings(tmp_path: Path) -> Settings:
         mxl_root=root,
         mxl_output_domain_dir=root / "flowxer-test",
         mxl_output_domain_id="flowxer-test",
-        nmos_seed="test-flowxer",
         storage_root=tmp_path / "storage",
         simulate=True,
         gst_mode="simulate",
@@ -27,6 +26,9 @@ def settings(tmp_path: Path) -> Settings:
         overlay_url="http://127.0.0.1:9610/graphics/lower-third.html",
         group_hint="FlowXerTest",
         stinger_auto_tick=False,
+        nmos_enable=False,
+        nmos_bind=False,
+        nmos_seed="test-flowxer",
     )
 
 

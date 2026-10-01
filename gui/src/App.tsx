@@ -129,6 +129,7 @@ export default function App() {
           resources={snapshot.resources}
           mixer={snapshot.mixer}
           formatId={snapshot.workspace.format_id}
+          nmos={snapshot.nmos ?? snapshot.mixer.nmos}
         />
       </header>
 

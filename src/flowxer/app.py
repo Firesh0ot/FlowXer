@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
@@ -81,9 +82,16 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
     settings = settings or get_settings()
     mixer = mixer or VisionMixer(settings)
 
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        mixer.nmos.boot()
+        yield
+        mixer.nmos.shutdown()
+
     app = FastAPI(
         title=settings.title,
         version=settings.version,
+        lifespan=lifespan,
         description=(
             "FlowXer is a Dynamic Media Facility (DMF) vision mixer media function. "
             "It is controlled entirely over HTTP, documents itself with OpenAPI, and "
@@ -95,7 +103,10 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
             "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
             "The operator GUI on port 9620 is a thin client of this API. "
             "TSL UMD 5.0 carries Program/Preview tally and source labels to "
-            "Companion, VSM, BFE, Riedel HI, and other listeners."
+            "Companion, VSM, BFE, Riedel HI, and other listeners. "
+            "When FLOWXER_NMOS_ENABLE is true, an IS-04/IS-05 node on "
+            "FLOWXER_NMOS_PORT (default 3252) advertises live-input receivers "
+            "and program senders for BCP-007-03 MXL routing."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},

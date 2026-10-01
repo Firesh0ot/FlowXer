@@ -77,6 +77,31 @@ export interface MixerStatus {
   wipe_armed?: boolean;
   last_transition?: string;
   error?: string | null;
+  nmos?: NmosStatus;
+}
+
+export interface NmosReceiverStatus {
+  input_id: string;
+  role: string;
+  receiver_id: string;
+  state: string;
+  master_enable: boolean;
+  sender_id?: string | null;
+  mxl_domain_id?: string | null;
+  mxl_flow_id?: string | null;
+}
+
+export interface NmosStatus {
+  enabled: boolean;
+  registry_url: string;
+  registry_up: boolean;
+  node_id: string;
+  device_id: string;
+  href: string;
+  host_ip: string;
+  port: number;
+  dns_sd: boolean;
+  receivers: NmosReceiverStatus[];
 }
 
 export interface ResourceInfo {
@@ -134,6 +159,7 @@ export interface ConsoleState {
   clips: { name: string; path: string }[];
   stingers: StingerInfo[];
   tally?: TallyConfig;
+  nmos?: NmosStatus;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
