@@ -58,8 +58,20 @@ command -v cmake
 git init /mxl
 cd /mxl
 git remote add origin "${MXL_REPO}"
+# GitHub advertises full commit SHAs and branch/tag names, not 7-char abbreviations.
+# Short pins such as 218ddaa fail with "couldn't find remote ref".
+set +e
 git fetch --depth 1 origin "${MXL_REF}"
-git checkout FETCH_HEAD
+fetch_status=$?
+set -e
+if [[ "${fetch_status}" -eq 0 ]]; then
+  git checkout FETCH_HEAD
+else
+  branch="${MXL_BRANCH:-release/v1.1}"
+  echo "MXL_REF ${MXL_REF} is not a remote ref; fetching ${branch} and checking out the pin"
+  git fetch --filter=blob:none origin "${branch}"
+  git checkout --detach "${MXL_REF}"
+fi
 
 cd /mxl/rust
 cargo build --manifest-path Cargo.toml -p gst-mxl-rs --release --locked

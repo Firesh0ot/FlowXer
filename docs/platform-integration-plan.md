@@ -204,8 +204,9 @@ record it here. Simulate-mode unit tests cover the state machine without GST.
 
 ### 3.5 Image and MXL revision
 
-- Default `MXL_REF=218ddaa` (compatible with `v1.1.0`; pin matches
-  mxl-fabrics-agent). One build-arg. Label `io.dmf.mxl.revision`.
+- Default `MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7` (short `218ddaa`;
+  GitHub `git fetch` rejects the abbreviation). Compatible with `v1.1.0`; pin
+  matches mxl-fabrics-agent. One build-arg. Label `io.dmf.mxl.revision`.
 - `MXL_ENABLE_FABRICS_OFI` stays off (already the case in `docker/build-mxl.sh`).
 - `USER 1000:1000`. Own `/storage`, CEF cache, `/tmp` bits we write.
 - No runtime network for CEF downloads. HTML keyer URLs remain the operator's
@@ -362,3 +363,4 @@ integration and AMWA script in PR 8).
 - **PR 5** (`cursor/network-bind-85ef`): `FLOWXER_HOST` default 127.0.0.1 (bridge Compose overrides 0.0.0.0), GUI `FLOWXER_MIXER_URL` / `FLOWXER_GUI_PORT`, WebRTC host ICE IP + UDP range wrap.
 - **PR 6** (`cursor/metrics-probes-85ef`): Prometheus `flowxer_*` at `/metrics` and `/api/v1/metrics`, `/livez` `/readyz` (registry blip does not fail ready), Grafana `deploy/grafana/flowxer.json`.
 - **PR 7** (`cursor/k8s-amwa-85ef`): `deploy/kubernetes/flowxer.yaml`, `docker-compose.host.yml`, README platform section, `scripts/nmos-testing.sh` + workflow_dispatch CI job for AMWA IS-04-01 / IS-05-01 / IS-05-02.
+- **Follow-up** (`cursor/amwa-release-ci-85ef`): AMWA job was `workflow_dispatch`-only, so PRs #43 (dev→stage) and #44 (stage→main) skipped it. It now runs on PRs into `stage`/`main` and on the Stage workflow. Mixer image pin is the full SHA `218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7` because GitHub rejects `git fetch origin 218ddaa` (`couldn't find remote ref`).

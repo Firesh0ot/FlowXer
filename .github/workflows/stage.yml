@@ -73,6 +73,19 @@ jobs:
           npm ci
           npx tsc --noEmit
 
+  nmos-testing:
+    name: AMWA NMOS testing tool
+    needs: [test]
+    if: ${{ needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stage
+      - uses: ./.github/actions/nmos-testing
+
   container:
     needs: [test]
     runs-on: ubuntu-latest
