@@ -218,7 +218,7 @@ Services:
 
 The mixer image builds these from source. You do not compile them yourself:
 
-- [MXL](https://github.com/dmf-mxl/mxl) `release/v1.1` at commit `218ddaa` (same pin as mxl-fabrics-agent; gst-mxl-rs is compatible with tag `v1.1.0`) — `libmxl` plus `mxlsrc` / `mxlsink` (`/opt/mxl`). Image label `io.dmf.mxl.revision` and `GET /api/v1/health` `mxl_revision` record the pin.
+- [MXL](https://github.com/dmf-mxl/mxl) `release/v1.1` at commit `218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7` (same pin as mxl-fabrics-agent; gst-mxl-rs is compatible with tag `v1.1.0`) — `libmxl` plus `mxlsrc` / `mxlsink` (`/opt/mxl`). Image label `io.dmf.mxl.revision` and `GET /api/v1/health` `mxl_revision` record the pin.
 - [`gstcefsrc`](https://github.com/centricular/gstcefsrc) — `cefsrc` HTML keyer and the CEF runtime (`/opt/gstcef`)
 
 When those plugins load, Program is published as MXL `video/v210` and `audio/float32`, and the HTML overlay uses `cefsrc`. If a plugin is missing, the mixer falls back to `fakesink` and a Pillow lower-third.
@@ -322,7 +322,7 @@ NMOS_TESTING_SUITES=IS-04-01,IS-05-01,IS-05-02,BCP-007-03-01 \
   bash scripts/nmos-testing.sh http://127.0.0.1:3252
 ```
 
-GitHub Actions: **Actions → CI → Run workflow** runs the `nmos-testing` job (`continue-on-error`; IS-04-01 DNS-SD / events WebSocket are expected gaps). Grafana: `deploy/grafana/flowxer.json`.
+GitHub Actions runs the `nmos-testing` job on **PRs into `stage` or `main`** (dev→stage and stage→main) and on every **Stage** workflow after pytest. Manual: **Actions → CI → Run workflow**. `continue-on-error` so IS-04-01 DNS-SD / events WebSocket gaps do not block the promotion; JUnit XML is uploaded as an artifact. Grafana: `deploy/grafana/flowxer.json`.
 
 ## Local development
 
@@ -422,7 +422,7 @@ code     test       container
 | Branch | What you do | Automation |
 |--------|-------------|------------|
 | **dev** | Write code. Open PRs into `dev`. | Push increments the **patch** (code) counter. Tests run on the PR (`ci.yml`). |
-| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. Then merges `stage` back into `dev` so `VERSION` stays aligned. |
+| **stage** | Merge `dev` → `stage` when a slice is ready to verify. | Push increments the **minor** (stage) counter, runs pytest + typecheck, **AMWA NMOS testing** (`continue-on-error`), **builds containers without publishing**, and starts a **Cursor cloud agent** if `CURSOR_API_KEY` is set. Then merges `stage` back into `dev` so `VERSION` stays aligned. |
 | **main** | **Manually** merge `stage` → `main` when you want a release. | Push increments the **major** (main) counter, tags `vX.Y.Z`, publishes `ghcr.io/<owner>/flowxer-vision-mixer` and `flowxer-gui`, then merges `main` → `stage` → `dev`. |
 
 Example: `1.4.12` means 1 production release, 4 stage promotions, 12 coding pushes since the counters started.
