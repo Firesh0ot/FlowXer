@@ -7,11 +7,12 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from flowxer import __version__
 from flowxer.api.auth import ApiTokenMiddleware
+from flowxer.api.metrics import ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.engine.mixer import VisionMixer
 from flowxer.settings import Settings, get_settings
@@ -133,6 +134,22 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
     app.dependency_overrides[get_mixer] = lambda: app.state.mixer
     app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router, prefix="/api/v1")
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics_root() -> PlainTextResponse:
+        return PlainTextResponse(
+            render_prometheus(mixer),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/livez", include_in_schema=False)
+    def livez() -> dict:
+        return {"status": "live"}
+
+    @app.get("/readyz", include_in_schema=False)
+    def readyz():
+        code, body = ready_payload(mixer)
+        return JSONResponse(status_code=code, content=body)
     if not (settings.api_token or "").strip():
         log.warning(
             "FLOWXER_API_TOKEN is unset; the HTTP control plane is unauthenticated. "
