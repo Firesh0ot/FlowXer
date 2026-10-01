@@ -95,9 +95,13 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
 def test_health_and_config(client: TestClient) -> None:
     health = client.get("/api/v1/health").json()
     assert health["status"] == "ok"
+    assert health["mxl_output_domain_id"] == "flowxer-test"
     config = client.get("/api/v1/config").json()
     assert config["video_media_type"] == "video/v210"
     assert config["audio_media_type"] == "audio/float32"
+    assert config["mxl_output_domain_id"] == "flowxer-test"
+    domains = client.get("/api/v1/domains").json()
+    assert any(item["id"] == "flowxer-test" for item in domains)
 
 
 def test_control_surface_and_docs(client: TestClient) -> None:

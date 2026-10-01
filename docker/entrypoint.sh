@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p "${FLOWXER_MXL_DOMAIN:-/mxl-domain}" \
-         "${FLOWXER_STORAGE_ROOT:-/storage}/clips" \
+mkdir -p "${FLOWXER_STORAGE_ROOT:-/storage}/clips" \
          "${FLOWXER_STORAGE_ROOT:-/storage}/stingers" \
          "${FLOWXER_STORAGE_ROOT:-/storage}/graphics"
-
-if [[ ! -f "${FLOWXER_MXL_DOMAIN:-/mxl-domain}/domain_def.json" ]]; then
-  cp /app/configs/domain_def.json "${FLOWXER_MXL_DOMAIN:-/mxl-domain}/domain_def.json"
-fi
 
 if [[ -d /opt/mxl/lib || -d /opt/gstcef ]]; then
   ldconfig || true

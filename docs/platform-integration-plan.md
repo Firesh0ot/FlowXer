@@ -345,3 +345,10 @@ route decklink → FlowXer → decklink, mirror-domain play, raster mint, uid 10
 offline image, GUI still works). Automated tests land with the matching PR
 (domain scan in PR 2, REST↔IS-05 and state machine in PR 3, registry
 integration and AMWA script in PR 8).
+
+---
+
+## 8. Implementation log
+
+- **PR 1** (`cursor/platform-integration-plan-85ef`): this file.
+- **PR 2** (`cursor/mxl-multi-domain-85ef`): `FLOWXER_MXL_ROOT` scan, output domain create, `domain_id` on essences, refuse mirrors, stop baking `domain_def.json`, deprecate `FLOWXER_MXL_DOMAIN`. `FLOWXER_READ_OFFSET_GRAINS` logged as ignored.

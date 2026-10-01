@@ -28,7 +28,13 @@ from flowxer.api.schemas import (
     TallyReceiverStatus,
 )
 from flowxer.domain import nmos
-from flowxer.domain.mxl_domain import flows_by_group_hint, list_flows
+from flowxer.domain.mxl_domain import (
+    DomainError,
+    ensure_output_domain,
+    flows_by_group_hint_in_root,
+    list_flows_in_root,
+    resolve_domain_path,
+)
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
@@ -530,12 +536,27 @@ class VisionMixer:
         if not self.inputs:
             raise MixerError("register at least one logical input")
 
-        domain = self.settings.mxl_domain.resolve()
+        output = self.settings.output_domain.resolve()
         if request.domain:
             requested = Path(request.domain).expanduser().resolve()
-            if requested != domain:
+            if requested != output:
                 raise MixerError("MXL domain path override is not allowed")
-        domain.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_output_domain(
+                output,
+                domain_id=self.settings.resolved_output_domain_id,
+                label="FlowXer MXL domain",
+                description="Uncompressed v210 video and float32 audio essences for the FlowXer vision mixer",
+                history_duration_ns=self.settings.mxl_history_duration_ns,
+            )
+        except DomainError as exc:
+            raise MixerError(str(exc)) from exc
+        if self.settings.read_offset_grains:
+            log.info(
+                "FLOWXER_READ_OFFSET_GRAINS=%s is ignored; gst-mxl-rs mxlsrc has no "
+                "read-offset property and reads at the live edge (about one grain behind head)",
+                self.settings.read_offset_grains,
+            )
         group_hint = request.group_hint or self.settings.group_hint
         if request.overlay_url:
             try:
@@ -545,7 +566,7 @@ class VisionMixer:
         if request.overlay_enabled:
             self.overlay.enabled = True
 
-        self._bind_group_hints(domain)
+        self._bind_group_hints()
 
         video_id = nmos.flow_uuid(group_hint, "video")
         audio_id = nmos.flow_uuid(group_hint, "audio")
@@ -589,9 +610,10 @@ class VisionMixer:
             stinger=stinger,
             output_video_flow_id=video_id,
             output_audio_flow_id=audio_id,
-            domain=str(domain),
+            domain=str(output),
             use_mxl_sink=use_mxl,
             use_cefsrc=use_cef,
+            domain_paths=self._source_domain_paths(),
         )
         self.pipeline = description
 
@@ -631,20 +653,51 @@ class VisionMixer:
                 return item.id
         return next(iter(self.inputs))
 
-    def _bind_group_hints(self, domain: Path) -> None:
+    def _source_domain_paths(self) -> dict[str, str]:
+        """Map `{input_id}:video|audio` to an mxlsrc `domain` filesystem path."""
+        output = str(self.settings.output_domain.resolve())
+        root = self.settings.mxl_root
+        paths: dict[str, str] = {}
+        for item in self.list_inputs():
+            if item.kind != InputKind.mxl_live:
+                continue
+            for role, essence in (("video", item.video), ("audio", item.audio)):
+                domain_id = getattr(essence, "domain_id", None) if essence else None
+                if not domain_id:
+                    paths[f"{item.id}:{role}"] = output
+                    continue
+                resolved = resolve_domain_path(root, str(domain_id))
+                if resolved is None:
+                    log.warning(
+                        "MXL domain id %s for input %s %s not found under %s",
+                        domain_id,
+                        item.id,
+                        role,
+                        root,
+                    )
+                    paths[f"{item.id}:{role}"] = str((root / str(domain_id)).resolve())
+                else:
+                    paths[f"{item.id}:{role}"] = str(resolved)
+        return paths
+
+    def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
             if item.kind != InputKind.mxl_live or not item.group_hint:
                 continue
-            matched = flows_by_group_hint(domain, item.group_hint)
+            matched = flows_by_group_hint_in_root(self.settings.mxl_root, item.group_hint)
             if "video" in matched and (item.video is None or item.video.flow_id is None):
                 video = item.video.model_dump() if item.video else {}
                 video["flow_id"] = matched["video"].id
+                if matched["video"].domain_id:
+                    video["domain_id"] = matched["video"].domain_id
                 from flowxer.api.schemas import VideoEssence
 
                 item.video = VideoEssence(**video)
             if "audio" in matched and (item.audio is None or item.audio.flow_id is None):
                 audio = item.audio.model_dump() if item.audio else {}
                 audio["flow_id"] = matched["audio"].id
+                if matched["audio"].domain_id:
+                    audio["domain_id"] = matched["audio"].domain_id
                 from flowxer.api.schemas import AudioEssence
 
                 item.audio = AudioEssence(**audio)
@@ -1027,4 +1080,4 @@ class VisionMixer:
         )
 
     def domain_flows(self):
-        return list_flows(self.settings.mxl_domain)
+        return list_flows_in_root(self.settings.mxl_root)
