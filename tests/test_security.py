@@ -41,6 +41,11 @@ def test_apache_license_and_notice_are_complete() -> None:
     assert '"license": "Apache-2.0"' in gui_pkg
     gui_df = (ROOT / "gui" / "Dockerfile").read_text(encoding="utf-8")
     assert "USER 1000:1000" in gui_df
+    assert "FLOWXER_MIXER_URL" in gui_df
+    nginx = (ROOT / "gui" / "nginx.conf").read_text(encoding="utf-8")
+    assert "${FLOWXER_MIXER_URL}" in nginx
+    assert "${FLOWXER_GUI_PORT}" in nginx
+    assert "vision-mixer:9610" not in nginx
     workflow = (ROOT / ".github" / "workflows" / "main.yml").read_text(encoding="utf-8")
     assert "git-${{ github.sha }}" in workflow
 
@@ -48,6 +53,8 @@ def test_apache_license_and_notice_are_complete() -> None:
 def test_compose_keeps_mixer_api_on_loopback() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "127.0.0.1:9610:9610" in compose
+    assert "FLOWXER_HOST" in compose
+    assert "FLOWXER_MIXER_URL" in compose
     assert "FLOWXER_API_TOKEN" in compose
     assert "ghcr.io/firesh0ot/flowxer-vision-mixer" in compose
     assert "ghcr.io/firesh0ot/flowxer-gui" in compose

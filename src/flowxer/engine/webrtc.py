@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -17,6 +18,87 @@ def webrtc_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def peer_count() -> int:
+    return len(_PEERS)
+
+
+def rewrite_ice_host(sdp: str, public_ip: str) -> str:
+    """Advertise FLOWXER_WEBRTC_PUBLIC_IP on host ICE candidates.
+
+    aioice gathers the kernel's local address; lab clients need the management IP.
+    """
+    ip = (public_ip or "").strip()
+    if not ip:
+        return sdp
+    out: list[str] = []
+    for line in sdp.splitlines(keepends=True):
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("c=IN IP4 "):
+            out.append(f"c=IN IP4 {ip}{ending}")
+            continue
+        if stripped.startswith("a=candidate:") and " typ host" in stripped:
+            parts = stripped.split()
+            if len(parts) >= 6:
+                parts[4] = ip
+                out.append(" ".join(parts) + ending)
+                continue
+        out.append(line)
+    return "".join(out)
+
+
+def resolved_webrtc_ip(settings) -> str:
+    return (
+        (getattr(settings, "webrtc_public_ip", "") or "").strip()
+        or (getattr(settings, "nmos_host_ip", "") or "").strip()
+    )
+
+
+@asynccontextmanager
+async def ice_udp_port_range(port_min: int, port_max: int):
+    """Bind aioice host sockets in [min, max]. aioice 0.10 always uses port 0.
+
+    Documented in docs/platform-integration-plan.md: wrap create_datagram_endpoint
+    rather than a non-existent RTCConfiguration field.
+    """
+    if port_min <= 0 or port_max <= 0 or port_max < port_min:
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    original = loop.create_datagram_endpoint
+
+    async def _bound(protocol_factory, local_addr=None, **kwargs):
+        if (
+            local_addr
+            and isinstance(local_addr, tuple)
+            and len(local_addr) >= 2
+            and local_addr[1] == 0
+        ):
+            last_error: OSError | None = None
+            host = local_addr[0]
+            extra = local_addr[2:]
+            for port in range(port_min, port_max + 1):
+                try:
+                    return await original(
+                        protocol_factory, local_addr=(host, port, *extra), **kwargs
+                    )
+                except OSError as exc:
+                    last_error = exc
+            log.warning(
+                "WebRTC UDP ports %s-%s busy (%s); falling back to an ephemeral port",
+                port_min,
+                port_max,
+                last_error,
+            )
+        return await original(protocol_factory, local_addr=local_addr, **kwargs)
+
+    loop.create_datagram_endpoint = _bound  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        loop.create_datagram_endpoint = original  # type: ignore[method-assign]
 
 
 async def create_whep_answer(mixer, stream_id: str, offer_sdp: str) -> str:
@@ -70,9 +152,15 @@ async def create_whep_answer(mixer, stream_id: str, offer_sdp: str) -> str:
     _prefer_h264(sender, RTCRtpSender)
     await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type="offer"))
     answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    await _wait_ice(pc)
-    return pc.localDescription.sdp
+    settings = mixer.settings
+    async with ice_udp_port_range(
+        int(getattr(settings, "webrtc_udp_port_min", 0) or 0),
+        int(getattr(settings, "webrtc_udp_port_max", 0) or 0),
+    ):
+        await pc.setLocalDescription(answer)
+        await _wait_ice(pc)
+    sdp = pc.localDescription.sdp
+    return rewrite_ice_host(sdp, resolved_webrtc_ip(settings))
 
 
 def _as_ndarray(image):

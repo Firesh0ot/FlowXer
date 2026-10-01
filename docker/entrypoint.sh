@@ -16,4 +16,4 @@ if [[ -z "${DISPLAY:-}" ]] && command -v Xvfb >/dev/null 2>&1; then
 fi
 mkdir -p "${GST_CEF_CACHE_LOCATION:-/tmp/cef-cache}"
 
-exec uvicorn flowxer.app:create_app --factory --host "${FLOWXER_HOST:-0.0.0.0}" --port "${FLOWXER_PORT:-9610}"
+exec uvicorn flowxer.app:create_app --factory --host "${FLOWXER_HOST:-127.0.0.1}" --port "${FLOWXER_PORT:-9610}"

@@ -22,7 +22,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 9610
     title: str = "FlowXer Vision Mixer"
     version: str = __version__
@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     api_token: str = ""
     cors_origins: str = "*"
     max_webrtc_peers: int = Field(default=16, ge=1, le=256)
+    webrtc_public_ip: str = ""
+    webrtc_udp_port_min: int = Field(default=32600, ge=1, le=65535)
+    webrtc_udp_port_max: int = Field(default=32631, ge=1, le=65535)
 
     mxl_domain_deprecated: bool = False
 

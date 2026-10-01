@@ -306,9 +306,13 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
 
 ## 5. Open questions
 
-1. **aiortc UDP port range** — confirm the exact aiortc API for pinning ICE
-   host ports before implementing item 4. If it cannot, document and use a
-   iptables/CNI-friendly range via `RTCConfiguration` ice candidate filter.
+1. **aiortc UDP port range** — aioice 0.10 binds `local_addr=(host, 0)` and
+   `RTCConfiguration` has no port field. FlowXer wraps
+   `loop.create_datagram_endpoint` during ICE gather so host sockets land in
+   `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` (default 32600–32631, clear of fabrics
+   23500–23599). Advertised host IP is rewritten to
+   `FLOWXER_WEBRTC_PUBLIC_IP` (else `FLOWXER_NMOS_HOST_IP`). JPEG snapshot
+   fallback is unchanged.
 2. **`/readyz` vs registry down** — prefer “Node up + output domain writable”
    so a registry blip does not kill the mixer; expose `nmos_registry_up` in
    metrics. Confirm against lab ops.
@@ -355,3 +359,4 @@ integration and AMWA script in PR 8).
 - **PR 2** (`cursor/mxl-multi-domain-85ef`): `FLOWXER_MXL_ROOT` scan, output domain create, `domain_id` on essences, refuse mirrors, stop baking `domain_def.json`, deprecate `FLOWXER_MXL_DOMAIN`. `FLOWXER_READ_OFFSET_GRAINS` logged as ignored.
 - **PR 3** (`cursor/nmos-node-85ef`): in-process IS-04 v1.3 / IS-05 v1.2 / BCP-007-03 node (Option C). Live-input receivers, PGM senders, REST↔IS-05, waiting retry, GUI status, `docs/nmos.md`. NvNmos evaluated and not used (cannot ACK missing-domain activations).
 - **PR 4** (`cursor/image-nonroot-85ef`): mixer/GUI `USER 1000:1000`, `MXL_REF=218ddaa`, label `io.dmf.mxl.revision`, health `mxl_revision`, `git-<sha>` GHCR tags, CEF flags that skip component updates. GHCR public still a GitHub UI step.
+- **PR 5** (`cursor/network-bind-85ef`): `FLOWXER_HOST` default 127.0.0.1 (bridge Compose overrides 0.0.0.0), GUI `FLOWXER_MIXER_URL` / `FLOWXER_GUI_PORT`, WebRTC host ICE IP + UDP range wrap.
