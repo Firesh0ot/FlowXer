@@ -124,6 +124,8 @@ def render_jpeg(mixer, stream_id: str, *, width: int = 640, height: int = 360, q
     image = render_monitor(mixer, stream_id, width=width, height=height)
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=quality)
+    if hasattr(mixer, "frames_rendered"):
+        mixer.frames_rendered += 1
     return buf.getvalue()
 
 

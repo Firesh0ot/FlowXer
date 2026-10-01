@@ -97,6 +97,11 @@ class VisionMixer:
         self.gst: GstRuntime | None = None
         self.stinger_player: StingerPlayer | None = None
         self.last_transition: str = "cut"
+        self.frames_rendered = 0
+        self.frames_dropped = 0
+        self.late_grains = 0
+        self.resyncs = 0
+        self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
         self.tally = TallyService()
@@ -936,6 +941,8 @@ class VisionMixer:
         panel.program_input_id = target.id
         panel.last_transition = transition.value
         self.last_transition = transition.value
+        kind = transition.value
+        self.transition_counts[kind] = self.transition_counts.get(kind, 0) + 1
         if flip_flop and outgoing and outgoing != target.id:
             panel.preview_input_id = outgoing
         if panel.id == (self.panels[0].id if self.panels else panel.id):
@@ -1011,6 +1018,7 @@ class VisionMixer:
         outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
         self.last_transition = "stinger"
         panel.last_transition = "stinger"
+        self.transition_counts["stinger"] = self.transition_counts.get("stinger", 0) + 1
         self.stinger_player = StingerPlayer(
             info,
             target_input_id,

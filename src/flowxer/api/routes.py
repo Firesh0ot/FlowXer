@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from flowxer.api.schemas import (
     ConsoleState,
@@ -34,6 +35,7 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
+from flowxer.api.metrics import ready_payload, render_prometheus
 from flowxer.domain.mxl_domain import load_domain_info, scan_domains
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
@@ -78,6 +80,29 @@ def health(
         simulate=mixer.backend == "simulate" or settings.simulate,
         mxl_revision=settings.resolved_mxl_revision,
     )
+
+
+@router.get(
+    "/metrics",
+    tags=["system"],
+    summary="Prometheus metrics (also served at GET /metrics)",
+)
+def api_metrics(mixer: VisionMixer = Depends(get_mixer)) -> PlainTextResponse:
+    return PlainTextResponse(
+        render_prometheus(mixer),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@router.get("/livez", tags=["system"], summary="Liveness probe (process up)")
+def api_livez() -> dict:
+    return {"status": "live"}
+
+
+@router.get("/readyz", tags=["system"], summary="Readiness: MXL root and output domain")
+def api_readyz(mixer: VisionMixer = Depends(get_mixer)):
+    code, body = ready_payload(mixer)
+    return JSONResponse(status_code=code, content=body)
 
 
 @router.get(

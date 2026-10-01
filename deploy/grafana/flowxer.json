@@ -1,0 +1,92 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "On air",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [{ "expr": "flowxer_on_air", "refId": "A" }]
+    },
+    {
+      "title": "NMOS registry",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [{ "expr": "flowxer_nmos_registry_up", "refId": "A" }]
+    },
+    {
+      "title": "WebRTC peers",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "targets": [{ "expr": "flowxer_webrtc_peers", "refId": "A" }]
+    },
+    {
+      "title": "CPU %",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [{ "expr": "flowxer_process_cpu_percent", "refId": "A" }]
+    },
+    {
+      "title": "Memory",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "targets": [{ "expr": "flowxer_process_memory_bytes", "refId": "A" }]
+    },
+    {
+      "title": "Frames rendered",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{ "expr": "rate(flowxer_frames_rendered_total[1m])", "refId": "A" }]
+    },
+    {
+      "title": "Transitions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "increase(flowxer_transitions_total[5m])", "legendFormat": "{{type}}", "refId": "A" }]
+    },
+    {
+      "title": "Input state",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "targets": [{ "expr": "flowxer_input_state == 1", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "NMOS activations",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [{ "expr": "increase(flowxer_nmos_activations_total[5m])", "legendFormat": "{{result}}", "refId": "A" }]
+    },
+    {
+      "title": "Tally send errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [{ "expr": "increase(flowxer_tally_send_errors_total[5m])", "refId": "A" }]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["flowxer", "mxl"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timezone": "browser",
+  "title": "FlowXer",
+  "uid": "flowxer",
+  "version": 1
+}

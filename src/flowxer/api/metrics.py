@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+def _esc(value: Any) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
+def _line(name: str, value: float | int, labels: dict[str, Any] | None = None) -> str:
+    if not labels:
+        return f"{name} {value}"
+    inner = ",".join(f'{key}="{_esc(val)}"' for key, val in labels.items())
+    return f"{name}{{{inner}}} {value}"
+
+
+def render_prometheus(mixer) -> str:
+    settings = mixer.settings
+    resources = None
+    try:
+        from flowxer.engine.resources import collect_resources
+
+        resources = collect_resources(mixer)
+    except Exception:
+        resources = {}
+    nmos = mixer.nmos.status() if getattr(mixer, "nmos", None) else {}
+    on_air = 1 if getattr(mixer.state, "value", mixer.state) == "running" else 0
+    gst_mode = mixer.backend if mixer.backend != "idle" else settings.gst_mode
+    lines = [
+        "# HELP flowxer_info FlowXer build and mode",
+        "# TYPE flowxer_info gauge",
+        _line(
+            "flowxer_info",
+            1,
+            {
+                "version": settings.version,
+                "mxl_revision": settings.resolved_mxl_revision,
+                "gst_mode": gst_mode,
+                "nmos_enabled": str(bool(nmos.get("enabled"))).lower(),
+            },
+        ),
+        "# HELP flowxer_on_air 1 when the mixer pipeline is running",
+        "# TYPE flowxer_on_air gauge",
+        _line("flowxer_on_air", on_air),
+        "# HELP flowxer_program_input Currently selected program source",
+        "# TYPE flowxer_program_input gauge",
+        _line(
+            "flowxer_program_input",
+            1 if mixer.program_input_id else 0,
+            {"input": mixer.program_input_id or ""},
+        ),
+        "# HELP flowxer_preview_input Currently selected preview source",
+        "# TYPE flowxer_preview_input gauge",
+        _line(
+            "flowxer_preview_input",
+            1 if mixer.preview_input_id else 0,
+            {"input": mixer.preview_input_id or ""},
+        ),
+        "# HELP flowxer_frames_rendered_total Preview/program frames produced",
+        "# TYPE flowxer_frames_rendered_total counter",
+        _line("flowxer_frames_rendered_total", int(getattr(mixer, "frames_rendered", 0))),
+        "# HELP flowxer_frames_dropped_total Dropped mixer frames",
+        "# TYPE flowxer_frames_dropped_total counter",
+        _line("flowxer_frames_dropped_total", int(getattr(mixer, "frames_dropped", 0))),
+        "# HELP flowxer_input_late_grains_total MXL grains arrived late",
+        "# TYPE flowxer_input_late_grains_total counter",
+        _line("flowxer_input_late_grains_total", int(getattr(mixer, "late_grains", 0))),
+        "# HELP flowxer_input_resyncs_total MXL reader resyncs",
+        "# TYPE flowxer_input_resyncs_total counter",
+        _line("flowxer_input_resyncs_total", int(getattr(mixer, "resyncs", 0))),
+        "# HELP flowxer_webrtc_peers Active WHEP peers",
+        "# TYPE flowxer_webrtc_peers gauge",
+    ]
+    try:
+        from flowxer.engine.webrtc import peer_count
+
+        peers = peer_count()
+    except Exception:
+        peers = 0
+    lines.append(_line("flowxer_webrtc_peers", peers))
+    lines += [
+        "# HELP flowxer_nmos_registry_up 1 when the last registry heartbeat succeeded",
+        "# TYPE flowxer_nmos_registry_up gauge",
+        _line("flowxer_nmos_registry_up", 1 if nmos.get("registry_up") else 0),
+        "# HELP flowxer_nmos_activations_total IS-05 activations by result",
+        "# TYPE flowxer_nmos_activations_total counter",
+        _line(
+            "flowxer_nmos_activations_total",
+            int(getattr(mixer.nmos, "activations_ok", 0)),
+            {"result": "ok"},
+        ),
+        _line(
+            "flowxer_nmos_activations_total",
+            int(getattr(mixer.nmos, "activations_error", 0)),
+            {"result": "error"},
+        ),
+        "# HELP flowxer_tally_send_errors_total Failed TSL sends",
+        "# TYPE flowxer_tally_send_errors_total counter",
+        _line(
+            "flowxer_tally_send_errors_total",
+            int(getattr(mixer.tally, "send_errors", 0)),
+        ),
+        "# HELP flowxer_process_cpu_percent Process CPU percent",
+        "# TYPE flowxer_process_cpu_percent gauge",
+        _line("flowxer_process_cpu_percent", float(resources.get("cpu_percent") or 0)),
+        "# HELP flowxer_process_memory_bytes Process memory bytes",
+        "# TYPE flowxer_process_memory_bytes gauge",
+        _line("flowxer_process_memory_bytes", int(resources.get("memory_bytes") or 0)),
+        "# HELP flowxer_transitions_total Mixer transitions by type",
+        "# TYPE flowxer_transitions_total counter",
+    ]
+    counts = getattr(mixer, "transition_counts", {}) or {}
+    for kind in ("cut", "mix", "stinger"):
+        lines.append(_line("flowxer_transitions_total", int(counts.get(kind, 0)), {"type": kind}))
+    lines += [
+        "# HELP flowxer_input_state 1 for the current per-essence input state",
+        "# TYPE flowxer_input_state gauge",
+    ]
+    for item in mixer.list_inputs():
+        for role in ("video", "audio"):
+            if getattr(item.kind, "value", item.kind) == "mxl_live" and getattr(mixer, "nmos", None):
+                state = mixer.nmos.input_state(item.id, role)
+            else:
+                state = "running" if on_air else "idle"
+            for candidate in ("not_routed", "waiting", "no_signal", "running", "error", "idle"):
+                lines.append(
+                    _line(
+                        "flowxer_input_state",
+                        1 if state == candidate else 0,
+                        {"input": item.id, "essence": role, "state": candidate},
+                    )
+                )
+    return "\n".join(lines) + "\n"
+
+
+def ready_payload(mixer) -> tuple[int, dict[str, Any]]:
+    settings = mixer.settings
+    reasons: list[str] = []
+    root = settings.mxl_root
+    if not root.exists() or not root.is_dir():
+        reasons.append(f"MXL root not readable: {root}")
+    output = settings.output_domain
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        probe = output / ".flowxer-ready"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        reasons.append(f"output domain not writable: {output} ({exc})")
+    if settings.nmos_enable and getattr(mixer, "nmos", None) is None:
+        reasons.append("NMOS enabled but node is missing")
+    body = {
+        "ready": not reasons,
+        "reasons": reasons,
+        "nmos_registry_up": bool(getattr(getattr(mixer, "nmos", None), "registry_up", False)),
+        "mixer_state": getattr(mixer.state, "value", str(mixer.state)),
+    }
+    return (200 if not reasons else 503, body)

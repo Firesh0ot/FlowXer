@@ -360,3 +360,4 @@ integration and AMWA script in PR 8).
 - **PR 3** (`cursor/nmos-node-85ef`): in-process IS-04 v1.3 / IS-05 v1.2 / BCP-007-03 node (Option C). Live-input receivers, PGM senders, REST↔IS-05, waiting retry, GUI status, `docs/nmos.md`. NvNmos evaluated and not used (cannot ACK missing-domain activations).
 - **PR 4** (`cursor/image-nonroot-85ef`): mixer/GUI `USER 1000:1000`, `MXL_REF=218ddaa`, label `io.dmf.mxl.revision`, health `mxl_revision`, `git-<sha>` GHCR tags, CEF flags that skip component updates. GHCR public still a GitHub UI step.
 - **PR 5** (`cursor/network-bind-85ef`): `FLOWXER_HOST` default 127.0.0.1 (bridge Compose overrides 0.0.0.0), GUI `FLOWXER_MIXER_URL` / `FLOWXER_GUI_PORT`, WebRTC host ICE IP + UDP range wrap.
+- **PR 6** (`cursor/metrics-probes-85ef`): Prometheus `flowxer_*` at `/metrics` and `/api/v1/metrics`, `/livez` `/readyz` (registry blip does not fail ready), Grafana `deploy/grafana/flowxer.json`.
