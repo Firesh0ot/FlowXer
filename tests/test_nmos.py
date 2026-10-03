@@ -322,3 +322,121 @@ def test_console_and_mixer_status_include_nmos(tmp_path: Path) -> None:
     assert any(item["input_id"] == "cam-1" for item in console["nmos"]["receivers"])
     status = client.get("/api/v1/mixer").json()
     assert status["nmos"]["enabled"] is True
+
+
+def test_connection_id_list_has_trailing_slashes(tmp_path: Path) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    assert client.get("/").json() == ["x-nmos/"]
+    assert "bulk/" in client.get("/x-nmos/connection/v1.2/").json()
+    ids_list = client.get("/x-nmos/connection/v1.2/single/senders/").json()
+    assert ids_list
+    assert all(item.endswith("/") for item in ids_list)
+    sid = ids_list[0].rstrip("/")
+    constraints = client.get(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/constraints/"
+    )
+    assert constraints.status_code == 200
+    bulk = client.get("/x-nmos/connection/v1.2/bulk/senders")
+    assert bulk.status_code == 405
+    assert bulk.json()["code"] == 405
+    missing = client.get("/x-nmos/connection/v1.2/single/senders/not-a-sender/active")
+    assert missing.status_code == 404
+    assert missing.json() == {"code": 404, "error": "Not Found", "debug": None}
+    unknown = client.get(f"/x-nmos/node/v1.3/{sid}")
+    assert unknown.status_code == 404
+    assert unknown.json()["code"] == 404
+    assert "transporttype/" in client.get(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/"
+    ).json()
+    transporttype = client.get(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/transporttype/"
+    )
+    assert transporttype.status_code == 200
+    assert transporttype.json() == "urn:x-nmos:transport:mxl"
+    transportfile = client.get(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/transportfile/"
+    )
+    assert transportfile.status_code == 404
+    sender = client.get(f"/x-nmos/node/v1.3/senders/{sid}").json()
+    assert sender["interface_bindings"] == []
+    assert sender["manifest_href"] is None
+    node = client.get("/x-nmos/node/v1.3/self").json()
+    assert "attached_network_device" not in node["interfaces"][0]
+    source = client.get("/x-nmos/node/v1.3/sources/").json()[0]
+    assert "caps" in source
+    assert "grain_rate" in source
+    audio = next(item for item in client.get("/x-nmos/node/v1.3/sources/").json() if item["format"].endswith("audio"))
+    assert audio["channels"]
+    assert {ch["symbol"] for ch in audio["channels"]} == {"L", "R"}
+    flow = next(item for item in client.get("/x-nmos/node/v1.3/flows/").json() if item["format"].endswith("video"))
+    assert flow["grain_rate"]["numerator"] == 50
+    assert flow["components"]
+    assert flow["transfer_characteristic"] == "SDR"
+
+
+def test_staged_patch_rejects_unknown_fields_and_returns_immediate_activation(
+    tmp_path: Path,
+) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    sid = ids.sender_id(SEED, "me-1", "video")
+    refused = client.patch(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/staged",
+        json={"bad": "data"},
+    )
+    assert refused.status_code == 400
+    assert refused.json()["code"] == 400
+    patch = client.patch(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/staged",
+        json={"master_enable": True, "activation": {"mode": "activate_immediate"}},
+    )
+    assert patch.status_code == 200
+    assert patch.json()["activation"]["mode"] == "activate_immediate"
+    assert patch.json()["activation"]["activation_time"]
+    staged = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/staged").json()
+    assert staged["activation"] == {"mode": None, "requested_time": None, "activation_time": None}
+    active = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/active").json()
+    assert active["activation"]["mode"] == "activate_immediate"
+
+
+def test_bulk_post_stages_senders(tmp_path: Path) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    sid = ids.sender_id(SEED, "me-1", "video")
+    flow = str(uuid4())
+    response = client.post(
+        "/x-nmos/connection/v1.2/bulk/senders",
+        json=[{"id": sid, "params": {"transport_params": [{"mxl_flow_id": flow}]}}],
+    )
+    assert response.status_code == 200
+    assert response.json() == [{"id": sid, "code": 200}]
+    staged = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/staged").json()
+    assert staged["transport_params"][0]["mxl_flow_id"] == flow
+    assert client.get("/x-nmos/connection/v1.2/bulk/senders").status_code == 405
+
+
+def test_scheduled_relative_activation(tmp_path: Path) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    sid = ids.sender_id(SEED, "me-1", "video")
+    flow = str(uuid4())
+    client.patch(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/staged",
+        json={"transport_params": [{"mxl_flow_id": flow}]},
+    )
+    patch = client.patch(
+        f"/x-nmos/connection/v1.2/single/senders/{sid}/staged",
+        json={"activation": {"mode": "activate_scheduled_relative", "requested_time": "0:50000000"}},
+    )
+    assert patch.status_code == 202
+    assert patch.json()["activation"]["mode"] == "activate_scheduled_relative"
+    assert patch.json()["activation"]["requested_time"] == "0:50000000"
+    assert patch.json()["activation"]["activation_time"]
+    mixer.nmos._scheduled[sid].join(timeout=1.0)
+    active = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/active").json()
+    assert active["transport_params"][0]["mxl_flow_id"] == flow
+    assert active["activation"]["mode"] == "activate_scheduled_relative"
+    assert active["activation"]["requested_time"] == "0:50000000"
+    staged = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/staged").json()
+    assert staged["activation"] == {"mode": None, "requested_time": None, "activation_time": None}

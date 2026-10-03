@@ -42,14 +42,15 @@ def test_nmos_testing_script_invokes_amwa_cli() -> None:
     assert "nmos-test.py" in text
     assert "--entrypoint python3" in text
     assert "amwa/nmos-testing" in text
+    assert "test_04" in text
+    assert "--ignore" in text
     userconfig = (ROOT / "scripts" / "nmos-testing-userconfig.py").read_text(encoding="utf-8")
     assert "ENABLE_DNS_SD = False" in userconfig
 
 
-def test_ci_runs_amwa_on_stage_and_main_prs() -> None:
+def test_ci_runs_amwa_on_pull_requests() -> None:
     text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "github.base_ref == 'stage'" in text
-    assert "github.base_ref == 'main'" in text
+    assert "github.event_name == 'pull_request'" in text
     assert "workflow_dispatch" in text
     assert "if: github.event_name == 'workflow_dispatch'\n" not in text
     assert "./.github/actions/nmos-testing" in text

@@ -57,14 +57,16 @@ IS-04 Source and Flow. Active params:
 - `mxl_domain_id` = FlowXer's output domain id
 - `mxl_flow_id` = current PGM video/audio MXL flow UUIDs
 
-MXL has no SDP; `transportfile` is HTTP 204.
+MXL has no SDP; `transportfile` is HTTP 404. `transporttype` is
+`urn:x-nmos:transport:mxl`. Senders and receivers use an empty
+`interface_bindings` array (BCP-007-03).
 
 ## Activation behaviour
 
 IS-05 `PATCH .../receivers/{id}/staged` with `activation.mode = activate_immediate`:
 
 1. Malformed UUIDs, `mxl_flow_id: "auto"`, or a non-null transport file → **400**
-   with `{ "code": 400, "error": "...", "debug": "..." }`.
+   with `{ "code": 400, "error": "...", "debug": null }`.
 2. Well-formed params are **accepted even if the domain or flow is not on disk
    yet** (on-demand fabrics). The input essence goes to `waiting` and retries
    with exponential backoff (250 ms → 5 s) while `master_enable` is true.
@@ -84,7 +86,8 @@ Per-essence state machine:
 Deleting the flow directory returns the essence to `waiting` without another
 PATCH. `GET /console` and `GET /mixer` expose the same states.
 
-Only `activate_immediate` is implemented. Scheduled activations return 400.
+Only `activate_immediate` and IS-05 scheduled activations (`activate_scheduled_relative`,
+`activate_scheduled_absolute`) are implemented. Scheduled PATCH returns **202**.
 
 ## REST ↔ IS-05
 
@@ -123,9 +126,9 @@ non-interactive mode against the Node API (default
 
 The image entrypoint starts the web UI; the script overrides it with
 `python3 nmos-test.py suite …` and mounts `scripts/nmos-testing-userconfig.py`
-(`ENABLE_DNS_SD = False`). GitHub Actions runs this on **PRs into `stage` or
-`main`** and on the **Stage** workflow (not on every PR into `dev`). You can
-also dispatch **Actions → CI**. Expected gaps: DNS-SD registry discovery and
-the IS-04 events WebSocket (reserved port 3253, not implemented). Revisit
-nvnmosd only if those suites fail for Node/Connection API gaps Option C
-cannot fix.
+(`ENABLE_DNS_SD = False`). GitHub Actions runs this on **every PR** and on the
+**Stage** workflow. You can also dispatch **Actions → CI**. IS-04-01
+mock-registry discovery tests
+(`test_04`, `test_07`–`test_10`) are `--ignore`d: FlowXer uses
+`FLOWXER_NMOS_REGISTRY_URL`, not DNS-SD. Revisit nvnmosd only if those suites
+fail for Node/Connection API gaps Option C cannot fix.
