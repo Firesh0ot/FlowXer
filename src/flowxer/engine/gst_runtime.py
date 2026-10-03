@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
 
 class GstRuntime:
-    """Optional live GStreamer backend. Failures fall back to the simulator."""
+    """Live GStreamer backend. `on_error` receives every pipeline error message."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_error: Callable[[str], None] | None = None) -> None:
         self.pipeline = None
         self.loop = None
         self.thread = None
         self._gst = None
+        self._on_error = on_error
 
     def start(self, description: str) -> None:
         import threading
@@ -34,6 +36,9 @@ class GstRuntime:
             if message.type == Gst.MessageType.ERROR:
                 err, debug = message.parse_error()
                 log.error("GStreamer error: %s (%s)", err, debug)
+                if self._on_error is not None:
+                    source = message.src.get_name() if message.src is not None else "pipeline"
+                    self._on_error(f"{source}: {err.message}")
             elif message.type == Gst.MessageType.EOS:
                 log.info("GStreamer EOS")
 
@@ -113,11 +118,14 @@ class GstRuntime:
         return True
 
 
-def try_start_gst(description: str) -> GstRuntime | None:
+def try_start_gst(
+    description: str, on_error: Callable[[str], None] | None = None
+) -> tuple[GstRuntime | None, str]:
+    """Start the pipeline. Returns the runtime, or None and the reason it failed."""
     try:
-        runtime = GstRuntime()
+        runtime = GstRuntime(on_error)
         runtime.start(description)
-        return runtime
+        return runtime, ""
     except Exception as exc:
-        log.warning("GStreamer backend unavailable, simulating mixer: %s", exc)
-        return None
+        log.error("GStreamer pipeline failed to start: %s", exc)
+        return None, str(exc)

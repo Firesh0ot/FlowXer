@@ -101,6 +101,7 @@ class VisionMixer:
         self.frames_dropped = 0
         self.late_grains = 0
         self.resyncs = 0
+        self.pipeline_errors = 0
         self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
@@ -723,12 +724,19 @@ class VisionMixer:
 
         force_sim = self.settings.simulate or self.settings.gst_mode == "simulate"
         self.gst = None
+        self.error = None
         if not force_sim and capabilities["gstreamer"]:
-            self.gst = try_start_gst(description)
+            self.gst, reason = try_start_gst(description, self._on_pipeline_error)
+            if self.gst is None:
+                # Never fall back to the simulator when GStreamer is installed: the
+                # API would report on-air while nothing reaches MXL.
+                self.state = MixerState.error
+                self.backend = "idle"
+                self.error = f"GStreamer pipeline failed: {reason}"
+                raise MixerError(self.error)
 
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
-        self.error = None
         self.program_input_id = request.program_input_id or self._default_program_id()
         self.preview_input_id = request.preview_input_id or self.program_input_id
         self.last_live_input_id = self.program_input_id
@@ -741,6 +749,11 @@ class VisionMixer:
         self.nmos.sync_senders_from_outputs()
         self._publish_tally()
         return self.status()
+
+    def _on_pipeline_error(self, message: str) -> None:
+        """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
+        self.error = message
+        self.pipeline_errors += 1
 
     def stop(self) -> MixerStatus:
         if self.gst is not None:

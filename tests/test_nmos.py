@@ -172,6 +172,41 @@ def test_is05_activation_state_machine(tmp_path: Path) -> None:
     assert mixer.nmos.input_state("cam-1", "video") == "not_routed"
 
 
+def test_refresh_does_not_restart_running_essences(tmp_path: Path) -> None:
+    mixer = _live_mixer(tmp_path)
+    client = TestClient(create_nmos_app(mixer.nmos))
+    rid = ids.receiver_id(SEED, "cam-1", "video")
+    cam_dir = mixer.settings.mxl_root / "camera-a"
+    cam_dir.mkdir(parents=True)
+    (cam_dir / "domain_def.json").write_text(json.dumps({"id": CAM_DOMAIN}), encoding="utf-8")
+    _write_flow(cam_dir, VIDEO_FLOW, grains=True)
+    patch = client.patch(
+        f"/x-nmos/connection/v1.2/single/receivers/{rid}/staged",
+        json={
+            "master_enable": True,
+            "activation": {"mode": "activate_immediate"},
+            "transport_params": [{"mxl_domain_id": CAM_DOMAIN, "mxl_flow_id": VIDEO_FLOW}],
+        },
+    )
+    assert patch.status_code == 200
+    assert mixer.nmos.input_state("cam-1", "video") == "running"
+
+    applied: list[str] = []
+    original = mixer.apply_nmos_receiver
+
+    def counting(input_id: str, role: str, **kwargs) -> None:
+        applied.append(role)
+        original(input_id, role, **kwargs)
+
+    mixer.apply_nmos_receiver = counting  # type: ignore[method-assign]
+    # Re-applying restarts the input's mxlsrc (NULL -> PLAYING); the refresh loop
+    # runs every 250 ms, so a running essence must never be applied again.
+    for _ in range(3):
+        mixer.nmos.refresh_waiting()
+    assert applied == []
+    assert mixer.nmos.input_state("cam-1", "video") == "running"
+
+
 def test_malformed_params_are_rejected(tmp_path: Path) -> None:
     mixer = _live_mixer(tmp_path)
     client = TestClient(create_nmos_app(mixer.nmos))
