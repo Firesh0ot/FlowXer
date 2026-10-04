@@ -21,6 +21,13 @@ PAD_MIX = "sink_1"
 PAD_KEYER = "sink_2"
 STINGER_ZORDER = 3
 
+# GUI monitor pictures: one appsink per source (MONITOR_PREFIX + input id) and
+# one for Program, each holding its newest RGB picture.
+MONITOR_PREFIX = "mon_"
+MONITOR_PROGRAM = "mon__program"
+MONITOR_WIDTH = 640
+MONITOR_HEIGHT = 360
+
 
 def _gst_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
@@ -52,14 +59,29 @@ def _mix(settings: Settings) -> str:
     )
 
 
-def _buses(kind: str, inp: LogicalInput) -> str:
-    """A source feeds both selectors of its kind: A (Program) and B (incoming mix)."""
+def _buses(kind: str, inp: LogicalInput, settings: Settings) -> str:
+    """A source feeds both selectors of its kind: A (Program) and B (incoming mix),
+    and a video source its GUI monitor."""
     tee = f"{kind}t_{inp.id}"
     sel = "vsel" if kind == "v" else "asel"
-    return (
+    chain = (
         f"tee name={tee}\n"
         f"{tee}. ! queue ! {sel}.sink_{inp.slot}\n"
         f"{tee}. ! queue ! {sel}b.sink_{inp.slot}"
+    )
+    if kind == "v" and settings.monitor_fps:
+        chain += f"\n{tee}. ! {monitor_tap(settings, MONITOR_PREFIX + inp.id)}"
+    return chain
+
+
+def monitor_tap(settings: Settings, name: str) -> str:
+    """Branch to a GUI monitor: the rate drops first, then one conversion pass
+    scales the full-size frame straight to the small RGB picture."""
+    return (
+        "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
+        f"! videoconvertscale ! video/x-raw,format=RGB,width={MONITOR_WIDTH},height={MONITOR_HEIGHT},"
+        f"pixel-aspect-ratio=1/1,framerate={settings.monitor_fps}/1 "
+        f"! appsink name={name} max-buffers=1 drop=true sync=false"
     )
 
 
@@ -107,7 +129,7 @@ def _video_source_bin(
                 f"! {bgra} ! videoconvert ! {caps} "
                 f"! identity sync=true ! "
             )
-    return chain + _buses("v", inp)
+    return chain + _buses("v", inp, settings)
 
 
 def _audio_source_bin(
@@ -146,7 +168,7 @@ def _audio_source_bin(
                 f"! audioconvert ! audioresample ! {caps} "
                 f"! identity sync=true ! "
             )
-    return chain + _buses("a", inp)
+    return chain + _buses("a", inp, settings)
 
 
 # MXL audio: this audioconvert gets a mix-matrix when the flow's caps arrive
@@ -222,6 +244,10 @@ def build_pipeline_description(
             f"! queue name=html5q ! comp.{PAD_KEYER}"
         )
 
+    program_monitor = (
+        f"\npgmt. ! {monitor_tap(settings, MONITOR_PROGRAM)}" if settings.monitor_fps else ""
+    )
+
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
@@ -255,7 +281,7 @@ vselb. ! queue ! comp.{PAD_MIX}
 
 {overlay_bin}
 
-comp. ! {_mix(settings)} ! identity name=ptsfix ! {video_sink}
+comp. ! {_mix(settings)} ! tee name=pgmt ! identity name=ptsfix ! {video_sink}{program_monitor}
 
 {audio_sources}
 

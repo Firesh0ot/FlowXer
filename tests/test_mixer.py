@@ -57,6 +57,22 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     assert "audioconvert name=amap_cam-1 " in description
     # Stingers are not part of the pipeline; each playback gets its own bin.
     assert "stinger" not in description
+    # GUI monitors: one picture per source and one of Program.
+    assert "appsink name=mon_cam-1 " in description
+    assert "appsink name=mon__program " in description
+    mixer.settings.monitor_fps = 0
+    without = build_pipeline_description(
+        settings=mixer.settings,
+        inputs=mixer.list_inputs(),
+        overlay_url=mixer.overlay.url,
+        overlay_enabled=True,
+        output_video_flow_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        output_audio_flow_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        domain="/mxl-domain",
+        use_mxl_sink=True,
+        use_cefsrc=True,
+    )
+    assert "appsink" not in without
 
 
 def test_stinger_bin_for_sequences_and_videos(mixer: VisionMixer) -> None:

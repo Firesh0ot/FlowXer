@@ -7,6 +7,9 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Added
 
+- The GUI monitors (JPEG and WebRTC) show the pipeline's pictures: each
+  source and, for the main panel, the mixed Program (`FLOWXER_MONITOR_FPS`,
+  default 10). They were generated cards.
 - Fade and Fade to Black dissolve picture and sound (they were cuts);
   `POST /mixer/take` with `transition: mix` uses its `duration_ms`.
 - CI job `Pytest (GStreamer)`: the media pipeline on the GStreamer of the

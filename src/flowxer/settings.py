@@ -91,6 +91,8 @@ class Settings(BaseSettings):
     api_token: str = ""
     cors_origins: str = "*"
     max_webrtc_peers: int = Field(default=16, ge=1, le=256)
+    # Rate of the GUI monitor pictures taken from the pipeline (0: generated cards).
+    monitor_fps: int = Field(default=10, ge=0, le=50)
     webrtc_public_ip: str = ""
     webrtc_udp_port_min: int = Field(default=32600, ge=1, le=65535)
     webrtc_udp_port_max: int = Field(default=32631, ge=1, le=65535)

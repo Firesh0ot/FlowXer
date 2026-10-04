@@ -157,6 +157,29 @@ def test_a_stinger_plays_from_its_own_frames_every_time(live: VisionMixer) -> No
         _wait(lambda: len(comp.sinkpads) == pads_before, "the stinger pad released")
 
 
+def _mean(image) -> float:
+    from PIL import ImageStat
+
+    return sum(ImageStat.Stat(image).mean) / 3
+
+
+def test_monitors_show_the_pictures_of_the_pipeline(live: VisionMixer) -> None:
+    from flowxer.engine.preview import render_monitor
+
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="black"))
+    names = {"mon_cam-1", "mon_black", "mon__program"}
+    _wait(lambda: names <= set(live.gst.monitors), lambda: f"monitor pictures ({sorted(live.gst.monitors)})")
+    # Live pictures: the test source's time overlay changes them, a card would not.
+    first = render_monitor(live, "source:cam-1").tobytes()
+    time.sleep(0.5)
+    assert render_monitor(live, "source:cam-1").tobytes() != first
+    assert _mean(render_monitor(live, "source:black")) < 10
+    assert _mean(render_monitor(live, "panel:me-1:pgm")) > 50
+    # The Program monitor shows the mixed output: it follows a cut.
+    live.take("black")
+    _wait(lambda: _mean(render_monitor(live, "panel:me-1:pgm")) < 10, "black on the Program monitor")
+
+
 def _first_frame(caps: str, samples: bytes, out_channels: int) -> tuple[float, ...]:
     """Push one buffer through the MXL audio channel map and return the first output frame."""
     import gi

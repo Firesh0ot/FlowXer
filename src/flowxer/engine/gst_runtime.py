@@ -5,7 +5,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from flowxer.engine.pipeline import AUDIO_MAP_PREFIX, PAD_MIX, PAD_PROGRAM, STINGER_ZORDER
+from flowxer.engine.pipeline import AUDIO_MAP_PREFIX, MONITOR_PREFIX, PAD_MIX, PAD_PROGRAM, STINGER_ZORDER
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,8 @@ class GstRuntime:
         self._lock = threading.Lock()
         self._mix: _Mix | None = None
         self._stinger = None
+        # Newest GUI monitor picture per appsink name: (width, height, RGB bytes).
+        self.monitors: dict[str, tuple[int, int, bytes]] = {}
 
     def start(self, description: str, audio_channels: int = 2) -> None:
         import gi
@@ -111,6 +113,9 @@ class GstRuntime:
                 break
             if element.get_name().startswith(AUDIO_MAP_PREFIX):
                 map_audio_channels(element, audio_channels)
+            elif element.get_name().startswith(MONITOR_PREFIX):
+                element.set_property("emit-signals", True)
+                element.connect("new-sample", self._on_monitor_sample)
         for name in ("comp", "amix"):
             element = pipeline.get_by_name(name)
             if element is not None:
@@ -132,6 +137,22 @@ class GstRuntime:
         self.loop = None
         self._mix = None
         self._stinger = None
+
+    def _on_monitor_sample(self, sink) -> object:
+        sample = sink.emit("pull-sample")
+        if sample is not None:
+            structure = sample.get_caps().get_structure(0)
+            buffer = sample.get_buffer()
+            ok, mapped = buffer.map(self._gst.MapFlags.READ)
+            if ok:
+                picture = bytes(mapped.data)
+                buffer.unmap(mapped)
+                self.monitors[sink.get_name()] = (
+                    structure.get_int("width")[1],
+                    structure.get_int("height")[1],
+                    picture,
+                )
+        return self._gst.FlowReturn.OK
 
     def running_time(self) -> int:
         clock = self.pipeline.get_clock() if self.pipeline is not None else None
