@@ -47,7 +47,7 @@ from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
-from flowxer.engine.pipeline import build_pipeline_description
+from flowxer.engine.pipeline import PAD_KEYER, build_pipeline_description, stinger_bin_description
 from flowxer.engine.security import (
     SecurityError,
     assert_http_url,
@@ -73,6 +73,8 @@ from flowxer.settings import Settings, ensure_storage
 log = logging.getLogger(__name__)
 
 CLIP_SUFFIXES = {".mp4", ".mov", ".mkv", ".ts", ".mxf", ".wav", ".m4a"}
+# A mix (take with transition mix) without a duration.
+DEFAULT_MIX_MS = 400
 
 
 class MixerError(RuntimeError):
@@ -102,7 +104,8 @@ class VisionMixer:
         self.gst: GstRuntime | None = None
         self.stinger_player: StingerPlayer | None = None
         self.last_transition: str = "cut"
-        self.frames_rendered = 0
+        # Program frames of earlier runs; frames_rendered adds the running pipeline's.
+        self._frames_before = 0
         self.frames_dropped = 0
         self.late_grains = 0
         self.resyncs = 0
@@ -714,14 +717,11 @@ class VisionMixer:
         capabilities = probe_backend()
         use_mxl = bool(capabilities["mxl_plugins"])
         use_cef = bool(capabilities["cefsrc"])
-        slot = self.stinger_slots[0] if self.stinger_slots else None
-        stinger = self._info_for_slot(slot).model_dump()
         description = build_pipeline_description(
             settings=self.settings,
             inputs=self.list_inputs(),
             overlay_url=self.overlay.url,
             overlay_enabled=self.overlay.enabled,
-            stinger=stinger,
             output_video_flow_id=video_id,
             output_audio_flow_id=audio_id,
             domain=str(output),
@@ -764,8 +764,14 @@ class VisionMixer:
         self.error = message
         self.pipeline_errors += 1
 
+    @property
+    def frames_rendered(self) -> int:
+        """Frames that reached the Program video sink (none in simulate)."""
+        return self._frames_before + (self.gst.program_frames if self.gst is not None else 0)
+
     def stop(self) -> MixerStatus:
         if self.gst is not None:
+            self._frames_before += self.gst.program_frames
             self.gst.stop()
             self.gst = None
         self.state = MixerState.idle
@@ -855,12 +861,11 @@ class VisionMixer:
             return
         slot = self.get_input(self.program_input_id).slot
         if self.gst is not None:
-            self.gst.set_active_slot("vsel", slot)
-            self.gst.set_active_slot("asel", slot)
+            self.gst.set_program(slot)
 
     def _apply_overlay_alpha(self) -> None:
         if self.gst is not None:
-            self.gst.set_compositor_alpha("sink_1", 1.0 if self.overlay.enabled else 0.0)
+            self.gst.set_compositor_alpha(PAD_KEYER, 1.0 if self.overlay.enabled else 0.0)
             self.gst.set_overlay_png(self.overlay.png_path)
 
     # ── takes / replay / overlay ─────────────────────────────────────────────
@@ -871,6 +876,7 @@ class VisionMixer:
         transition: TransitionType = TransitionType.cut,
         stinger_id: str | None = None,
         panel_id: str = "me-1",
+        duration_ms: int = 0,
     ) -> MixerStatus:
         """Direct source → Program (source-tile right-click). Does not consume Wipe."""
         if self.state != MixerState.running:
@@ -888,7 +894,7 @@ class VisionMixer:
                     direction="to_replay" if self._is_replay(input_id) else "to_live",
                     panel_id=panel.id,
                 )
-        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False)
+        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False, duration_ms=duration_ms)
         return self.status()
 
     def cut(self, panel_id: str = "me-1") -> MixerStatus:
@@ -992,8 +998,10 @@ class VisionMixer:
                 self.program_bus = ProgramBus.live
             else:
                 self.program_bus = ProgramBus.replay
-            self._apply_program()
-        _ = duration_ms  # mix duration is recorded; GST input-selector is a hard switch
+            if transition == TransitionType.mix and self.gst is not None:
+                self.gst.mix(target.slot, (duration_ms or DEFAULT_MIX_MS) * 1_000_000)
+            else:
+                self._apply_program()
         self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
@@ -1057,7 +1065,7 @@ class VisionMixer:
         self.last_transition = "stinger"
         panel.last_transition = "stinger"
         self.transition_counts["stinger"] = self.transition_counts.get("stinger", 0) + 1
-        self.stinger_player = StingerPlayer(
+        player = StingerPlayer(
             info,
             target_input_id,
             direction,
@@ -1065,12 +1073,29 @@ class VisionMixer:
             flip_flop=flip_flop,
             panel_id=panel.id,
         )
+        self.stinger_player = player
         if self.gst is not None:
-            self.gst.set_compositor_alpha("sink_2", 1.0)
+            # Each frame that reaches the compositor advances the player, so Program
+            # cuts on the stinger's own cut frame.
+            self.gst.play_stinger(
+                stinger_bin_description(info.model_dump(), self.settings),
+                on_frame=lambda: self._stinger_frame(player),
+                on_end=lambda: self._stinger_ended(player),
+            )
+            return self.status()
         # Advance to first frame so status reports "playing".
         self.advance_stinger(1)
         self._arm_stinger_clock()
         return self.status()
+
+    def _stinger_frame(self, player: StingerPlayer) -> None:
+        if self.stinger_player is player:
+            self.advance_stinger(1)
+
+    def _stinger_ended(self, player: StingerPlayer) -> None:
+        """The stinger media ended (or failed): finish the player, cut included."""
+        if self.stinger_player is player and not player.done:
+            self.advance_stinger(max(player.info.frame_count - player.frame, 1))
 
     def advance_stinger(self, frames: int = 1) -> MixerStatus:
         """Advance the TGA stinger. Called by the GST pad probe or tests."""
@@ -1104,8 +1129,6 @@ class VisionMixer:
             self._apply_program()
             self._publish_tally()
         if "complete" in snapshot["events"]:
-            if self.gst is not None:
-                self.gst.set_compositor_alpha("sink_2", 0.0)
             self.stinger_player = None
         return self.status()
 
