@@ -284,6 +284,7 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `SHUTDOWN_TIMEOUT_S` / `FLOWXER_SHUTDOWN_TIMEOUT_S` | `10` | Open requests get half; the rest is for stopping media and deregistering |
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
+| `FLOWXER_MONITOR_FPS` | `10` | GUI monitor pictures (JPEG and WebRTC) taken from the pipeline per second; `0` draws generated cards |
 | `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
 | `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |
 
