@@ -43,34 +43,38 @@ def live(settings: Settings):
 
 
 class ProgramTap:
-    """The latest Program frame at the video sink, as a count of distinct v210 words:
-    a black frame has a handful, colour bars hundreds."""
+    """Mean luma (10-bit) of the latest Program frame at the video sink: black is
+    64, colour bars are far brighter."""
 
     def __init__(self, mixer: VisionMixer) -> None:
         from gi.repository import Gst
 
         self._lock = threading.Lock()
-        self._words = 0
+        self._luma = -1.0
         pad = mixer.gst.pipeline.get_by_name("vout").get_static_pad("sink")
         pad.add_probe(Gst.PadProbeType.BUFFER, self._probe)
 
     def _probe(self, _pad, info):
+        from array import array
+
         from gi.repository import Gst
 
         buffer = info.get_buffer()
         ok, mapped = buffer.map(Gst.MapFlags.READ)
         if ok:
-            data = bytes(mapped.data)
+            words = array("I", bytes(mapped.data))
             buffer.unmap(mapped)
-            words = {data[i : i + 4] for i in range(0, len(data), 4)}
+            # v210 words: Cb Y0 Cr | Y1 Cb Y2 | Cr Y3 Cb | Y4 Cr Y5 (10 bits each).
+            luma = [w >> 10 & 0x3FF for w in words[0::4]] + [w >> 10 & 0x3FF for w in words[2::4]]
+            luma += [w & 0x3FF for w in words[1::2]] + [w >> 20 & 0x3FF for w in words[1::2]]
             with self._lock:
-                self._words = len(words)
+                self._luma = sum(luma) / len(luma)
         return Gst.PadProbeReturn.OK
 
     @property
-    def words(self) -> int:
+    def luma(self) -> float:
         with self._lock:
-            return self._words
+            return self._luma
 
 
 def test_program_runs_at_the_mixer_rate(live: VisionMixer) -> None:
@@ -86,16 +90,16 @@ def test_program_runs_at_the_mixer_rate(live: VisionMixer) -> None:
 def test_cut_changes_the_program_picture(live: VisionMixer) -> None:
     live.start(MixerStartRequest(program_input_id="black", preview_input_id="cam-1"))
     tap = ProgramTap(live)
-    _wait(lambda: 0 < tap.words < 16, lambda: f"black on Program ({tap.words} distinct words)")
+    _wait(lambda: 0 <= tap.luma < 100, lambda: f"black on Program (mean luma {tap.luma:.0f})")
     live.cut()
-    _wait(lambda: tap.words > 50, lambda: f"colour bars on Program ({tap.words} distinct words)")
+    _wait(lambda: tap.luma > 200, lambda: f"colour bars on Program (mean luma {tap.luma:.0f})")
     assert live.program_input_id == "cam-1"
 
 
 def test_fade_dissolves_then_hands_program_to_the_a_bus(live: VisionMixer) -> None:
     live.start(MixerStartRequest(program_input_id="black", preview_input_id="cam-1"))
     tap = ProgramTap(live)
-    _wait(lambda: 0 < tap.words < 16, lambda: f"black on Program ({tap.words} distinct words)")
+    _wait(lambda: 0 <= tap.luma < 100, lambda: f"black on Program (mean luma {tap.luma:.0f})")
     comp = live.gst.pipeline.get_by_name("comp")
     amix = live.gst.pipeline.get_by_name("amix")
     incoming = comp.get_static_pad(PAD_MIX)
@@ -113,7 +117,7 @@ def test_fade_dissolves_then_hands_program_to_the_a_bus(live: VisionMixer) -> No
     assert vsel.get_property("active-pad").get_name() == f"sink_{live.get_input('cam-1').slot}"
     assert amix.get_static_pad(PAD_PROGRAM).get_property("volume") == 1.0
     assert amix.get_static_pad(PAD_MIX).get_property("volume") == 0.0
-    assert tap.words > 50
+    assert tap.luma > 200
     assert live.program_input_id == "cam-1"
 
 

@@ -41,6 +41,19 @@ jobs:
           .venv/bin/pip install -e '.[dev]'
       - name: Test
         run: .venv/bin/pytest -q tests/test_gst_media.py
+      - name: Audio channel diagnostics (temporary)
+        if: always()
+        run: |
+          for caps in "channels=16,channel-mask=(bitmask)0xffff" "channels=16,channel-mask=(bitmask)0x0"; do
+            for chain in "audioconvert" 'capssetter caps="audio/x-raw,channel-mask=(bitmask)0x0" ! audioconvert'; do
+              for out in "channels=2" "channels=2,channel-mask=(bitmask)0x0"; do
+                echo "=== in: $caps | $chain | out: $out"
+                GST_DEBUG=2,audioconvert:4,audio-converter:4,capssetter:4 gst-launch-1.0 -q audiotestsrc num-buffers=3 \
+                  ! "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,$caps" ! $chain \
+                  ! "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,$out" ! fakesink 2>&1 | tail -6 && echo "exit $?"
+              done
+            done
+          done
 
   nmos-testing:
     name: AMWA NMOS testing tool
