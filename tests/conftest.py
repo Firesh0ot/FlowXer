@@ -16,6 +16,7 @@ def settings(tmp_path: Path) -> Settings:
         mxl_output_domain_dir=root / "flowxer-test",
         mxl_output_domain_id="flowxer-test",
         storage_root=tmp_path / "storage",
+        state_dir=tmp_path / "config",
         simulate=True,
         gst_mode="simulate",
         width=64,

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flowxer import __version__
 from flowxer.domain.nmos import output_domain_uuid, seed_short
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
@@ -16,32 +16,52 @@ log = logging.getLogger(__name__)
 class Settings(BaseSettings):
     """Runtime configuration for the FlowXer vision mixer media function."""
 
+    # Platform names (MXL_*, NMOS_*, SHUTDOWN_TIMEOUT_S) and the FLOWXER_* names both
+    # work; the platform name wins when both are set.
     model_config = SettingsConfigDict(
         env_prefix="FLOWXER_",
         env_file=".env",
         extra="ignore",
+        populate_by_name=True,
     )
 
     host: str = "127.0.0.1"
-    port: int = 9610
+    port: int = Field(default=9610, ge=1, le=65535)
     title: str = "FlowXer Vision Mixer"
     version: str = __version__
 
     # MXL root is scanned for domain_def.json (including mirror-* siblings).
-    mxl_root: Path = Path("/Volumes/mxl")
-    mxl_output_domain_dir: Path | None = None
-    mxl_output_domain_id: str = ""
+    mxl_root: Path = Field(default=Path("/Volumes/mxl"), validation_alias=AliasChoices("MXL_DOMAIN_SCAN_PATH", "FLOWXER_MXL_ROOT"))
+    mxl_output_domain_dir: Path | None = Field(
+        default=None, validation_alias=AliasChoices("MXL_OUTPUT_DOMAIN_DIR", "FLOWXER_MXL_OUTPUT_DOMAIN_DIR")
+    )
+    mxl_output_domain_id: str = Field(default="", validation_alias=AliasChoices("MXL_OUTPUT_DOMAIN_ID", "FLOWXER_MXL_OUTPUT_DOMAIN_ID"))
     # Deprecated: when set, used as both root and output domain (single-domain layout).
     mxl_domain: Path | None = None
-    mxl_history_duration_ns: int = Field(default=200_000_000, ge=1)
+    mxl_history_duration_ns: int = Field(
+        default=200_000_000, ge=1, validation_alias=AliasChoices("MXL_HISTORY_DURATION", "FLOWXER_MXL_HISTORY_DURATION_NS")
+    )
+    # Remove the own output domain directory on SIGTERM (never another function's).
+    mxl_cleanup_on_exit: bool = Field(default=False, validation_alias=AliasChoices("MXL_CLEANUP_ON_EXIT", "FLOWXER_MXL_CLEANUP_ON_EXIT"))
     # gst-mxl-rs mxlsrc has no offset property; kept for the platform env table.
     read_offset_grains: int = Field(default=2, ge=0)
-    nmos_seed: str = ""
+    nmos_seed: str = Field(default="", validation_alias=AliasChoices("NMOS_SEED", "FLOWXER_NMOS_SEED"))
+    # Node label (and device label); empty: FLOWXER_TITLE.
+    nmos_label: str = Field(default="", validation_alias=AliasChoices("NMOS_LABEL", "FLOWXER_NMOS_LABEL"))
+    # JSON object of tag name to string array, added to the node and the device.
+    nmos_tags: dict[str, list[str]] = Field(default_factory=dict, validation_alias=AliasChoices("NMOS_TAGS", "FLOWXER_NMOS_TAGS"))
     nmos_enable: bool = True
+    # Registration API: FLOWXER_NMOS_REGISTRY_URL, or NMOS_REGISTRY_ADDRESS and
+    # NMOS_REGISTRY_PORT (the platform's names). No DNS-SD.
     nmos_registry_url: str = ""
-    nmos_dns_sd: bool = False
-    nmos_port: int = 3252
-    nmos_host_ip: str = ""
+    nmos_registry_address: str = Field(default="", validation_alias=AliasChoices("NMOS_REGISTRY_ADDRESS", "FLOWXER_NMOS_REGISTRY_ADDRESS"))
+    nmos_registry_port: int = Field(default=0, ge=0, le=65535, validation_alias=AliasChoices("NMOS_REGISTRY_PORT", "FLOWXER_NMOS_REGISTRY_PORT"))
+    nmos_dns_sd: bool = Field(default=False, validation_alias=AliasChoices("NMOS_DNS_SD", "FLOWXER_NMOS_DNS_SD"))
+    nmos_port: int = Field(default=3252, ge=1, le=65535, validation_alias=AliasChoices("NMOS_PORT", "FLOWXER_NMOS_PORT"))
+    nmos_host_ip: str = Field(default="", validation_alias=AliasChoices("NMOS_HOST_ADDRESS", "FLOWXER_NMOS_HOST_IP"))
+    # Mixer state (inputs, layout, keyers, stingers, tally, IS-05 routes), kept across restarts.
+    state_dir: Path = Path("/config")
+    shutdown_timeout_s: int = Field(default=10, ge=1, le=300, validation_alias=AliasChoices("SHUTDOWN_TIMEOUT_S", "FLOWXER_SHUTDOWN_TIMEOUT_S"))
     # Bind the Node/Connection APIs. Tests set this false and use TestClient.
     nmos_bind: bool = True
     storage_root: Path = Path("./storage")
@@ -105,6 +125,21 @@ class Settings(BaseSettings):
         elif self.mxl_output_domain_dir is None:
             self.mxl_output_domain_dir = self.mxl_root / f"flowxer-{self.seed_short}"
         return self
+
+    @property
+    def resolved_registry_url(self) -> str:
+        """Registration API base URL, or empty when no registry is configured."""
+        url = (self.nmos_registry_url or "").strip()
+        if url:
+            return url.rstrip("/")
+        address = (self.nmos_registry_address or "").strip()
+        if address and self.nmos_registry_port:
+            return f"http://{address}:{self.nmos_registry_port}"
+        return ""
+
+    @property
+    def node_label(self) -> str:
+        return (self.nmos_label or "").strip() or self.title
 
     @property
     def resolved_nmos_seed(self) -> str:

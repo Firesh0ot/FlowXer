@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -220,10 +221,29 @@ def ensure_output_domain(
         existing = _read_json(def_path) or {}
         existing_id = str(existing.get("id") or "")
         if existing_id and existing_id != domain_id:
-            log.warning(
+            log.error(
                 "output domain %s already has id %s; not overwriting with %s",
                 path,
                 existing_id,
                 domain_id,
             )
     return load_domain_info(path)
+
+
+def remove_output_domain(path: Path, *, domain_id: str, root: Path) -> bool:
+    """MXL_CLEANUP_ON_EXIT: delete the own output domain directory.
+
+    Only when its domain_def.json carries `domain_id`, it is not a mirror and it is
+    not the MXL root itself (the deprecated single-domain layout).
+    """
+    if not path.is_dir() or path.resolve() == root.resolve():
+        return False
+    payload = _read_json(path / "domain_def.json")
+    if not isinstance(payload, dict) or str(payload.get("id") or "") != domain_id:
+        log.warning("not removing %s: it is not the output domain %s", path, domain_id)
+        return False
+    if is_mirror_domain(path, payload):
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    log.info("removed MXL output domain %s", path)
+    return True

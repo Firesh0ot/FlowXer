@@ -155,12 +155,15 @@ def ready_payload(mixer) -> tuple[int, dict[str, Any]]:
         probe.unlink(missing_ok=True)
     except OSError as exc:
         reasons.append(f"output domain not writable: {output} ({exc})")
-    if settings.nmos_enable and getattr(mixer, "nmos", None) is None:
+    nmos = getattr(mixer, "nmos", None)
+    if settings.nmos_enable and nmos is None:
         reasons.append("NMOS enabled but node is missing")
+    elif nmos is not None and not nmos.registered():
+        reasons.append(f"not registered with {settings.resolved_registry_url}")
     body = {
         "ready": not reasons,
         "reasons": reasons,
-        "nmos_registry_up": bool(getattr(getattr(mixer, "nmos", None), "registry_up", False)),
+        "nmos_registry_up": bool(getattr(nmos, "registry_up", False)),
         "mixer_state": getattr(mixer.state, "value", str(mixer.state)),
     }
     return (200 if not reasons else 503, body)

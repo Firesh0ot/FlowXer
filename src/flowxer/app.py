@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import logging
+import socket
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from flowxer import __version__
 from flowxer.api.auth import ApiTokenMiddleware
 from flowxer.api.metrics import ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
+from flowxer.domain.mxl_domain import DomainError
 from flowxer.engine.mixer import VisionMixer
+from flowxer.listen import bind_listener
 from flowxer.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
+
+# Exit codes of the platform contract: invalid configuration, port taken.
+EXIT_CONFIG = 78
+EXIT_PORT = 75
 
 OPENAPI_TAGS = [
     {"name": "system", "description": "Health, raster and backend capability probes."},
@@ -79,15 +89,19 @@ OPENAPI_TAGS = [
 ]
 
 
-def create_app(settings: Settings | None = None, mixer: VisionMixer | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    mixer: VisionMixer | None = None,
+    nmos_listener: socket.socket | None = None,
+) -> FastAPI:
     settings = settings or get_settings()
     mixer = mixer or VisionMixer(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        mixer.nmos.boot()
+        mixer.nmos.boot(nmos_listener)
         yield
-        mixer.nmos.shutdown()
+        mixer.shutdown()
 
     app = FastAPI(
         title=settings.title,
@@ -119,6 +133,18 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
         redoc_url="/redoc",
         openapi_url="/openapi.json",
     )
+    @app.middleware("http")
+    async def persist_changes(request: Request, call_next):
+        # Every successful change through the API lands in STATE_DIR/state.json.
+        response = await call_next(request)
+        if (
+            request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path.startswith("/api/v1/")
+            and response.status_code < 400
+        ):
+            await run_in_threadpool(mixer.persist)
+        return response
+
     # Auth is inner; CORS is added last so it is outermost (preflight stays unauthenticated).
     app.add_middleware(ApiTokenMiddleware)
     origins = settings.cors_origin_list
@@ -176,20 +202,58 @@ def create_app(settings: Settings | None = None, mixer: VisionMixer | None = Non
     return app
 
 
+class _Server(uvicorn.Server):
+    """Remembers the signal that stopped it."""
+
+    signal = 0
+
+    def handle_exit(self, sig, frame) -> None:
+        self.signal = sig
+        super().handle_exit(sig, frame)
+
+
 def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except ValidationError as exc:
+        # Without the input values: they may hold the API token.
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors(include_input=False, include_url=False)
+        )
+        log.error("invalid configuration: %s", problems)
+        sys.exit(EXIT_CONFIG)
+    # Bind both ports before anything starts, so a taken port is exit 75 and not a
+    # half-started mixer.
+    try:
+        listener = bind_listener(settings.host, settings.port)
+        nmos_listener = (
+            bind_listener("0.0.0.0", settings.nmos_port)
+            if settings.nmos_enable and settings.nmos_bind
+            else None
+        )
+    except OSError as exc:
+        log.error("cannot listen: %s", exc)
+        sys.exit(EXIT_PORT)
+    try:
+        app = create_app(settings, nmos_listener=nmos_listener)
+    except DomainError as exc:
+        log.error("invalid MXL output domain: %s", exc)
+        sys.exit(EXIT_CONFIG)
     log.info("FlowXer %s listening on %s:%s", __version__, settings.host, settings.port)
-    uvicorn.run(
-        "flowxer.app:create_app",
-        factory=True,
-        host=settings.host,
-        port=settings.port,
-        reload=False,
+    # Open requests get half of SHUTDOWN_TIMEOUT_S; the rest is for stopping media,
+    # deregistering and removing the output domain.
+    server = _Server(
+        uvicorn.Config(app, timeout_graceful_shutdown=max(1, settings.shutdown_timeout_s // 2))
     )
+    server.run(sockets=[listener])
+    # uvicorn raises the signal again after shutting down. As PID 1 in a container
+    # the kernel ignores that, so exit with 128 + signal here (SIGTERM: 143).
+    sys.exit(128 + server.signal if server.signal else 1)
 
 
 if __name__ == "__main__":

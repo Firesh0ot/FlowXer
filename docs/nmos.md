@@ -102,10 +102,21 @@ They are one control plane:
 
 ## Registry
 
-Set `FLOWXER_NMOS_REGISTRY_URL` (for example `http://10.0.0.5:3210`). FlowXer
-POSTs Node, Device, Source, Flow, Sender, Receiver to the Registration API and
-heartbeats every 5 s. An empty URL still serves the Node API locally;
-`registry_up` stays false.
+Set `NMOS_REGISTRY_ADDRESS` and `NMOS_REGISTRY_PORT`, or the full URL in
+`FLOWXER_NMOS_REGISTRY_URL` (for example `http://10.0.0.5:3210`). FlowXer POSTs
+Node, Device, Source, Flow, Sender, Receiver to the Registration API once and
+then only heartbeats every 5 s. It registers again when resources change (an
+input added, an activation) or when the registry lost the node (heartbeat 404
+or unreachable), and deletes resources that no longer exist. An empty URL still
+serves the Node API locally; `registry_up` stays false.
+
+`NMOS_LABEL` sets the node and device label, `NMOS_TAGS` (a JSON object of tag
+to string array) adds tags to both. `/readyz` is 503 until the node is
+registered (last heartbeat within 12 s). On SIGTERM the node is deleted from
+the registry (`DELETE /resource/nodes/{id}`) before the Node API stops.
+
+Receiver connections are part of the saved state (`FLOWXER_STATE_DIR/state.json`)
+and are activated again after a restart, `master_enable: false` included.
 
 ## GUI
 

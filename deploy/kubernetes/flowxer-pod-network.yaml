@@ -1,6 +1,12 @@
-# FlowXer on an MXL host (hostNetwork). Edit nodeSelector, registry URL, and IPs
-# before apply. Mixer binds loopback :9610; GUI :9620; Node API :3252.
-# Both containers share the host netns so nginx can proxy 127.0.0.1:9610.
+# FlowXer on the pod network with the MXL platform's standard env names
+# (mxl-poc-platform media function contract). Edit nodeSelector, registry
+# address, seed and tags before apply.
+#
+# The mixer listens on 0.0.0.0:9610 inside the pod (the API token guards it;
+# /livez, /readyz and /metrics are open) and the GUI on 9620 proxies /api to it.
+# The node announces the pod IP (NMOS_HOST_ADDRESS from the downward API).
+# WebRTC previews need the pod IP to be routable from the browser; the GUI
+# falls back to JPEG otherwise.
 ---
 apiVersion: v1
 kind: Namespace
@@ -19,53 +25,45 @@ stringData:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: flowxer
+  name: flowxer-pod
   namespace: flowxer
 data:
-  FLOWXER_HOST: "127.0.0.1"
+  FLOWXER_HOST: "0.0.0.0"
   FLOWXER_PORT: "9610"
   FLOWXER_MIXER_URL: "http://127.0.0.1:9610"
   FLOWXER_GUI_PORT: "9620"
-  FLOWXER_MXL_ROOT: "/Volumes/mxl"
   FLOWXER_STORAGE_ROOT: "/storage"
   FLOWXER_STATE_DIR: "/config"
+  MXL_DOMAIN_SCAN_PATH: "/Volumes/mxl"
+  MXL_CLEANUP_ON_EXIT: "true"
+  NMOS_SEED: "demo-flowxer-1"
+  NMOS_LABEL: "FlowXer 1"
+  NMOS_TAGS: '{"urn:x-srf:production":["demo"],"urn:x-srf:function":["flowxer-1"]}'
+  NMOS_REGISTRY_ADDRESS: "10.0.0.5"
+  NMOS_REGISTRY_PORT: "3210"
+  NMOS_DNS_SD: "false"
+  NMOS_PORT: "3252"
   SHUTDOWN_TIMEOUT_S: "10"
-  FLOWXER_GROUP_HINT: "FlowXer"
-  FLOWXER_GST_MODE: "auto"
-  FLOWXER_NMOS_ENABLE: "true"
-  FLOWXER_NMOS_DNS_SD: "false"
-  FLOWXER_NMOS_PORT: "3252"
-  FLOWXER_NMOS_REGISTRY_URL: "http://10.0.0.5:3210"
-  FLOWXER_NMOS_HOST_IP: "10.0.0.20"
-  FLOWXER_WEBRTC_PUBLIC_IP: "10.0.0.20"
-  FLOWXER_WEBRTC_UDP_PORT_MIN: "32600"
-  FLOWXER_WEBRTC_UDP_PORT_MAX: "32631"
-  FLOWXER_OVERLAY_URL: "http://127.0.0.1:9610/graphics/lower-third.html"
-  FLOWXER_CORS_ORIGINS: "*"
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: flowxer
+  name: flowxer-1
   namespace: flowxer
   labels:
-    app: flowxer
+    app: flowxer-1
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      app: flowxer
+      app: flowxer-1
   template:
     metadata:
       labels:
-        app: flowxer
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9610"
-        prometheus.io/path: "/metrics"
+        app: flowxer-1
     spec:
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       # Longer than SHUTDOWN_TIMEOUT_S: stop media, deregister, remove the domain.
       terminationGracePeriodSeconds: 20
       securityContext:
@@ -82,32 +80,36 @@ spec:
           effect: NoSchedule
       containers:
         - name: mixer
-          image: ghcr.io/firesh0ot/flowxer-vision-mixer:latest
-          imagePullPolicy: Always
+          image: ghcr.io/firesh0ot/flowxer-vision-mixer:REPLACE_WITH_VERSION
           envFrom:
             - configMapRef:
-                name: flowxer
+                name: flowxer-pod
             - secretRef:
                 name: flowxer-api-token
+          env:
+            - name: NMOS_HOST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: FLOWXER_WEBRTC_PUBLIC_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           ports:
             - name: mixer
               containerPort: 9610
             - name: nmos
               containerPort: 3252
-            - name: nmos-ws
-              containerPort: 3253
           livenessProbe:
             httpGet:
               path: /livez
               port: 9610
-            initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /readyz
               port: 9610
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 5
           volumeMounts:
             - name: mxl
               mountPath: /Volumes/mxl
@@ -117,14 +119,13 @@ spec:
               mountPath: /config
           securityContext:
             allowPrivilegeEscalation: false
-            runAsUser: 1000
-            runAsGroup: 1000
+            capabilities:
+              drop: [ALL]
         - name: gui
-          image: ghcr.io/firesh0ot/flowxer-gui:latest
-          imagePullPolicy: Always
+          image: ghcr.io/firesh0ot/flowxer-gui:REPLACE_WITH_VERSION
           envFrom:
             - configMapRef:
-                name: flowxer
+                name: flowxer-pod
             - secretRef:
                 name: flowxer-api-token
           ports:
@@ -133,12 +134,13 @@ spec:
           livenessProbe:
             tcpSocket:
               port: 9620
-            initialDelaySeconds: 5
             periodSeconds: 10
           securityContext:
             allowPrivilegeEscalation: false
-            runAsUser: 1000
-            runAsGroup: 1000
+            capabilities:
+              drop: [ALL]
+      # hostPath directories are not chowned by fsGroup: make storage and config
+      # writable for uid 1000 on the node (or use PersistentVolumeClaims).
       volumes:
         - name: mxl
           hostPath:
@@ -146,24 +148,23 @@ spec:
             type: Directory
         - name: storage
           hostPath:
-            path: /var/lib/flowxer/storage
+            path: /var/lib/flowxer/flowxer-1/storage
             type: DirectoryOrCreate
         - name: config
           hostPath:
-            path: /var/lib/flowxer/config
+            path: /var/lib/flowxer/flowxer-1/config
             type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: flowxer
+  name: flowxer-1
   namespace: flowxer
   labels:
-    app: flowxer
+    app: flowxer-1
 spec:
   selector:
-    matchLabels:
-      app: flowxer
+    app: flowxer-1
   ports:
     - name: mixer
       port: 9610

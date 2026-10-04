@@ -133,7 +133,7 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 | Preview pictures | `POST /webrtc/whep/{stream_id}` or `GET /preview/jpeg/{stream_id}` |
 | NMOS (IS-04/IS-05) | Node API on **3252** — see [docs/nmos.md](docs/nmos.md) |
 
-API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
+API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `GET /config/export`, `POST /config/import`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
 Useful calls (through the GUI proxy on **9620**; mixer `:9610` is loopback-only):
 
@@ -241,6 +241,8 @@ kubectl apply -f deploy/kubernetes/flowxer.yaml
 kubectl apply -f deploy/kubernetes/servicemonitor.yaml
 ```
 
+`deploy/kubernetes/flowxer-pod-network.yaml` is the same function on the pod network with the platform's env names (`MXL_*`, `NMOS_*`, `SHUTDOWN_TIMEOUT_S`): the node announces the pod IP, probes go to `/livez` and `/readyz` on 9610, state lives on a `/config` volume.
+
 Host Compose: `docker compose -f docker-compose.host.yml up` with `/Volumes/mxl` mounted and `FLOWXER_API_TOKEN` set. Both files use **host networking**, uid **1000**, and GUI upstream `http://127.0.0.1:9610`.
 
 ### Ports
@@ -257,25 +259,50 @@ Do not use 8080, 8090, 8095, 8100, 8888/8889, 9100, 3212/3213, 3232/3233, 3242/3
 
 ### Configuration
 
+Settings come from the environment (or a `.env` file). Where a platform name exists it wins over the `FLOWXER_` name; both work. An invalid value stops the process with exit code 78.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `FLOWXER_HOST` | `127.0.0.1` | Mixer bind. Bridge Compose uses `0.0.0.0`. |
 | `FLOWXER_PORT` | `9610` | |
 | `FLOWXER_MIXER_URL` | `http://127.0.0.1:9610` | GUI nginx/Vite upstream |
 | `FLOWXER_GUI_PORT` | `9620` | |
-| `FLOWXER_MXL_ROOT` | `/Volumes/mxl` | Scan for `domain_def.json` |
-| `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` | `<root>/flowxer-<seed-short>` | PGM write path; never `mirror-*` |
-| `FLOWXER_MXL_OUTPUT_DOMAIN_ID` | UUIDv5(seed) | |
+| `MXL_DOMAIN_SCAN_PATH` / `FLOWXER_MXL_ROOT` | `/Volumes/mxl` | Scan for `domain_def.json` |
+| `MXL_OUTPUT_DOMAIN_DIR` / `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` | `<root>/flowxer-<seed-short>` | PGM write path; never `mirror-*`. An existing `domain_def.json` with another id is logged as an error and kept. |
+| `MXL_OUTPUT_DOMAIN_ID` / `FLOWXER_MXL_OUTPUT_DOMAIN_ID` | UUIDv5(seed) | |
+| `MXL_HISTORY_DURATION` / `FLOWXER_MXL_HISTORY_DURATION_NS` | `200000000` | ns; written to `options.json` when the domain is created |
+| `MXL_CLEANUP_ON_EXIT` / `FLOWXER_MXL_CLEANUP_ON_EXIT` | `false` | Remove the own output domain on SIGTERM (only when its id matches; never the root or a mirror) |
 | `FLOWXER_NMOS_ENABLE` | `true` | `false` keeps REST-only behaviour |
-| `FLOWXER_NMOS_SEED` | `{hostname}-flowxer` | Stable UUIDv5 IDs |
-| `FLOWXER_NMOS_PORT` | `3252` | |
-| `FLOWXER_NMOS_HOST_IP` | first non-loopback | Node `href` / `api.endpoints` |
-| `FLOWXER_NMOS_REGISTRY_URL` | empty | e.g. `http://10.0.0.5:3210` |
-| `FLOWXER_NMOS_DNS_SD` | `false` | Not implemented |
+| `NMOS_SEED` / `FLOWXER_NMOS_SEED` | `{hostname}-flowxer` | Stable UUIDv5 IDs |
+| `NMOS_LABEL` / `FLOWXER_NMOS_LABEL` | `FLOWXER_TITLE` | Node and device label |
+| `NMOS_TAGS` / `FLOWXER_NMOS_TAGS` | `{}` | JSON object of tag → string array, on the node and the device |
+| `NMOS_PORT` / `FLOWXER_NMOS_PORT` | `3252` | |
+| `NMOS_HOST_ADDRESS` / `FLOWXER_NMOS_HOST_IP` | first non-loopback | Node `href` / `api.endpoints` (an IP address) |
+| `NMOS_REGISTRY_ADDRESS`, `NMOS_REGISTRY_PORT` | empty | Registration API; or the full URL in `FLOWXER_NMOS_REGISTRY_URL` (e.g. `http://10.0.0.5:3210`) |
+| `NMOS_DNS_SD` / `FLOWXER_NMOS_DNS_SD` | `false` | Not implemented; `true` only logs a warning |
+| `FLOWXER_STATE_DIR` | `/config` | Saved state, see below |
+| `SHUTDOWN_TIMEOUT_S` / `FLOWXER_SHUTDOWN_TIMEOUT_S` | `10` | Open requests get half; the rest is for stopping media and deregistering |
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
 | `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
 | `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |
+
+### Saved state, export and import
+
+The mixer saves its configuration to `FLOWXER_STATE_DIR/state.json` after every successful change through the API and after every IS-05 activation, and loads it on start: inputs, console layout, mixer panels, downstream keyers, stinger slots, tally receivers and the receiver connections. Mount `/config` to keep it across restarts. A file that cannot be read is logged and ignored (the mixer starts with defaults).
+
+`GET /api/v1/config/export` returns the same document; `POST /api/v1/config/import` restores it (409 while the mixer is on-air, 422 when it is invalid). It holds no secrets: the API token only comes from the environment.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 1 | Start-up failed (see the log) |
+| 75 | The mixer or NMOS port cannot be bound |
+| 78 | Invalid configuration (the message names the setting) or an unusable output domain |
+| 143 | Stopped by SIGTERM: media stopped, node deregistered, own domain removed with `MXL_CLEANUP_ON_EXIT` |
+
+`/readyz` is 200 only when the MXL root is readable, the output domain is writable and, with a registry configured, the node is registered (heartbeat within 12 s).
 
 See [docs/nmos.md](docs/nmos.md) for receivers/senders and REST ↔ IS-05.
 
