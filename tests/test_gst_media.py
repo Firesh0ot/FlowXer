@@ -6,6 +6,7 @@ Skipped where GStreamer and PyGObject are not installed; CI runs these in the
 
 from __future__ import annotations
 
+import struct
 import threading
 import time
 
@@ -13,7 +14,8 @@ import pytest
 
 from flowxer.engine.capabilities import gstreamer_available
 from flowxer.engine.mixer import VisionMixer
-from flowxer.engine.pipeline import PAD_MIX, PAD_PROGRAM, mxl_audio_adapter
+from flowxer.engine.gst_runtime import first_channels_matrix, map_audio_channels
+from flowxer.engine.pipeline import PAD_MIX, PAD_PROGRAM
 from flowxer.api.schemas import MixerStartRequest
 from flowxer.settings import Settings
 
@@ -155,10 +157,8 @@ def test_a_stinger_plays_from_its_own_frames_every_time(live: VisionMixer) -> No
         _wait(lambda: len(comp.sinkpads) == pads_before, "the stinger pad released")
 
 
-def _first_frame(caps: str, chain: str, out_caps: str, samples: bytes) -> tuple[float, ...]:
-    """Push one buffer through `chain` and return the first output frame."""
-    import struct
-
+def _first_frame(caps: str, samples: bytes, out_channels: int) -> tuple[float, ...]:
+    """Push one buffer through the MXL audio channel map and return the first output frame."""
     import gi
 
     gi.require_version("Gst", "1.0")
@@ -166,8 +166,11 @@ def _first_frame(caps: str, chain: str, out_caps: str, samples: bytes) -> tuple[
 
     Gst.init(None)
     pipeline = Gst.parse_launch(
-        f'appsrc name=src format=time caps="{caps}" ! {chain} ! {out_caps} ! appsink name=out sync=false'
+        f'appsrc name=src format=time caps="{caps}" ! audioconvert name=amap ! audioconvert '
+        f"! audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels={out_channels} "
+        "! appsink name=out sync=false"
     )
+    map_audio_channels(pipeline.get_by_name("amap"), out_channels)
     pipeline.set_state(Gst.State.PLAYING)
     buffer = Gst.Buffer.new_wrapped(samples)
     buffer.pts = 0
@@ -181,20 +184,25 @@ def _first_frame(caps: str, chain: str, out_caps: str, samples: bytes) -> tuple[
     ok, mapped = out.map(Gst.MapFlags.READ)
     data = bytes(mapped.data)
     out.unmap(mapped)
-    channels = sample.get_caps().get_structure(0).get_int("channels")[1]
-    return struct.unpack(f"<{channels}f", data[: 4 * channels])
+    return struct.unpack(f"<{out_channels}f", data[: 4 * out_channels])
 
 
-def test_mxl_audio_takes_the_first_channels_without_a_downmix(settings: Settings) -> None:
-    import struct
-
-    # Channel 1 = 0.5, channel 2 = -0.5, channels 3-16 = 0.25; with mxlsrc's caps.
-    frame = struct.pack("<16f", 0.5, -0.5, *([0.25] * 14))
-    out_caps = f"audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels={settings.audio_channels}"
-    left, right = _first_frame(
-        "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=16,channel-mask=(bitmask)0xffff",
-        mxl_audio_adapter(settings),
-        out_caps,
-        frame * 480,
+def test_first_channels_matrix() -> None:
+    assert first_channels_matrix(3, 2) == (
+        "<<(float)1.0, (float)0.0, (float)0.0>, <(float)0.0, (float)1.0, (float)0.0>>"
     )
-    assert (left, right) == pytest.approx((0.5, -0.5))
+
+
+@pytest.mark.parametrize("mask", ["0xffff", "0x0"])
+def test_mxl_audio_takes_the_first_channels_without_a_downmix(mask: str) -> None:
+    # Channel 1 = 0.5, channel 2 = -0.5, channels 3-16 = 0.25; mxlsrc's caps (0xffff)
+    # and unpositioned ones.
+    frame = struct.pack("<16f", 0.5, -0.5, *([0.25] * 14))
+    caps = f"audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=16,channel-mask=(bitmask){mask}"
+    assert _first_frame(caps, frame * 480, 2) == pytest.approx((0.5, -0.5))
+
+
+def test_mxl_stereo_audio_passes_unchanged() -> None:
+    frame = struct.pack("<2f", 0.5, -0.5)
+    caps = "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3"
+    assert _first_frame(caps, frame * 480, 2) == pytest.approx((0.5, -0.5))

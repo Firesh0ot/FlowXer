@@ -735,7 +735,7 @@ class VisionMixer:
         self.gst = None
         self.error = None
         if not force_sim and capabilities["gstreamer"]:
-            self.gst, reason = try_start_gst(description, self._on_pipeline_error)
+            self.gst, reason = try_start_gst(description, self._on_pipeline_error, self.settings.audio_channels)
             if self.gst is None:
                 # Never fall back to the simulator when GStreamer is installed: the
                 # API would report on-air while nothing reaches MXL.

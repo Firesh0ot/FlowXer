@@ -124,7 +124,7 @@ def _audio_source_bin(
             f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "
             f"domain={_gst_string(src_domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
-            f"! {mxl_audio_adapter(settings)} ! {caps} ! "
+            f"! audioconvert name={AUDIO_MAP_PREFIX}{inp.id} ! audioconvert ! audioresample ! {caps} ! "
         )
     elif inp.kind in {InputKind.black, InputKind.test}:
         wave = "silence" if inp.kind == InputKind.black else "ticks"
@@ -149,12 +149,9 @@ def _audio_source_bin(
     return chain + _buses("a", inp)
 
 
-def mxl_audio_adapter(settings: Settings) -> str:
-    """mxlsrc gives an N-channel flow the first N speaker positions (16 channels on
-    the lab test player: front, rear, side, top ...), so audioconvert downmixed
-    every channel into Program. Broadcast channels are separate signals: mark them
-    unpositioned, and audioconvert takes the first ones one to one."""
-    return 'capssetter caps="audio/x-raw,channel-mask=(bitmask)0x0" ! audioconvert ! audioresample'
+# MXL audio: this audioconvert gets a mix-matrix when the flow's caps arrive
+# (GstRuntime.map_audio_channels), so its channel count can be anything.
+AUDIO_MAP_PREFIX = "amap_"
 
 
 def stinger_bin_description(stinger: dict, settings: Settings) -> str:

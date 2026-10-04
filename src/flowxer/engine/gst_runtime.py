@@ -5,7 +5,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from flowxer.engine.pipeline import PAD_MIX, PAD_PROGRAM, STINGER_ZORDER
+from flowxer.engine.pipeline import AUDIO_MAP_PREFIX, PAD_MIX, PAD_PROGRAM, STINGER_ZORDER
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +14,35 @@ log = logging.getLogger(__name__)
 STINGER_LEAD_NS = 100_000_000
 # Frames Program keeps the incoming source on both buses before the B bus is hidden.
 MIX_HANDOVER_FRAMES = 3
+
+
+def first_channels_matrix(in_channels: int, out_channels: int) -> str:
+    """audioconvert mix-matrix (one row per output channel) that takes the first
+    input channels one to one and drops the rest."""
+    rows = []
+    for out in range(out_channels):
+        row = ", ".join("(float)1.0" if i == out else "(float)0.0" for i in range(in_channels))
+        rows.append(f"<{row}>")
+    return "<" + ", ".join(rows) + ">"
+
+
+def map_audio_channels(element, out_channels: int) -> None:
+    """Give `element` (an audioconvert) a first-channels mix-matrix for every caps
+    its input announces. MXL audio channels are separate signals, and mxlsrc gives
+    an N-channel flow the first N speaker positions: without the matrix,
+    audioconvert downmixed all of them into Program (16 on the lab test player).
+    GStreamer 1.24 cannot drop channels any other way."""
+    from gi.repository import Gst
+
+    def probe(_pad, info):
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.CAPS:
+            ok, channels = event.parse_caps().get_structure(0).get_int("channels")
+            if ok:
+                Gst.util_set_object_arg(element, "mix-matrix", first_channels_matrix(channels, out_channels))
+        return Gst.PadProbeReturn.OK
+
+    element.get_static_pad("sink").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, probe)
 
 
 @dataclass
@@ -41,7 +70,7 @@ class GstRuntime:
         self._mix: _Mix | None = None
         self._stinger = None
 
-    def start(self, description: str) -> None:
+    def start(self, description: str, audio_channels: int = 2) -> None:
         import gi
 
         gi.require_version("Gst", "1.0")
@@ -75,6 +104,13 @@ class GstRuntime:
         self._glib = GLib
         self.pipeline = pipeline
         self._count_program_frames()
+        iterator = pipeline.iterate_recurse()
+        while True:
+            result, element = iterator.next()
+            if result != Gst.IteratorResult.OK:
+                break
+            if element.get_name().startswith(AUDIO_MAP_PREFIX):
+                map_audio_channels(element, audio_channels)
         for name in ("comp", "amix"):
             element = pipeline.get_by_name(name)
             if element is not None:
@@ -319,12 +355,12 @@ class GstRuntime:
 
 
 def try_start_gst(
-    description: str, on_error: Callable[[str], None] | None = None
+    description: str, on_error: Callable[[str], None] | None = None, audio_channels: int = 2
 ) -> tuple[GstRuntime | None, str]:
     """Start the pipeline. Returns the runtime, or None and the reason it failed."""
     try:
         runtime = GstRuntime(on_error)
-        runtime.start(description)
+        runtime.start(description, audio_channels)
         return runtime, ""
     except Exception as exc:
         log.error("GStreamer pipeline failed to start: %s", exc)

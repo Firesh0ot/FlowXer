@@ -53,8 +53,8 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     assert "video/x-raw,format=v210" in description
     # GStreamer 1.24 (Ubuntu 24.04) has no compositor property of that name; parsing failed.
     assert "zero-size-is-unconfigured" not in description
-    # MXL audio channels are separate signals: unpositioned, the first two go to Program.
-    assert 'capssetter caps="audio/x-raw,channel-mask=(bitmask)0x0"' in description
+    # MXL audio gets a channel map when its caps arrive (GstRuntime.map_audio_channels).
+    assert "audioconvert name=amap_cam-1 " in description
     # Stingers are not part of the pipeline; each playback gets its own bin.
     assert "stinger" not in description
 
