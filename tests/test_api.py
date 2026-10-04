@@ -113,3 +113,10 @@ def test_control_surface_and_docs(client: TestClient) -> None:
     assert docs.status_code == 200
     graphics = client.get("/graphics/lower-third.html")
     assert graphics.status_code == 200
+
+
+def test_invalid_input_patch_is_422_not_500(client: TestClient) -> None:
+    # mxl_live without essences or group hint is invalid once merged into the input.
+    response = client.patch("/api/v1/inputs/cam-1", json={"kind": "mxl_live"})
+    assert response.status_code == 422
+    assert "group_hint" in response.text

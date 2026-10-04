@@ -147,7 +147,7 @@ def build_pipeline_description(
     if stinger and kind == "video":
         stinger_bin = (
             f'filesrc name=stinger location="{stinger.get("media_path") or stinger["path"]}" '
-            f"! decodebin name=stingerdec ! videoconvert ! videoscale ! {bgra} "
+            f"! decodebin name=stingerdec ! videoconvert ! videoscale ! videorate ! {bgra} "
             f"! queue name=stingerq ! comp.sink_2"
         )
     else:
@@ -155,9 +155,12 @@ def build_pipeline_description(
             f"{stinger['path']}/{stinger['pattern']}" if stinger else "/dev/null/frame_%05d.tga"
         )
         stinger_stop = (stinger["frame_count"] - 1) if stinger else 0
+        # A TGA sequence has no rate of its own: give it the mixer rate, or the
+        # BGRA caps below cannot negotiate.
         stinger_bin = (
             f"multifilesrc name=stinger location={stinger_location} index=0 "
-            f"stop-index={stinger_stop} loop=false caps=image/x-tga "
+            f"stop-index={stinger_stop} loop=false "
+            f"caps=image/x-tga,framerate={settings.frame_rate} "
             f"! decodebin ! videoconvert ! videoscale ! {bgra} "
             f"! queue name=stingerq ! comp.sink_2"
         )
@@ -198,7 +201,7 @@ def build_pipeline_description(
     return f"""
 input-selector name=vsel sync-streams=true cache-buffers=true
 input-selector name=asel sync-streams=true cache-buffers=true
-compositor name=comp zero-size-is-unconfigured=false
+compositor name=comp
   sink_0::zorder=0 sink_0::alpha=1.0
   sink_1::zorder=1 sink_1::alpha={overlay_alpha} sink_1::sync=false
   sink_2::zorder=2 sink_2::alpha=0.0 sink_2::sync=false

@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-libav \
+        gstreamer1.0-x \
         libgdk-pixbuf2.0-0 \
         fonts-dejavu-core \
         ffmpeg \

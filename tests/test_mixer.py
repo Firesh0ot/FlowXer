@@ -1,5 +1,7 @@
+import pytest
+
 from flowxer.api.schemas import MixerStartRequest
-from flowxer.engine.mixer import VisionMixer
+from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.engine.pipeline import build_pipeline_description
 
 
@@ -60,6 +62,36 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     )
     assert 'filesrc name=stinger location="/tmp/sting.webm"' in video_description
     assert "video/x-raw,format=v210" in description
+    # GStreamer 1.24 (Ubuntu 24.04) has no compositor property of that name; parsing failed.
+    assert "zero-size-is-unconfigured" not in description
+    # A TGA sequence needs the mixer rate in its caps, or the BGRA caps cannot negotiate.
+    assert "caps=image/x-tga,framerate=50/1" in description
+    assert "videorate" in video_description.split("comp.sink_2")[0].split("filesrc name=stinger")[1]
+
+
+def test_failed_pipeline_does_not_fall_back_to_simulate(
+    settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import flowxer.engine.mixer as mixer_module
+
+    live = VisionMixer(settings.model_copy(update={"simulate": False, "gst_mode": "auto"}))
+    monkeypatch.setattr(
+        mixer_module,
+        "probe_backend",
+        lambda: {"gstreamer": True, "mxlsrc": True, "mxlsink": True, "cefsrc": False, "mxl_plugins": True},
+    )
+    monkeypatch.setattr(mixer_module, "try_start_gst", lambda *_args: (None, "no element \"x\""))
+    with pytest.raises(MixerError, match="GStreamer pipeline failed"):
+        live.start(MixerStartRequest(program_input_id="cam-1"))
+    assert live.state.value == "error"
+    assert live.backend == "idle"
+    assert "no element" in (live.status().error or "")
+
+
+def test_pipeline_errors_are_reported(mixer: VisionMixer) -> None:
+    mixer._on_pipeline_error("asrc_cam-2: Internal data stream error.")
+    assert mixer.pipeline_errors == 1
+    assert mixer.status().error == "asrc_cam-2: Internal data stream error."
 
 
 def test_file_player_location_is_quoted(mixer: VisionMixer) -> None:

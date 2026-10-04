@@ -73,6 +73,9 @@ def render_prometheus(mixer) -> str:
         "# HELP flowxer_input_resyncs_total MXL reader resyncs",
         "# TYPE flowxer_input_resyncs_total counter",
         _line("flowxer_input_resyncs_total", int(getattr(mixer, "resyncs", 0))),
+        "# HELP flowxer_pipeline_errors_total GStreamer pipeline error messages",
+        "# TYPE flowxer_pipeline_errors_total counter",
+        _line("flowxer_pipeline_errors_total", int(getattr(mixer, "pipeline_errors", 0))),
         "# HELP flowxer_webrtc_peers Active WHEP peers",
         "# TYPE flowxer_webrtc_peers gauge",
     ]

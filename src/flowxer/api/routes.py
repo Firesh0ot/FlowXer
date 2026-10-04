@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError
 
 from flowxer.api.schemas import (
     ConsoleState,
@@ -219,6 +220,13 @@ def patch_input(
     except MixerError as exc:
         code = status.HTTP_404_NOT_FOUND if "unknown" in str(exc) else status.HTTP_409_CONFLICT
         raise _http(exc, code)
+    except ValidationError as exc:
+        # The patch is merged into the stored input; the merged result can still be
+        # invalid (e.g. mxl_live without essences or group hint).
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False),
+        ) from exc
 
 
 @router.delete(

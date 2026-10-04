@@ -879,19 +879,29 @@ class NmosNode:
             self._staged.pop(rid, None)
 
     def refresh_waiting(self) -> None:
-        """Promote waiting/no_signal receivers when the flow appears (no extra PATCH)."""
+        """Promote waiting/no_signal receivers when the flow appears (no extra PATCH).
+
+        Only an essence that leaves `waiting` is applied to the mixer again, so its
+        mxlsrc points at the domain path that now exists. Every other essence only
+        gets its state refreshed: applying it again would restart a live mxlsrc.
+        """
         with self.lock:
             for item in self._live_inputs():
                 for role in ("video", "audio"):
-                    if self.input_state(item.id, role) not in {
-                        "waiting",
-                        "no_signal",
-                        "running",
-                    }:
+                    state = self.input_state(item.id, role)
+                    if state not in {"waiting", "no_signal", "running"}:
                         continue
                     rid = ids.receiver_id(self.seed, item.id, role)
                     active = self._active.get(rid)
                     if not active:
+                        continue
+                    params = (active.get("transport_params") or [{}])[0]
+                    domain_id = params.get("mxl_domain_id") or self.settings.resolved_output_domain_id
+                    presence = flow_presence(
+                        self.settings.mxl_root, str(domain_id), str(params.get("mxl_flow_id"))
+                    )
+                    if state != "waiting" or presence == "waiting":
+                        self._input_states.setdefault(item.id, {})[role] = presence
                         continue
                     try:
                         self._apply_receiver(rid, active)
