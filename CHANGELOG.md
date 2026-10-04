@@ -7,6 +7,10 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Added
 
+- Fade and Fade to Black dissolve picture and sound (they were cuts);
+  `POST /mixer/take` with `transition: mix` uses its `duration_ms`.
+- CI job `Pytest (GStreamer)`: the media pipeline on the GStreamer of the
+  image.
 - Platform env names (`MXL_*`, `NMOS_*`, `SHUTDOWN_TIMEOUT_S`) next to the
   `FLOWXER_` names; the platform name wins.
 - Saved state in `FLOWXER_STATE_DIR` (default `/config`), restored on start,
@@ -21,6 +25,9 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Changed
 
+- The compositor works in AYUV instead of BGRA (no RGB round trip for
+  Program).
+- `flowxer_frames_rendered_total` counts Program frames at the video output.
 - The registry client registers once and then heartbeats, instead of posting
   every resource every 5 s.
 - `/readyz` is 503 until the node is registered (with a registry configured).
@@ -36,3 +43,7 @@ in `docs/platform-integration-plan.md` §8.
 - `timeoverlay` missing from the image; TGA stinger caps without a frame rate.
 - The NMOS refresh loop restarted live inputs four times a second.
 - An invalid `PATCH /inputs/{id}` returned 500 instead of 422.
+- A stinger played only once (at pipeline start); every playback now decodes
+  it again and its frames drive the cut.
+- An MXL audio flow with more channels than Program (16 on the test player)
+  was downmixed into Program; Program now gets its first channels.

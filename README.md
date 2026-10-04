@@ -84,7 +84,7 @@ The gear on each **stinger** (`PATCH /stinger-slots/{id}`) picks a TGA sequence 
 
 **Tally → Receivers…** (`PUT /tally/receivers`) adds TSL UMD 5.0 listeners: **Bitfocus Companion**, **Lawo VSM**, **BFE Commander**, **Riedel HI**, or a custom host. Program lights the right-hand lamp red, Preview the left-hand lamp green, and the source name is the UMD label. Display INDEX is the source slot plus an optional offset. Receivers can be changed while on-air.
 
-**Cut / Fade / Fade to Black / Wipe** on the transition bank map to `/mixer/cut`, `/mixer/fade`, `/mixer/fade-to-black`, and `/mixer/wipe`. Wipe arms the next Cut when the Preview source has no auto-stinger.
+**Cut / Fade / Fade to Black / Wipe** on the transition bank map to `/mixer/cut`, `/mixer/fade`, `/mixer/fade-to-black`, and `/mixer/wipe`. Fade and Fade to Black dissolve picture and sound over `duration_ms` (default 400 and 600 ms; `POST /mixer/take` with `transition: mix` uses its `duration_ms`, default 400). A Cut during a Fade ends it at once. Wipe arms the next Cut when the Preview source has no auto-stinger.
 
 The top-right **status chip** is a compact CPU / RAM / format pill. Click it for mixer state, load averages, memory, raster, WebRTC, uptime, PID, and issues (`GET /console` or `GET /resources`).
 
@@ -212,7 +212,7 @@ Services:
 - **vision-mixer** on **127.0.0.1:9610** — mixer process. `FLOWXER_HOST` defaults to `127.0.0.1` (safe under `hostNetwork`); bridge Compose sets `0.0.0.0` so the GUI container can reach it.
 - tmpfs MXL root (Compose still mounts `/mxl-domain` and sets the deprecated `FLOWXER_MXL_DOMAIN` alias so local demos keep a single-domain layout)
 - bind-mount `./storage` for clips, TGA stingers, overlay cache
-- GStreamer path: `videotestsrc` / `filesrc` → `input-selector` → compositor → **v210** / **F32LE**
+- GStreamer path: `videotestsrc` / `filesrc` → `tee` → `input-selector` A (Program) and B (incoming source of a Fade) → compositor (with the keyer, and a new pad for each stinger playback) → **v210**; audio the same way through an `audiomixer` → **F32LE**. An MXL audio flow with more channels than Program gives Program its first channels (no downmix).
 
 ### Real MXL I/O and HTML keyer
 
@@ -370,7 +370,7 @@ cd gui && npm run dev
 
 ## Stinger convention
 
-Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut frame** — the moment Program switches while the sting covers the picture. The GUI field is **Cut at (frame)** (`cut_frame`); `cut_ms` is stored alongside for the mixer clock.
+Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut frame** — the moment Program switches while the sting covers the picture. The GUI field is **Cut at (frame)** (`cut_frame`); `cut_ms` is stored alongside for the mixer clock. Every playback decodes the stinger again on its own compositor pad, and Program switches when the cut frame reaches the compositor.
 
 Place sequences under `storage/stingers/<id>/`:
 
