@@ -39,6 +39,7 @@ def _settings(tmp_path: Path) -> Settings:
         nmos_enable=True,
         nmos_bind=False,
         storage_root=tmp_path / "storage",
+        state_dir=tmp_path / "config",
         simulate=True,
         gst_mode="simulate",
         width=64,

@@ -10,12 +10,17 @@ from typing import Any
 
 from flowxer.api.schemas import InputKind
 from flowxer.domain.mxl_domain import resolve_domain_path
+from flowxer.listen import bind_listener
 from flowxer.nmos import ids
 from flowxer.nmos.registry import RegistryClient
 
 log = logging.getLogger(__name__)
 
 TAI_OFFSET_NS = 37 * 10**9
+# Heartbeat period, and how long after the last good one the node counts as registered
+# (nmos-cpp expires nodes after 12 s without a heartbeat).
+HEARTBEAT_S = 5.0
+REGISTRATION_FRESH_S = 12.0
 TRANSPORT_MXL = "urn:x-nmos:transport:mxl"
 FORMAT_VIDEO = "urn:x-nmos:format:video"
 FORMAT_AUDIO = "urn:x-nmos:format:audio"
@@ -105,6 +110,9 @@ class NmosNode:
         self.settings = mixer.settings
         self.lock = threading.RLock()
         self.registry_up = False
+        self.registered_at = 0.0
+        self._dirty = threading.Event()
+        self._registered: dict[str, set[str]] = {}
         self.activations_ok = 0
         self.activations_error = 0
         self._staged: dict[str, dict[str, Any]] = {}
@@ -154,7 +162,7 @@ class NmosNode:
                     )
             return {
                 "enabled": self.enabled(),
-                "registry_url": self.settings.nmos_registry_url,
+                "registry_url": self.settings.resolved_registry_url,
                 "registry_up": self.registry_up,
                 "node_id": self.node_uuid,
                 "device_id": self.device_uuid,
@@ -165,20 +173,25 @@ class NmosNode:
                 "receivers": receivers,
             }
 
-    def boot(self) -> None:
+    def boot(self, listener: socket.socket | None = None) -> None:
+        """Start the Node API (on `listener` when given) and the registry client.
+
+        Binding the Node API port raises OSError, so a taken port stops the process
+        (exit 75 in flowxer.app.run) instead of leaving a node without an API.
+        """
         if not self.enabled():
             log.info("NMOS node disabled (FLOWXER_NMOS_ENABLE=false)")
             return
         if self.settings.nmos_dns_sd:
-            log.warning("FLOWXER_NMOS_DNS_SD=true is ignored; DNS-SD/mDNS is not implemented")
+            log.warning("NMOS_DNS_SD=true is ignored; DNS-SD/mDNS is not implemented")
         self._stop.clear()
         if self.settings.nmos_bind:
-            self._start_http()
+            self._start_http(listener or bind_listener("0.0.0.0", self.settings.nmos_port))
         self._wait_thread = threading.Thread(
             target=self._refresh_loop, daemon=True, name="nmos-wait"
         )
         self._wait_thread.start()
-        if (self.settings.nmos_registry_url or "").strip():
+        if self.settings.resolved_registry_url:
             self._registry_thread = threading.Thread(
                 target=self._registry_loop, daemon=True, name="nmos-registry"
             )
@@ -191,27 +204,43 @@ class NmosNode:
             self.settings.nmos_bind,
         )
 
+    def registered(self) -> bool:
+        """True without a registry, else when the last registration or heartbeat succeeded."""
+        if not self.enabled() or not self.settings.resolved_registry_url:
+            return True
+        return self.registry_up and time.monotonic() - self.registered_at < REGISTRATION_FRESH_S
+
+    def mark_changed(self) -> None:
+        """Resources changed: the registry loop registers them again (with new versions)."""
+        self._dirty.set()
+
     def shutdown(self) -> None:
+        """Stop the loops, deregister the node, then stop the Node API."""
         self._stop.set()
+        if self._registry_thread is not None:
+            self._registry_thread.join(timeout=RegistryClient.timeout_s + 1)
+        if self.enabled() and self.settings.resolved_registry_url:
+            try:
+                RegistryClient(self.settings.resolved_registry_url).delete_node(self.node_uuid)
+                log.info("NMOS node %s deregistered", self.node_uuid)
+            except Exception as exc:
+                log.warning("NMOS deregistration failed: %s", exc)
+            self.registry_up = False
         if self._server is not None:
             self._server.should_exit = True
         self._server = None
 
-    def _start_http(self) -> None:
+    def _start_http(self, listener: socket.socket) -> None:
         import uvicorn
 
         from flowxer.nmos.http import create_nmos_app
 
         app = create_nmos_app(self)
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=self.settings.nmos_port,
-            log_level="info",
-        )
+        config = uvicorn.Config(app, log_level="info")
         self._server = uvicorn.Server(config)
+        server = self._server
         self._http_thread = threading.Thread(
-            target=self._server.run, daemon=True, name="nmos-http"
+            target=lambda: server.run(sockets=[listener]), daemon=True, name="nmos-http"
         )
         self._http_thread.start()
 
@@ -230,29 +259,45 @@ class NmosNode:
             delay = min(delay * 2, 5.0) if waiting else 0.25
 
     def _registry_loop(self) -> None:
-        client = RegistryClient(self.settings.nmos_registry_url)
+        # Register once, then heartbeat. Resources are registered again only when they
+        # changed or the registry lost the node (heartbeat 404, or it was unreachable):
+        # posting every resource every 5 s gave each one a new version each time.
+        client = RegistryClient(self.settings.resolved_registry_url)
+        current = False
         while not self._stop.is_set():
             try:
-                self._register_all(client)
+                if not current or self._dirty.is_set():
+                    self._dirty.clear()
+                    self._register_all(client)
+                    current = True
                 client.heartbeat(self.node_uuid)
                 self.registry_up = True
+                self.registered_at = time.monotonic()
             except Exception as exc:
+                current = False
                 self.registry_up = False
-                log.warning("NMOS registry %s: %s", self.settings.nmos_registry_url, exc)
-            self._stop.wait(5.0)
+                log.warning("NMOS registry %s: %s", self.settings.resolved_registry_url, exc)
+            self._stop.wait(HEARTBEAT_S)
 
     def _register_all(self, client: RegistryClient) -> None:
         with self.lock:
-            client.register("node", self.self_resource())
-            client.register("device", self.device_resource())
-            for source in self.sources():
-                client.register("source", source)
-            for flow in self.flows():
-                client.register("flow", flow)
-            for sender in self.senders():
-                client.register("sender", sender)
-            for receiver in self.receivers():
-                client.register("receiver", receiver)
+            resources = [
+                ("node", [self.self_resource()]),
+                ("device", [self.device_resource()]),
+                ("source", self.sources()),
+                ("flow", self.flows()),
+                ("sender", self.senders()),
+                ("receiver", self.receivers()),
+            ]
+        for kind, items in resources:
+            for item in items:
+                client.register(kind, item)
+        # Remove what no longer exists (an input deleted, fewer panels), children first.
+        current = {kind: {item["id"] for item in items} for kind, items in resources}
+        for kind in ("receiver", "sender", "flow", "source", "device"):
+            for stale in self._registered.get(kind, set()) - current[kind]:
+                client.delete(kind, stale)
+        self._registered = current
 
     def _empty_receiver_active(self) -> dict[str, Any]:
         return {
@@ -281,13 +326,17 @@ class NmosNode:
             out.add(ids.sender_id(self.seed, panel.id, "audio"))
         return out
 
+    def _tags(self) -> dict[str, list[str]]:
+        """NMOS_TAGS on the node and the device (e.g. the platform's production and function)."""
+        return {str(name): [str(value) for value in values] for name, values in self.settings.nmos_tags.items()}
+
     def self_resource(self) -> dict[str, Any]:
         return {
             "id": self.node_uuid,
             "version": nmos_version(),
-            "label": self.settings.title,
+            "label": self.settings.node_label,
             "description": "FlowXer Vision Mixer",
-            "tags": {},
+            "tags": self._tags(),
             "href": self.href(),
             "caps": {},
             "services": [
@@ -329,9 +378,9 @@ class NmosNode:
         return {
             "id": self.device_uuid,
             "version": nmos_version(),
-            "label": "FlowXer Vision Mixer",
+            "label": self.settings.node_label,
             "description": "FlowXer Vision Mixer",
-            "tags": {},
+            "tags": self._tags(),
             "type": "urn:x-nmos:device:generic",
             "node_id": self.node_uuid,
             "senders": senders,
@@ -727,6 +776,9 @@ class NmosNode:
         except NmosActivationError:
             self.activations_error += 1
             raise
+        # The IS-04 subscription changed, and the route belongs to the saved state.
+        self.mark_changed()
+        self.mixer.persist()
         return active
 
     def _cancel_scheduled(self, resource_id: str) -> None:
@@ -850,6 +902,7 @@ class NmosNode:
                     states[role] = flow_presence(
                         self.settings.mxl_root, domain_id, flow_id
                     )
+        self.mark_changed()
 
     def reconcile_inputs(self) -> None:
         """Create/remove receivers when live inputs appear or disappear."""
@@ -870,6 +923,7 @@ class NmosNode:
                 if rid not in valid_receivers and rid not in senders:
                     self._active.pop(rid, None)
                     self._staged.pop(rid, None)
+        self.mark_changed()
 
     def _drop_input_receivers(self, input_id: str) -> None:
         self._input_states.pop(input_id, None)
@@ -877,6 +931,59 @@ class NmosNode:
             rid = ids.receiver_id(self.seed, input_id, role)
             self._active.pop(rid, None)
             self._staged.pop(rid, None)
+
+    def export_routes(self) -> list[dict[str, Any]]:
+        """Receiver connections by input and role (no seed-derived ids), for the saved state."""
+        routes = []
+        with self.lock:
+            for item in self._live_inputs():
+                for role in ("video", "audio"):
+                    active = self._active.get(ids.receiver_id(self.seed, item.id, role))
+                    if not active:
+                        continue
+                    params = (active.get("transport_params") or [{}])[0]
+                    routes.append(
+                        {
+                            "input_id": item.id,
+                            "role": role,
+                            "sender_id": active.get("sender_id"),
+                            "master_enable": bool(active.get("master_enable")),
+                            "mxl_domain_id": params.get("mxl_domain_id"),
+                            "mxl_flow_id": params.get("mxl_flow_id"),
+                        }
+                    )
+        return routes
+
+    def import_routes(self, routes: list[dict[str, Any]]) -> None:
+        """Activate saved receiver connections again, so they survive a restart."""
+        with self.lock:
+            live = {item.id for item in self._live_inputs()}
+            for route in routes:
+                if not isinstance(route, dict) or route.get("role") not in {"video", "audio"}:
+                    continue
+                if route.get("input_id") not in live:
+                    continue
+                rid = ids.receiver_id(self.seed, route["input_id"], route["role"])
+                active = self._empty_receiver_active()
+                active["sender_id"] = route.get("sender_id")
+                active["master_enable"] = bool(route.get("master_enable"))
+                active["activation"] = {
+                    "mode": "activate_immediate",
+                    "requested_time": None,
+                    "activation_time": nmos_version(),
+                }
+                active["transport_params"] = [
+                    {"mxl_domain_id": route.get("mxl_domain_id"), "mxl_flow_id": route.get("mxl_flow_id")}
+                ]
+                self._active[rid] = active
+                staged = dict(active)
+                staged["activation"] = dict(NULL_ACTIVATION)
+                self._staged[rid] = staged
+                try:
+                    self._apply_receiver(rid, active)
+                except (NmosActivationError, RuntimeError) as exc:
+                    log.warning("saved route of %s/%s not restored: %s", route["input_id"], route["role"], exc)
+        self.mark_changed()
 
     def refresh_waiting(self) -> None:
         """Promote waiting/no_signal receivers when the flow appears (no extra PATCH).
@@ -922,3 +1029,4 @@ class NmosNode:
                     sid = ids.sender_id(self.seed, panel.id, role)
                     self._active[sid] = self._empty_sender_active(domain_id, flow)
                     self._staged[sid] = dict(self._active[sid])
+        self.mark_changed()

@@ -16,4 +16,6 @@ if [[ -z "${DISPLAY:-}" ]] && command -v Xvfb >/dev/null 2>&1; then
 fi
 mkdir -p "${GST_CEF_CACHE_LOCATION:-/tmp/cef-cache}"
 
-exec uvicorn flowxer.app:create_app --factory --host "${FLOWXER_HOST:-127.0.0.1}" --port "${FLOWXER_PORT:-9610}"
+# flowxer binds FLOWXER_HOST:FLOWXER_PORT and NMOS_PORT itself: exit 75 when a port is
+# taken, 78 on invalid settings, 143 after SIGTERM.
+exec flowxer

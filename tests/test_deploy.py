@@ -22,6 +22,21 @@ def test_kubernetes_manifest_is_host_network_non_root() -> None:
     assert "path: /metrics" in monitor
 
 
+def test_pod_network_manifest_follows_the_platform_contract() -> None:
+    text = (ROOT / "deploy" / "kubernetes" / "flowxer-pod-network.yaml").read_text(encoding="utf-8")
+    assert "hostNetwork" not in text
+    assert "hostIPC" not in text
+    assert "terminationGracePeriodSeconds: 20" in text
+    assert 'SHUTDOWN_TIMEOUT_S: "10"' in text
+    assert "mountPath: /config" in text
+    assert "fieldPath: status.podIP" in text
+    for name in ("MXL_DOMAIN_SCAN_PATH", "MXL_CLEANUP_ON_EXIT", "NMOS_SEED", "NMOS_TAGS", "NMOS_REGISTRY_ADDRESS", "NMOS_HOST_ADDRESS"):
+        assert name in text
+    assert "path: /livez" in text
+    assert "path: /readyz" in text
+    assert "/Volumes/mxl" in text
+
+
 def test_host_compose_uses_host_network_and_token() -> None:
     text = (ROOT / "docker-compose.host.yml").read_text(encoding="utf-8")
     assert "network_mode: host" in text

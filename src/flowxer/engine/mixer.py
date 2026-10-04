@@ -7,6 +7,9 @@ from pathlib import Path
 
 from uuid import UUID
 
+from pydantic import ValidationError
+
+from flowxer import __version__
 from flowxer.api.schemas import (
     AudioEssence,
     DownstreamKeyer,
@@ -37,6 +40,7 @@ from flowxer.domain.mxl_domain import (
     ensure_output_domain,
     flows_by_group_hint_in_root,
     list_flows_in_root,
+    remove_output_domain,
     resolve_domain_path,
 )
 from flowxer.engine.capabilities import probe_backend
@@ -61,6 +65,7 @@ from flowxer.engine.stinger import (
     register_video_stinger,
     update_stinger_cut,
 )
+from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
@@ -122,6 +127,8 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        self._store = StateStore(settings.state_dir)
+        self._restore_state()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -662,6 +669,7 @@ class VisionMixer:
         video_id = nmos.flow_uuid(
             group_hint,
             "video",
+            seed=self.settings.resolved_nmos_seed,
             width=self.settings.width,
             height=self.settings.height,
             frame_rate_num=self.settings.frame_rate_num,
@@ -670,6 +678,7 @@ class VisionMixer:
         audio_id = nmos.flow_uuid(
             group_hint,
             "audio",
+            seed=self.settings.resolved_nmos_seed,
             width=self.settings.width,
             height=self.settings.height,
             frame_rate_num=self.settings.frame_rate_num,
@@ -764,6 +773,22 @@ class VisionMixer:
         self.stinger_player = None
         self._publish_tally()
         return self.status()
+
+    def shutdown(self) -> None:
+        """SIGTERM: stop media (releases the MXL readers and writers), deregister from
+        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set."""
+        try:
+            self.stop()
+        except Exception:
+            log.exception("stopping the media pipeline failed")
+        self.tally.close()
+        self.nmos.shutdown()
+        if self.settings.mxl_cleanup_on_exit:
+            remove_output_domain(
+                self.settings.output_domain,
+                domain_id=self.settings.resolved_output_domain_id,
+                root=self.settings.mxl_root,
+            )
 
     def _default_program_id(self) -> str:
         for item in self.list_inputs():
@@ -1149,6 +1174,105 @@ class VisionMixer:
         except Exception as exc:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
+
+    # ── saved state and config export/import ─────────────────────────────────
+
+    def export_state(self) -> dict:
+        """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
+        # The NMOS lock guards the state: IS-05 activations hold it when they persist.
+        with self.nmos.lock:
+            return {
+                "format": STATE_FORMAT,
+                "flowxer_version": __version__,
+                "workspace": self.workspace.model_dump(mode="json"),
+                "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
+                "panels": [panel.model_dump(mode="json") for panel in self.panels],
+                "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
+                "stinger_slots": [slot.model_dump(mode="json") for slot in self.stinger_slots],
+                "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
+                "nmos_receivers": self.nmos.export_routes(),
+            }
+
+    def import_state(self, data: dict) -> dict:
+        """Restore an export_state() document (POST /config/import). The mixer must be stopped."""
+        if self.state == MixerState.running:
+            raise MixerError("stop the mixer before importing a configuration")
+        self._apply_state(data, checked=True)
+        self._publish_tally()
+        self.persist()
+        return self.export_state()
+
+    def persist(self) -> None:
+        with self.nmos.lock:
+            self._store.save(self.export_state())
+
+    def _restore_state(self) -> None:
+        saved = self._store.load()
+        if saved is None:
+            return
+        try:
+            # Written by this function: no DNS lookups, so a resolver hiccup keeps the state.
+            self._apply_state(saved, checked=False)
+        except MixerError as exc:
+            log.error("ignoring %s, starting with defaults: %s", self._store.path, exc)
+            return
+        log.info("restored the mixer state from %s", self._store.path)
+
+    def _apply_state(self, data: dict, *, checked: bool) -> None:
+        """Validate everything first, then replace the state. `checked` applies the
+        storage and egress checks of the single-object API calls."""
+        if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
+            raise MixerError(f"not a {STATE_FORMAT} document")
+        try:
+            workspace = WorkspaceConfig(**(data.get("workspace") or {}))
+            fmt = format_by_id(workspace.format_id)
+            inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
+            panels = [MixerPanel(**item) for item in data.get("panels") or []]
+            keyers = [DownstreamKeyer(**item) for item in data.get("keyers") or []]
+            slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
+            tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
+            routes = list(data.get("nmos_receivers") or [])
+            for item in inputs:
+                if item.file_path and item.file_path != "_unassigned":
+                    item.file_path = str(resolve_under(self.settings.clips_dir, item.file_path))
+            for slot in slots:
+                require_safe_id(slot.stinger_id, what="stinger id")
+                if slot.media_path:
+                    contained_path(slot.media_path, self.settings.clips_dir, self.settings.stingers_dir)
+            if checked:
+                for keyer in keyers:
+                    if keyer.url:
+                        assert_http_url(keyer.url, what="keyer URL")
+        except (ValidationError, SecurityError, TypeError, ValueError) as exc:
+            raise MixerError(f"invalid configuration: {exc}") from exc
+        if len({item.id for item in inputs}) != len(inputs):
+            raise MixerError("invalid configuration: duplicate input ids")
+        with self.nmos.lock:
+            if checked:
+                try:
+                    self.tally.replace(tally)
+                except ValueError as exc:
+                    raise MixerError(f"invalid configuration: {exc}") from exc
+            else:
+                self.tally.receivers = tally
+            self.settings.width = fmt.width
+            self.settings.height = fmt.height
+            self.settings.frame_rate_num = fmt.frame_rate_num
+            self.settings.frame_rate_den = fmt.frame_rate_den
+            self.workspace = workspace
+            self.inputs = {item.id: item for item in inputs}
+            self.panels = panels
+            self.keyers = keyers
+            self.stinger_slots = slots
+            main = panels[0] if panels else None
+            self.program_input_id = main.program_input_id if main and main.program_input_id in self.inputs else None
+            self.preview_input_id = main.preview_input_id if main and main.preview_input_id in self.inputs else None
+            self._sync_sources()
+            self._sync_panels()
+            self._sync_keyers()
+            self._sync_stinger_slots()
+            self.nmos.reconcile_inputs()
+            self.nmos.import_routes(routes)
 
     def status(self) -> MixerStatus:
         capabilities = probe_backend()

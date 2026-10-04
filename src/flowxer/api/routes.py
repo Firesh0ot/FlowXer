@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
@@ -17,6 +17,7 @@ from flowxer.api.schemas import (
     LogicalInputUpdate,
     MixerCommandResponse,
     MixerStartRequest,
+    MixerState,
     MixerStatus,
     OverlayStatus,
     OverlayUpdate,
@@ -604,6 +605,29 @@ def put_workspace(
         return mixer.apply_workspace(payload)
     except (MixerError, ValueError) as exc:
         raise _http(MixerError(str(exc)))
+
+
+@router.get(
+    "/config/export",
+    tags=["gui"],
+    summary="Export the configuration (inputs, layout, keyers, stingers, tally, IS-05 routes) as one JSON document",
+)
+def config_export(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.export_state()
+
+
+@router.post(
+    "/config/import",
+    tags=["gui"],
+    summary="Restore an exported configuration; the mixer must be stopped",
+    responses={409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def config_import(payload: dict = Body(...), mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.import_state(payload)
+    except MixerError as exc:
+        code = status.HTTP_409_CONFLICT if mixer.state == MixerState.running else 422
+        raise _http(exc, code)
 
 
 @router.get(

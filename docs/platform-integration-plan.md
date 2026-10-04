@@ -314,9 +314,11 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
    23500–23599). Advertised host IP is rewritten to
    `FLOWXER_WEBRTC_PUBLIC_IP` (else `FLOWXER_NMOS_HOST_IP`). JPEG snapshot
    fallback is unchanged.
-2. **`/readyz` vs registry down** — prefer “Node up + output domain writable”
-   so a registry blip does not kill the mixer; expose `nmos_registry_up` in
-   metrics. Confirm against lab ops.
+2. **`/readyz` vs registry down** — decided by the platform contract (G7):
+   with a registry configured, `/readyz` is 503 until the node is registered
+   (last heartbeat within 12 s). Readiness only takes the pod out of its
+   Service; liveness (`/livez`) does not depend on the registry, so a registry
+   blip does not restart the mixer.
 3. **nvnmosd vs Option C** — Option C shipped in PR 3 because ACK-then-wait
    cannot be expressed as an NvNmos NACK. Revisit if AMWA IS-04-01 / IS-05-01
    fail for Node/Connection API gaps (events WebSocket, scheduled activations).
@@ -374,3 +376,12 @@ integration and AMWA script in PR 8).
   - `PATCH /inputs/{id}` that makes an input invalid returned 500; it is 422.
   - Measured after the fixes: Program 1080p50 at **50.0 grains/s**, 0 late reads, 4.3 cores with 4 live MXL inputs, 2 test inputs and the CEF keyer; 5.8 cores while cutting, keying and running transitions. Program is written about 5 grains (≈90 ms) behind real time. Cut and the CEF downstream keyer work on Program.
   - Still open, seen in the same run: a stinger plays only once (the branch reaches EOS at pipeline start, so later stingers are plain cuts); Fade and Fade to Black are cuts; a 16-channel audio source made `mxlsrc` (audio) fail with a stream error; the GUI monitors are generated cards, not pictures. These are the next PRs.
+- **Platform contract** (`feat/platform-contract`): the mxl-poc-platform media function contract (`docs/requests/leeo86-v1-readiness.md` there, G1–G14).
+  - Platform env names (`MXL_DOMAIN_SCAN_PATH`, `MXL_OUTPUT_DOMAIN_*`, `MXL_HISTORY_DURATION`, `MXL_CLEANUP_ON_EXIT`, `NMOS_SEED`, `NMOS_LABEL`, `NMOS_TAGS`, `NMOS_REGISTRY_ADDRESS`/`PORT`, `NMOS_HOST_ADDRESS`, `NMOS_PORT`, `NMOS_DNS_SD`, `SHUTDOWN_TIMEOUT_S`) next to the `FLOWXER_` names; the platform name wins.
+  - `flowxer` binds both ports before it starts: a taken port is exit 75, an invalid setting exit 78 (without the value: it may be the token), SIGTERM exit 143 also as PID 1. The entrypoint runs `flowxer` instead of the uvicorn CLI.
+  - SIGTERM: stop media, delete the node from the registry, remove the own output domain with `MXL_CLEANUP_ON_EXIT` (only when its id matches; never the root or a mirror). An output domain with another id is an error in the log, not a warning.
+  - Registry: register once, then heartbeat; register again only after a change or when the registry lost the node; delete stale resources. Before, every resource was posted every 5 s with a new version.
+  - `/readyz` waits for the registration (open question 2).
+  - Saved state in `FLOWXER_STATE_DIR` (`/config`), written after each API change and IS-05 activation; `GET /api/v1/config/export`, `POST /api/v1/config/import`. Receiver connections survive a restart.
+  - Program flow ids include the NMOS seed: two mixers with the same group hint no longer announce the same flows. The ids of existing deployments change once.
+  - `deploy/kubernetes/flowxer-pod-network.yaml`: the platform's pod-network example. OCI labels `source` and `revision`.
