@@ -225,7 +225,10 @@ class GstRuntime:
         Gst = self._gst
         self._end_stinger()
         comp = self.pipeline.get_by_name("comp")
-        stinger = Gst.parse_bin_from_description(description, True)
+        # Ghost only the last queue: decodebin's output pad appears later, and an
+        # automatic ghost of the then-unlinked videoconvert sink would take its link.
+        stinger = Gst.parse_bin_from_description(description, False)
+        stinger.add_pad(Gst.GhostPad.new("src", stinger.get_by_name("stingerq").get_static_pad("src")))
         pad = comp.request_pad_simple("sink_%u")
         pad.set_property("zorder", STINGER_ZORDER)
         src = stinger.get_static_pad("src")

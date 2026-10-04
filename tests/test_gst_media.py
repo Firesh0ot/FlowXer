@@ -20,10 +20,12 @@ from flowxer.settings import Settings
 pytestmark = pytest.mark.skipif(not gstreamer_available(), reason="GStreamer with PyGObject is not installed")
 
 
-def _wait(predicate, what: str, timeout: float = 5.0) -> None:
+def _wait(predicate, what, timeout: float = 5.0) -> None:
+    """`what` is a text or a callable giving one (evaluated on timeout)."""
     deadline = time.monotonic() + timeout
     while not predicate():
-        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what() if callable(what) else what}")
         time.sleep(0.01)
 
 
@@ -34,6 +36,8 @@ def live(settings: Settings):
     settings.width = 320
     settings.height = 180
     mixer = VisionMixer(settings)
+    # Keyer off: Program is only the selected source.
+    mixer.update_keyer("dsk-1", enabled=False)
     yield mixer
     mixer.stop()
 
@@ -82,16 +86,16 @@ def test_program_runs_at_the_mixer_rate(live: VisionMixer) -> None:
 def test_cut_changes_the_program_picture(live: VisionMixer) -> None:
     live.start(MixerStartRequest(program_input_id="black", preview_input_id="cam-1"))
     tap = ProgramTap(live)
-    _wait(lambda: 0 < tap.words < 16, "black on Program")
+    _wait(lambda: 0 < tap.words < 16, lambda: f"black on Program ({tap.words} distinct words)")
     live.cut()
-    _wait(lambda: tap.words > 50, "colour bars on Program")
+    _wait(lambda: tap.words > 50, lambda: f"colour bars on Program ({tap.words} distinct words)")
     assert live.program_input_id == "cam-1"
 
 
 def test_fade_dissolves_then_hands_program_to_the_a_bus(live: VisionMixer) -> None:
     live.start(MixerStartRequest(program_input_id="black", preview_input_id="cam-1"))
     tap = ProgramTap(live)
-    _wait(lambda: 0 < tap.words < 16, "black on Program")
+    _wait(lambda: 0 < tap.words < 16, lambda: f"black on Program ({tap.words} distinct words)")
     comp = live.gst.pipeline.get_by_name("comp")
     amix = live.gst.pipeline.get_by_name("amix")
     incoming = comp.get_static_pad(PAD_MIX)
@@ -147,7 +151,10 @@ def test_a_stinger_plays_from_its_own_frames_every_time(live: VisionMixer) -> No
         _wait(lambda: len(comp.sinkpads) == pads_before, "the stinger pad released")
 
 
-def test_mxl_audio_with_sixteen_channels_reaches_program(settings: Settings) -> None:
+def _first_frame(caps: str, chain: str, out_caps: str, samples: bytes) -> tuple[float, ...]:
+    """Push one buffer through `chain` and return the first output frame."""
+    import struct
+
     import gi
 
     gi.require_version("Gst", "1.0")
@@ -155,14 +162,35 @@ def test_mxl_audio_with_sixteen_channels_reaches_program(settings: Settings) -> 
 
     Gst.init(None)
     pipeline = Gst.parse_launch(
-        "audiotestsrc num-buffers=5 "
-        "! audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=16,channel-mask=(bitmask)0x0 "
-        f"! {mxl_audio_adapter(settings)} "
-        f"! audio/x-raw,format=F32LE,layout=interleaved,rate={settings.audio_rate},channels={settings.audio_channels} "
-        "! fakesink"
+        f'appsrc name=src format=time caps="{caps}" ! {chain} ! {out_caps} ! appsink name=out sync=false'
     )
     pipeline.set_state(Gst.State.PLAYING)
-    message = pipeline.get_bus().timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    buffer = Gst.Buffer.new_wrapped(samples)
+    buffer.pts = 0
+    pipeline.get_by_name("src").emit("push-buffer", buffer)
+    pipeline.get_by_name("src").emit("end-of-stream")
+    sample = pipeline.get_by_name("out").emit("try-pull-sample", 5 * Gst.SECOND)
+    error = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
     pipeline.set_state(Gst.State.NULL)
-    assert message is not None, "no EOS"
-    assert message.type == Gst.MessageType.EOS, message.parse_error()
+    assert sample is not None, error.parse_error() if error else "no output"
+    out = sample.get_buffer()
+    ok, mapped = out.map(Gst.MapFlags.READ)
+    data = bytes(mapped.data)
+    out.unmap(mapped)
+    channels = sample.get_caps().get_structure(0).get_int("channels")[1]
+    return struct.unpack(f"<{channels}f", data[: 4 * channels])
+
+
+def test_mxl_audio_takes_the_first_channels_without_a_downmix(settings: Settings) -> None:
+    import struct
+
+    # Channel 1 = 0.5, channel 2 = -0.5, channels 3-16 = 0.25; with mxlsrc's caps.
+    frame = struct.pack("<16f", 0.5, -0.5, *([0.25] * 14))
+    out_caps = f"audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels={settings.audio_channels}"
+    left, right = _first_frame(
+        "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=16,channel-mask=(bitmask)0xffff",
+        mxl_audio_adapter(settings),
+        out_caps,
+        frame * 480,
+    )
+    assert (left, right) == pytest.approx((0.5, -0.5))

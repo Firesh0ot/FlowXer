@@ -150,13 +150,11 @@ def _audio_source_bin(
 
 
 def mxl_audio_adapter(settings: Settings) -> str:
-    """MXL audio flows carry any number of unpositioned channels (16 on the lab
-    test player); audioconvert cannot map those onto the program layout and the
-    stream failed. Take the first program-many channels instead."""
-    return (
-        f"audiomixmatrix mode=first-channels out-channels={settings.audio_channels} "
-        f"! audioconvert ! audioresample"
-    )
+    """mxlsrc gives an N-channel flow the first N speaker positions (16 channels on
+    the lab test player: front, rear, side, top ...), so audioconvert downmixed
+    every channel into Program. Broadcast channels are separate signals: mark them
+    unpositioned, and audioconvert takes the first ones one to one."""
+    return 'capssetter caps="audio/x-raw,channel-mask=(bitmask)0x0" ! audioconvert ! audioresample'
 
 
 def stinger_bin_description(stinger: dict, settings: Settings) -> str:
@@ -176,7 +174,7 @@ def stinger_bin_description(stinger: dict, settings: Settings) -> str:
             f"stop-index={stinger['frame_count'] - 1} loop=false "
             f"caps=image/x-tga,framerate={settings.frame_rate}"
         )
-    return f"{source} ! decodebin ! videoconvert ! videoscale ! videorate ! {bgra} ! queue"
+    return f"{source} ! decodebin ! videoconvert ! videoscale ! videorate ! {bgra} ! queue name=stingerq"
 
 
 def build_pipeline_description(
