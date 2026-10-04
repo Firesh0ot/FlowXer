@@ -61,7 +61,7 @@ def render_prometheus(mixer) -> str:
             1 if mixer.preview_input_id else 0,
             {"input": mixer.preview_input_id or ""},
         ),
-        "# HELP flowxer_frames_rendered_total Preview/program frames produced",
+        "# HELP flowxer_frames_rendered_total Program frames that reached the video output",
         "# TYPE flowxer_frames_rendered_total counter",
         _line("flowxer_frames_rendered_total", int(getattr(mixer, "frames_rendered", 0))),
         "# HELP flowxer_frames_dropped_total Dropped mixer frames",

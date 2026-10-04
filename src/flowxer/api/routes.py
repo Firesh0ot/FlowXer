@@ -290,7 +290,9 @@ def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
-        body = mixer.take(payload.input_id, payload.transition, payload.stinger_id, payload.panel_id)
+        body = mixer.take(
+            payload.input_id, payload.transition, payload.stinger_id, payload.panel_id, payload.duration_ms
+        )
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="taken", mixer=body)

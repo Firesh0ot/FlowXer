@@ -57,7 +57,6 @@ def test_pipeline_black_is_black_not_smpte(mixer: VisionMixer) -> None:
         inputs=mixer.list_inputs(),
         overlay_url=mixer.overlay.url,
         overlay_enabled=False,
-        stinger=mixer.get_stinger("replay-wipe").model_dump(),
         output_video_flow_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         output_audio_flow_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         domain="/mxl-domain",
