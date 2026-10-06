@@ -574,9 +574,15 @@ class VisionMixer:
             path = str(found) if found else str((self.settings.mxl_root / str(resolved_domain)).resolve())
         try:
             if not enabled or parsed_flow is None:
-                self.gst.retarget_mxl_source(src_name, None, path, role)
+                applied = self.gst.retarget_mxl_source(src_name, None, path, role)
             else:
-                self.gst.retarget_mxl_source(src_name, str(parsed_flow), path, role)
+                applied = self.gst.retarget_mxl_source(src_name, str(parsed_flow), path, role)
+            if not applied and self.state == MixerState.running:
+                log.info(
+                    "input %s (%s): the running pipeline does not read it from MXL; the route applies at the next start",
+                    input_id,
+                    role,
+                )
         except Exception as exc:
             log.warning(
                 "on-air NMOS retarget of %s failed (program continues): %s",

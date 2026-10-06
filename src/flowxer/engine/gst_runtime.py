@@ -357,21 +357,27 @@ class GstRuntime:
 
         Properties are mutable_ready: the element is taken to NULL, updated,
         then PLAYING again. Program continues on the other selector sinks.
+
+        Returns False without touching an element that is not an mxlsrc: an
+        input whose kind changed on air keeps its earlier source until the
+        next start. Taking such a source to NULL and failing on the missing
+        property left it stopped, the input-selectors then held the other
+        inputs' streaming threads, and the next retarget blocked the API.
         """
         if self.pipeline is None or self._gst is None:
             return False
         element = self.pipeline.get_by_name(element_name)
-        if element is None:
+        flow_property = "video-flow-id" if role == "video" else "audio-flow-id"
+        if element is None or element.find_property(flow_property) is None:
             return False
         Gst = self._gst
         element.set_state(Gst.State.NULL)
-        if role == "video":
-            element.set_property("video-flow-id", flow_id or "")
-        else:
-            element.set_property("audio-flow-id", flow_id or "")
-        if domain:
-            element.set_property("domain", domain)
-        element.set_state(Gst.State.PLAYING)
+        try:
+            element.set_property(flow_property, flow_id or "")
+            if domain:
+                element.set_property("domain", domain)
+        finally:
+            element.set_state(Gst.State.PLAYING)
         return True
 
 
