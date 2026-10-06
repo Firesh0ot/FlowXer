@@ -38,6 +38,14 @@ in `docs/platform-integration-plan.md` §8.
   deployments.
 - The image starts `flowxer` instead of the uvicorn CLI.
 
+### Fixed (CI)
+
+- The merge-back after a release (`main` → `stage` → `dev`) failed when the
+  merge conflicted in the version files: `reconcile-refs` read `VERSION` with
+  the conflict markers in it. It now resolves conflicts that only differ in the
+  version line in `VERSION`, `pyproject.toml` and `src/flowxer/__init__.py`
+  before it reconciles; any other conflict there still stops the merge-back.
+
 ### Fixed (lab run on real hardware)
 
 - The mixer silently fell back to simulate when the pipeline did not parse
