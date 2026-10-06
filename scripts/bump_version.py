@@ -10,6 +10,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# The files that carry the version, and the one line in each that holds it.
+VERSION_LINES = {
+    "VERSION": re.compile(r"^\d+\.\d+\.\d+$"),
+    "pyproject.toml": re.compile(r'^version = "[^"]+"$'),
+    "src/flowxer/__init__.py": re.compile(r'^__version__ = "[^"]+"$'),
+}
+
 
 def parse_version(text: str) -> tuple[int, int, int]:
     parts = text.strip().split(".")
@@ -94,7 +101,52 @@ def version_from_git_ref(ref: str, root: Path = ROOT) -> tuple[int, int, int] | 
         return None
 
 
+def resolve_version_conflicts(root: Path = ROOT) -> None:
+    """Resolve merge-conflict hunks in the version files that only differ in the version line.
+
+    Merging two branches with different versions conflicts in exactly these lines, and the
+    version is written again right after. A hunk with any other line is left to a person.
+    """
+    for name, pattern in VERSION_LINES.items():
+        path = root / name
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "<<<<<<< " not in text:
+            continue
+        out: list[str] = []
+        hunk: list[str] | None = None
+        for line in text.splitlines(keepends=True):
+            bare = line.rstrip("\r\n")
+            if hunk is None:
+                if bare.startswith("<<<<<<< "):
+                    hunk = []
+                else:
+                    out.append(line)
+            elif bare.startswith(">>>>>>> "):
+                ours: list[str] = []
+                in_ours = True
+                for entry in hunk:
+                    content = entry.rstrip("\r\n")
+                    if content == "=======" or content.startswith("||||||| "):
+                        in_ours = False
+                    elif content.strip() and not pattern.match(content):
+                        raise ValueError(
+                            f"{name}: merge conflict outside the version line: {content!r}"
+                        )
+                    elif in_ours:
+                        ours.append(entry)
+                out.extend(ours)
+                hunk = None
+            else:
+                hunk.append(line)
+        if hunk is not None:
+            raise ValueError(f"{name}: unterminated merge conflict")
+        path.write_text("".join(out), encoding="utf-8")
+
+
 def reconcile(root: Path, versions: list[tuple[int, int, int]]) -> str:
+    resolve_version_conflicts(root)
     found = list(versions)
     if (root / "VERSION").exists():
         found.append(read_version(root))
@@ -105,6 +157,7 @@ def reconcile(root: Path, versions: list[tuple[int, int, int]]) -> str:
 
 
 def reconcile_refs(root: Path, refs: list[str]) -> str:
+    resolve_version_conflicts(root)
     found: list[tuple[int, int, int]] = []
     if (root / "VERSION").exists():
         found.append(read_version(root))
