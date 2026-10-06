@@ -314,9 +314,11 @@ Smaller slices inside 2–3 are allowed if a PR grows past review size.
    23500–23599). Advertised host IP is rewritten to
    `FLOWXER_WEBRTC_PUBLIC_IP` (else `FLOWXER_NMOS_HOST_IP`). JPEG snapshot
    fallback is unchanged.
-2. **`/readyz` vs registry down** — prefer “Node up + output domain writable”
-   so a registry blip does not kill the mixer; expose `nmos_registry_up` in
-   metrics. Confirm against lab ops.
+2. **`/readyz` vs registry down** — decided by the platform contract (G7):
+   with a registry configured, `/readyz` is 503 until the node is registered
+   (last heartbeat within 12 s). Readiness only takes the pod out of its
+   Service; liveness (`/livez`) does not depend on the registry, so a registry
+   blip does not restart the mixer.
 3. **nvnmosd vs Option C** — Option C shipped in PR 3 because ACK-then-wait
    cannot be expressed as an NvNmos NACK. Revisit if AMWA IS-04-01 / IS-05-01
    fail for Node/Connection API gaps (events WebSocket, scheduled activations).
@@ -363,4 +365,30 @@ integration and AMWA script in PR 8).
 - **PR 5** (`cursor/network-bind-85ef`): `FLOWXER_HOST` default 127.0.0.1 (bridge Compose overrides 0.0.0.0), GUI `FLOWXER_MIXER_URL` / `FLOWXER_GUI_PORT`, WebRTC host ICE IP + UDP range wrap.
 - **PR 6** (`cursor/metrics-probes-85ef`): Prometheus `flowxer_*` at `/metrics` and `/api/v1/metrics`, `/livez` `/readyz` (registry blip does not fail ready), Grafana `deploy/grafana/flowxer.json`.
 - **PR 7** (`cursor/k8s-amwa-85ef`): `deploy/kubernetes/flowxer.yaml`, `docker-compose.host.yml`, README platform section, `scripts/nmos-testing.sh` + workflow_dispatch CI job for AMWA IS-04-01 / IS-05-01 / IS-05-02.
-- **Follow-up** (`cursor/amwa-release-ci-85ef`): AMWA job was `workflow_dispatch`-only, so PRs #43 (dev→stage) and #44 (stage→main) skipped it. It now runs on PRs into `stage`/`main` and on the Stage workflow. Mixer image pin is the full SHA `218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7` because GitHub rejects `git fetch origin 218ddaa` (`couldn't find remote ref`).
+- **Follow-up** (`cursor/amwa-release-ci-85ef`): AMWA job was `workflow_dispatch`-only, so PRs #43 (dev→stage) and #44 (stage→main) skipped it. It now runs on PRs into `stage`/`main` and on the Stage workflow. Mixer image pin is the full SHA `218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7`.
+- **Follow-up** (`cursor/nmos-amwa-fixes-85ef`): AMWA IS-04/IS-05 on the #46 `dev`→`stage` PR failed. Trailing-slash ID lists, source/flow schema fields, BCP-007-03 empty `interface_bindings`, `transporttype`, `transportfile` 404, bulk POST, unknown PATCH 400, and scheduled activations. Local `amwa/nmos-testing` IS-04-01 / IS-05-01 / IS-05-02 exit 0 (registry discovery tests stay `--ignore`d; no DNS-SD). CI now runs AMWA on every PR, not only promotions.
+- **Lab run** (`fix/lab-hardware-run`): first run of the mixer image on real hardware (iptv-web-lab-1: 2× Xeon Gold 6136, NVIDIA A16, MXL tmpfs, nmos-cpp registry; sources: mxl-test-player 4× 1080p50 v210 + 16 ch float32). Every run before this one used simulate mode, so these blockers were never seen:
+  - `compositor zero-size-is-unconfigured` does not exist in GStreamer 1.24 (Ubuntu 24.04). The parse failed and the mixer silently fell back to **simulate**: the API said on-air, nothing reached MXL. A failed pipeline is now `state=error` with the reason, and `/mixer/start` returns 409. Simulate stays only for `FLOWXER_SIMULATE` / `FLOWXER_GST_MODE=simulate` or when GStreamer is not installed.
+  - `timeoverlay` (test inputs) is in `gstreamer1.0-x`, which the image did not install.
+  - The TGA stinger branch had no frame rate in its caps and did not negotiate; the video stinger branch now has `videorate` for clips at other rates.
+  - The NMOS refresh loop applied every running essence to the mixer again every 250 ms, which set its `mxlsrc` to NULL and back to PLAYING: live inputs restarted four times a second, and with a stalled pipeline `set_state(NULL)` blocked while holding the NMOS lock (`GET /mixer` hung). Only an essence that leaves `waiting` is applied again.
+  - GStreamer bus errors are now in `GET /mixer` `error` and `flowxer_pipeline_errors_total`.
+  - `PATCH /inputs/{id}` that makes an input invalid returned 500; it is 422.
+  - Measured after the fixes: Program 1080p50 at **50.0 grains/s**, 0 late reads, 4.3 cores with 4 live MXL inputs, 2 test inputs and the CEF keyer; 5.8 cores while cutting, keying and running transitions. Program is written about 5 grains (≈90 ms) behind real time. Cut and the CEF downstream keyer work on Program.
+  - Still open, seen in the same run: a stinger plays only once (the branch reaches EOS at pipeline start, so later stingers are plain cuts); Fade and Fade to Black are cuts; a 16-channel audio source made `mxlsrc` (audio) fail with a stream error; the GUI monitors are generated cards, not pictures. These are the next PRs (the first three: `feat/media-transitions` below).
+- **Platform contract** (`feat/platform-contract`): the mxl-poc-platform media function contract (`docs/requests/leeo86-v1-readiness.md` there, G1–G14).
+  - Platform env names (`MXL_DOMAIN_SCAN_PATH`, `MXL_OUTPUT_DOMAIN_*`, `MXL_HISTORY_DURATION`, `MXL_CLEANUP_ON_EXIT`, `NMOS_SEED`, `NMOS_LABEL`, `NMOS_TAGS`, `NMOS_REGISTRY_ADDRESS`/`PORT`, `NMOS_HOST_ADDRESS`, `NMOS_PORT`, `NMOS_DNS_SD`, `SHUTDOWN_TIMEOUT_S`) next to the `FLOWXER_` names; the platform name wins.
+  - `flowxer` binds both ports before it starts: a taken port is exit 75, an invalid setting exit 78 (without the value: it may be the token), SIGTERM exit 143 also as PID 1. The entrypoint runs `flowxer` instead of the uvicorn CLI.
+  - SIGTERM: stop media, delete the node from the registry, remove the own output domain with `MXL_CLEANUP_ON_EXIT` (only when its id matches; never the root or a mirror). An output domain with another id is an error in the log, not a warning.
+  - Registry: register once, then heartbeat; register again only after a change or when the registry lost the node; delete stale resources. Before, every resource was posted every 5 s with a new version.
+  - `/readyz` waits for the registration (open question 2).
+  - Saved state in `FLOWXER_STATE_DIR` (`/config`), written after each API change and IS-05 activation; `GET /api/v1/config/export`, `POST /api/v1/config/import`. Receiver connections survive a restart.
+  - Program flow ids include the NMOS seed: two mixers with the same group hint no longer announce the same flows. The ids of existing deployments change once.
+  - `deploy/kubernetes/flowxer-pod-network.yaml`: the platform's pod-network example. OCI labels `source` and `revision`.
+- **Media transitions** (`feat/media-transitions`): the open points of the lab run, tested on GStreamer 1.24 in a new CI job (`Pytest (GStreamer)`, the image's packages, fakesink outputs).
+  - Fade and Fade to Black dissolve: every source feeds two input-selectors through a `tee`, A (Program) and B. During a mix B shows the incoming source on a compositor pad above A, and an audiomixer pad; their alpha and level are set from the compositor's and audiomixer's `samples-selected` signal for each output frame, so the dissolve follows the output timeline (MXL sources carry absolute timestamps). At the end A takes the source over and B is hidden again. A Cut during a mix ends it. The compositor skips a pad at alpha 0, so the idle B bus costs no conversion.
+  - The compositor now outputs AYUV instead of BGRA: Program (v210) no longer goes through an RGB matrix and back.
+  - Stingers: each playback is a new bin (`stinger_bin_description`) linked to a new compositor pad at the current running time (+100 ms for the decoder); a probe on its output counts the frames that reach the compositor and drives the cut frame; at EOS the pad is released and the bin removed. Before, the branch was part of the pipeline and reached EOS at start.
+  - MXL audio: mxlsrc gives an N-channel flow the first N speaker positions, so audioconvert downmixed all 16 test-player channels into Program; unpositioned channels cannot change their count in 1.24 at all. A probe sets a first-channels `mix-matrix` on `audioconvert name=amap_<input>` when the caps arrive, so Program gets channels 1 and 2 of any flow.
+  - `flowxer_frames_rendered_total` counts Program frames at the video sink (it counted JPEG previews).
+- **Monitor pictures** (`feat/monitor-pictures`): the last open point of the lab run. Every source's `tee` and Program (after the compositor) feed an `appsink` at `FLOWXER_MONITOR_FPS` (default 10): `videorate` drops first, then one `videoconvertscale` pass makes the 640×360 RGB picture from the full-size frame; the newest one is kept. `render_monitor` (JPEG and WebRTC) uses it while the pipeline runs and draws the card otherwise. Tested in the GStreamer CI job: the pictures change with the test source's time overlay, black stays black, and the Program monitor follows a cut.

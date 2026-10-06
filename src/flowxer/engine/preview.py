@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from flowxer.api.schemas import InputKind
 from flowxer.engine.formats import SOURCE_COLORS
+from flowxer.engine.pipeline import MONITOR_PREFIX, MONITOR_PROGRAM
 
 _FRAME_CACHE: OrderedDict[str, Image.Image] = OrderedDict()
 _CACHE_LIMIT = 48
@@ -108,7 +109,13 @@ def render_monitor(
     width: int = 640,
     height: int = 360,
 ) -> Image.Image:
-    """Picture of the logical source on this monitor (same essence on SRC/PVW/PGM)."""
+    """Picture of the logical source on this monitor (same essence on SRC/PVW/PGM).
+
+    While the pipeline runs this is the picture it produced: the source, or for
+    the main panel's Program the mixed output. Otherwise a generated card."""
+    live = _live_picture(mixer, stream_id, width, height)
+    if live is not None:
+        return live
     input_id, _tally, _badge = _resolve_stream(mixer, stream_id)
     try:
         source = mixer.get_input(input_id) if input_id else None
@@ -120,12 +127,33 @@ def render_monitor(
     return _cache_get(key, lambda: _draw_source(source, width, height))
 
 
+def _live_picture(mixer, stream_id: str, width: int, height: int) -> Image.Image | None:
+    gst = getattr(mixer, "gst", None)
+    if gst is None:
+        return None
+    main_program = bool(mixer.panels) and stream_id == f"panel:{mixer.panels[0].id}:pgm"
+    if main_program:
+        name = MONITOR_PROGRAM
+    else:
+        try:
+            input_id, _tally, _badge = _resolve_stream(mixer, stream_id)
+        except Exception:
+            return None
+        name = f"{MONITOR_PREFIX}{input_id}"
+    picture = gst.monitors.get(name)
+    if picture is None:
+        return None
+    picture_width, picture_height, data = picture
+    image = Image.frombytes("RGB", (picture_width, picture_height), data)
+    if (picture_width, picture_height) != (width, height):
+        image = image.resize((width, height))
+    return image
+
+
 def render_jpeg(mixer, stream_id: str, *, width: int = 640, height: int = 360, quality: int = 70) -> bytes:
     image = render_monitor(mixer, stream_id, width=width, height=height)
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=quality)
-    if hasattr(mixer, "frames_rendered"):
-        mixer.frames_rendered += 1
     return buf.getvalue()
 
 

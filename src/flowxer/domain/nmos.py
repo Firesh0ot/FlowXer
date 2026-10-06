@@ -15,16 +15,18 @@ def flow_uuid(
     group_hint: str,
     role: str,
     *,
+    seed: str,
     width: int | None = None,
     height: int | None = None,
     frame_rate_num: int | None = None,
     frame_rate_den: int | None = None,
 ) -> str:
-    """Deterministic MXL PGM flow UUID. Raster is part of the key so a format
-    change mints new flow IDs and the NMOS sender's mxl_flow_id follows."""
-    key = f"{group_hint}:{role}"
+    """Deterministic MXL PGM flow UUID. The NMOS seed keeps two mixers with the
+    same group hint apart. Raster is part of the key so a format change mints
+    new flow IDs and the NMOS sender's mxl_flow_id follows."""
+    key = f"{seed}:{group_hint}:{role}"
     if width and height and frame_rate_num and frame_rate_den:
-        key = f"{group_hint}:{role}:{width}x{height}:{frame_rate_num}/{frame_rate_den}"
+        key = f"{key}:{width}x{height}:{frame_rate_num}/{frame_rate_den}"
     return str(uuid.uuid5(FLOWXER_NAMESPACE, key))
 
 
