@@ -154,7 +154,6 @@ def test_live_input_mxlsrc_uses_resolved_domain_path(mixer: VisionMixer, tmp_pat
         inputs=mixer.list_inputs(),
         overlay_url=mixer.overlay.url,
         overlay_enabled=False,
-        stinger=mixer.get_stinger("replay-wipe").model_dump(),
         output_video_flow_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         output_audio_flow_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
         domain=str(mixer.settings.output_domain),

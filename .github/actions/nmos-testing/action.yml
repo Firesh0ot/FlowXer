@@ -1,0 +1,34 @@
+name: Run AMWA NMOS testing tool
+description: Start FlowXer with NMOS and run the AMWA testing image non-interactively
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install and start FlowXer (simulate + NMOS)
+      shell: bash
+      run: |
+        set -euo pipefail
+        pip install -e '.[dev]'
+        mkdir -p /tmp/mxl /tmp/flowxer-storage
+        FLOWXER_SIMULATE=true FLOWXER_NMOS_ENABLE=true FLOWXER_NMOS_BIND=true \
+          FLOWXER_NMOS_HOST_IP=127.0.0.1 FLOWXER_HOST=127.0.0.1 \
+          FLOWXER_MXL_ROOT=/tmp/mxl FLOWXER_STORAGE_ROOT=/tmp/flowxer-storage \
+          uvicorn flowxer.app:create_app --factory --host 127.0.0.1 --port 9610 &
+        for i in $(seq 1 30); do
+          curl -fsS http://127.0.0.1:3252/x-nmos/node/v1.3/self && break
+          sleep 1
+        done
+        curl -fsS http://127.0.0.1:3252/x-nmos/node/v1.3/self
+        curl -fsS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers
+    - name: Run AMWA testing image
+      shell: bash
+      run: bash scripts/nmos-testing.sh http://127.0.0.1:3252
+    - name: Upload AMWA results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nmos-testing-results
+        path: nmos-testing-results/
+        if-no-files-found: ignore

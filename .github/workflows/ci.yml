@@ -23,37 +23,33 @@ jobs:
           npm ci
           npx tsc --noEmit
 
+  gstreamer:
+    name: Pytest (GStreamer)
+    # The media pipeline on the GStreamer of the mixer image (Ubuntu 24.04), with the
+    # system Python and PyGObject the image uses. Without the MXL plugins it ends in
+    # fakesinks.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             python3-gi python3-venv gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0             gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good             gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-x
+      - name: Install
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install -e '.[dev]'
+      - name: Test
+        run: .venv/bin/pytest -q tests/test_gst_media.py
+
   nmos-testing:
     name: AMWA NMOS testing tool
-    if: github.event_name == 'workflow_dispatch'
+    # Run on every PR (including into dev) so Node/Connection API gaps fail
+    # on the feature PR instead of the first promotion to stage.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install and start FlowXer (simulate + NMOS)
-        run: |
-          pip install -e '.[dev]'
-          mkdir -p /tmp/mxl /tmp/flowxer-storage
-          FLOWXER_SIMULATE=true FLOWXER_NMOS_ENABLE=true FLOWXER_NMOS_BIND=true \
-            FLOWXER_NMOS_HOST_IP=127.0.0.1 FLOWXER_HOST=127.0.0.1 \
-            FLOWXER_MXL_ROOT=/tmp/mxl FLOWXER_STORAGE_ROOT=/tmp/flowxer-storage \
-            uvicorn flowxer.app:create_app --factory --host 127.0.0.1 --port 9610 &
-          for i in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:3252/x-nmos/node/v1.3/self && break
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:3252/x-nmos/node/v1.3/self
-          curl -fsS http://127.0.0.1:3252/x-nmos/connection/v1.2/single/receivers
-      - name: Run AMWA testing image
-        run: bash scripts/nmos-testing.sh http://127.0.0.1:3252
-      - name: Upload AMWA results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nmos-testing-results
-          path: nmos-testing-results/
-          if-no-files-found: ignore
+      - uses: ./.github/actions/nmos-testing

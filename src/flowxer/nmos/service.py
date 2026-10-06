@@ -10,17 +10,30 @@ from typing import Any
 
 from flowxer.api.schemas import InputKind
 from flowxer.domain.mxl_domain import resolve_domain_path
+from flowxer.listen import bind_listener
 from flowxer.nmos import ids
 from flowxer.nmos.registry import RegistryClient
 
 log = logging.getLogger(__name__)
 
 TAI_OFFSET_NS = 37 * 10**9
+# Heartbeat period, and how long after the last good one the node counts as registered
+# (nmos-cpp expires nodes after 12 s without a heartbeat).
+HEARTBEAT_S = 5.0
+REGISTRATION_FRESH_S = 12.0
 TRANSPORT_MXL = "urn:x-nmos:transport:mxl"
 FORMAT_VIDEO = "urn:x-nmos:format:video"
 FORMAT_AUDIO = "urn:x-nmos:format:audio"
 GROUPHINT = "urn:x-nmos:tag:grouphint/v1.0"
 NULL_ACTIVATION = {"mode": None, "requested_time": None, "activation_time": None}
+STAGED_PATCH_FIELDS = {
+    "sender_id",
+    "receiver_id",
+    "master_enable",
+    "activation",
+    "transport_params",
+    "transport_file",
+}
 
 
 def nmos_version() -> str:
@@ -97,10 +110,14 @@ class NmosNode:
         self.settings = mixer.settings
         self.lock = threading.RLock()
         self.registry_up = False
+        self.registered_at = 0.0
+        self._dirty = threading.Event()
+        self._registered: dict[str, set[str]] = {}
         self.activations_ok = 0
         self.activations_error = 0
         self._staged: dict[str, dict[str, Any]] = {}
         self._active: dict[str, dict[str, Any]] = {}
+        self._scheduled: dict[str, threading.Timer] = {}
         self._input_states: dict[str, dict[str, str]] = {}
         self._stop = threading.Event()
         self._server = None
@@ -145,7 +162,7 @@ class NmosNode:
                     )
             return {
                 "enabled": self.enabled(),
-                "registry_url": self.settings.nmos_registry_url,
+                "registry_url": self.settings.resolved_registry_url,
                 "registry_up": self.registry_up,
                 "node_id": self.node_uuid,
                 "device_id": self.device_uuid,
@@ -156,20 +173,25 @@ class NmosNode:
                 "receivers": receivers,
             }
 
-    def boot(self) -> None:
+    def boot(self, listener: socket.socket | None = None) -> None:
+        """Start the Node API (on `listener` when given) and the registry client.
+
+        Binding the Node API port raises OSError, so a taken port stops the process
+        (exit 75 in flowxer.app.run) instead of leaving a node without an API.
+        """
         if not self.enabled():
             log.info("NMOS node disabled (FLOWXER_NMOS_ENABLE=false)")
             return
         if self.settings.nmos_dns_sd:
-            log.warning("FLOWXER_NMOS_DNS_SD=true is ignored; DNS-SD/mDNS is not implemented")
+            log.warning("NMOS_DNS_SD=true is ignored; DNS-SD/mDNS is not implemented")
         self._stop.clear()
         if self.settings.nmos_bind:
-            self._start_http()
+            self._start_http(listener or bind_listener("0.0.0.0", self.settings.nmos_port))
         self._wait_thread = threading.Thread(
             target=self._refresh_loop, daemon=True, name="nmos-wait"
         )
         self._wait_thread.start()
-        if (self.settings.nmos_registry_url or "").strip():
+        if self.settings.resolved_registry_url:
             self._registry_thread = threading.Thread(
                 target=self._registry_loop, daemon=True, name="nmos-registry"
             )
@@ -182,27 +204,43 @@ class NmosNode:
             self.settings.nmos_bind,
         )
 
+    def registered(self) -> bool:
+        """True without a registry, else when the last registration or heartbeat succeeded."""
+        if not self.enabled() or not self.settings.resolved_registry_url:
+            return True
+        return self.registry_up and time.monotonic() - self.registered_at < REGISTRATION_FRESH_S
+
+    def mark_changed(self) -> None:
+        """Resources changed: the registry loop registers them again (with new versions)."""
+        self._dirty.set()
+
     def shutdown(self) -> None:
+        """Stop the loops, deregister the node, then stop the Node API."""
         self._stop.set()
+        if self._registry_thread is not None:
+            self._registry_thread.join(timeout=RegistryClient.timeout_s + 1)
+        if self.enabled() and self.settings.resolved_registry_url:
+            try:
+                RegistryClient(self.settings.resolved_registry_url).delete_node(self.node_uuid)
+                log.info("NMOS node %s deregistered", self.node_uuid)
+            except Exception as exc:
+                log.warning("NMOS deregistration failed: %s", exc)
+            self.registry_up = False
         if self._server is not None:
             self._server.should_exit = True
         self._server = None
 
-    def _start_http(self) -> None:
+    def _start_http(self, listener: socket.socket) -> None:
         import uvicorn
 
         from flowxer.nmos.http import create_nmos_app
 
         app = create_nmos_app(self)
-        config = uvicorn.Config(
-            app,
-            host="0.0.0.0",
-            port=self.settings.nmos_port,
-            log_level="info",
-        )
+        config = uvicorn.Config(app, log_level="info")
         self._server = uvicorn.Server(config)
+        server = self._server
         self._http_thread = threading.Thread(
-            target=self._server.run, daemon=True, name="nmos-http"
+            target=lambda: server.run(sockets=[listener]), daemon=True, name="nmos-http"
         )
         self._http_thread.start()
 
@@ -221,29 +259,45 @@ class NmosNode:
             delay = min(delay * 2, 5.0) if waiting else 0.25
 
     def _registry_loop(self) -> None:
-        client = RegistryClient(self.settings.nmos_registry_url)
+        # Register once, then heartbeat. Resources are registered again only when they
+        # changed or the registry lost the node (heartbeat 404, or it was unreachable):
+        # posting every resource every 5 s gave each one a new version each time.
+        client = RegistryClient(self.settings.resolved_registry_url)
+        current = False
         while not self._stop.is_set():
             try:
-                self._register_all(client)
+                if not current or self._dirty.is_set():
+                    self._dirty.clear()
+                    self._register_all(client)
+                    current = True
                 client.heartbeat(self.node_uuid)
                 self.registry_up = True
+                self.registered_at = time.monotonic()
             except Exception as exc:
+                current = False
                 self.registry_up = False
-                log.warning("NMOS registry %s: %s", self.settings.nmos_registry_url, exc)
-            self._stop.wait(5.0)
+                log.warning("NMOS registry %s: %s", self.settings.resolved_registry_url, exc)
+            self._stop.wait(HEARTBEAT_S)
 
     def _register_all(self, client: RegistryClient) -> None:
         with self.lock:
-            client.register("node", self.self_resource())
-            client.register("device", self.device_resource())
-            for source in self.sources():
-                client.register("source", source)
-            for flow in self.flows():
-                client.register("flow", flow)
-            for sender in self.senders():
-                client.register("sender", sender)
-            for receiver in self.receivers():
-                client.register("receiver", receiver)
+            resources = [
+                ("node", [self.self_resource()]),
+                ("device", [self.device_resource()]),
+                ("source", self.sources()),
+                ("flow", self.flows()),
+                ("sender", self.senders()),
+                ("receiver", self.receivers()),
+            ]
+        for kind, items in resources:
+            for item in items:
+                client.register(kind, item)
+        # Remove what no longer exists (an input deleted, fewer panels), children first.
+        current = {kind: {item["id"] for item in items} for kind, items in resources}
+        for kind in ("receiver", "sender", "flow", "source", "device"):
+            for stale in self._registered.get(kind, set()) - current[kind]:
+                client.delete(kind, stale)
+        self._registered = current
 
     def _empty_receiver_active(self) -> dict[str, Any]:
         return {
@@ -272,23 +326,29 @@ class NmosNode:
             out.add(ids.sender_id(self.seed, panel.id, "audio"))
         return out
 
+    def _tags(self) -> dict[str, list[str]]:
+        """NMOS_TAGS on the node and the device (e.g. the platform's production and function)."""
+        return {str(name): [str(value) for value in values] for name, values in self.settings.nmos_tags.items()}
+
     def self_resource(self) -> dict[str, Any]:
         return {
             "id": self.node_uuid,
             "version": nmos_version(),
-            "label": self.settings.title,
+            "label": self.settings.node_label,
             "description": "FlowXer Vision Mixer",
-            "tags": {},
+            "tags": self._tags(),
             "href": self.href(),
             "caps": {},
             "services": [
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/node/v1.3/",
                     "type": "urn:x-nmos:service:node/v1.3",
+                    "authorization": False,
                 },
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/connection/v1.2/",
                     "type": "urn:x-nmos:service:connection/v1.2",
+                    "authorization": False,
                 },
             ],
             "clocks": [{"name": "clk0", "ref_type": "internal"}],
@@ -297,7 +357,6 @@ class NmosNode:
                     "chassis_id": None,
                     "port_id": "00-00-00-00-00-00",
                     "name": "mgmt",
-                    "attached_network_device": None,
                 }
             ],
             "api": {
@@ -307,6 +366,7 @@ class NmosNode:
                         "host": self.host_ip,
                         "port": self.settings.nmos_port,
                         "protocol": "http",
+                        "authorization": False,
                     }
                 ],
             },
@@ -318,9 +378,9 @@ class NmosNode:
         return {
             "id": self.device_uuid,
             "version": nmos_version(),
-            "label": "FlowXer Vision Mixer",
+            "label": self.settings.node_label,
             "description": "FlowXer Vision Mixer",
-            "tags": {},
+            "tags": self._tags(),
             "type": "urn:x-nmos:device:generic",
             "node_id": self.node_uuid,
             "senders": senders,
@@ -329,6 +389,7 @@ class NmosNode:
                 {
                     "href": f"http://{self.host_ip}:{self.settings.nmos_port}/x-nmos/connection/v1.2/",
                     "type": "urn:x-nmos:control:sr-ctrl/v1.2",
+                    "authorization": False,
                 }
             ],
         }
@@ -381,7 +442,7 @@ class NmosNode:
                         "tags": {GROUPHINT: [f"{item.id}:{role.title()}"]},
                         "device_id": self.device_uuid,
                         "transport": TRANSPORT_MXL,
-                        "interface_bindings": ["mgmt"],
+                        "interface_bindings": [],
                         "subscription": {
                             "sender_id": active.get("sender_id"),
                             "active": bool(active.get("master_enable")),
@@ -412,7 +473,7 @@ class NmosNode:
                         "device_id": self.device_uuid,
                         "manifest_href": None,
                         "transport": TRANSPORT_MXL,
-                        "interface_bindings": ["mgmt"],
+                        "interface_bindings": [],
                         "subscription": {
                             "receiver_id": None,
                             "active": bool(outputs),
@@ -428,26 +489,61 @@ class NmosNode:
 
     def sources(self) -> list[dict[str, Any]]:
         out = []
+        grain = {
+            "numerator": self.settings.frame_rate_num,
+            "denominator": self.settings.frame_rate_den,
+        }
+        count = max(1, self.settings.audio_channels)
+        if count == 2:
+            channels = [
+                {"label": "Left Channel", "symbol": "L"},
+                {"label": "Right Channel", "symbol": "R"},
+            ]
+        else:
+            channels = [
+                {"label": f"Channel {index + 1}", "symbol": f"NSC{index + 1:03d}"}
+                for index in range(count)
+            ]
         for panel in self.mixer.panels or []:
-            for role, fmt in (("video", FORMAT_VIDEO), ("audio", FORMAT_AUDIO)):
-                out.append(
-                    {
-                        "id": ids.source_id(self.seed, panel.id, role),
-                        "version": nmos_version(),
-                        "label": f"{panel.label} PGM {role.title()} source",
-                        "description": "",
-                        "tags": {GROUPHINT: [f"{panel.id}:Pgm{role.title()}"]},
-                        "device_id": self.device_uuid,
-                        "parents": [],
-                        "clock_name": "clk0",
-                        "format": fmt,
-                    }
-                )
+            video = {
+                "id": ids.source_id(self.seed, panel.id, "video"),
+                "version": nmos_version(),
+                "label": f"{panel.label} PGM Video source",
+                "description": "",
+                "tags": {GROUPHINT: [f"{panel.id}:PgmVideo"]},
+                "device_id": self.device_uuid,
+                "parents": [],
+                "clock_name": "clk0",
+                "caps": {},
+                "format": FORMAT_VIDEO,
+                "grain_rate": dict(grain),
+            }
+            audio = {
+                "id": ids.source_id(self.seed, panel.id, "audio"),
+                "version": nmos_version(),
+                "label": f"{panel.label} PGM Audio source",
+                "description": "",
+                "tags": {GROUPHINT: [f"{panel.id}:PgmAudio"]},
+                "device_id": self.device_uuid,
+                "parents": [],
+                "clock_name": "clk0",
+                "caps": {},
+                "format": FORMAT_AUDIO,
+                "grain_rate": dict(grain),
+                "channels": channels,
+            }
+            out.extend([video, audio])
         return out
 
     def flows(self) -> list[dict[str, Any]]:
         out = []
         outputs = self.mixer.outputs
+        grain = {
+            "numerator": self.settings.frame_rate_num,
+            "denominator": self.settings.frame_rate_den,
+        }
+        width = self.settings.width
+        height = self.settings.height
         for panel in self.mixer.panels or []:
             video = {
                 "id": ids.flow_id(self.seed, panel.id, "video"),
@@ -460,10 +556,17 @@ class NmosNode:
                 "parents": [],
                 "format": FORMAT_VIDEO,
                 "media_type": self.settings.video_media_type,
-                "frame_width": self.settings.width,
-                "frame_height": self.settings.height,
+                "grain_rate": dict(grain),
+                "frame_width": width,
+                "frame_height": height,
                 "colorspace": "BT709",
                 "interlace_mode": "progressive",
+                "transfer_characteristic": "SDR",
+                "components": [
+                    {"name": "Y", "width": width, "height": height, "bit_depth": 10},
+                    {"name": "Cb", "width": width // 2, "height": height, "bit_depth": 10},
+                    {"name": "Cr", "width": width // 2, "height": height, "bit_depth": 10},
+                ],
             }
             audio = {
                 "id": ids.flow_id(self.seed, panel.id, "audio"),
@@ -476,6 +579,7 @@ class NmosNode:
                 "parents": [],
                 "format": FORMAT_AUDIO,
                 "media_type": self.settings.audio_media_type,
+                "grain_rate": dict(grain),
                 "sample_rate": {"numerator": self.settings.audio_rate, "denominator": 1},
                 "bit_depth": 32,
             }
@@ -495,9 +599,11 @@ class NmosNode:
         }
         if collection not in mapping:
             return []
-        return [item["id"] for item in mapping[collection]()]
+        return [f"{item['id']}/" for item in mapping[collection]()]
 
     def get_resource(self, collection: str, resource_id: str) -> dict[str, Any] | None:
+        collection = collection.rstrip("/")
+        resource_id = resource_id.rstrip("/")
         if collection == "devices" and resource_id == self.device_uuid:
             return self.device_resource()
         mapping = {
@@ -521,45 +627,54 @@ class NmosNode:
         return None
 
     def constraints(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if side == "receivers":
             return {
                 "mxl_domain_id": {},
                 "mxl_flow_id": {},
             }
         domain_id = self.settings.resolved_output_domain_id
-        outputs = self.mixer.outputs
-        flow = None
-        for panel in self.mixer.panels or []:
-            if ids.sender_id(self.seed, panel.id, "video") == resource_id and outputs:
-                flow = outputs.video_flow_id
-            if ids.sender_id(self.seed, panel.id, "audio") == resource_id and outputs:
-                flow = outputs.audio_flow_id
+        flow = self._sender_mxl_flow(resource_id)
         return {
             "mxl_domain_id": {"enum": [domain_id]},
             "mxl_flow_id": {"enum": [flow]} if flow else {},
         }
 
     def staged(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if resource_id in self._staged:
             return self._staged[resource_id]
         return self.active(resource_id, side)
 
     def active(self, resource_id: str, side: str) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
         if resource_id in self._active:
             return self._active[resource_id]
         if side == "receivers":
             return self._empty_receiver_active()
         domain_id = self.settings.resolved_output_domain_id
-        flow = None
+        return self._empty_sender_active(domain_id, self._sender_mxl_flow(resource_id))
+
+    def _sender_mxl_flow(self, resource_id: str) -> str | None:
         outputs = self.mixer.outputs
+        if not outputs:
+            return None
         for panel in self.mixer.panels or []:
-            if ids.sender_id(self.seed, panel.id, "video") == resource_id and outputs:
-                flow = outputs.video_flow_id
-            if ids.sender_id(self.seed, panel.id, "audio") == resource_id and outputs:
-                flow = outputs.audio_flow_id
-        return self._empty_sender_active(domain_id, flow)
+            if ids.sender_id(self.seed, panel.id, "video") == resource_id:
+                return outputs.video_flow_id
+            if ids.sender_id(self.seed, panel.id, "audio") == resource_id:
+                return outputs.audio_flow_id
+        return None
 
     def patch_staged(self, resource_id: str, side: str, body: dict[str, Any]) -> dict[str, Any]:
+        resource_id = resource_id.rstrip("/")
+        side = side.rstrip("/")
+        unknown = sorted(set(body) - STAGED_PATCH_FIELDS)
+        if unknown:
+            raise NmosActivationError(f"unknown fields: {', '.join(unknown)}")
         with self.lock:
             current = dict(self.staged(resource_id, side))
             if "master_enable" in body:
@@ -594,11 +709,11 @@ class NmosNode:
             activation = (body.get("activation") or {}).get("mode")
             if activation in {None, ""}:
                 return current
-            if activation != "activate_immediate":
-                raise NmosActivationError(
-                    "only activate_immediate is supported (scheduled activations are not)"
-                )
-            return self.activate(resource_id, side)
+            if activation == "activate_immediate":
+                return self.activate(resource_id, side)
+            if activation in {"activate_scheduled_relative", "activate_scheduled_absolute"}:
+                return self._schedule_activation(resource_id, side, current["activation"])
+            raise NmosActivationError(f"unsupported activation mode {activation!r}")
 
     def _validate_params(
         self,
@@ -626,17 +741,30 @@ class NmosNode:
             raise NmosActivationError("receiver mxl_flow_id must not be auto")
         if domain_id == "auto":
             domain_id = self.settings.resolved_output_domain_id
+        if side == "senders" and flow_id == "auto":
+            flow_id = self._sender_mxl_flow(resource_id)
         return [{"mxl_domain_id": domain_id, "mxl_flow_id": flow_id}]
 
     def activate(self, resource_id: str, side: str) -> dict[str, Any]:
         staged = dict(self.staged(resource_id, side))
         now = nmos_version()
+        pending = staged.get("activation") or {}
+        mode = pending.get("mode")
+        if mode in {"activate_scheduled_relative", "activate_scheduled_absolute"}:
+            activation = {
+                "mode": mode,
+                "requested_time": pending.get("requested_time"),
+                "activation_time": pending.get("activation_time") or now,
+            }
+        else:
+            activation = {
+                "mode": "activate_immediate",
+                "requested_time": None,
+                "activation_time": now,
+            }
         active = dict(staged)
-        active["activation"] = {
-            "mode": "activate_immediate",
-            "requested_time": None,
-            "activation_time": now,
-        }
+        active["activation"] = activation
+        self._cancel_scheduled(resource_id)
         self._active[resource_id] = active
         staged_reset = dict(active)
         staged_reset["activation"] = dict(NULL_ACTIVATION)
@@ -648,7 +776,66 @@ class NmosNode:
         except NmosActivationError:
             self.activations_error += 1
             raise
-        return staged_reset
+        # The IS-04 subscription changed, and the route belongs to the saved state.
+        self.mark_changed()
+        self.mixer.persist()
+        return active
+
+    def _cancel_scheduled(self, resource_id: str) -> None:
+        timer = self._scheduled.pop(resource_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_activation(
+        self, resource_id: str, side: str, activation: dict[str, Any]
+    ) -> dict[str, Any]:
+        mode = activation.get("mode")
+        requested = activation.get("requested_time")
+        if not isinstance(requested, str) or ":" not in requested:
+            raise NmosActivationError(
+                "scheduled activation requires requested_time as seconds:nanoseconds"
+            )
+        try:
+            seconds_s, nanos_s = requested.split(":", 1)
+            seconds = int(seconds_s)
+            nanos = int(nanos_s)
+        except ValueError as exc:
+            raise NmosActivationError("invalid requested_time") from exc
+        if mode == "activate_scheduled_relative":
+            delay = max(0.0, seconds + nanos / 1_000_000_000)
+            fire_at = time.time_ns() + TAI_OFFSET_NS + int(delay * 1_000_000_000)
+        else:
+            fire_at = seconds * 1_000_000_000 + nanos
+            now = time.time_ns() + TAI_OFFSET_NS
+            delay = max(0.0, (fire_at - now) / 1_000_000_000)
+        activation_time = f"{fire_at // 10**9}:{fire_at % 10**9}"
+        current = dict(self._staged[resource_id])
+        current["activation"] = {
+            "mode": mode,
+            "requested_time": requested,
+            "activation_time": activation_time,
+        }
+        self._staged[resource_id] = current
+        self._cancel_scheduled(resource_id)
+
+        def _fire() -> None:
+            with self.lock:
+                staged = self._staged.get(resource_id)
+                if not staged:
+                    return
+                pending = staged.get("activation") or {}
+                if pending.get("activation_time") != activation_time:
+                    return
+                try:
+                    self.activate(resource_id, side)
+                except NmosActivationError:
+                    log.debug("scheduled activation failed for %s", resource_id, exc_info=True)
+
+        timer = threading.Timer(delay, _fire)
+        timer.daemon = True
+        self._scheduled[resource_id] = timer
+        timer.start()
+        return current
 
     def _apply_receiver(self, resource_id: str, active: dict[str, Any]) -> None:
         found = self._lookup_receiver(resource_id)
@@ -715,6 +902,7 @@ class NmosNode:
                     states[role] = flow_presence(
                         self.settings.mxl_root, domain_id, flow_id
                     )
+        self.mark_changed()
 
     def reconcile_inputs(self) -> None:
         """Create/remove receivers when live inputs appear or disappear."""
@@ -735,6 +923,7 @@ class NmosNode:
                 if rid not in valid_receivers and rid not in senders:
                     self._active.pop(rid, None)
                     self._staged.pop(rid, None)
+        self.mark_changed()
 
     def _drop_input_receivers(self, input_id: str) -> None:
         self._input_states.pop(input_id, None)
@@ -743,20 +932,83 @@ class NmosNode:
             self._active.pop(rid, None)
             self._staged.pop(rid, None)
 
-    def refresh_waiting(self) -> None:
-        """Promote waiting/no_signal receivers when the flow appears (no extra PATCH)."""
+    def export_routes(self) -> list[dict[str, Any]]:
+        """Receiver connections by input and role (no seed-derived ids), for the saved state."""
+        routes = []
         with self.lock:
             for item in self._live_inputs():
                 for role in ("video", "audio"):
-                    if self.input_state(item.id, role) not in {
-                        "waiting",
-                        "no_signal",
-                        "running",
-                    }:
+                    active = self._active.get(ids.receiver_id(self.seed, item.id, role))
+                    if not active:
+                        continue
+                    params = (active.get("transport_params") or [{}])[0]
+                    routes.append(
+                        {
+                            "input_id": item.id,
+                            "role": role,
+                            "sender_id": active.get("sender_id"),
+                            "master_enable": bool(active.get("master_enable")),
+                            "mxl_domain_id": params.get("mxl_domain_id"),
+                            "mxl_flow_id": params.get("mxl_flow_id"),
+                        }
+                    )
+        return routes
+
+    def import_routes(self, routes: list[dict[str, Any]]) -> None:
+        """Activate saved receiver connections again, so they survive a restart."""
+        with self.lock:
+            live = {item.id for item in self._live_inputs()}
+            for route in routes:
+                if not isinstance(route, dict) or route.get("role") not in {"video", "audio"}:
+                    continue
+                if route.get("input_id") not in live:
+                    continue
+                rid = ids.receiver_id(self.seed, route["input_id"], route["role"])
+                active = self._empty_receiver_active()
+                active["sender_id"] = route.get("sender_id")
+                active["master_enable"] = bool(route.get("master_enable"))
+                active["activation"] = {
+                    "mode": "activate_immediate",
+                    "requested_time": None,
+                    "activation_time": nmos_version(),
+                }
+                active["transport_params"] = [
+                    {"mxl_domain_id": route.get("mxl_domain_id"), "mxl_flow_id": route.get("mxl_flow_id")}
+                ]
+                self._active[rid] = active
+                staged = dict(active)
+                staged["activation"] = dict(NULL_ACTIVATION)
+                self._staged[rid] = staged
+                try:
+                    self._apply_receiver(rid, active)
+                except (NmosActivationError, RuntimeError) as exc:
+                    log.warning("saved route of %s/%s not restored: %s", route["input_id"], route["role"], exc)
+        self.mark_changed()
+
+    def refresh_waiting(self) -> None:
+        """Promote waiting/no_signal receivers when the flow appears (no extra PATCH).
+
+        Only an essence that leaves `waiting` is applied to the mixer again, so its
+        mxlsrc points at the domain path that now exists. Every other essence only
+        gets its state refreshed: applying it again would restart a live mxlsrc.
+        """
+        with self.lock:
+            for item in self._live_inputs():
+                for role in ("video", "audio"):
+                    state = self.input_state(item.id, role)
+                    if state not in {"waiting", "no_signal", "running"}:
                         continue
                     rid = ids.receiver_id(self.seed, item.id, role)
                     active = self._active.get(rid)
                     if not active:
+                        continue
+                    params = (active.get("transport_params") or [{}])[0]
+                    domain_id = params.get("mxl_domain_id") or self.settings.resolved_output_domain_id
+                    presence = flow_presence(
+                        self.settings.mxl_root, str(domain_id), str(params.get("mxl_flow_id"))
+                    )
+                    if state != "waiting" or presence == "waiting":
+                        self._input_states.setdefault(item.id, {})[role] = presence
                         continue
                     try:
                         self._apply_receiver(rid, active)
@@ -777,3 +1029,4 @@ class NmosNode:
                     sid = ids.sender_id(self.seed, panel.id, role)
                     self._active[sid] = self._empty_sender_active(domain_id, flow)
                     self._staged[sid] = dict(self._active[sid])
+        self.mark_changed()

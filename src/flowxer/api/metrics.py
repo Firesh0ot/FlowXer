@@ -61,7 +61,7 @@ def render_prometheus(mixer) -> str:
             1 if mixer.preview_input_id else 0,
             {"input": mixer.preview_input_id or ""},
         ),
-        "# HELP flowxer_frames_rendered_total Preview/program frames produced",
+        "# HELP flowxer_frames_rendered_total Program frames that reached the video output",
         "# TYPE flowxer_frames_rendered_total counter",
         _line("flowxer_frames_rendered_total", int(getattr(mixer, "frames_rendered", 0))),
         "# HELP flowxer_frames_dropped_total Dropped mixer frames",
@@ -73,6 +73,9 @@ def render_prometheus(mixer) -> str:
         "# HELP flowxer_input_resyncs_total MXL reader resyncs",
         "# TYPE flowxer_input_resyncs_total counter",
         _line("flowxer_input_resyncs_total", int(getattr(mixer, "resyncs", 0))),
+        "# HELP flowxer_pipeline_errors_total GStreamer pipeline error messages",
+        "# TYPE flowxer_pipeline_errors_total counter",
+        _line("flowxer_pipeline_errors_total", int(getattr(mixer, "pipeline_errors", 0))),
         "# HELP flowxer_webrtc_peers Active WHEP peers",
         "# TYPE flowxer_webrtc_peers gauge",
     ]
@@ -152,12 +155,15 @@ def ready_payload(mixer) -> tuple[int, dict[str, Any]]:
         probe.unlink(missing_ok=True)
     except OSError as exc:
         reasons.append(f"output domain not writable: {output} ({exc})")
-    if settings.nmos_enable and getattr(mixer, "nmos", None) is None:
+    nmos = getattr(mixer, "nmos", None)
+    if settings.nmos_enable and nmos is None:
         reasons.append("NMOS enabled but node is missing")
+    elif nmos is not None and not nmos.registered():
+        reasons.append(f"not registered with {settings.resolved_registry_url}")
     body = {
         "ready": not reasons,
         "reasons": reasons,
-        "nmos_registry_up": bool(getattr(getattr(mixer, "nmos", None), "registry_up", False)),
+        "nmos_registry_up": bool(getattr(nmos, "registry_up", False)),
         "mixer_state": getattr(mixer.state, "value", str(mixer.state)),
     }
     return (200 if not reasons else 503, body)

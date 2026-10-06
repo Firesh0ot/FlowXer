@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError
 
 from flowxer.api.schemas import (
     ConsoleState,
@@ -16,6 +17,7 @@ from flowxer.api.schemas import (
     LogicalInputUpdate,
     MixerCommandResponse,
     MixerStartRequest,
+    MixerState,
     MixerStatus,
     OverlayStatus,
     OverlayUpdate,
@@ -219,6 +221,13 @@ def patch_input(
     except MixerError as exc:
         code = status.HTTP_404_NOT_FOUND if "unknown" in str(exc) else status.HTTP_409_CONFLICT
         raise _http(exc, code)
+    except ValidationError as exc:
+        # The patch is merged into the stored input; the merged result can still be
+        # invalid (e.g. mxl_live without essences or group hint).
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False),
+        ) from exc
 
 
 @router.delete(
@@ -281,7 +290,9 @@ def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
-        body = mixer.take(payload.input_id, payload.transition, payload.stinger_id, payload.panel_id)
+        body = mixer.take(
+            payload.input_id, payload.transition, payload.stinger_id, payload.panel_id, payload.duration_ms
+        )
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="taken", mixer=body)
@@ -596,6 +607,29 @@ def put_workspace(
         return mixer.apply_workspace(payload)
     except (MixerError, ValueError) as exc:
         raise _http(MixerError(str(exc)))
+
+
+@router.get(
+    "/config/export",
+    tags=["gui"],
+    summary="Export the configuration (inputs, layout, keyers, stingers, tally, IS-05 routes) as one JSON document",
+)
+def config_export(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.export_state()
+
+
+@router.post(
+    "/config/import",
+    tags=["gui"],
+    summary="Restore an exported configuration; the mixer must be stopped",
+    responses={409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def config_import(payload: dict = Body(...), mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.import_state(payload)
+    except MixerError as exc:
+        code = status.HTTP_409_CONFLICT if mixer.state == MixerState.running else 422
+        raise _http(exc, code)
 
 
 @router.get(

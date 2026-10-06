@@ -5,7 +5,7 @@
 
 ARG UBUNTU=ubuntu:24.04
 ARG MXL_REPO=https://github.com/dmf-mxl/mxl.git
-ARG MXL_REF=218ddaa
+ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
 ARG RUST_TOOLCHAIN=1.92
 ARG GSTCEFSRC_REPO=https://github.com/centricular/gstcefsrc.git
 ARG GSTCEFSRC_REF=b63340852fc93b0ab67b07200e1ff44f59ba6769
@@ -34,9 +34,12 @@ FROM ${UBUNTU}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLOWXER_VERSION=0.1.0
-ARG MXL_REF=218ddaa
+ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
+ARG VCS_REF=unknown
 LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.source="https://github.com/Firesh0ot/FlowXer"
+LABEL org.opencontainers.image.revision=$VCS_REF
 LABEL io.dmf.mxl.revision=$MXL_REF
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,6 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-libav \
+        gstreamer1.0-x \
         libgdk-pixbuf2.0-0 \
         fonts-dejavu-core \
         ffmpeg \
@@ -121,6 +125,6 @@ ENV FLOWXER_OVERLAY_URL=http://127.0.0.1:9610/graphics/lower-third.html
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 9610 3252 3253
-VOLUME ["/Volumes/mxl", "/storage"]
+VOLUME ["/Volumes/mxl", "/storage", "/config"]
 USER 1000:1000
 ENTRYPOINT ["/entrypoint.sh"]

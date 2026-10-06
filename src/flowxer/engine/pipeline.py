@@ -10,6 +10,23 @@ V210_CAPS = (
 )
 BGRA_CAPS = "video/x-raw,format=BGRA,width={width},height={height},framerate={fps}"
 AUDIO_CAPS = "audio/x-raw,format=F32LE,layout=interleaved,rate={rate},channels={channels}"
+# Compositor output: 4:4:4 YUV with alpha, so Program (v210) needs no RGB matrix on
+# its way in and out. Keyers and stingers (BGRA) are converted per pad.
+MIX_CAPS = "video/x-raw,format=AYUV,width={width},height={height},framerate={fps}"
+
+# Compositor and audiomixer pads. Program is the A bus; during a mix the B bus
+# shows the incoming source above it. Every stinger gets a new pad above the keyer.
+PAD_PROGRAM = "sink_0"
+PAD_MIX = "sink_1"
+PAD_KEYER = "sink_2"
+STINGER_ZORDER = 3
+
+# GUI monitor pictures: one appsink per source (MONITOR_PREFIX + input id) and
+# one for Program, each holding its newest RGB picture.
+MONITOR_PREFIX = "mon_"
+MONITOR_PROGRAM = "mon__program"
+MONITOR_WIDTH = 640
+MONITOR_HEIGHT = 360
 
 
 def _gst_string(value: str) -> str:
@@ -36,6 +53,38 @@ def _audio(settings: Settings) -> str:
     return AUDIO_CAPS.format(rate=settings.audio_rate, channels=settings.audio_channels)
 
 
+def _mix(settings: Settings) -> str:
+    return MIX_CAPS.format(
+        width=settings.width, height=settings.height, fps=settings.frame_rate
+    )
+
+
+def _buses(kind: str, inp: LogicalInput, settings: Settings) -> str:
+    """A source feeds both selectors of its kind: A (Program) and B (incoming mix),
+    and a video source its GUI monitor."""
+    tee = f"{kind}t_{inp.id}"
+    sel = "vsel" if kind == "v" else "asel"
+    chain = (
+        f"tee name={tee}\n"
+        f"{tee}. ! queue ! {sel}.sink_{inp.slot}\n"
+        f"{tee}. ! queue ! {sel}b.sink_{inp.slot}"
+    )
+    if kind == "v" and settings.monitor_fps:
+        chain += f"\n{tee}. ! {monitor_tap(settings, MONITOR_PREFIX + inp.id)}"
+    return chain
+
+
+def monitor_tap(settings: Settings, name: str) -> str:
+    """Branch to a GUI monitor: the rate drops first, then one conversion pass
+    scales the full-size frame straight to the small RGB picture."""
+    return (
+        "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
+        f"! videoconvertscale ! video/x-raw,format=RGB,width={MONITOR_WIDTH},height={MONITOR_HEIGHT},"
+        f"pixel-aspect-ratio=1/1,framerate={settings.monitor_fps}/1 "
+        f"! appsink name={name} max-buffers=1 drop=true sync=false"
+    )
+
+
 def _video_source_bin(
     inp: LogicalInput,
     settings: Settings,
@@ -47,37 +96,40 @@ def _video_source_bin(
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else "UNBOUND"
         src_domain = domain_paths.get(f"{inp.id}:video", domain)
-        return (
+        chain = (
             f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} "
             f"domain={_gst_string(src_domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
-            f"! videoconvert ! {caps} ! queue ! vsel.sink_{inp.slot}"
+            f"! videoconvert ! {caps} ! "
         )
-    if inp.kind == InputKind.black:
-        return (
+    elif inp.kind == InputKind.black:
+        chain = (
             f"videotestsrc name=vsrc_{inp.id} pattern=black "
             f"foreground-color=0xFF000000 background-color=0xFF000000 is-live=true "
-            f"! {caps} ! queue ! vsel.sink_{inp.slot}"
+            f"! {caps} ! "
         )
-    if inp.kind == InputKind.test:
-        return (
+    elif inp.kind == InputKind.test:
+        chain = (
             f"videotestsrc name=vsrc_{inp.id} pattern=smpte is-live=true "
-            f"! timeoverlay ! {caps} ! queue ! vsel.sink_{inp.slot}"
+            f"! timeoverlay ! {caps} ! "
         )
-    # file / replay: decode any container, convert to uncompressed v210, run as live.
-    location = inp.file_path or "_unassigned"
-    if location.endswith("_unassigned") or location == "_unassigned":
-        return (
-            f"videotestsrc name=vsrc_{inp.id} pattern=black is-live=true "
-            f"! {caps} ! queue ! vsel.sink_{inp.slot}"
-        )
-    return (
-        f'filesrc name=vsrc_{inp.id} location="{location}" '
-        f"! decodebin name=vdec_{inp.id} "
-        f"! videoconvert ! videoscale ! videorate "
-        f"! {bgra} ! videoconvert ! {caps} "
-        f"! identity sync=true ! queue ! vsel.sink_{inp.slot}"
-    )
+    else:
+        # file / replay: decode any container, convert to uncompressed v210, run as live.
+        location = inp.file_path or "_unassigned"
+        if location.endswith("_unassigned") or location == "_unassigned":
+            chain = (
+                f"videotestsrc name=vsrc_{inp.id} pattern=black is-live=true "
+                f"! {caps} ! "
+            )
+        else:
+            chain = (
+                f'filesrc name=vsrc_{inp.id} location="{location}" '
+                f"! decodebin name=vdec_{inp.id} "
+                f"! videoconvert ! videoscale ! videorate "
+                f"! {bgra} ! videoconvert ! {caps} "
+                f"! identity sync=true ! "
+            )
+    return chain + _buses("v", inp, settings)
 
 
 def _audio_source_bin(
@@ -90,30 +142,58 @@ def _audio_source_bin(
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else "UNBOUND"
         src_domain = domain_paths.get(f"{inp.id}:audio", domain)
-        return (
+        chain = (
             f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "
             f"domain={_gst_string(src_domain)} "
             f"! queue max-size-buffers=2 leaky=downstream "
-            f"! audioconvert ! audioresample ! {caps} ! queue ! asel.sink_{inp.slot}"
+            f"! audioconvert name={AUDIO_MAP_PREFIX}{inp.id} ! audioconvert ! audioresample ! {caps} ! "
         )
-    if inp.kind in {InputKind.black, InputKind.test}:
+    elif inp.kind in {InputKind.black, InputKind.test}:
         wave = "silence" if inp.kind == InputKind.black else "ticks"
-        return (
+        chain = (
             f"audiotestsrc name=asrc_{inp.id} wave={wave} is-live=true "
-            f"! {caps} ! queue ! asel.sink_{inp.slot}"
+            f"! {caps} ! "
         )
-    location = inp.file_path or "_unassigned"
-    if location.endswith("_unassigned") or location == "_unassigned":
-        return (
-            f"audiotestsrc name=asrc_{inp.id} wave=silence is-live=true "
-            f"! {caps} ! queue ! asel.sink_{inp.slot}"
+    else:
+        location = inp.file_path or "_unassigned"
+        if location.endswith("_unassigned") or location == "_unassigned":
+            chain = (
+                f"audiotestsrc name=asrc_{inp.id} wave=silence is-live=true "
+                f"! {caps} ! "
+            )
+        else:
+            chain = (
+                f'filesrc name=asrc_{inp.id} location="{location}" '
+                f"! decodebin name=adec_{inp.id} "
+                f"! audioconvert ! audioresample ! {caps} "
+                f"! identity sync=true ! "
+            )
+    return chain + _buses("a", inp, settings)
+
+
+# MXL audio: this audioconvert gets a mix-matrix when the flow's caps arrive
+# (GstRuntime.map_audio_channels), so its channel count can be anything.
+AUDIO_MAP_PREFIX = "amap_"
+
+
+def stinger_bin_description(stinger: dict, settings: Settings) -> str:
+    """One playback of a stinger: decoded to BGRA at the mixer raster and rate.
+
+    The runtime builds a new bin from this for every playback and links it to a
+    new compositor pad, so a stinger can play any number of times.
+    """
+    bgra = _bgra(settings)
+    if stinger.get("kind") == "video":
+        source = f"filesrc location={_gst_string(stinger.get('media_path') or stinger['path'])}"
+    else:
+        # A TGA sequence has no rate of its own: give it the mixer rate.
+        location = f"{stinger['path']}/{stinger['pattern']}"
+        source = (
+            f"multifilesrc location={_gst_string(location)} index=0 "
+            f"stop-index={stinger['frame_count'] - 1} loop=false "
+            f"caps=image/x-tga,framerate={settings.frame_rate}"
         )
-    return (
-        f'filesrc name=asrc_{inp.id} location="{location}" '
-        f"! decodebin name=adec_{inp.id} "
-        f"! audioconvert ! audioresample ! {caps} "
-        f"! identity sync=true ! queue ! asel.sink_{inp.slot}"
-    )
+    return f"{source} ! decodebin ! videoconvert ! videoscale ! videorate ! {bgra} ! queue name=stingerq"
 
 
 def build_pipeline_description(
@@ -122,7 +202,6 @@ def build_pipeline_description(
     inputs: list[LogicalInput],
     overlay_url: str,
     overlay_enabled: bool,
-    stinger: dict | None,
     output_video_flow_id: str,
     output_audio_flow_id: str,
     domain: str,
@@ -133,8 +212,9 @@ def build_pipeline_description(
     """
     Build a GStreamer gst-launch-style description:
 
-      sources → input-selector → compositor (HTML5 + TGA stinger) → v210 mxlsink
-      sources → input-selector → float32 mxlsink
+      sources → tee → input-selector A (Program) / B (mix) → compositor (+ HTML5 keyer,
+      + stingers added while they play) → v210 mxlsink
+      sources → tee → input-selector A / B → audiomixer → float32 mxlsink
     """
     if not inputs:
         raise ValueError("at least one logical input is required")
@@ -143,24 +223,6 @@ def build_pipeline_description(
     v210 = _v210(settings)
     audio = _audio(settings)
     overlay_alpha = "1.0" if overlay_enabled else "0.0"
-    kind = (stinger or {}).get("kind") or "sequence"
-    if stinger and kind == "video":
-        stinger_bin = (
-            f'filesrc name=stinger location="{stinger.get("media_path") or stinger["path"]}" '
-            f"! decodebin name=stingerdec ! videoconvert ! videoscale ! {bgra} "
-            f"! queue name=stingerq ! comp.sink_2"
-        )
-    else:
-        stinger_location = (
-            f"{stinger['path']}/{stinger['pattern']}" if stinger else "/dev/null/frame_%05d.tga"
-        )
-        stinger_stop = (stinger["frame_count"] - 1) if stinger else 0
-        stinger_bin = (
-            f"multifilesrc name=stinger location={stinger_location} index=0 "
-            f"stop-index={stinger_stop} loop=false caps=image/x-tga "
-            f"! decodebin ! videoconvert ! videoscale ! {bgra} "
-            f"! queue name=stingerq ! comp.sink_2"
-        )
 
     video_sources = "\n".join(
         _video_source_bin(i, settings, domain, domain_paths or {}) for i in inputs
@@ -173,14 +235,18 @@ def build_pipeline_description(
         overlay_bin = (
             f'cefsrc name=html5 url="{overlay_url}" '
             f"! {bgra} ! videorate ! {bgra} ! queue name=html5q "
-            f"! comp.sink_1"
+            f"! comp.{PAD_KEYER}"
         )
     else:
         overlay_bin = (
             f"videotestsrc name=html5 pattern=black is-live=true "
             f"! {bgra} ! gdkpixbufoverlay name=html5fallback "
-            f"! queue name=html5q ! comp.sink_1"
+            f"! queue name=html5q ! comp.{PAD_KEYER}"
         )
+
+    program_monitor = (
+        f"\npgmt. ! {monitor_tap(settings, MONITOR_PROGRAM)}" if settings.monitor_fps else ""
+    )
 
     if use_mxl_sink:
         video_sink = (
@@ -195,25 +261,31 @@ def build_pipeline_description(
         video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"
         audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true"
 
+    # The compositor converts each pad itself and skips a pad whose alpha is 0, so
+    # the B bus and an idle keyer cost nothing until they are shown.
     return f"""
 input-selector name=vsel sync-streams=true cache-buffers=true
+input-selector name=vselb sync-streams=true cache-buffers=true
 input-selector name=asel sync-streams=true cache-buffers=true
-compositor name=comp zero-size-is-unconfigured=false
-  sink_0::zorder=0 sink_0::alpha=1.0
-  sink_1::zorder=1 sink_1::alpha={overlay_alpha} sink_1::sync=false
-  sink_2::zorder=2 sink_2::alpha=0.0 sink_2::sync=false
+input-selector name=aselb sync-streams=true cache-buffers=true
+compositor name=comp background=black emit-signals=true
+  {PAD_PROGRAM}::zorder=0
+  {PAD_MIX}::zorder=1 {PAD_MIX}::alpha=0.0
+  {PAD_KEYER}::zorder=2 {PAD_KEYER}::alpha={overlay_alpha}
+audiomixer name=amix emit-signals=true {PAD_PROGRAM}::volume=1.0 {PAD_MIX}::volume=0.0
 
 {video_sources}
 
-vsel. ! videoconvert ! {bgra} ! queue ! comp.sink_0
+vsel. ! queue ! comp.{PAD_PROGRAM}
+vselb. ! queue ! comp.{PAD_MIX}
 
 {overlay_bin}
 
-{stinger_bin}
-
-comp. ! identity name=ptsfix ! {video_sink}
+comp. ! {_mix(settings)} ! tee name=pgmt ! identity name=ptsfix ! {video_sink}{program_monitor}
 
 {audio_sources}
 
-asel. ! audioconvert ! audioresample ! {audio_sink}
+asel. ! audioconvert ! queue ! amix.{PAD_PROGRAM}
+aselb. ! audioconvert ! queue ! amix.{PAD_MIX}
+amix. ! audioconvert ! audioresample ! {audio_sink}
 """.strip()

@@ -53,6 +53,7 @@ jobs:
           push: true
           build-args: |
             FLOWXER_VERSION=${{ steps.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
           tags: |
             ghcr.io/${{ steps.image.outputs.owner }}/flowxer-vision-mixer:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.image.outputs.owner }}/flowxer-vision-mixer:latest

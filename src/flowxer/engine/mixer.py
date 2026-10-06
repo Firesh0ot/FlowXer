@@ -7,6 +7,9 @@ from pathlib import Path
 
 from uuid import UUID
 
+from pydantic import ValidationError
+
+from flowxer import __version__
 from flowxer.api.schemas import (
     AudioEssence,
     DownstreamKeyer,
@@ -37,13 +40,14 @@ from flowxer.domain.mxl_domain import (
     ensure_output_domain,
     flows_by_group_hint_in_root,
     list_flows_in_root,
+    remove_output_domain,
     resolve_domain_path,
 )
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import format_by_id
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
-from flowxer.engine.pipeline import build_pipeline_description
+from flowxer.engine.pipeline import PAD_KEYER, build_pipeline_description, stinger_bin_description
 from flowxer.engine.security import (
     SecurityError,
     assert_http_url,
@@ -61,6 +65,7 @@ from flowxer.engine.stinger import (
     register_video_stinger,
     update_stinger_cut,
 )
+from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
@@ -68,6 +73,8 @@ from flowxer.settings import Settings, ensure_storage
 log = logging.getLogger(__name__)
 
 CLIP_SUFFIXES = {".mp4", ".mov", ".mkv", ".ts", ".mxf", ".wav", ".m4a"}
+# A mix (take with transition mix) without a duration.
+DEFAULT_MIX_MS = 400
 
 
 class MixerError(RuntimeError):
@@ -97,10 +104,12 @@ class VisionMixer:
         self.gst: GstRuntime | None = None
         self.stinger_player: StingerPlayer | None = None
         self.last_transition: str = "cut"
-        self.frames_rendered = 0
+        # Program frames of earlier runs; frames_rendered adds the running pipeline's.
+        self._frames_before = 0
         self.frames_dropped = 0
         self.late_grains = 0
         self.resyncs = 0
+        self.pipeline_errors = 0
         self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
         self._lock = threading.RLock()
         self._stinger_clock: threading.Thread | None = None
@@ -121,6 +130,8 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        self._store = StateStore(settings.state_dir)
+        self._restore_state()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -661,6 +672,7 @@ class VisionMixer:
         video_id = nmos.flow_uuid(
             group_hint,
             "video",
+            seed=self.settings.resolved_nmos_seed,
             width=self.settings.width,
             height=self.settings.height,
             frame_rate_num=self.settings.frame_rate_num,
@@ -669,6 +681,7 @@ class VisionMixer:
         audio_id = nmos.flow_uuid(
             group_hint,
             "audio",
+            seed=self.settings.resolved_nmos_seed,
             width=self.settings.width,
             height=self.settings.height,
             frame_rate_num=self.settings.frame_rate_num,
@@ -704,14 +717,11 @@ class VisionMixer:
         capabilities = probe_backend()
         use_mxl = bool(capabilities["mxl_plugins"])
         use_cef = bool(capabilities["cefsrc"])
-        slot = self.stinger_slots[0] if self.stinger_slots else None
-        stinger = self._info_for_slot(slot).model_dump()
         description = build_pipeline_description(
             settings=self.settings,
             inputs=self.list_inputs(),
             overlay_url=self.overlay.url,
             overlay_enabled=self.overlay.enabled,
-            stinger=stinger,
             output_video_flow_id=video_id,
             output_audio_flow_id=audio_id,
             domain=str(output),
@@ -723,12 +733,19 @@ class VisionMixer:
 
         force_sim = self.settings.simulate or self.settings.gst_mode == "simulate"
         self.gst = None
+        self.error = None
         if not force_sim and capabilities["gstreamer"]:
-            self.gst = try_start_gst(description)
+            self.gst, reason = try_start_gst(description, self._on_pipeline_error, self.settings.audio_channels)
+            if self.gst is None:
+                # Never fall back to the simulator when GStreamer is installed: the
+                # API would report on-air while nothing reaches MXL.
+                self.state = MixerState.error
+                self.backend = "idle"
+                self.error = f"GStreamer pipeline failed: {reason}"
+                raise MixerError(self.error)
 
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
-        self.error = None
         self.program_input_id = request.program_input_id or self._default_program_id()
         self.preview_input_id = request.preview_input_id or self.program_input_id
         self.last_live_input_id = self.program_input_id
@@ -742,8 +759,19 @@ class VisionMixer:
         self._publish_tally()
         return self.status()
 
+    def _on_pipeline_error(self, message: str) -> None:
+        """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
+        self.error = message
+        self.pipeline_errors += 1
+
+    @property
+    def frames_rendered(self) -> int:
+        """Frames that reached the Program video sink (none in simulate)."""
+        return self._frames_before + (self.gst.program_frames if self.gst is not None else 0)
+
     def stop(self) -> MixerStatus:
         if self.gst is not None:
+            self._frames_before += self.gst.program_frames
             self.gst.stop()
             self.gst = None
         self.state = MixerState.idle
@@ -751,6 +779,22 @@ class VisionMixer:
         self.stinger_player = None
         self._publish_tally()
         return self.status()
+
+    def shutdown(self) -> None:
+        """SIGTERM: stop media (releases the MXL readers and writers), deregister from
+        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set."""
+        try:
+            self.stop()
+        except Exception:
+            log.exception("stopping the media pipeline failed")
+        self.tally.close()
+        self.nmos.shutdown()
+        if self.settings.mxl_cleanup_on_exit:
+            remove_output_domain(
+                self.settings.output_domain,
+                domain_id=self.settings.resolved_output_domain_id,
+                root=self.settings.mxl_root,
+            )
 
     def _default_program_id(self) -> str:
         for item in self.list_inputs():
@@ -817,12 +861,11 @@ class VisionMixer:
             return
         slot = self.get_input(self.program_input_id).slot
         if self.gst is not None:
-            self.gst.set_active_slot("vsel", slot)
-            self.gst.set_active_slot("asel", slot)
+            self.gst.set_program(slot)
 
     def _apply_overlay_alpha(self) -> None:
         if self.gst is not None:
-            self.gst.set_compositor_alpha("sink_1", 1.0 if self.overlay.enabled else 0.0)
+            self.gst.set_compositor_alpha(PAD_KEYER, 1.0 if self.overlay.enabled else 0.0)
             self.gst.set_overlay_png(self.overlay.png_path)
 
     # ── takes / replay / overlay ─────────────────────────────────────────────
@@ -833,6 +876,7 @@ class VisionMixer:
         transition: TransitionType = TransitionType.cut,
         stinger_id: str | None = None,
         panel_id: str = "me-1",
+        duration_ms: int = 0,
     ) -> MixerStatus:
         """Direct source → Program (source-tile right-click). Does not consume Wipe."""
         if self.state != MixerState.running:
@@ -850,7 +894,7 @@ class VisionMixer:
                     direction="to_replay" if self._is_replay(input_id) else "to_live",
                     panel_id=panel.id,
                 )
-        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False)
+        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False, duration_ms=duration_ms)
         return self.status()
 
     def cut(self, panel_id: str = "me-1") -> MixerStatus:
@@ -954,8 +998,10 @@ class VisionMixer:
                 self.program_bus = ProgramBus.live
             else:
                 self.program_bus = ProgramBus.replay
-            self._apply_program()
-        _ = duration_ms  # mix duration is recorded; GST input-selector is a hard switch
+            if transition == TransitionType.mix and self.gst is not None:
+                self.gst.mix(target.slot, (duration_ms or DEFAULT_MIX_MS) * 1_000_000)
+            else:
+                self._apply_program()
         self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
@@ -1019,7 +1065,7 @@ class VisionMixer:
         self.last_transition = "stinger"
         panel.last_transition = "stinger"
         self.transition_counts["stinger"] = self.transition_counts.get("stinger", 0) + 1
-        self.stinger_player = StingerPlayer(
+        player = StingerPlayer(
             info,
             target_input_id,
             direction,
@@ -1027,12 +1073,29 @@ class VisionMixer:
             flip_flop=flip_flop,
             panel_id=panel.id,
         )
+        self.stinger_player = player
         if self.gst is not None:
-            self.gst.set_compositor_alpha("sink_2", 1.0)
+            # Each frame that reaches the compositor advances the player, so Program
+            # cuts on the stinger's own cut frame.
+            self.gst.play_stinger(
+                stinger_bin_description(info.model_dump(), self.settings),
+                on_frame=lambda: self._stinger_frame(player),
+                on_end=lambda: self._stinger_ended(player),
+            )
+            return self.status()
         # Advance to first frame so status reports "playing".
         self.advance_stinger(1)
         self._arm_stinger_clock()
         return self.status()
+
+    def _stinger_frame(self, player: StingerPlayer) -> None:
+        if self.stinger_player is player:
+            self.advance_stinger(1)
+
+    def _stinger_ended(self, player: StingerPlayer) -> None:
+        """The stinger media ended (or failed): finish the player, cut included."""
+        if self.stinger_player is player and not player.done:
+            self.advance_stinger(max(player.info.frame_count - player.frame, 1))
 
     def advance_stinger(self, frames: int = 1) -> MixerStatus:
         """Advance the TGA stinger. Called by the GST pad probe or tests."""
@@ -1066,8 +1129,6 @@ class VisionMixer:
             self._apply_program()
             self._publish_tally()
         if "complete" in snapshot["events"]:
-            if self.gst is not None:
-                self.gst.set_compositor_alpha("sink_2", 0.0)
             self.stinger_player = None
         return self.status()
 
@@ -1136,6 +1197,105 @@ class VisionMixer:
         except Exception as exc:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
+
+    # ── saved state and config export/import ─────────────────────────────────
+
+    def export_state(self) -> dict:
+        """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
+        # The NMOS lock guards the state: IS-05 activations hold it when they persist.
+        with self.nmos.lock:
+            return {
+                "format": STATE_FORMAT,
+                "flowxer_version": __version__,
+                "workspace": self.workspace.model_dump(mode="json"),
+                "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
+                "panels": [panel.model_dump(mode="json") for panel in self.panels],
+                "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
+                "stinger_slots": [slot.model_dump(mode="json") for slot in self.stinger_slots],
+                "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
+                "nmos_receivers": self.nmos.export_routes(),
+            }
+
+    def import_state(self, data: dict) -> dict:
+        """Restore an export_state() document (POST /config/import). The mixer must be stopped."""
+        if self.state == MixerState.running:
+            raise MixerError("stop the mixer before importing a configuration")
+        self._apply_state(data, checked=True)
+        self._publish_tally()
+        self.persist()
+        return self.export_state()
+
+    def persist(self) -> None:
+        with self.nmos.lock:
+            self._store.save(self.export_state())
+
+    def _restore_state(self) -> None:
+        saved = self._store.load()
+        if saved is None:
+            return
+        try:
+            # Written by this function: no DNS lookups, so a resolver hiccup keeps the state.
+            self._apply_state(saved, checked=False)
+        except MixerError as exc:
+            log.error("ignoring %s, starting with defaults: %s", self._store.path, exc)
+            return
+        log.info("restored the mixer state from %s", self._store.path)
+
+    def _apply_state(self, data: dict, *, checked: bool) -> None:
+        """Validate everything first, then replace the state. `checked` applies the
+        storage and egress checks of the single-object API calls."""
+        if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
+            raise MixerError(f"not a {STATE_FORMAT} document")
+        try:
+            workspace = WorkspaceConfig(**(data.get("workspace") or {}))
+            fmt = format_by_id(workspace.format_id)
+            inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
+            panels = [MixerPanel(**item) for item in data.get("panels") or []]
+            keyers = [DownstreamKeyer(**item) for item in data.get("keyers") or []]
+            slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
+            tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
+            routes = list(data.get("nmos_receivers") or [])
+            for item in inputs:
+                if item.file_path and item.file_path != "_unassigned":
+                    item.file_path = str(resolve_under(self.settings.clips_dir, item.file_path))
+            for slot in slots:
+                require_safe_id(slot.stinger_id, what="stinger id")
+                if slot.media_path:
+                    contained_path(slot.media_path, self.settings.clips_dir, self.settings.stingers_dir)
+            if checked:
+                for keyer in keyers:
+                    if keyer.url:
+                        assert_http_url(keyer.url, what="keyer URL")
+        except (ValidationError, SecurityError, TypeError, ValueError) as exc:
+            raise MixerError(f"invalid configuration: {exc}") from exc
+        if len({item.id for item in inputs}) != len(inputs):
+            raise MixerError("invalid configuration: duplicate input ids")
+        with self.nmos.lock:
+            if checked:
+                try:
+                    self.tally.replace(tally)
+                except ValueError as exc:
+                    raise MixerError(f"invalid configuration: {exc}") from exc
+            else:
+                self.tally.receivers = tally
+            self.settings.width = fmt.width
+            self.settings.height = fmt.height
+            self.settings.frame_rate_num = fmt.frame_rate_num
+            self.settings.frame_rate_den = fmt.frame_rate_den
+            self.workspace = workspace
+            self.inputs = {item.id: item for item in inputs}
+            self.panels = panels
+            self.keyers = keyers
+            self.stinger_slots = slots
+            main = panels[0] if panels else None
+            self.program_input_id = main.program_input_id if main and main.program_input_id in self.inputs else None
+            self.preview_input_id = main.preview_input_id if main and main.preview_input_id in self.inputs else None
+            self._sync_sources()
+            self._sync_panels()
+            self._sync_keyers()
+            self._sync_stinger_slots()
+            self.nmos.reconcile_inputs()
+            self.nmos.import_routes(routes)
 
     def status(self) -> MixerStatus:
         capabilities = probe_backend()
