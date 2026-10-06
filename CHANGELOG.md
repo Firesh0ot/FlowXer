@@ -38,6 +38,26 @@ in `docs/platform-integration-plan.md` §8.
   deployments.
 - The image starts `flowxer` instead of the uvicorn CLI.
 
+### Fixed (8.15.31 on the lab)
+
+- Routing an input over IS-05 whose kind was changed on air (a test source made
+  `mxl_live` while Program runs) no longer stops its source and hangs the API.
+  The running pipeline still has the earlier source (the new kind applies at
+  the next start); the retarget took that source to NULL, failed on the missing
+  `video-flow-id`/`audio-flow-id` property and left it stopped, the
+  input-selectors then held the other inputs' streaming threads, and the next
+  route blocked: REST, NMOS and GUI stopped answering while Program ran on.
+  Only an `mxlsrc` is retargeted now, it always returns to PLAYING, and the
+  log says that the route applies at the next start.
+
+### Fixed (CI)
+
+- The merge-back after a release (`main` → `stage` → `dev`) failed when the
+  merge conflicted in the version files: `reconcile-refs` read `VERSION` with
+  the conflict markers in it. It now resolves conflicts that only differ in the
+  version line in `VERSION`, `pyproject.toml` and `src/flowxer/__init__.py`
+  before it reconciles; any other conflict there still stops the merge-back.
+
 ### Fixed (lab run on real hardware)
 
 - The mixer silently fell back to simulate when the pipeline did not parse
