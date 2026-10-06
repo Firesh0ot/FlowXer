@@ -9,6 +9,7 @@ from __future__ import annotations
 import struct
 import threading
 import time
+from uuid import uuid4
 
 import pytest
 
@@ -16,7 +17,7 @@ from flowxer.engine.capabilities import gstreamer_available
 from flowxer.engine.mixer import VisionMixer
 from flowxer.engine.gst_runtime import first_channels_matrix, map_audio_channels
 from flowxer.engine.pipeline import PAD_MIX, PAD_PROGRAM
-from flowxer.api.schemas import MixerStartRequest
+from flowxer.api.schemas import InputKind, LogicalInputUpdate, MixerStartRequest
 from flowxer.settings import Settings
 
 pytestmark = pytest.mark.skipif(not gstreamer_available(), reason="GStreamer with PyGObject is not installed")
@@ -208,6 +209,33 @@ def _first_frame(caps: str, samples: bytes, out_channels: int) -> tuple[float, .
     data = bytes(mapped.data)
     out.unmap(mapped)
     return struct.unpack(f"<{out_channels}f", data[: 4 * out_channels])
+
+
+def test_routing_an_input_whose_kind_changed_on_air_does_not_block(live: VisionMixer) -> None:
+    # 8.15.31: the inputs still had their test sources in the running pipeline; routing them took
+    # the source to NULL, failed on the missing flow-id property and left it stopped, and the next
+    # route blocked (and with it the REST, NMOS and GUI API) while Program ran on.
+    from gi.repository import Gst
+
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    _wait(lambda: live.frames_rendered >= 10, "the first Program frames")
+    for input_id in ("cam-1", "cam-2"):
+        live.update_input(input_id, LogicalInputUpdate(kind=InputKind.mxl_live, group_hint=f"player-{input_id}"))
+    routed = threading.Event()
+
+    def route() -> None:
+        for input_id in ("cam-1", "cam-2"):
+            for role in ("video", "audio"):
+                live.apply_nmos_receiver(input_id, role, domain_id=None, flow_id=str(uuid4()), enabled=True)
+        routed.set()
+
+    threading.Thread(target=route, daemon=True).start()
+    assert routed.wait(5), "routing the inputs blocked"
+    for name in ("vsrc_cam-1", "asrc_cam-1", "vsrc_cam-2", "asrc_cam-2"):
+        _, state, _ = live.gst.pipeline.get_by_name(name).get_state(0)
+        assert state == Gst.State.PLAYING, f"{name} is {state.value_nick}"
+    first = live.frames_rendered
+    _wait(lambda: live.frames_rendered >= first + 10, "Program frames after the routes")
 
 
 def test_first_channels_matrix() -> None:
