@@ -1,10 +1,14 @@
-"""Loop-conforming audio to whole-frame lengths (incl. 59.94 cadence)."""
+"""Loop-conforming audio to whole-frame lengths (incl. 59.94 cadence).
+
+ffmpeg pads or cuts the sound to the sample count (see build_clip_audio_command); this
+module computes that count and blends the loop point in place.
+"""
 
 from __future__ import annotations
 
-import array
-import struct
 from pathlib import Path
+
+import numpy as np
 
 
 def samples_until_grain(index: int, rate_num: int, rate_den: int, sample_rate: int = 48000) -> int:
@@ -23,53 +27,31 @@ def samples_in_grain(index: int, rate_num: int, rate_den: int, sample_rate: int 
     return b - a
 
 
-def conform_interleaved(
-    src: list[float] | array.array,
-    src_channels: int,
-    src_samples: int,
-    dst_channels: int,
-    dst_samples: int,
-    crossfade_samples: int = 0,
-) -> array.array:
-    """Pad/truncate interleaved float32 audio and optional loop-point crossfade."""
-    if dst_channels < 1 or dst_samples <= 0:
-        return array.array("f")
-    dst = array.array("f", [0.0] * (dst_samples * dst_channels))
-    if src and src_channels > 0 and src_samples > 0:
-        n = min(src_samples, dst_samples)
-        ch = min(src_channels, dst_channels)
-        for i in range(n):
-            for c in range(ch):
-                dst[i * dst_channels + c] = float(src[i * src_channels + c])
-    if crossfade_samples > 1 and dst_samples > crossfade_samples * 2:
-        n = crossfade_samples
-        for i in range(n):
-            a = i / float(n)
-            head = i
-            tail = dst_samples - n + i
-            for c in range(dst_channels):
-                h = dst[head * dst_channels + c]
-                t = dst[tail * dst_channels + c]
-                m = h * (1.0 - a) + t * a
-                dst[head * dst_channels + c] = m
-                dst[tail * dst_channels + c] = m
-    return dst
-
-
-def read_f32le(path: Path) -> array.array:
-    data = path.read_bytes()
-    count = len(data) // 4
-    out = array.array("f")
-    out.frombytes(data[: count * 4])
-    return out
-
-
-def write_f32le(path: Path, samples: array.array) -> None:
-    path.write_bytes(samples.tobytes())
-
-
-def pack_silence(channels: int, samples: int) -> array.array:
-    return array.array("f", [0.0] * (max(channels, 1) * max(samples, 0)))
+def crossfade_loop_file(path: Path, channels: int, samples: int, crossfade_samples: int) -> bool:
+    """Blend the head and the tail of raw interleaved float32 audio so a loop has no click:
+    sample i of both becomes head*(1-a) + tail*a with a = i/n. Only the two n-sample windows
+    are read and written. Returns False when the file is too short for a crossfade."""
+    n = crossfade_samples
+    if channels < 1 or n <= 1 or samples <= n * 2:
+        return False
+    frame = channels * 4
+    window = n * frame
+    tail_offset = (samples - n) * frame
+    with open(path, "r+b") as handle:
+        head_bytes = handle.read(window)
+        handle.seek(tail_offset)
+        tail_bytes = handle.read(window)
+        if len(head_bytes) != window or len(tail_bytes) != window:
+            return False
+        head = np.frombuffer(head_bytes, dtype="<f4").reshape(n, channels)
+        tail = np.frombuffer(tail_bytes, dtype="<f4").reshape(n, channels)
+        a = (np.arange(n, dtype=np.float64) / n)[:, None]
+        mixed = (head * (1.0 - a) + tail * a).astype("<f4").tobytes()
+        handle.seek(0)
+        handle.write(mixed)
+        handle.seek(tail_offset)
+        handle.write(mixed)
+    return True
 
 
 def cut_frame_after_fps_change(
@@ -97,7 +79,3 @@ def cut_frame_after_fps_change(
     frame = max(0, min(frame, new_frame_count - 1))
     ms = int(round((frame / new_fps) * 1000)) if new_fps > 0 else 0
     return frame, ms
-
-
-# Keep struct available for potential binary helpers / tests.
-_ = struct

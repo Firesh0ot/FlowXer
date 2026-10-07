@@ -585,7 +585,7 @@ class ConvertOptionsIn(BaseModel):
     fps_mode: str = "drop"
     loudness: bool = False
     crossfade_ms: int = Field(default=0, ge=0, le=2000)
-    map_channels: int = Field(default=0, ge=0, le=64)
+    map_channels: int = Field(default=0, ge=0, le=2, description="Clip sound: 1 mono, 2 or 0 stereo")
     sequence_fps: float | None = Field(default=None, gt=0)
     cut_frame: int | None = Field(default=None, ge=0)
     cut_ms: int | None = Field(default=None, ge=0)

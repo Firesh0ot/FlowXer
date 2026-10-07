@@ -124,11 +124,9 @@ def _video_source_bin(
                 f"! {caps} ! "
             )
         else:
-            preroll = max(int(getattr(settings, "preroll_frames", 25) or 0), 0)
             chain = (
                 f'filesrc name=vsrc_{inp.id} location="{location}" '
                 f"! decodebin name=vdec_{inp.id} "
-                f"! queue max-size-buffers={max(preroll, 2)} "
                 f"! videoconvert ! videoscale ! videorate "
                 f"! {bgra} ! videoconvert ! {caps} "
                 f"! identity sync=true ! "

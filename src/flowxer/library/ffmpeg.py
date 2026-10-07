@@ -6,13 +6,19 @@ import json
 import logging
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
 log = logging.getLogger(__name__)
 
-Runner = Callable[[Sequence[str], Path | None], "RunResult"]
+# runner(cmd, timeout=..., cancel=...) -> RunResult
+Runner = Callable[..., "RunResult"]
+
+PROBE_TIMEOUT_S = 60.0
+_LOW_PRIORITY: list[str] | None = None
 
 
 @dataclass
@@ -20,6 +26,7 @@ class RunResult:
     code: int
     stdout: str = ""
     stderr: str = ""
+    cancelled: bool = False
 
     @property
     def output(self) -> str:
@@ -39,6 +46,7 @@ class ProbeStream:
     field_order: str = ""
     color_space: str = ""
     channels: int = 0
+    channel_layout: str = ""
     sample_rate: str = ""
     tags: dict = field(default_factory=dict)
 
@@ -55,19 +63,53 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
-def default_runner(cmd: Sequence[str], cwd: Path | None = None) -> RunResult:
+def low_priority_prefix() -> list[str]:
+    """nice -n 10 and ionice -c3 (idle I/O) where the tools exist: ingest must not take
+    CPU or disk time from the live mixer."""
+    global _LOW_PRIORITY
+    if _LOW_PRIORITY is None:
+        prefix: list[str] = []
+        if shutil.which("nice"):
+            prefix += ["nice", "-n", "10"]
+        if shutil.which("ionice"):
+            prefix += ["ionice", "-c3"]
+        _LOW_PRIORITY = prefix
+    return list(_LOW_PRIORITY)
+
+
+def default_runner(
+    cmd: Sequence[str],
+    timeout: float | None = None,
+    cancel: threading.Event | None = None,
+) -> RunResult:
+    """Run at low priority. A set cancel event or the timeout kills the process."""
     try:
-        proc = subprocess.run(
-            list(cmd),
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
+        proc = subprocess.Popen(
+            low_priority_prefix() + list(cmd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=3600,
+            errors="replace",
         )
-        return RunResult(code=proc.returncode, stdout=proc.stdout or "", stderr=proc.stderr or "")
-    except (OSError, subprocess.SubprocessError) as exc:
+    except OSError as exc:
         return RunResult(code=127, stderr=str(exc))
+    deadline = time.monotonic() + timeout if timeout else None
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            return RunResult(code=proc.returncode, stdout=out or "", stderr=err or "")
+        except subprocess.TimeoutExpired:
+            cancelled = cancel is not None and cancel.is_set()
+            if not cancelled and (deadline is None or time.monotonic() < deadline):
+                continue
+            proc.kill()
+            try:
+                out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:  # a grandchild still holds the pipes
+                out, err = "", ""
+            reason = "cancelled" if cancelled else f"timed out after {timeout:.0f} s"
+            return RunResult(code=-9, stdout=out or "", stderr=f"{err or ''}\n{reason}", cancelled=cancelled)
 
 
 class FFmpeg:
@@ -84,15 +126,17 @@ class FFmpeg:
             "ffprobe",
             "-v",
             "error",
+            "-protocol_whitelist",
+            "file",
             "-show_entries",
             "format=duration,format_name,size:stream=index,codec_type,codec_name,"
             "width,height,pix_fmt,r_frame_rate,avg_frame_rate,nb_frames,field_order,"
-            "color_space,channels,sample_rate",
+            "color_space,channels,channel_layout,sample_rate",
             "-of",
             "json",
             str(path),
         ]
-        result = self.runner(cmd, None)
+        result = self.runner(cmd, timeout=PROBE_TIMEOUT_S)
         if result.code != 0:
             raise RuntimeError(f"ffprobe failed: {result.stderr.strip() or result.code}")
         data = json.loads(result.stdout or "{}")
@@ -111,6 +155,7 @@ class FFmpeg:
                     field_order=str(raw.get("field_order") or ""),
                     color_space=str(raw.get("color_space") or ""),
                     channels=int(raw.get("channels") or 0),
+                    channel_layout=str(raw.get("channel_layout") or ""),
                     sample_rate=str(raw.get("sample_rate") or ""),
                     tags=dict(raw.get("tags") or {}),
                 )
@@ -123,9 +168,15 @@ class FFmpeg:
             size=int(fmt.get("size") or 0),
         )
 
-    def run(self, cmd: Sequence[str], cwd: Path | None = None) -> RunResult:
+    def run(
+        self,
+        cmd: Sequence[str],
+        *,
+        timeout: float | None = None,
+        cancel: threading.Event | None = None,
+    ) -> RunResult:
         log.debug("ffmpeg cmd: %s", " ".join(cmd))
-        return self.runner(cmd, cwd)
+        return self.runner(cmd, timeout=timeout, cancel=cancel)
 
 
 def parse_frame_rate(value: str | None, default: float = 50.0) -> float:
@@ -191,27 +242,26 @@ def build_video_filter(
     return ",".join(parts)
 
 
-def build_clip_mezz_commands(
-    *,
-    original: Path,
-    video_tmp: Path,
-    audio_raw: Path,
-    audio_conf: Path,
-    mezz: Path,
-    thumb: Path,
-    vf: str,
-    af: str,
-    audio_channels: int,
-    src_audio_channels: int,
-) -> list[list[str]]:
-    """Return ordered ffmpeg command lists for clip mezzanine conversion."""
-    video_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
+_FFMPEG = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-y"]
+# Inputs come from uploads: local files only, no network protocols.
+_INPUT = ["-protocol_whitelist", "file"]
+
+
+def conversion_timeout(duration_s: float, *, motion: bool = False) -> float:
+    """Kill a stuck ffmpeg: 5 min plus 10x (motion interpolation: 60x) the input length."""
+    return 300.0 + max(duration_s, 0.0) * (60.0 if motion else 10.0)
+
+
+def build_clip_video_command(*, original: Path, video_tmp: Path, vf: str) -> list[str]:
+    """Clip picture to ProRes 422 HQ; the sound is conformed by its own command."""
+    return [
+        *_FFMPEG,
+        *_INPUT,
         "-i",
         str(original),
         "-an",
+        "-sn",
+        "-dn",
         "-vf",
         vf,
         "-c:v",
@@ -220,28 +270,72 @@ def build_clip_mezz_commands(
         "3",
         "-pix_fmt",
         "yuv422p10le",
+        "-f",
+        "mov",
         str(video_tmp),
     ]
-    extract_ch = max(1, src_audio_channels) if src_audio_channels > 0 else 1
-    audio_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(original),
+
+
+def channel_map_filter(src_channels: int, dst_channels: int) -> str:
+    """pan to dst_channels: source channel n on output n, the other outputs silent."""
+    used = max(1, min(src_channels, dst_channels))
+    return "pan=" + "|".join([f"{dst_channels}c", *(f"c{n}=c{n}" for n in range(used))])
+
+
+def channel_remix_filter(src_channels: int, src_layout: str, dst_channels: int) -> str:
+    """To dst_channels (1 or 2): a proper downmix (or mono to both sides) when the source
+    layout is known, else the first channels one to one."""
+    if src_channels == dst_channels:
+        return ""
+    if src_layout and src_layout != "unknown":
+        return f"aformat=channel_layouts={'mono' if dst_channels == 1 else 'stereo'}"
+    return channel_map_filter(src_channels, dst_channels)
+
+
+def build_clip_audio_command(
+    *,
+    original: Path | None,
+    audio_tmp: Path,
+    af: str,
+    src_channels: int,
+    dst_channels: int,
+    samples: int,
+    src_layout: str = "",
+) -> list[str]:
+    """The clip's sound as raw float32, remixed to dst_channels and padded or cut to exactly
+    samples (whole frames). ffmpeg streams it to disk, so the mixer process never holds the
+    sound in memory. Without an original it writes silence of that length."""
+    conform = f"apad=whole_len={samples},atrim=end_sample={samples}"
+    if original is None:
+        source = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono"]
+        chain = ",".join(f for f in (channel_map_filter(1, dst_channels) if dst_channels > 1 else "", conform) if f)
+    else:
+        source = [*_INPUT, "-i", str(original), "-map", "0:a:0"]
+        remix = channel_remix_filter(src_channels, src_layout, dst_channels)
+        chain = ",".join(f for f in (af, remix, conform) if f)
+    return [
+        *_FFMPEG,
+        *source,
         "-vn",
+        "-sn",
+        "-dn",
         "-af",
-        af,
+        chain,
+        "-ar",
+        "48000",
+        "-c:a",
+        "pcm_f32le",
         "-f",
         "f32le",
-        "-ac",
-        str(extract_ch),
-        str(audio_raw),
+        str(audio_tmp),
     ]
-    mux_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
+
+
+def build_clip_mux_command(*, video_tmp: Path, audio_tmp: Path, audio_channels: int, mezz: Path) -> list[str]:
+    """ProRes plus the conformed sound. The sound is stored big-endian: GStreamer's qtdemux
+    reads MOV float PCM as F32BE whatever ffmpeg marks (little-endian plays as silence)."""
+    return [
+        *_FFMPEG,
         "-i",
         str(video_tmp),
         "-f",
@@ -251,7 +345,7 @@ def build_clip_mezz_commands(
         "-ac",
         str(max(1, audio_channels)),
         "-i",
-        str(audio_conf),
+        str(audio_tmp),
         "-map",
         "0:v",
         "-map",
@@ -259,39 +353,35 @@ def build_clip_mezz_commands(
         "-c:v",
         "copy",
         "-c:a",
-        "pcm_f32le",
+        "pcm_f32be",
         "-shortest",
+        "-f",
+        "mov",
         str(mezz),
     ]
-    thumb_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
+
+
+def build_thumb_command(*, mezz: Path, thumb: Path) -> list[str]:
+    return [
+        *_FFMPEG,
         "-i",
         str(mezz),
         "-vf",
         "scale=320:-1",
         "-frames:v",
         "1",
+        "-f",
+        "image2",
         str(thumb),
     ]
-    return [video_cmd, audio_cmd, mux_cmd, thumb_cmd]
 
 
-def build_stinger_mezz_commands(
-    *,
-    input_args: list[str],
-    mezz: Path,
-    thumb: Path,
-    vf: str,
-    has_audio: bool,
-    af: str = "aresample=48000",
-) -> list[list[str]]:
-    """ProRes 4444 mezzanine for stingers (preserves alpha when present)."""
-    video_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
+def build_stinger_mezz_command(*, input_args: list[str], mezz: Path, vf: str) -> list[str]:
+    """ProRes 4444 mezzanine for stingers (preserves alpha when present). No sound: the
+    mixer plays only a stinger's picture."""
+    return [
+        *_FFMPEG,
+        *_INPUT,
         *input_args,
         "-vf",
         vf,
@@ -301,22 +391,8 @@ def build_stinger_mezz_commands(
         "4",
         "-pix_fmt",
         "yuva444p10le",
-    ]
-    if has_audio:
-        video_cmd.extend(["-af", af, "-c:a", "pcm_f32le"])
-    else:
-        video_cmd.append("-an")
-    video_cmd.append(str(mezz))
-    thumb_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-i",
+        "-an",
+        "-f",
+        "mov",
         str(mezz),
-        "-vf",
-        "scale=320:-1",
-        "-frames:v",
-        "1",
-        str(thumb),
     ]
-    return [video_cmd, thumb_cmd]

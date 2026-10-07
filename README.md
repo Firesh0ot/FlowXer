@@ -199,7 +199,7 @@ docker compose pull
 docker compose up
 ```
 
-The mixer image already includes `ffmpeg` for background mezzanine conversion. Library env knobs: `FLOWXER_LIBRARY_DIR`, `FLOWXER_IMPORT_DIR`, `FLOWXER_CONVERT_CONCURRENCY` (default 1), `FLOWXER_RAM_CLIP_MAX_S` (20), `FLOWXER_RAM_BUDGET_MB` (4096), `FLOWXER_PREROLL_FRAMES` (25), `FLOWXER_UPLOAD_LIMIT_GB` (20).
+The mixer image already includes `ffmpeg` for background mezzanine conversion. Library env knobs: `FLOWXER_LIBRARY_DIR`, `FLOWXER_IMPORT_DIR`, `FLOWXER_CONVERT_CONCURRENCY` (default 1), `FLOWXER_RAM_CLIP_MAX_S` (20), `FLOWXER_RAM_BUDGET_MB` (4096), `FLOWXER_UPLOAD_LIMIT_GB` (20).
 
 Images:
 
@@ -375,7 +375,7 @@ cd gui && npm run dev
 
 ## Media library
 
-Clips and stingers share one ingest path: **upload → background conversion → intra-frame mezzanine → play**. Heavy work happens at ingest; playback reads mezzanine (short items may be marked RAM, longer ones use GStreamer decode-ahead with `FLOWXER_PREROLL_FRAMES`).
+Clips and stingers share one ingest path: **upload → background conversion → intra-frame mezzanine → play**. Heavy work happens at ingest; playback decodes the mezzanine file (`playback` is `ram` for short items, `decode_ahead` for longer ones: a label of the RAM budget, both play from the file).
 
 Layout under `FLOWXER_LIBRARY_DIR` (default `storage/library/`):
 
@@ -383,12 +383,19 @@ Layout under `FLOWXER_LIBRARY_DIR` (default `storage/library/`):
 <id>/
   item.json
   original… or sequence/
-  mezz-<format>.mov      # ProRes 422 HQ (clips) or ProRes 4444 with alpha (stingers)
+  mezz-<format>.mov      # ProRes 422 HQ + stereo float PCM (clips) or ProRes 4444 with alpha, no sound (stingers)
   thumb.jpg
   convert.log
 ```
 
-Upload via the operator GUI (**File → Clip / Stinger library…**) or HTTP (`POST /uploads` chunked, or `POST /uploads/sequence` for a TGA folder). Options include fit/fill, sequence framerate, and cut frame. Files already in `storage/clips` or `storage/stingers/<id>/` are imported non-destructively on start. Changing the mixer format (off-air) re-queues conversion for every item.
+Upload via the operator GUI (**File → Clip / Stinger library…**) or HTTP (`POST /uploads` chunked, or `POST /uploads/sequence` for a TGA folder). Options include fit/fill, sequence framerate, and cut frame. Changing the mixer format (off-air) re-queues conversion for every item.
+
+- **Chunked upload:** `POST /uploads` with the file size (413 above `FLOWXER_UPLOAD_LIMIT_GB`, 507 when the library volume lacks the space), then `PUT /uploads/{id}/chunks/{n}` — every chunk exactly `chunk_size` bytes (8 MiB), the last one the rest (otherwise 413/422) — and `POST /uploads/{id}/complete`, which fails with 422 while a chunk is missing. Chunks go straight into place on disk and completing is a rename, so it answers at once; a repeated complete returns the same item. An upload idle for an hour is dropped, and leftovers are removed at start. A TGA ZIP is checked when the upload completes and unpacked by its conversion job. The GUI's nginx passes `/api/v1/uploads` through unbuffered and without a body size limit; the mixer enforces the limits.
+- **`POST /uploads/sequence`** (multipart: `name`, `sequence_fps`, `cut_frame`, `fit`, `files`): the frames are written to disk part by part, at most `FLOWXER_UPLOAD_LIMIT_GB` and 10 000 files. Frame names keep their padding, case (`.TGA`) and first number.
+- **Legacy storage:** files in `storage/clips` and `storage/stingers/<id>/` are imported in the background after start and referenced in place (not copied; their conversions wait behind uploads). Deleting an imported item leaves the legacy file alone and it is not imported again.
+- **Import dir** (`FLOWXER_IMPORT_DIR`): a file whose size held still for one scan (2 s) moves to `.processing/` and then into the library; a file that cannot be imported moves to `.failed/`. A read-only import dir is copied from, and each file (name, size, mtime) is imported once — also when it failed.
+- **Conversion:** ffmpeg runs under `nice -n 10` and `ionice -c3`, with a timeout that grows with the input length. The sound is padded or cut to whole frames inside ffmpeg and stored as stereo (or mono with `map_channels: 1`) big-endian float: GStreamer's MOV demuxer plays no more channels and reads float PCM as big-endian. A source with more channels is downmixed when its layout is known, else its first two channels are used. Cancelling a job (or deleting its item) kills its ffmpeg. A reconversion keeps the current mezzanine playable until the new one replaces it. A restart re-queues conversions it interrupted.
+- **Mixer state:** inputs and stinger slots that use the library are saved with `library_item_id` only; the mezzanine is looked up when the state (or `POST /config/import`) is loaded and again when a conversion ends. A clip assigned while it converts is black until then; a running Program picks it up at its next start.
 
 A stinger that is still converting never blocks the mixer: `/stinger/play` and auto-stinger fall back to a hard cut and log a warning.
 

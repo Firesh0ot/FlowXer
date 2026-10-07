@@ -55,7 +55,8 @@ class ConvertOptions(BaseModel):
     fps_mode: FpsMode = FpsMode.drop
     loudness: bool = False
     crossfade_ms: int = Field(default=0, ge=0, le=2000)
-    map_channels: int = Field(default=0, ge=0, le=64)
+    # Sound channels of a clip's mezzanine: 1 (mono) or 2 (stereo, also for 0).
+    map_channels: int = Field(default=0, ge=0, le=2)
     sequence_fps: float | None = Field(default=None, gt=0)
     cut_frame: int | None = Field(default=None, ge=0)
     cut_ms: int | None = Field(default=None, ge=0)
@@ -117,3 +118,7 @@ class UploadSession(BaseModel):
     chunk_size: int = 8 * 1024 * 1024
     received: list[int] = Field(default_factory=list)
     created_at: float = 0.0
+    updated_at: float = 0.0
+    # receiving → completing → done (item_id set; a repeated complete returns that item)
+    state: Literal["receiving", "completing", "done"] = "receiving"
+    item_id: str | None = None

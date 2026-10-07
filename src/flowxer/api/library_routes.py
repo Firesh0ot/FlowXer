@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+import shutil
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from flowxer.api.schemas import (
     ConvertJobOut,
@@ -14,14 +17,36 @@ from flowxer.api.schemas import (
     UploadInitRequest,
     UploadInitResponse,
 )
-from flowxer.engine.mixer import MixerError, VisionMixer
+from flowxer.engine.mixer import VisionMixer
 from flowxer.library.models import ConvertOptions, FitMode, FpsMode, LibraryKind, UploadMode
+from flowxer.library.multipart import receive_files
+from flowxer.library.uploads import UploadBusy, UploadError, UploadNoSpace, UploadTooLarge
 
 router = APIRouter(tags=["library"])
+
+# Frames of one TGA folder upload.
+MAX_SEQUENCE_FILES = 10_000
 
 
 def get_mixer() -> VisionMixer:
     raise RuntimeError("mixer dependency is overridden in app startup")
+
+
+def _upload_http(exc: ValueError) -> HTTPException:
+    if isinstance(exc, UploadTooLarge):
+        code = 413
+    elif isinstance(exc, UploadNoSpace):
+        code = 507
+    elif isinstance(exc, UploadBusy):
+        code = status.HTTP_409_CONFLICT
+    else:
+        code = 422
+    return HTTPException(code, detail=str(exc))
+
+
+def _content_length(request: Request) -> int | None:
+    value = request.headers.get("content-length", "")
+    return int(value) if value.isdigit() else None
 
 
 def _options(payload: ConvertOptionsIn | None) -> ConvertOptions:
@@ -59,7 +84,7 @@ def list_library(
         try:
             parsed = LibraryKind(kind)
         except ValueError as exc:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="kind must be clip or stinger") from exc
+            raise HTTPException(422, detail="kind must be clip or stinger") from exc
     return [_item_out(mixer, item) for item in mixer.library.list_items(kind=parsed, query=q)]
 
 
@@ -96,7 +121,8 @@ def patch_library_item(
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown library item") from exc
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(422, detail=str(exc)) from exc
+    mixer.refresh_library_bindings()
     return _item_out(mixer, item)
 
 
@@ -106,10 +132,10 @@ def patch_library_item(
     summary="Delete a library item (409 if in use)",
 )
 def delete_library_item(item_id: str, mixer: VisionMixer = Depends(get_mixer)) -> None:
-    if mixer.library.get(item_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown library item")
     try:
         mixer.library.delete(item_id)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown library item") from exc
     except PermissionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
@@ -136,6 +162,8 @@ def reconvert_library_item(
     summary="Thumbnail JPEG for a library item",
 )
 def library_thumb(item_id: str, mixer: VisionMixer = Depends(get_mixer)) -> FileResponse:
+    if mixer.library.get(item_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown library item")
     path = mixer.library.store.thumb_path(item_id)
     if not path.is_file():
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="thumbnail not ready")
@@ -166,14 +194,14 @@ def cancel_job(job_id: str, mixer: VisionMixer = Depends(get_mixer)) -> ConvertJ
 @router.post(
     "/uploads",
     response_model=UploadInitResponse,
-    summary="Start a chunked upload",
+    summary="Start a chunked upload (413 over FLOWXER_UPLOAD_LIMIT_GB, 507 without disk space)",
 )
 def upload_init(payload: UploadInitRequest, mixer: VisionMixer = Depends(get_mixer)) -> UploadInitResponse:
     try:
         kind = LibraryKind(payload.kind)
         mode = UploadMode(payload.mode)
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise HTTPException(422, detail=str(exc)) from exc
     try:
         session = mixer.library.begin_upload(
             name=payload.name,
@@ -183,14 +211,14 @@ def upload_init(payload: UploadInitRequest, mixer: VisionMixer = Depends(get_mix
             options=_options(payload.options),
         )
     except ValueError as exc:
-        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
+        raise _upload_http(exc) from exc
     return UploadInitResponse(id=session.id, chunk_size=session.chunk_size, received=session.received)
 
 
 @router.put(
     "/uploads/{upload_id}/chunks/{index}",
     response_model=UploadInitResponse,
-    summary="Upload one chunk (raw body)",
+    summary="Upload one chunk (raw body): chunk_size bytes, the last one the rest",
 )
 async def upload_chunk(
     upload_id: str,
@@ -198,13 +226,14 @@ async def upload_chunk(
     request: Request,
     mixer: VisionMixer = Depends(get_mixer),
 ) -> UploadInitResponse:
-    data = await request.body()
     try:
-        session = mixer.library.write_chunk(upload_id, index, data)
+        session = await mixer.library.uploads.receive_chunk(
+            upload_id, index, request.stream(), _content_length(request)
+        )
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown upload") from exc
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise _upload_http(exc) from exc
     return UploadInitResponse(id=session.id, chunk_size=session.chunk_size, received=session.received)
 
 
@@ -224,7 +253,7 @@ def upload_status(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Up
     "/uploads/{upload_id}/complete",
     response_model=LibraryItemOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Assemble chunks and enqueue conversion",
+    summary="Turn the uploaded chunks into a library item and queue its conversion",
 )
 def upload_complete(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
     try:
@@ -232,7 +261,7 @@ def upload_complete(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> 
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="unknown upload") from exc
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise _upload_http(exc) from exc
     return _item_out(mixer, item)
 
 
@@ -240,29 +269,35 @@ def upload_complete(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> 
     "/uploads/sequence",
     response_model=LibraryItemOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload a TGA folder (multipart files) as a stinger",
+    summary="Upload a TGA folder (multipart: name, sequence_fps, cut_frame, fit, files) as a stinger",
 )
-async def upload_sequence(
-    name: str = Form(...),
-    sequence_fps: float | None = Form(default=None),
-    cut_frame: int | None = Form(default=None),
-    fit: str = Form(default="fit"),
-    files: list[UploadFile] = File(...),
-    mixer: VisionMixer = Depends(get_mixer),
-) -> LibraryItemOut:
-    payload: list[tuple[str, bytes]] = []
-    for upload in files:
-        data = await upload.read()
-        payload.append((upload.filename or "frame.tga", data))
-    options = ConvertOptions(
-        fit=FitMode(fit) if fit in FitMode._value2member_map_ else FitMode.fit,
-        sequence_fps=sequence_fps,
-        cut_frame=cut_frame,
-    )
+async def upload_sequence(request: Request, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
+    library = mixer.library
+    stage = None
     try:
-        item = mixer.library.ingest_sequence_files(payload, name=name, options=options)
+        stage = library.uploads.new_stage(_content_length(request) or 0)
+        fields, files = await receive_files(
+            request.stream(),
+            request.headers.get("content-type", ""),
+            stage,
+            max_bytes=library.uploads.upload_limit_bytes,
+            max_files=MAX_SEQUENCE_FILES,
+            keep=lambda name: name.lower().endswith(".tga"),
+        )
+        if not files:
+            raise UploadError("no .tga files in the upload")
+        fit = fields.get("fit", "fit")
+        options = ConvertOptions(
+            fit=FitMode(fit) if fit in FitMode._value2member_map_ else FitMode.fit,
+            sequence_fps=float(fields["sequence_fps"]) if fields.get("sequence_fps") else None,
+            cut_frame=int(fields["cut_frame"]) if fields.get("cut_frame") else None,
+        )
+        item = await run_in_threadpool(
+            library.ingest_sequence_dir, stage, name=fields.get("name") or "sequence", options=options
+        )
     except ValueError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    except MixerError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        raise _upload_http(exc) from exc
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
     return _item_out(mixer, item)

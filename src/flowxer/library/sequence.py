@@ -31,6 +31,8 @@ class SequenceInfo:
     height: int
     has_alpha: bool
     issues: list[SequenceIssue] = field(default_factory=list)
+    # First frame number: ffmpeg's image2 input needs it as -start_number.
+    start_number: int = 0
 
     @property
     def ok(self) -> bool:
@@ -57,8 +59,10 @@ def infer_pattern(files: list[Path]) -> str:
     if not match:
         return first
     stem = match.group("stem")
-    width = len(match.group("num"))
-    return f"{stem}%0{width}d.tga"
+    suffix = first[match.end("num"):]
+    widths = [len(m.group("num")) for m in (TGA_RE.match(f.name) for f in files) if m]
+    # The smallest padding: %02d also matches 100. The extension keeps its case (.TGA).
+    return f"{stem}%0{min(widths)}d{suffix}"
 
 
 def validate_sequence(directory: Path) -> SequenceInfo:
@@ -80,6 +84,19 @@ def validate_sequence(directory: Path) -> SequenceInfo:
 
     if len(stems) > 1:
         issues.append(SequenceIssue("error", f"mixed filename stems: {sorted(stems)}"))
+    suffixes = {path.name[-4:] for path in files}
+    if len(suffixes) > 1:
+        issues.append(SequenceIssue("error", f"mixed file name extensions: {sorted(suffixes)}"))
+    pattern = infer_pattern(files)
+    pad_match = re.search(r"%0(\d+)d", pattern)
+    pad = int(pad_match.group(1)) if pad_match else 1
+    unpadded = sorted(
+        path.name
+        for path in files
+        if (m := TGA_RE.match(path.name)) and m.group("num") != f"{int(m.group('num')):0{pad}d}"
+    )
+    if unpadded:
+        issues.append(SequenceIssue("error", f"inconsistent zero padding: {', '.join(unpadded[:4])}"))
 
     if numbers:
         expected = list(range(min(numbers), max(numbers) + 1))
@@ -113,7 +130,6 @@ def validate_sequence(directory: Path) -> SequenceInfo:
     if not has_alpha:
         issues.append(SequenceIssue("warning", "sequence has no alpha channel"))
 
-    pattern = infer_pattern(files)
     return SequenceInfo(
         files=files,
         pattern=pattern,
@@ -122,6 +138,7 @@ def validate_sequence(directory: Path) -> SequenceInfo:
         height=height,
         has_alpha=has_alpha,
         issues=issues,
+        start_number=min(numbers) if numbers else 0,
     )
 
 
@@ -133,6 +150,77 @@ def _is_ignored_zip_member(name: str) -> bool:
     if base.startswith(".") or base == "Thumbs.db":
         return True
     return False
+
+
+def _tga_members(
+    zf: zipfile.ZipFile,
+    *,
+    max_entries: int,
+    max_unpacked_bytes: int,
+    max_single_file: int,
+) -> tuple[list[zipfile.ZipInfo], str]:
+    """Checks on the central directory only: the .tga members and their one root folder."""
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+    tga_members = []
+    for info in infos:
+        name = info.filename.replace("\\", "/")
+        if _is_ignored_zip_member(name):
+            continue
+        if Path(name).suffix.lower() != ".tga":
+            continue
+        tga_members.append(info)
+
+    if not tga_members:
+        raise ValueError("zip contains no .tga files")
+    if len(tga_members) > max_entries:
+        raise ValueError(f"too many entries ({len(tga_members)} > {max_entries})")
+
+    # Exactly one root folder (or all files under one top-level directory).
+    tops = set()
+    for info in tga_members:
+        parts = Path(info.filename.replace("\\", "/")).parts
+        if not parts:
+            raise ValueError("empty zip member name")
+        tops.add(parts[0])
+    if len(tops) != 1:
+        raise ValueError("zip must contain exactly one root folder")
+
+    total = 0
+    for info in tga_members:
+        if info.external_attr >> 16 & 0o170000 == 0o120000:
+            raise ValueError(f"symlink rejected: {info.filename}")
+        # ZipInfo flag_bits bit 11 is UTF-8; create_system etc. — also reject abs paths.
+        name = info.filename.replace("\\", "/")
+        if name.startswith("/") or ".." in Path(name).parts:
+            raise ValueError(f"unsafe path rejected: {info.filename}")
+        size = info.file_size
+        if size > max_single_file:
+            raise ValueError(f"entry too large: {info.filename}")
+        total += size
+        if total > max_unpacked_bytes:
+            raise ValueError("unpacked size exceeds limit")
+    return tga_members, next(iter(tops))
+
+
+def inspect_tga_zip(
+    zip_path: Path,
+    *,
+    max_entries: int = DEFAULT_MAX_ENTRIES,
+    max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES,
+    max_single_file: int = DEFAULT_MAX_SINGLE_FILE,
+) -> int:
+    """Validate a TGA ZIP without unpacking it (fast enough for an upload request).
+    Returns the number of .tga members."""
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError("not a zip archive")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members, _ = _tga_members(
+            zf,
+            max_entries=max_entries,
+            max_unpacked_bytes=max_unpacked_bytes,
+            max_single_file=max_single_file,
+        )
+    return len(members)
 
 
 def safe_extract_tga_zip(
@@ -154,47 +242,16 @@ def safe_extract_tga_zip(
         raise ValueError("not a zip archive")
 
     with zipfile.ZipFile(zip_path, "r") as zf:
-        infos = [i for i in zf.infolist() if not i.is_dir()]
-        tga_members = []
-        for info in infos:
-            name = info.filename.replace("\\", "/")
-            if _is_ignored_zip_member(name):
-                continue
-            if Path(name).suffix.lower() != ".tga":
-                continue
-            tga_members.append(info)
-
-        if not tga_members:
-            raise ValueError("zip contains no .tga files")
-        if len(tga_members) > max_entries:
-            raise ValueError(f"too many entries ({len(tga_members)} > {max_entries})")
-
-        # Exactly one root folder (or all files under one top-level directory).
-        tops = set()
-        for info in tga_members:
-            parts = Path(info.filename.replace("\\", "/")).parts
-            if not parts:
-                raise ValueError("empty zip member name")
-            tops.add(parts[0])
-        if len(tops) != 1:
-            raise ValueError("zip must contain exactly one root folder")
-
-        total = 0
+        tga_members, root_name = _tga_members(
+            zf,
+            max_entries=max_entries,
+            max_unpacked_bytes=max_unpacked_bytes,
+            max_single_file=max_single_file,
+        )
         dest_resolved = dest.resolve()
         for info in tga_members:
-            if info.external_attr >> 16 & 0o170000 == 0o120000:
-                raise ValueError(f"symlink rejected: {info.filename}")
-            # ZipInfo flag_bits bit 11 is UTF-8; create_system etc. — also reject abs paths.
             name = info.filename.replace("\\", "/")
-            if name.startswith("/") or ".." in Path(name).parts:
-                raise ValueError(f"unsafe path rejected: {info.filename}")
             size = info.file_size
-            if size > max_single_file:
-                raise ValueError(f"entry too large: {info.filename}")
-            total += size
-            if total > max_unpacked_bytes:
-                raise ValueError("unpacked size exceeds limit")
-
             target = (dest / name).resolve()
             if not target.is_relative_to(dest_resolved):
                 raise ValueError(f"zip-slip rejected: {info.filename}")
@@ -208,7 +265,6 @@ def safe_extract_tga_zip(
                     out.write(chunk)
                     remaining -= len(chunk)
 
-        root_name = next(iter(tops))
         root = dest / root_name
         if root.is_dir():
             return root

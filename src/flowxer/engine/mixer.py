@@ -97,6 +97,8 @@ class VisionMixer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.library = LibraryService(settings)
+        self.library.consumers_fn = self._library_consumers
+        self.library.add_listener(self._on_library_job)
         self.inputs: dict[str, LogicalInput] = {}
         self.workspace = WorkspaceConfig()
         self.panels: list[MixerPanel] = []
@@ -147,7 +149,7 @@ class VisionMixer:
         self._store = StateStore(settings.state_dir)
         self._restore_state()
         self.library.start(self.workspace.format_id, fps=self.settings.fps)
-        self._refresh_stinger_ready_flags()
+        self.refresh_library_bindings()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -298,7 +300,7 @@ class VisionMixer:
             self.library.set_format(self.workspace.format_id, fps=self.settings.fps)
         self.nmos.reconcile_inputs()
         self._publish_tally()
-        self._refresh_stinger_ready_flags()
+        self.refresh_library_bindings()
         return self.workspace
 
     def get_panel(self, panel_id: str) -> MixerPanel:
@@ -351,39 +353,35 @@ class VisionMixer:
             slot.label = payload.label
         slot.kind = kind
 
-        if "library_item_id" in payload.model_fields_set:
-            if payload.library_item_id is None:
-                if slot.library_item_id:
-                    self.library.mark_free(slot.library_item_id, f"slot:{slot.id}")
-                slot.library_item_id = None
-                slot.ready = True
-            else:
-                item = self.library.get(payload.library_item_id)
-                if item is None or item.kind != LibraryKind.stinger:
-                    raise MixerError(f"unknown library stinger {payload.library_item_id}")
-                if slot.library_item_id and slot.library_item_id != item.id:
-                    self.library.mark_free(slot.library_item_id, f"slot:{slot.id}")
-                slot.library_item_id = item.id
-                slot.stinger_id = item.name or item.id
-                self.library.mark_in_use(item.id, f"slot:{slot.id}")
-                info = self._stinger_info_from_library(item)
-                slot.kind = info.kind
-                slot.media_path = info.media_path
-                if payload.cut_frame is not None or payload.cut_ms is not None:
-                    updated = self.library.patch(
-                        item.id,
-                        cut_frame=payload.cut_frame,
-                        cut_ms=payload.cut_ms,
-                    )
-                    slot.cut_frame = updated.cut_frame
-                    slot.cut_ms = updated.cut_ms
-                else:
-                    slot.cut_frame = info.cut_frame
-                    slot.cut_ms = info.cut_ms
-                slot.ready = info.frame_count > 0 and bool(
-                    self.library.mezzanine_path(item.id, self.workspace.format_id)
-                )
-                return slot
+        library_item_id = (
+            payload.library_item_id if "library_item_id" in payload.model_fields_set else slot.library_item_id
+        )
+        if payload.stinger_id and "library_item_id" not in payload.model_fields_set:
+            # A stinger id names a legacy stinger; one that only the library has binds the item.
+            legacy = inspect_stinger(self.settings.stingers_dir, payload.stinger_id, fps=self.settings.fps)
+            found = None if legacy and legacy.frame_count else self._find_library_stinger(payload.stinger_id)
+            library_item_id = found.id if found else None
+        elif payload.media_path:
+            library_item_id = None
+        if library_item_id:
+            item = self.library.get(library_item_id)
+            if item is None or item.kind != LibraryKind.stinger:
+                raise MixerError(f"unknown library stinger {library_item_id}")
+            if payload.cut_frame is not None or payload.cut_ms is not None:
+                # The cut belongs to the item (like stinger.json for legacy stingers).
+                self.library.patch(item.id, cut_frame=payload.cut_frame, cut_ms=payload.cut_ms)
+            slot.library_item_id = item.id
+            self._bind_library_slot(slot)
+            return slot
+        if slot.library_item_id:
+            slot.library_item_id = None
+            slot.ready = True
+            if not payload.stinger_id and not payload.media_path:
+                # Unbound from the library without new media: back to the default stinger.
+                slot.stinger_id = self.settings.default_stinger
+                slot.media_path = None
+                slot.cut_ms = slot.cut_frame = None
+                kind = slot.kind = "sequence"
 
         if kind == "video" and payload.media_path:
             video = Path(payload.media_path)
@@ -479,14 +477,12 @@ class VisionMixer:
 
     def _info_for_slot(self, slot: StingerSlot | None, stinger_id: str | None = None) -> StingerInfo:
         if slot is not None and slot.library_item_id:
-            item = self.library.get(slot.library_item_id)
-            if item is None:
-                raise StingerNotReady(f"library stinger {slot.library_item_id} missing")
-            info = self._stinger_info_from_library(item)
-            if not self.library.mezzanine_path(item.id, self.workspace.format_id):
-                raise StingerNotReady(f"library stinger {item.id} not ready")
-        else:
-            info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
+            # Always the item as it is now (mezzanine, cut), never a snapshot taken at assignment.
+            info = self._bind_library_slot(slot)
+            if info is None or not slot.ready:
+                raise StingerNotReady(f"library stinger {slot.library_item_id} not ready")
+            return info
+        info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
         if slot is None:
             return info
         fps = info.fps or self.settings.fps
@@ -553,12 +549,15 @@ class VisionMixer:
             if library_item_id:
                 return self.load_library_clip(input_id, library_item_id)
             return self.load_clip(input_id, payload.file_path or "")
+        if current.library_item_id and "library_item_id" in patch and not patch["library_item_id"]:
+            # Unbound from the library: the mezzanine path is not a clip under storage/clips.
+            patch["file_path"] = patch.get("file_path") or "_unassigned"
         data = current.model_dump()
         data.update(patch)
         updated = LogicalInput(**data)
         if updated.library_item_id:
             updated = self._apply_library_clip(updated)
-        elif updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
+        elif updated.kind in {InputKind.file, InputKind.replay} and updated.file_path not in {None, "_unassigned"}:
             updated.file_path = self._resolve_clip(updated.file_path)
         self._apply_default_domain(updated)
         self.inputs[input_id] = updated
@@ -686,15 +685,9 @@ class VisionMixer:
         lib = self.library.get(item.library_item_id or "")
         if lib is None or lib.kind != LibraryKind.clip:
             raise MixerError(f"unknown library clip {item.library_item_id}")
-        consumer = f"input:{item.id}"
-        if item.library_item_id:
-            # Clear previous consumers for this input id only.
-            for other_id in list(self.library.consumers(item.library_item_id)):
-                if other_id == consumer:
-                    self.library.mark_free(item.library_item_id, consumer)
-        self.library.mark_in_use(lib.id, consumer)
         mezz = self.library.mezzanine_path(lib.id, self.workspace.format_id)
         item.library_item_id = lib.id
+        # Not converted yet: black until the conversion ends (refresh_library_bindings).
         item.file_path = str(mezz) if mezz else "_unassigned"
         return item
 
@@ -702,10 +695,51 @@ class VisionMixer:
         target = self.get_input(input_id)
         if target.kind not in {InputKind.file, InputKind.replay}:
             raise MixerError(f"input {input_id} cannot play files")
-        if target.library_item_id and target.library_item_id != library_item_id:
-            self.library.mark_free(target.library_item_id, f"input:{input_id}")
+        previous = target.library_item_id
         target.library_item_id = library_item_id
-        return self._apply_library_clip(target)
+        try:
+            return self._apply_library_clip(target)
+        except MixerError:
+            target.library_item_id = previous
+            raise
+
+    def _library_consumers(self, item_id: str) -> list[str]:
+        """Inputs and stinger slots that use a library item: derived from the mixer state,
+        so it holds after a restart or a config import."""
+        users = [f"input:{i.id}" for i in list(self.inputs.values()) if i.library_item_id == item_id]
+        users += [f"slot:{s.id}" for s in list(self.stinger_slots) if s.library_item_id == item_id]
+        return users
+
+    def _bind_library_slot(self, slot: StingerSlot) -> StingerInfo | None:
+        """Point a slot at its library item as it is now. None when the item is gone."""
+        item = self.library.get(slot.library_item_id or "")
+        if item is None or item.kind != LibraryKind.stinger:
+            slot.ready = False
+            return None
+        info = self._stinger_info_from_library(item)
+        slot.stinger_id = item.id
+        slot.kind = info.kind
+        slot.media_path = info.media_path or None
+        slot.cut_frame = info.cut_frame
+        slot.cut_ms = info.cut_ms
+        slot.ready = bool(info.media_path)
+        return info
+
+    def refresh_library_bindings(self) -> None:
+        """Library inputs and slots follow their items: a conversion that ends (or a format
+        change) sets the mezzanine. A running pipeline picks a new clip up at its next start."""
+        with self.nmos.lock:
+            for source in list(self.inputs.values()):
+                if source.library_item_id:
+                    mezz = self.library.mezzanine_path(source.library_item_id, self.workspace.format_id)
+                    source.file_path = str(mezz) if mezz else "_unassigned"
+            for slot in list(self.stinger_slots):
+                if slot.library_item_id:
+                    self._bind_library_slot(slot)
+
+    def _on_library_job(self, job) -> None:
+        if job.state in {"done", "failed", "cancelled"} and job.format_id == self.workspace.format_id:
+            self.refresh_library_bindings()
 
     def library_item_out(self, item: LibraryItem):
         from flowxer.api.schemas import LibraryItemOut
@@ -734,51 +768,34 @@ class VisionMixer:
         )
 
     def _stinger_info_from_library(self, item: LibraryItem) -> StingerInfo:
+        """A library stinger plays its mezzanine; media_path is empty until that is ready."""
         fmt = self.workspace.format_id
         conv = item.conversion_for(fmt)
         mezz = self.library.mezzanine_path(item.id, fmt)
         frames = conv.frames or int(item.original.get("frame_count") or 0)
         fps = self.settings.fps
-        cut_frame = item.cut_frame if item.cut_frame is not None else (conv.cut_frame or frames // 2)
+        if item.cut_frame is not None:
+            cut_frame = item.cut_frame
+        else:
+            cut_frame = conv.cut_frame if conv.cut_frame is not None else frames // 2
         cut_ms = item.cut_ms if item.cut_ms is not None else (
             conv.cut_ms if conv.cut_ms is not None else cut_ms_from_frame(cut_frame, fps)
         )
-        # Prefer mezzanine video path; fall back to legacy sequence dir for not-ready items.
-        if mezz is not None:
-            kind = "video"
-            media_path = str(mezz)
-            path = str(mezz.parent)
-        elif item.original.get("source_kind") == "sequence":
-            kind = "sequence"
-            seq = self.library.store.item_dir(item.id) / (item.original.get("path") or "sequence")
-            media_path = str(seq)
-            path = str(seq)
-        else:
-            kind = "video"
-            media_path = str(self.library.store.item_dir(item.id) / (item.original.get("path") or ""))
-            path = str(self.library.store.item_dir(item.id))
         return StingerInfo(
-            id=item.name or item.id,
-            path=path,
+            id=item.id,
+            path=str(mezz.parent if mezz else self.library.store.item_dir(item.id)),
             frame_count=max(frames, 0),
             cut_frame=cut_frame or 0,
             pattern=str(item.original.get("pattern") or "frame_%05d.tga"),
             width=int(item.original.get("width") or self.settings.width),
             height=int(item.original.get("height") or self.settings.height),
             has_alpha=bool(item.has_alpha or conv.has_alpha),
-            kind=kind,
-            media_path=media_path,
+            kind="video",
+            media_path=str(mezz) if mezz else "",
             cut_ms=cut_ms or 0,
             duration_ms=duration_ms_from_frames(frames, fps) if frames else 0,
             fps=fps,
         )
-
-    def _refresh_stinger_ready_flags(self) -> None:
-        for slot in self.stinger_slots:
-            if slot.library_item_id:
-                slot.ready = bool(self.library.mezzanine_path(slot.library_item_id, self.workspace.format_id))
-            else:
-                slot.ready = True
 
     def _find_library_stinger(self, stinger_id: str) -> LibraryItem | None:
         direct = self.library.get(stinger_id)
@@ -820,14 +837,12 @@ class VisionMixer:
 
     def list_stingers(self) -> list[StingerInfo]:
         items = list(list_stingers(self.settings.stingers_dir))
-        seen = {item.id for item in items}
+        legacy = {f"stingers/{item.id}" for item in items}
         for lib in self.library.list_items(kind=LibraryKind.stinger):
-            info = self._stinger_info_from_library(lib)
-            # Keep legacy entries authoritative when the id already exists on disk.
-            if info.id in seen:
+            # A legacy stinger and its imported library item are listed once (the legacy one).
+            if lib.legacy_path in legacy:
                 continue
-            items.append(info)
-            seen.add(info.id)
+            items.append(self._stinger_info_from_library(lib))
         return items
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
@@ -843,7 +858,7 @@ class VisionMixer:
         lib = self._find_library_stinger(stinger_id)
         if lib is not None:
             lib_info = self._stinger_info_from_library(lib)
-            if not self.library.mezzanine_path(lib.id, self.workspace.format_id) and lib_info.frame_count == 0:
+            if not lib_info.media_path:
                 raise StingerNotReady(f"stinger {stinger_id} not ready")
             return lib_info
         raise MixerError(f"unknown stinger {stinger_id}")
@@ -856,6 +871,7 @@ class VisionMixer:
             raise MixerError("mixer is already running")
         if not self.inputs:
             raise MixerError("register at least one logical input")
+        self.refresh_library_bindings()
 
         output = self.settings.output_domain.resolve()
         if request.domain:
@@ -1269,10 +1285,8 @@ class VisionMixer:
         target = self.get_input(input_id)
         if target.kind not in {InputKind.file, InputKind.replay}:
             raise MixerError(f"input {input_id} cannot play files")
-        if target.library_item_id:
-            self.library.mark_free(target.library_item_id, f"input:{input_id}")
-            target.library_item_id = None
         resolved = self._resolve_clip(file_path)
+        target.library_item_id = None
         target.file_path = resolved
         return target
 
@@ -1311,31 +1325,15 @@ class VisionMixer:
                 if item.stinger_id == stinger_id:
                     slot = item
                     break
+        self.get_input(target_input_id)
+        panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
         try:
             info = self._info_for_slot(slot, stinger_id)
         except StingerNotReady as exc:
+            # Straight to Program: take() would pick the input's auto stinger again (recursion).
             log.warning("stinger not ready — hard cut: %s", exc)
-            self._refresh_stinger_ready_flags()
-            return self.take(
-                target_input_id,
-                transition=TransitionType.cut,
-                panel_id=panel_id or (self.panels[0].id if self.panels else "me-1"),
-            )
-        # Library mezzanine path preferred; require a playable media path.
-        if info.kind == "video" and info.media_path:
-            mezz_ready = Path(info.media_path).is_file()
-            if not mezz_ready and (slot and slot.library_item_id):
-                log.warning(
-                    "stinger %s mezzanine missing — hard cut",
-                    slot.library_item_id,
-                )
-                return self.take(
-                    target_input_id,
-                    transition=TransitionType.cut,
-                    panel_id=panel_id or (self.panels[0].id if self.panels else "me-1"),
-                )
-        self.get_input(target_input_id)
-        panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
+            self._put_on_program(panel, target_input_id, TransitionType.cut, flip_flop=flip_flop)
+            return self.status()
         outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
         self.last_transition = "stinger"
         panel.last_transition = "stinger"
@@ -1479,14 +1477,24 @@ class VisionMixer:
         """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
         # The NMOS lock guards the state: IS-05 activations hold it when they persist.
         with self.nmos.lock:
+            # Library inputs and slots keep only library_item_id: the mezzanine path is
+            # resolved when the state is loaded.
+            inputs = [
+                item.model_dump(mode="json", exclude={"file_path"} if item.library_item_id else None)
+                for item in self.list_inputs()
+            ]
+            slots = [
+                slot.model_dump(mode="json", exclude={"media_path", "ready"} if slot.library_item_id else None)
+                for slot in self.stinger_slots
+            ]
             return {
                 "format": STATE_FORMAT,
                 "flowxer_version": __version__,
                 "workspace": self.workspace.model_dump(mode="json"),
-                "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
+                "inputs": inputs,
                 "panels": [panel.model_dump(mode="json") for panel in self.panels],
                 "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
-                "stinger_slots": [slot.model_dump(mode="json") for slot in self.stinger_slots],
+                "stinger_slots": slots,
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
             }
@@ -1531,9 +1539,18 @@ class VisionMixer:
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])
             for item in inputs:
-                if item.file_path and item.file_path != "_unassigned":
+                if item.library_item_id:
+                    # Set from the library after the swap (refresh_library_bindings).
+                    require_safe_id(item.library_item_id, what="library item id")
+                    item.file_path = "_unassigned"
+                elif item.file_path and item.file_path != "_unassigned":
                     item.file_path = str(resolve_under(self.settings.clips_dir, item.file_path))
             for slot in slots:
+                if slot.library_item_id:
+                    require_safe_id(slot.library_item_id, what="library item id")
+                    slot.stinger_id = slot.library_item_id
+                    slot.media_path = None
+                    continue
                 require_safe_id(slot.stinger_id, what="stinger id")
                 if slot.media_path:
                     contained_path(slot.media_path, self.settings.clips_dir, self.settings.stingers_dir)
@@ -1569,6 +1586,13 @@ class VisionMixer:
             self._sync_panels()
             self._sync_keyers()
             self._sync_stinger_slots()
+            self.refresh_library_bindings()
+            for item in self.inputs.values():
+                if item.library_item_id and self.library.get(item.library_item_id) is None:
+                    log.warning("input %s: library clip %s is missing", item.id, item.library_item_id)
+            for slot in self.stinger_slots:
+                if slot.library_item_id and self.library.get(slot.library_item_id) is None:
+                    log.warning("stinger slot %s: library stinger %s is missing", slot.id, slot.library_item_id)
             self.nmos.reconcile_inputs()
             self.nmos.import_routes(routes)
 
