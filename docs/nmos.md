@@ -57,6 +57,12 @@ IS-04 Source and Flow. Active params:
 - `mxl_domain_id` = FlowXer's output domain id
 - `mxl_flow_id` = current PGM video/audio MXL flow UUIDs
 
+Sender labels are `{panel label} PGM Video` / `PGM Audio`, and the panels are
+`ME 1`..`ME 4`. With the structure from the environment (`FLOWXER_LIVE_INPUTS`,
+`FLOWXER_INPUT_LABELS`, `FLOWXER_PANELS`; README, *Production structure from the
+environment*) the labels cannot be changed over the API, so a controller can plan
+links by label before the mixer starts.
+
 MXL has no SDP; `transportfile` is HTTP 404. `transporttype` is
 `urn:x-nmos:transport:mxl`. Senders and receivers use an empty
 `interface_bindings` array (BCP-007-03).

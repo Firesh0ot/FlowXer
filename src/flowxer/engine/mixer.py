@@ -36,6 +36,7 @@ from flowxer.api.schemas import (
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import (
+    find_flow_domain,
     DomainError,
     ensure_output_domain,
     flows_by_group_hint_in_root,
@@ -59,6 +60,7 @@ from flowxer.engine.stinger import (
     StingerPlayer,
     cut_frame_from_ms,
     cut_ms_from_frame,
+    duration_ms_from_frames,
     generate_replay_wipe,
     inspect_stinger,
     list_stingers,
@@ -68,9 +70,13 @@ from flowxer.engine.stinger import (
 from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
+from flowxer.library.models import LibraryItem, LibraryKind
+from flowxer.library.service import LibraryService
 from flowxer.settings import Settings, ensure_storage
 
 log = logging.getLogger(__name__)
+# A running Program without a new frame for this long is reported in the status (error).
+PROGRAM_STALL_S = 3.0
 
 CLIP_SUFFIXES = {".mp4", ".mov", ".mkv", ".ts", ".mxf", ".wav", ".m4a"}
 # A mix (take with transition mix) without a duration.
@@ -81,13 +87,20 @@ class MixerError(RuntimeError):
     pass
 
 
+class StingerNotReady(MixerError):
+    """Raised when a library stinger has no mezzanine yet; callers hard-cut instead."""
+
+
 class VisionMixer:
     """Control-plane + media-plane orchestrator for the DMF vision mixer."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.library = LibraryService(settings)
+        self.library.consumers_fn = self._library_consumers
+        self.library.add_listener(self._on_library_job)
         self.inputs: dict[str, LogicalInput] = {}
-        self.workspace = WorkspaceConfig()
+        self.workspace = self._pinned(WorkspaceConfig())
         self.panels: list[MixerPanel] = []
         self.keyers: list[DownstreamKeyer] = []
         self.stinger_slots: list[StingerSlot] = []
@@ -106,6 +119,9 @@ class VisionMixer:
         self.last_transition: str = "cut"
         # Program frames of earlier runs; frames_rendered adds the running pipeline's.
         self._frames_before = 0
+        # (frames_rendered, monotonic time) when Program last advanced; a stall is reported in status().
+        self._frame_mark: tuple[int, float] = (0, 0.0)
+        self._stall_logged = False
         self.frames_dropped = 0
         self.late_grains = 0
         self.resyncs = 0
@@ -132,6 +148,8 @@ class VisionMixer:
         self._sync_stinger_slots()
         self._store = StateStore(settings.state_dir)
         self._restore_state()
+        self.library.start(self.workspace.format_id, fps=self.settings.fps)
+        self.refresh_library_bindings()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -147,7 +165,64 @@ class VisionMixer:
             frame_count=self.settings.stinger_frame_count,
         )
 
+    def _pinned(self, workspace: WorkspaceConfig) -> WorkspaceConfig:
+        """The structure the environment sets (FLOWXER_FORMAT, ...) wins over saved values."""
+        pinned = self.settings.pinned_workspace
+        return workspace.model_copy(update={field: value for field, (value, _) in pinned.items()})
+
+    def _inputs_pinned_by(self) -> str | None:
+        """The variables that set the input list, or None when the API may change it."""
+        pinned = self.settings.pinned_workspace.get("logical_source_count")
+        return pinned[1] if pinned else None
+
+    def _pin_sources(self) -> None:
+        """The inputs the environment sets: live cam-1..N, test-1..M, Black, Replay. Ids,
+        kinds and labels come from the environment; routes, clips and auto-stingers of an
+        input with the same id and kind stay."""
+        plan = [
+            (f"cam-{n}", label, InputKind.mxl_live)
+            for n, label in enumerate(self.settings.live_input_labels, 1)
+        ]
+        plan += [
+            (f"test-{n}", f"Test {n}", InputKind.test)
+            for n in range(1, (self.settings.test_sources or 0) + 1)
+        ]
+        plan += [("black", "Black", InputKind.black), ("replay", "Replay", InputKind.replay)]
+        inputs: dict[str, LogicalInput] = {}
+        for slot, (input_id, label, kind) in enumerate(plan):
+            item = self.inputs.get(input_id)
+            if item is None or item.kind != kind:
+                essences = (
+                    {"video": VideoEssence(), "audio": AudioEssence()}
+                    if kind == InputKind.mxl_live
+                    else {}
+                )
+                item = LogicalInput(
+                    id=input_id,
+                    label=label,
+                    kind=kind,
+                    slot=slot,
+                    stinger_slot_id=item.stinger_slot_id if item else None,
+                    **essences,
+                )
+                self._apply_default_domain(item)
+            item.label = label
+            item.slot = slot
+            inputs[input_id] = item
+        self.inputs = inputs
+        # Buses on an input the environment removed start empty.
+        for name in ("program_input_id", "preview_input_id", "last_live_input_id"):
+            if getattr(self, name) not in inputs:
+                setattr(self, name, None)
+        for panel in self.panels:
+            if panel.program_input_id not in inputs:
+                panel.program_input_id = None
+            if panel.preview_input_id not in inputs:
+                panel.preview_input_id = None
+
     def _sync_sources(self) -> None:
+        if self._inputs_pinned_by():
+            self._pin_sources()
         desired = self.workspace.logical_source_count
         while len(self.inputs) > desired:
             last = self.list_inputs()[-1]
@@ -255,6 +330,9 @@ class VisionMixer:
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
         patch = payload.model_dump(exclude_unset=True)
+        for field, (value, variables) in self.settings.pinned_workspace.items():
+            if field in patch and patch[field] != value:
+                raise MixerError(f"{field} is set by {variables} (environment)")
         display_only = set(patch) <= {"source_tile_aspect"}
         if self.state == MixerState.running and not display_only:
             raise MixerError("stop the mixer before changing console layout")
@@ -265,7 +343,8 @@ class VisionMixer:
         if aspect not in {None, "16:9", "9:16"}:
             raise MixerError("source_tile_aspect must be 16:9 or 9:16")
         data.update(patch)
-        if data["format_id"] != self.workspace.format_id:
+        format_changed = data["format_id"] != self.workspace.format_id
+        if format_changed:
             fmt = format_by_id(data["format_id"])
             self.settings.width = fmt.width
             self.settings.height = fmt.height
@@ -276,8 +355,12 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        if format_changed:
+            # Mixer is off-air here; re-convert library items for the new raster/rate.
+            self.library.set_format(self.workspace.format_id, fps=self.settings.fps)
         self.nmos.reconcile_inputs()
         self._publish_tally()
+        self.refresh_library_bindings()
         return self.workspace
 
     def get_panel(self, panel_id: str) -> MixerPanel:
@@ -329,6 +412,36 @@ class VisionMixer:
         if payload.label is not None:
             slot.label = payload.label
         slot.kind = kind
+
+        library_item_id = (
+            payload.library_item_id if "library_item_id" in payload.model_fields_set else slot.library_item_id
+        )
+        if payload.stinger_id and "library_item_id" not in payload.model_fields_set:
+            # A stinger id names a legacy stinger; one that only the library has binds the item.
+            legacy = inspect_stinger(self.settings.stingers_dir, payload.stinger_id, fps=self.settings.fps)
+            found = None if legacy and legacy.frame_count else self._find_library_stinger(payload.stinger_id)
+            library_item_id = found.id if found else None
+        elif payload.media_path:
+            library_item_id = None
+        if library_item_id:
+            item = self.library.get(library_item_id)
+            if item is None or item.kind != LibraryKind.stinger:
+                raise MixerError(f"unknown library stinger {library_item_id}")
+            if payload.cut_frame is not None or payload.cut_ms is not None:
+                # The cut belongs to the item (like stinger.json for legacy stingers).
+                self.library.patch(item.id, cut_frame=payload.cut_frame, cut_ms=payload.cut_ms)
+            slot.library_item_id = item.id
+            self._bind_library_slot(slot)
+            return slot
+        if slot.library_item_id:
+            slot.library_item_id = None
+            slot.ready = True
+            if not payload.stinger_id and not payload.media_path:
+                # Unbound from the library without new media: back to the default stinger.
+                slot.stinger_id = self.settings.default_stinger
+                slot.media_path = None
+                slot.cut_ms = slot.cut_frame = None
+                kind = slot.kind = "sequence"
 
         if kind == "video" and payload.media_path:
             video = Path(payload.media_path)
@@ -423,6 +536,12 @@ class VisionMixer:
         return self.settings.default_stinger
 
     def _info_for_slot(self, slot: StingerSlot | None, stinger_id: str | None = None) -> StingerInfo:
+        if slot is not None and slot.library_item_id:
+            # Always the item as it is now (mezzanine, cut), never a snapshot taken at assignment.
+            info = self._bind_library_slot(slot)
+            if info is None or not slot.ready:
+                raise StingerNotReady(f"library stinger {slot.library_item_id} not ready")
+            return info
         info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
         if slot is None:
             return info
@@ -449,6 +568,8 @@ class VisionMixer:
         self._sync_sources()
 
     def register_input(self, payload: LogicalInputCreate) -> LogicalInput:
+        if pinned := self._inputs_pinned_by():
+            raise MixerError(f"the input list is set by {pinned} (environment)")
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before adding inputs")
         if payload.id in self.inputs:
@@ -463,12 +584,22 @@ class VisionMixer:
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
         current = self.get_input(input_id)
         patch = payload.model_dump(exclude_unset=True)
+        pinned = self._inputs_pinned_by()
+        if pinned and any(
+            field in patch and patch[field] != getattr(current, field)
+            for field in ("label", "kind")
+        ):
+            raise MixerError(f"label and kind of {input_id} are set by {pinned} (environment)")
         if "stinger_slot_id" in patch:
             slot_id = patch["stinger_slot_id"] or None
             if slot_id:
                 self.get_stinger_slot(slot_id)
             patch["stinger_slot_id"] = slot_id
-        if self.state == MixerState.running and payload.file_path is None:
+        library_item_id = patch.get("library_item_id", None)
+        changing_media = payload.file_path is not None or (
+            "library_item_id" in patch and patch.get("library_item_id") is not None
+        )
+        if self.state == MixerState.running and not changing_media:
             # Live metadata updates are allowed; topology changes are not.
             data = current.model_dump()
             for field in ("label", "kind", "video", "audio", "group_hint", "stinger_slot_id"):
@@ -480,14 +611,21 @@ class VisionMixer:
             self.nmos.sync_from_rest(input_id)
             self._publish_tally()
             return updated
-        if self.state == MixerState.running and payload.file_path is not None:
+        if self.state == MixerState.running and changing_media:
             if current.kind not in {InputKind.file, InputKind.replay}:
                 raise MixerError("only file/replay inputs can change clip while on-air")
-            return self.load_clip(input_id, payload.file_path)
+            if library_item_id:
+                return self.load_library_clip(input_id, library_item_id)
+            return self.load_clip(input_id, payload.file_path or "")
+        if current.library_item_id and "library_item_id" in patch and not patch["library_item_id"]:
+            # Unbound from the library: the mezzanine path is not a clip under storage/clips.
+            patch["file_path"] = patch.get("file_path") or "_unassigned"
         data = current.model_dump()
         data.update(patch)
         updated = LogicalInput(**data)
-        if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
+        if updated.library_item_id:
+            updated = self._apply_library_clip(updated)
+        elif updated.kind in {InputKind.file, InputKind.replay} and updated.file_path not in {None, "_unassigned"}:
             updated.file_path = self._resolve_clip(updated.file_path)
         self._apply_default_domain(updated)
         self.inputs[input_id] = updated
@@ -496,6 +634,8 @@ class VisionMixer:
         return updated
 
     def delete_input(self, input_id: str) -> None:
+        if pinned := self._inputs_pinned_by():
+            raise MixerError(f"the input list is set by {pinned} (environment)")
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before removing inputs")
         if input_id not in self.inputs:
@@ -568,10 +708,7 @@ class VisionMixer:
         if self.gst is None:
             return
         src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
-        path = None
-        if resolved_domain:
-            found = resolve_domain_path(self.settings.mxl_root, str(resolved_domain))
-            path = str(found) if found else str((self.settings.mxl_root / str(resolved_domain)).resolve())
+        path = self._mxl_source_path(input_id, role, resolved_domain, str(parsed_flow) if parsed_flow else "")
         try:
             if not enabled or parsed_flow is None:
                 applied = self.gst.retarget_mxl_source(src_name, None, path, role)
@@ -591,6 +728,15 @@ class VisionMixer:
             )
 
     def _resolve_file_path(self, payload: LogicalInputCreate) -> LogicalInputCreate:
+        if payload.library_item_id:
+            item = self.library.get(payload.library_item_id)
+            if item is None or item.kind != LibraryKind.clip:
+                raise MixerError(f"unknown library clip {payload.library_item_id}")
+            mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
+            path = str(mezz) if mezz else "_unassigned"
+            return payload.model_copy(
+                update={"library_item_id": item.id, "file_path": path}
+            )
         if payload.kind in {InputKind.file, InputKind.replay} and payload.file_path:
             if payload.file_path != "_unassigned":
                 return payload.model_copy(update={"file_path": self._resolve_clip(payload.file_path)})
@@ -604,6 +750,131 @@ class VisionMixer:
         if not candidate.exists():
             raise MixerError(f"clip not found: {file_path}")
         return str(candidate)
+
+    def _apply_library_clip(self, item: LogicalInput) -> LogicalInput:
+        lib = self.library.get(item.library_item_id or "")
+        if lib is None or lib.kind != LibraryKind.clip:
+            raise MixerError(f"unknown library clip {item.library_item_id}")
+        mezz = self.library.mezzanine_path(lib.id, self.workspace.format_id)
+        item.library_item_id = lib.id
+        # Not converted yet: black until the conversion ends (refresh_library_bindings).
+        item.file_path = str(mezz) if mezz else "_unassigned"
+        return item
+
+    def load_library_clip(self, input_id: str, library_item_id: str) -> LogicalInput:
+        target = self.get_input(input_id)
+        if target.kind not in {InputKind.file, InputKind.replay}:
+            raise MixerError(f"input {input_id} cannot play files")
+        previous = target.library_item_id
+        target.library_item_id = library_item_id
+        try:
+            return self._apply_library_clip(target)
+        except MixerError:
+            target.library_item_id = previous
+            raise
+
+    def _library_consumers(self, item_id: str) -> list[str]:
+        """Inputs and stinger slots that use a library item: derived from the mixer state,
+        so it holds after a restart or a config import."""
+        users = [f"input:{i.id}" for i in list(self.inputs.values()) if i.library_item_id == item_id]
+        users += [f"slot:{s.id}" for s in list(self.stinger_slots) if s.library_item_id == item_id]
+        return users
+
+    def _bind_library_slot(self, slot: StingerSlot) -> StingerInfo | None:
+        """Point a slot at its library item as it is now. None when the item is gone."""
+        item = self.library.get(slot.library_item_id or "")
+        if item is None or item.kind != LibraryKind.stinger:
+            slot.ready = False
+            return None
+        info = self._stinger_info_from_library(item)
+        slot.stinger_id = item.id
+        slot.kind = info.kind
+        slot.media_path = info.media_path or None
+        slot.cut_frame = info.cut_frame
+        slot.cut_ms = info.cut_ms
+        slot.ready = bool(info.media_path)
+        return info
+
+    def refresh_library_bindings(self) -> None:
+        """Library inputs and slots follow their items: a conversion that ends (or a format
+        change) sets the mezzanine. A running pipeline picks a new clip up at its next start."""
+        with self.nmos.lock:
+            for source in list(self.inputs.values()):
+                if source.library_item_id:
+                    mezz = self.library.mezzanine_path(source.library_item_id, self.workspace.format_id)
+                    source.file_path = str(mezz) if mezz else "_unassigned"
+            for slot in list(self.stinger_slots):
+                if slot.library_item_id:
+                    self._bind_library_slot(slot)
+
+    def _on_library_job(self, job) -> None:
+        if job.state in {"done", "failed", "cancelled"} and job.format_id == self.workspace.format_id:
+            self.refresh_library_bindings()
+
+    def library_item_out(self, item: LibraryItem):
+        from flowxer.api.schemas import LibraryItemOut
+
+        fmt = self.workspace.format_id
+        conv = item.conversion_for(fmt)
+        thumb = self.library.store.thumb_path(item.id)
+        return LibraryItemOut(
+            id=item.id,
+            kind=item.kind.value,
+            name=item.name,
+            tags=list(item.tags),
+            status=conv.status.value,
+            ready=item.is_ready(fmt),
+            playback=conv.playback,
+            has_alpha=item.has_alpha or conv.has_alpha,
+            cut_frame=item.cut_frame if item.cut_frame is not None else conv.cut_frame,
+            cut_ms=item.cut_ms if item.cut_ms is not None else conv.cut_ms,
+            frame_count=conv.frames or int(item.original.get("frame_count") or 0),
+            duration_s=conv.duration_s,
+            thumb_url=f"/api/v1/library/{item.id}/thumb.jpg" if thumb.is_file() else None,
+            error=conv.error,
+            source=item.source,
+            legacy_path=item.legacy_path,
+            in_use=self.library.is_in_use(item.id),
+        )
+
+    def _stinger_info_from_library(self, item: LibraryItem) -> StingerInfo:
+        """A library stinger plays its mezzanine; media_path is empty until that is ready."""
+        fmt = self.workspace.format_id
+        conv = item.conversion_for(fmt)
+        mezz = self.library.mezzanine_path(item.id, fmt)
+        frames = conv.frames or int(item.original.get("frame_count") or 0)
+        fps = self.settings.fps
+        if item.cut_frame is not None:
+            cut_frame = item.cut_frame
+        else:
+            cut_frame = conv.cut_frame if conv.cut_frame is not None else frames // 2
+        cut_ms = item.cut_ms if item.cut_ms is not None else (
+            conv.cut_ms if conv.cut_ms is not None else cut_ms_from_frame(cut_frame, fps)
+        )
+        return StingerInfo(
+            id=item.id,
+            path=str(mezz.parent if mezz else self.library.store.item_dir(item.id)),
+            frame_count=max(frames, 0),
+            cut_frame=cut_frame or 0,
+            pattern=str(item.original.get("pattern") or "frame_%05d.tga"),
+            width=int(item.original.get("width") or self.settings.width),
+            height=int(item.original.get("height") or self.settings.height),
+            has_alpha=bool(item.has_alpha or conv.has_alpha),
+            kind="video",
+            media_path=str(mezz) if mezz else "",
+            cut_ms=cut_ms or 0,
+            duration_ms=duration_ms_from_frames(frames, fps) if frames else 0,
+            fps=fps,
+        )
+
+    def _find_library_stinger(self, stinger_id: str) -> LibraryItem | None:
+        direct = self.library.get(stinger_id)
+        if direct and direct.kind == LibraryKind.stinger:
+            return direct
+        for item in self.library.list_items(kind=LibraryKind.stinger):
+            if item.name == stinger_id or item.legacy_path == f"stingers/{stinger_id}":
+                return item
+        return None
 
     # ── storage ──────────────────────────────────────────────────────────────
 
@@ -619,20 +890,48 @@ class VisionMixer:
                         "suffix": path.suffix.lower(),
                     }
                 )
+        # Also expose ready library clips for the console picker.
+        for item in self.library.list_items(kind=LibraryKind.clip):
+            mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
+            clips.append(
+                {
+                    "name": f"lib:{item.name}",
+                    "path": str(mezz) if mezz else "",
+                    "size_bytes": mezz.stat().st_size if mezz else 0,
+                    "suffix": ".mov",
+                    "library_item_id": item.id,
+                    "ready": bool(mezz),
+                }
+            )
         return clips
 
     def list_stingers(self) -> list[StingerInfo]:
-        return list_stingers(self.settings.stingers_dir)
+        items = list(list_stingers(self.settings.stingers_dir))
+        legacy = {f"stingers/{item.id}" for item in items}
+        for lib in self.library.list_items(kind=LibraryKind.stinger):
+            # A legacy stinger and its imported library item are listed once (the legacy one).
+            if lib.legacy_path in legacy:
+                continue
+            items.append(self._stinger_info_from_library(lib))
+        return items
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
         try:
             require_safe_id(stinger_id, what="stinger id")
         except SecurityError as exc:
             raise MixerError(str(exc)) from exc
+        # Prefer the legacy storage/stingers tree when present so cut-frame edits
+        # and scripts/generate_stinger.py keep working unchanged.
         info = inspect_stinger(self.settings.stingers_dir, stinger_id, fps=self.settings.fps)
-        if info is None or not info.frame_count:
-            raise MixerError(f"unknown stinger {stinger_id}")
-        return info
+        if info is not None and info.frame_count:
+            return info
+        lib = self._find_library_stinger(stinger_id)
+        if lib is not None:
+            lib_info = self._stinger_info_from_library(lib)
+            if not lib_info.media_path:
+                raise StingerNotReady(f"stinger {stinger_id} not ready")
+            return lib_info
+        raise MixerError(f"unknown stinger {stinger_id}")
 
     # ── mixer lifecycle ──────────────────────────────────────────────────────
 
@@ -642,6 +941,7 @@ class VisionMixer:
             raise MixerError("mixer is already running")
         if not self.inputs:
             raise MixerError("register at least one logical input")
+        self.refresh_library_bindings()
 
         output = self.settings.output_domain.resolve()
         if request.domain:
@@ -752,6 +1052,8 @@ class VisionMixer:
 
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
+        self._frame_mark = (self.frames_rendered, time.monotonic())
+        self._stall_logged = False
         self.program_input_id = request.program_input_id or self._default_program_id()
         self.preview_input_id = request.preview_input_id or self.program_input_id
         self.last_live_input_id = self.program_input_id
@@ -765,10 +1067,43 @@ class VisionMixer:
         self._publish_tally()
         return self.status()
 
+    def autostart(self) -> None:
+        """FLOWXER_PROGRAM_AUTOSTART: ME 1 Program on the first live input (or the first
+        input), Preview on the next one."""
+        inputs = self.list_inputs()
+        ordered = [item for item in inputs if item.kind == InputKind.mxl_live]
+        ordered += [item for item in inputs if item.kind != InputKind.mxl_live]
+        program = ordered[0].id
+        preview = ordered[1].id if len(ordered) > 1 else program
+        try:
+            self.start(MixerStartRequest(program_input_id=program, preview_input_id=preview))
+        except MixerError as exc:
+            log.error("FLOWXER_PROGRAM_AUTOSTART: Program did not start: %s", exc)
+            return
+        log.info("FLOWXER_PROGRAM_AUTOSTART: Program on %s, Preview on %s", program, preview)
+
     def _on_pipeline_error(self, message: str) -> None:
         """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
         self.error = message
         self.pipeline_errors += 1
+
+    def program_stalled_s(self) -> float | None:
+        """Seconds without a new Program frame while on air with GStreamer; None while frames flow."""
+        if self.state != MixerState.running or self.gst is None:
+            return None
+        frames = self.frames_rendered
+        now = time.monotonic()
+        if frames != self._frame_mark[0]:
+            self._frame_mark = (frames, now)
+            self._stall_logged = False
+            return None
+        idle = now - self._frame_mark[1]
+        if idle < PROGRAM_STALL_S:
+            return None
+        if not self._stall_logged:
+            self._stall_logged = True
+            log.warning("Program renders no frames (%s so far, none for %.0f s); check the Program input's source", frames, idle)
+        return idle
 
     @property
     def frames_rendered(self) -> int:
@@ -793,6 +1128,10 @@ class VisionMixer:
             self.stop()
         except Exception:
             log.exception("stopping the media pipeline failed")
+        try:
+            self.library.stop()
+        except Exception:
+            log.exception("stopping the media library failed")
         self.tally.close()
         self.nmos.shutdown()
         if self.settings.mxl_cleanup_on_exit:
@@ -811,29 +1150,35 @@ class VisionMixer:
     def _source_domain_paths(self) -> dict[str, str]:
         """Map `{input_id}:video|audio` to an mxlsrc `domain` filesystem path."""
         output = str(self.settings.output_domain.resolve())
-        root = self.settings.mxl_root
         paths: dict[str, str] = {}
         for item in self.list_inputs():
             if item.kind != InputKind.mxl_live:
                 continue
             for role, essence in (("video", item.video), ("audio", item.audio)):
                 domain_id = getattr(essence, "domain_id", None) if essence else None
-                if not domain_id:
-                    paths[f"{item.id}:{role}"] = output
-                    continue
-                resolved = resolve_domain_path(root, str(domain_id))
-                if resolved is None:
-                    log.warning(
-                        "MXL domain id %s for input %s %s not found under %s",
-                        domain_id,
-                        item.id,
-                        role,
-                        root,
-                    )
-                    paths[f"{item.id}:{role}"] = str((root / str(domain_id)).resolve())
-                else:
-                    paths[f"{item.id}:{role}"] = str(resolved)
+                flow_id = str(essence.flow_id) if essence is not None and essence.flow_id else ""
+                paths[f"{item.id}:{role}"] = self._mxl_source_path(item.id, role, domain_id, flow_id) or output
         return paths
+
+    def _mxl_source_path(self, input_id: str, role: str, domain_id: str | None, flow_id: str) -> str | None:
+        """mxlsrc `domain` path for a routed essence. A route that names no domain or the wrong one
+        (REST and IS-05 default it to the own output domain) still finds its flow: the named domain
+        when it holds the flow, else any domain below the root that does (local before mirror),
+        else the named domain, where the flow may still appear. None without a domain."""
+        root = self.settings.mxl_root
+        resolved = resolve_domain_path(root, str(domain_id)) if domain_id else None
+        if flow_id and (resolved is None or not (resolved / f"{flow_id}.mxl-flow").is_dir()):
+            holder = find_flow_domain(root, flow_id)
+            if holder is not None:
+                if domain_id and resolved != holder:
+                    log.info("MXL flow %s for input %s %s is in %s, not in domain %s", flow_id, input_id, role, holder, domain_id)
+                return str(holder)
+        if not domain_id:
+            return None
+        if resolved is None:
+            log.warning("MXL domain id %s for input %s %s not found under %s", domain_id, input_id, role, root)
+            return str((root / str(domain_id)).resolve())
+        return str(resolved)
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
@@ -1026,6 +1371,7 @@ class VisionMixer:
         if target.kind not in {InputKind.file, InputKind.replay}:
             raise MixerError(f"input {input_id} cannot play files")
         resolved = self._resolve_clip(file_path)
+        target.library_item_id = None
         target.file_path = resolved
         return target
 
@@ -1064,9 +1410,15 @@ class VisionMixer:
                 if item.stinger_id == stinger_id:
                     slot = item
                     break
-        info = self._info_for_slot(slot, stinger_id)
         self.get_input(target_input_id)
         panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
+        try:
+            info = self._info_for_slot(slot, stinger_id)
+        except StingerNotReady as exc:
+            # Straight to Program: take() would pick the input's auto stinger again (recursion).
+            log.warning("stinger not ready — hard cut: %s", exc)
+            self._put_on_program(panel, target_input_id, TransitionType.cut, flip_flop=flip_flop)
+            return self.status()
         outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
         self.last_transition = "stinger"
         panel.last_transition = "stinger"
@@ -1210,14 +1562,24 @@ class VisionMixer:
         """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
         # The NMOS lock guards the state: IS-05 activations hold it when they persist.
         with self.nmos.lock:
+            # Library inputs and slots keep only library_item_id: the mezzanine path is
+            # resolved when the state is loaded.
+            inputs = [
+                item.model_dump(mode="json", exclude={"file_path"} if item.library_item_id else None)
+                for item in self.list_inputs()
+            ]
+            slots = [
+                slot.model_dump(mode="json", exclude={"media_path", "ready"} if slot.library_item_id else None)
+                for slot in self.stinger_slots
+            ]
             return {
                 "format": STATE_FORMAT,
                 "flowxer_version": __version__,
                 "workspace": self.workspace.model_dump(mode="json"),
-                "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
+                "inputs": inputs,
                 "panels": [panel.model_dump(mode="json") for panel in self.panels],
                 "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
-                "stinger_slots": [slot.model_dump(mode="json") for slot in self.stinger_slots],
+                "stinger_slots": slots,
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
             }
@@ -1253,7 +1615,7 @@ class VisionMixer:
         if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
             raise MixerError(f"not a {STATE_FORMAT} document")
         try:
-            workspace = WorkspaceConfig(**(data.get("workspace") or {}))
+            workspace = self._pinned(WorkspaceConfig(**(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
@@ -1262,9 +1624,18 @@ class VisionMixer:
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])
             for item in inputs:
-                if item.file_path and item.file_path != "_unassigned":
+                if item.library_item_id:
+                    # Set from the library after the swap (refresh_library_bindings).
+                    require_safe_id(item.library_item_id, what="library item id")
+                    item.file_path = "_unassigned"
+                elif item.file_path and item.file_path != "_unassigned":
                     item.file_path = str(resolve_under(self.settings.clips_dir, item.file_path))
             for slot in slots:
+                if slot.library_item_id:
+                    require_safe_id(slot.library_item_id, what="library item id")
+                    slot.stinger_id = slot.library_item_id
+                    slot.media_path = None
+                    continue
                 require_safe_id(slot.stinger_id, what="stinger id")
                 if slot.media_path:
                     contained_path(slot.media_path, self.settings.clips_dir, self.settings.stingers_dir)
@@ -1300,6 +1671,13 @@ class VisionMixer:
             self._sync_panels()
             self._sync_keyers()
             self._sync_stinger_slots()
+            self.refresh_library_bindings()
+            for item in self.inputs.values():
+                if item.library_item_id and self.library.get(item.library_item_id) is None:
+                    log.warning("input %s: library clip %s is missing", item.id, item.library_item_id)
+            for slot in self.stinger_slots:
+                if slot.library_item_id and self.library.get(slot.library_item_id) is None:
+                    log.warning("stinger slot %s: library stinger %s is missing", slot.id, slot.library_item_id)
             self.nmos.reconcile_inputs()
             self.nmos.import_routes(routes)
 
@@ -1343,7 +1721,7 @@ class VisionMixer:
             video_format=self.settings.video_media_type,
             audio_format=self.settings.audio_media_type,
             pipeline=self.pipeline,
-            error=self.error,
+            error=self._status_error(),
             workspace=self.workspace.model_dump(),
             panels=[panel.model_dump() for panel in self.panels],
             keyers=[keyer.model_dump() for keyer in self.keyers],
@@ -1353,6 +1731,13 @@ class VisionMixer:
             last_transition=self.last_transition,
             nmos=self.nmos.status(),
         )
+
+    def _status_error(self) -> str | None:
+        # The state stays "running" (on air: the GUI's on-air switch and start() depend on it).
+        stalled = self.program_stalled_s()
+        if stalled is not None and self.error is None:
+            return f"Program renders no frames (none for {stalled:.0f} s)"
+        return self.error
 
     def domain_flows(self):
         return list_flows_in_root(self.settings.mxl_root)

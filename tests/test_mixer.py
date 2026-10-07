@@ -1,8 +1,17 @@
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from flowxer.api.schemas import AudioEssence, InputKind, LogicalInputUpdate, MixerStartRequest, VideoEssence
 from flowxer.engine.mixer import MixerError, VisionMixer
-from flowxer.engine.pipeline import build_pipeline_description, stinger_bin_description
+from flowxer.api.metrics import render_prometheus
+from flowxer.api.schemas import MixerState
+from flowxer.engine.pipeline import (
+    UNROUTED_FLOW,
+    build_pipeline_description,
+    stinger_bin_description,
+)
 
 
 def test_start_publishes_uncompressed_output_flows(mixer: VisionMixer) -> None:
@@ -60,6 +69,13 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     # GUI monitors: one picture per source and one of Program.
     assert "appsink name=mon_cam-1 " in description
     assert "appsink name=mon__program " in description
+    # A source without data must not hold the pipeline out of PLAYING through its monitor.
+    assert "appsink name=mon_cam-1 max-buffers=1 drop=true sync=false async=false" in description
+    # Unrouted mxl_live essences wait on a flow id that never exists ("UNBOUND" made mxlsrc fail).
+    assert f"video-flow-id={UNROUTED_FLOW} " in description
+    assert f"audio-flow-id={UNROUTED_FLOW} " in description
+    # force-live made the mixers drop late buffers: dark frames at the end of fades.
+    assert "force-live" not in description
     mixer.settings.monitor_fps = 0
     without = build_pipeline_description(
         settings=mixer.settings,
@@ -130,3 +146,20 @@ def test_file_player_location_is_quoted(mixer: VisionMixer) -> None:
     )
     assert str(clip) in description
     assert "filesrc name=vsrc_replay" in description
+
+
+def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:
+    # Platform 9.16.33: Program stopped after a few frames while the status said "running" without
+    # an error. The state stays "running" (on air); the error and a gauge say that no frames come.
+    mixer.state = MixerState.running
+    mixer.gst = SimpleNamespace(program_frames=4)
+    mixer._frame_mark = (4, time.monotonic() - 10)
+    status = mixer.status()
+    assert status.state == MixerState.running
+    assert status.error is not None and status.error.startswith("Program renders no frames")
+    assert "flowxer_program_stalled 1" in render_prometheus(mixer)
+    mixer.gst.program_frames = 5
+    assert mixer.status().error is None
+    assert "flowxer_program_stalled 0" in render_prometheus(mixer)
+    mixer.gst = None
+    mixer.state = MixerState.idle

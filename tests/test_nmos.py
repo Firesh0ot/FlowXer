@@ -108,6 +108,10 @@ def test_rest_defaults_domain_id_and_syncs_is05(tmp_path: Path) -> None:
     assert active["transport_params"][0]["mxl_domain_id"] == "flowxer-test"
     receiver = client.get(f"/x-nmos/node/v1.3/receivers/{rid}").json()
     assert receiver["subscription"]["active"] is True
+    # Controllers append "/single/..." to the control href, which ends in "/".
+    doubled = client.get(f"/x-nmos/connection/v1.2//single/receivers/{rid}/active")
+    assert doubled.status_code == 200
+    assert doubled.json() == active
     assert receiver["transport"] == "urn:x-nmos:transport:mxl"
 
 
