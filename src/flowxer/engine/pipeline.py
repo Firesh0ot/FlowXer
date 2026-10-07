@@ -250,18 +250,20 @@ def build_pipeline_description(
         f"\npgmt. ! {monitor_tap(settings, MONITOR_PROGRAM)}" if settings.monitor_fps else ""
     )
 
+    # async=false: the pipeline is live, so the sinks must not wait for a first buffer to reach
+    # PLAYING; a Program or sound source that delivers nothing would otherwise hold everything.
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout flow-id={output_video_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=vout async=false flow-id={output_video_flow_id} domain={_gst_string(domain)}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
-            f"mxlsink name=aout flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=aout async=false flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
         )
     else:
-        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"
-        audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true"
+        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true async=false"
+        audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true async=false"
 
     # The compositor converts each pad itself and skips a pad whose alpha is 0, so
     # the B bus and an idle keyer cost nothing until they are shown.
@@ -270,11 +272,11 @@ input-selector name=vsel sync-streams=true cache-buffers=true
 input-selector name=vselb sync-streams=true cache-buffers=true
 input-selector name=asel sync-streams=true cache-buffers=true
 input-selector name=aselb sync-streams=true cache-buffers=true
-compositor name=comp background=black emit-signals=true
+compositor name=comp background=black emit-signals=true force-live=true
   {PAD_PROGRAM}::zorder=0
   {PAD_MIX}::zorder=1 {PAD_MIX}::alpha=0.0
   {PAD_KEYER}::zorder=2 {PAD_KEYER}::alpha={overlay_alpha}
-audiomixer name=amix emit-signals=true {PAD_PROGRAM}::volume=1.0 {PAD_MIX}::volume=0.0
+audiomixer name=amix emit-signals=true force-live=true {PAD_PROGRAM}::volume=1.0 {PAD_MIX}::volume=0.0
 
 {video_sources}
 
