@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -71,7 +73,11 @@ class LibraryStore:
         if not item.created_at:
             item.created_at = item.updated_at
         path = self.item_json_path(item.id)
-        path.write_text(item.model_dump_json(indent=2), encoding="utf-8")
+        # Conversion workers save progress while the API lists items: replace the file in one
+        # step, so a reader never sees it half written (it skipped the item).
+        temporary = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+        temporary.write_text(item.model_dump_json(indent=2), encoding="utf-8")
+        os.replace(temporary, path)
         return item
 
     def delete(self, item_id: str) -> None:
