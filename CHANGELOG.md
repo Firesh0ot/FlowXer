@@ -50,6 +50,13 @@ in `docs/platform-integration-plan.md` §8.
   Only an `mxlsrc` is retargeted now, it always returns to PLAYING, and the
   log says that the route applies at the next start.
 
+### Fixed (platform)
+
+- The NMOS node answers paths with a doubled slash. The device's IS-05 control
+  href ends in `/`, and a controller that appends `/single/...` to it asked for
+  `/x-nmos/connection/v1.2//single/receivers/<id>/active` and got 404 for every
+  receiver; nmos-cpp nodes accept that form.
+
 ### Fixed (CI)
 
 - The merge-back after a release (`main` → `stage` → `dev`) failed when the
