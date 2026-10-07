@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
+import { LibraryModal } from "./components/LibraryModal";
 import { Monitor } from "./components/Monitor";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
@@ -25,6 +26,7 @@ export default function App() {
   const [sourceEdit, setSourceEdit] = useState<LogicalInput | null>(null);
   const [stingerEdit, setStingerEdit] = useState<StingerSlot | null>(null);
   const [tallyOpen, setTallyOpen] = useState(false);
+  const [libraryKind, setLibraryKind] = useState<"clip" | "stinger" | null>(null);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
 
@@ -87,6 +89,22 @@ export default function App() {
                         }}
                       >
                         {snapshot.mixer.state === "running" ? "Take mixer off-air" : "Take mixer on-air"}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setLibraryKind("clip");
+                          setMenu(null);
+                        }}
+                      >
+                        Clip library…
+                      </button>
+                      <button
+                        onClick={() => {
+                          setLibraryKind("stinger");
+                          setMenu(null);
+                        }}
+                      >
+                        Stinger library…
                       </button>
                     </>
                   ) : null}
@@ -263,9 +281,14 @@ export default function App() {
         <SourceSettingsModal
           input={sourceEdit}
           clips={snapshot.clips}
+          libraryClips={(snapshot.library ?? []).filter((item) => item.kind === "clip")}
           stingerSlots={snapshot.stinger_slots}
           pinnedBy={snapshot.pinned?.logical_source_count}
           onClose={() => setSourceEdit(null)}
+          onOpenLibrary={() => {
+            setSourceEdit(null);
+            setLibraryKind("clip");
+          }}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);
             setSourceEdit(null);
@@ -277,12 +300,24 @@ export default function App() {
         <StingerSettingsModal
           slot={stingerEdit}
           console={snapshot}
+          libraryStingers={(snapshot.library ?? []).filter((item) => item.kind === "stinger")}
           onClose={() => setStingerEdit(null)}
+          onOpenLibrary={() => {
+            setStingerEdit(null);
+            setLibraryKind("stinger");
+          }}
           onSave={async (payload) => {
             await api.patchStingerSlot(stingerEdit.id, payload);
             setStingerEdit(null);
             await refresh();
           }}
+        />
+      ) : null}
+      {libraryKind ? (
+        <LibraryModal
+          kind={libraryKind}
+          onClose={() => setLibraryKind(null)}
+          onChanged={refresh}
         />
       ) : null}
       {tallyOpen ? (

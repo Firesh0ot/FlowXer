@@ -32,6 +32,29 @@ in `docs/platform-integration-plan.md` §8.
   own output domain.
 - `deploy/kubernetes/flowxer-pod-network.yaml`; OCI labels `source` and
   `revision`.
+- Media library for clips and stingers: chunked upload (or a TGA folder,
+  ZIP or the watched `FLOWXER_IMPORT_DIR`), background conversion with
+  ffmpeg to a ProRes mezzanine, `/library`, `/uploads` and `/jobs` in the
+  API and File → Clip / Stinger library… in the GUI. Inputs and stinger
+  slots take a `library_item_id`. Legacy `storage/clips` and
+  `storage/stingers` are imported in the background and referenced in place.
+  Settings `FLOWXER_LIBRARY_DIR`, `FLOWXER_IMPORT_DIR`,
+  `FLOWXER_CONVERT_CONCURRENCY`, `FLOWXER_UPLOAD_LIMIT_GB`. Review fixes
+  before the release: a restart or a config import keeps library inputs and
+  slots (they are saved by item id; the whole state was dropped); a stinger
+  that is still converting hard-cuts instead of recursing into a 500; the
+  sound is conformed by ffmpeg, not in the mixer process (about 92 MB per
+  stereo minute); the GUI proxy passes upload chunks (nginx answered 413);
+  chunk sizes, the upload limit and the free disk space are enforced and
+  completing an upload is a rename; a file in the import dir that fails is
+  moved to `.failed/` instead of being retried every 4 s; the legacy import
+  no longer copies everything before the API starts; ffmpeg runs at low
+  CPU and I/O priority and is killed on cancel. Found on the lab: GStreamer
+  read the mezzanine's little-endian float sound as big-endian (silence) and
+  cannot play more than two PCM channels from MOV, so clip sound is now stereo
+  (or mono) big-endian float and stinger mezzanines carry no sound; the queue
+  in front of a file input's video (`FLOWXER_PREROLL_FRAMES`, which did
+  nothing) could take the sound pad and stop the input, and is gone.
 
 ### Changed
 
@@ -63,11 +86,11 @@ in `docs/platform-integration-plan.md` §8.
   missing, in another domain than the route says, or a frozen mirror). The
   input's GUI monitor never got a first frame, so the pipeline never reached
   PLAYING and Program stopped after a few frames while the mixer said
-  `running` (small platform: 2–6 frames in 10 h). The pipeline is now set up as
-  the live pipeline it is: the GUI monitor taps and the Program/sound sinks do
-  not wait for a first buffer (`async=false`), and the compositor and the
-  audiomixer always mix on time (`force-live=true`) instead of waiting for a
-  pad without data. Such an input shows black and silence.
+  `running` (small platform: 2–6 frames in 10 h). The GUI monitor taps no
+  longer wait for a first buffer (`async=false`), and an `mxl_live` essence
+  without a route reads a flow id that never exists (nil UUID) instead of
+  `UNBOUND`, which made `mxlsrc` fail at start and held the pipeline the same
+  way. Such an input shows black and silence.
 - A route whose domain does not hold the flow (IS-05 and REST default a
   missing domain to the own output domain) reads the flow from the domain
   below the MXL root that has it, a local domain before a fabrics mirror.
@@ -77,6 +100,11 @@ in `docs/platform-integration-plan.md` §8.
 - The source ⚙ in the GUI sends the flows and the group hint only when they
   changed. Saving the auto-stinger of a live input without a route was 422,
   and saving a routed one set its domain back to the output domain.
+- `GET /api/v1/preview/jpeg/{stream_id}` answers 404 with the accepted forms
+  (`source:<input id>`, `panel:<panel id>:pgm|pvw`) for any other name or an
+  input or panel that does not exist. `panel:program` was a 500
+  (`not enough values to unpack`), `program` a NO SIGNAL picture. A bare input
+  id still works; a WebRTC monitor of an unknown name shows NO SIGNAL.
 - The NMOS node answers paths with a doubled slash. The device's IS-05 control
   href ends in `/`, and a controller that appends `/single/...` to it asked for
   `/x-nmos/connection/v1.2//single/receivers/<id>/active` and got 404 for every
