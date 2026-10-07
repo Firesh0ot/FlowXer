@@ -183,7 +183,7 @@ def upload_init(payload: UploadInitRequest, mixer: VisionMixer = Depends(get_mix
             options=_options(payload.options),
         )
     except ValueError as exc:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)) from exc
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc)) from exc
     return UploadInitResponse(id=session.id, chunk_size=session.chunk_size, received=session.received)
 
 
