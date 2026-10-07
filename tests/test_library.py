@@ -7,6 +7,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -185,6 +187,16 @@ def test_crossfade_loop_file_blends_head_and_tail(tmp_path: Path):
     assert abs(out[2] - out[14]) < 1e-6
     assert out[4] == 1.0  # the middle is untouched
     assert not crossfade_loop_file(path, 2, 8, 4)  # needs more than two windows
+
+
+def test_starting_the_app_does_not_load_numpy():
+    # numpy loaded before GStreamer made libmxl unwind with libunwind: the mixer crashed
+    # (SIGSEGV) when Program started with a missing or unrouted MXL flow (lab, 9.16.39).
+    code = "import sys, flowxer.app; print('numpy' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "False"
 
 
 def test_cut_frame_after_fps_change_keeps_ms():
