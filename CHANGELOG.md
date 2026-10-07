@@ -14,6 +14,15 @@ in `docs/platform-integration-plan.md` §8.
   lists them in `pinned` and the GUI greys them out.
   `FLOWXER_PROGRAM_AUTOSTART` starts Program at process start. Unset, nothing
   changes.
+- Optional GPU media path, `FLOWXER_GPU=auto|on|off` (default `off`): on an
+  NVIDIA GPU each source is uploaded once, unpacked from v210 by a shader,
+  composited by `glvideomixerelement` (cut, mix, stingers, keyer) and Program
+  is packed to v210 and downloaded once; the GUI monitor pictures are scaled
+  on the GPU. `auto` takes it when the GPU passes a test frame at start and
+  logs why not otherwise, `on` exits with 78 without it, `off` is the CPU
+  path unchanged. `flowxer_info{media_path}` and `media_path` /
+  `media_path_reason` in `GET /api/v1/mixer` name the path. The image adds
+  `gstreamer1.0-gl` and the glvnd EGL vendor file for `libEGL_nvidia`.
 - The GUI monitors (JPEG and WebRTC) show the pipeline's pictures: each
   source and, for the main panel, the mixed Program (`FLOWXER_MONITOR_FPS`,
   default 10). They were generated cards.

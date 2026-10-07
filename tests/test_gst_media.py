@@ -15,6 +15,7 @@ import pytest
 
 from flowxer.engine.capabilities import gstreamer_available
 from flowxer.engine.mixer import VisionMixer
+from flowxer.engine.gpu import GpuUnavailableError, v210_stride
 from flowxer.engine.gst_runtime import first_channels_matrix, map_audio_channels
 from flowxer.engine.pipeline import PAD_MIX, PAD_PROGRAM
 from flowxer.api.schemas import InputKind, LogicalInputUpdate, MixerStartRequest
@@ -32,13 +33,18 @@ def _wait(predicate, what, timeout: float = 5.0) -> None:
         time.sleep(0.01)
 
 
-@pytest.fixture
-def live(settings: Settings):
+@pytest.fixture(params=["cpu", "gpu"])
+def live(settings: Settings, request: pytest.FixtureRequest):
+    """A live mixer on each media path; the GPU path is skipped where it does not work."""
     settings.simulate = False
     settings.gst_mode = "auto"
     settings.width = 320
     settings.height = 180
-    mixer = VisionMixer(settings)
+    settings.gpu = "on" if request.param == "gpu" else "off"
+    try:
+        mixer = VisionMixer(settings)
+    except GpuUnavailableError as exc:
+        pytest.skip(str(exc))
     # Keyer off: Program is only the selected source.
     mixer.update_keyer("dsk-1", enabled=False)
     yield mixer
@@ -83,10 +89,12 @@ class ProgramTap:
 def test_program_runs_at_the_mixer_rate(live: VisionMixer) -> None:
     status = live.start(MixerStartRequest(program_input_id="cam-1"))
     assert status.backend == "gstreamer", status.error
-    _wait(lambda: live.frames_rendered >= 10, "the first Program frames")
+    # Measured after the first half second: a start (the GPU path compiles its shaders)
+    # is caught up in a burst.
+    _wait(lambda: live.frames_rendered >= 25, "the first Program frames")
     first = live.frames_rendered
-    time.sleep(1.0)
-    rate = live.frames_rendered - first
+    time.sleep(2.0)
+    rate = (live.frames_rendered - first) / 2
     assert 40 <= rate <= 60, rate
 
 
@@ -236,6 +244,133 @@ def test_routing_an_input_whose_kind_changed_on_air_does_not_block(live: VisionM
         assert state == Gst.State.PLAYING, f"{name} is {state.value_nick}"
     first = live.frames_rendered
     _wait(lambda: live.frames_rendered >= first + 10, "Program frames after the routes")
+
+
+def _v210_frame(width: int, height: int) -> bytes:
+    """Codes that 8 bits hold (multiples of 4) and that differ from word to word."""
+    words = []
+    for row in range(height):
+        for word in range(v210_stride(width) // 4):
+            a, b, c = (4 * (16 + (row * 7 + word * 3 + k * 61) % 219) for k in range(3))
+            words.append(a | b << 10 | c << 20)
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+def _replace_mxl_sources(live: VisionMixer, monkeypatch: pytest.MonkeyPatch, element: str) -> None:
+    """MXL inputs keep their own chains, with `element` (named and given the caps) in place of mxlsrc."""
+    from flowxer.engine import pipeline as pipeline_module
+
+    caps = {"v": pipeline_module._v210(live.settings), "a": pipeline_module._audio(live.settings)}
+    for name in ("_video_source_bin", "_gpu_video_source_bin", "_audio_source_bin"):
+        real = getattr(pipeline_module, name)
+        kind = "a" if name == "_audio_source_bin" else "v"
+
+        def replaced(inp, settings, domain, domain_paths, real=real, kind=kind):
+            description = real(inp, settings, domain, domain_paths)
+            if inp.kind != InputKind.mxl_live:
+                return description
+            factory, _, properties = element.partition(" ")
+            if kind == "a" and factory == "videotestsrc":
+                factory, properties = "audiotestsrc", "is-live=true"
+            if factory == "appsrc":
+                source = f'appsrc name={kind}src_{inp.id} {properties} caps="{caps[kind]}"'
+            else:
+                source = f"{factory} name={kind}src_{inp.id} {properties} ! {caps[kind]}"
+            return source + description[description.index(" ! ") :]
+
+        monkeypatch.setattr(pipeline_module, name, replaced)
+
+
+def test_a_fade_between_mxl_inputs(live: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # GPU path, lab 10.17.40: the first fade between two MXL inputs aborted the process. The
+    # selector switch made the incoming source renegotiate; capssetter passed its allocation query
+    # on with the v210 caps and glupload offered a GL pool for v210 ("gst_gl_format_from_video_info:
+    # code should not be reached"). A source that negotiates a pool stands in for mxlsrc.
+    _replace_mxl_sources(live, monkeypatch, "videotestsrc is-live=true pattern=smpte")
+    for input_id in ("cam-1", "cam-2"):
+        live.update_input(input_id, LogicalInputUpdate(kind=InputKind.mxl_live, group_hint=input_id))
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    _wait(lambda: live.frames_rendered >= 10, "the first Program frames")
+    live.fade(duration_ms=300)
+    _wait(lambda: live.program_input_id == "cam-2", "the fade to cam-2")
+    first = live.frames_rendered
+    _wait(lambda: live.frames_rendered >= first + 25, "Program frames after the fade")
+
+
+def test_an_mxl_input_can_be_restarted_on_air(live: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #69's source restart (IS-05 retarget, recovery of a failed mxlsrc) flushes the source's branch
+    # and renegotiates; on the GPU path that runs through the upload chain. A source that negotiates
+    # a buffer pool stands in for mxlsrc.
+    from flowxer.engine.gst_runtime import run_bounded
+
+    _replace_mxl_sources(live, monkeypatch, "videotestsrc is-live=true pattern=smpte")
+    for input_id in ("cam-1", "cam-2"):
+        live.update_input(input_id, LogicalInputUpdate(kind=InputKind.mxl_live, group_hint=input_id))
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    _wait(lambda: live.frames_rendered >= 10, "the first Program frames")
+    for name in ("vsrc_cam-1", "vsrc_cam-2", "vsrc_cam-1"):
+        source = live.gst.pipeline.get_by_name(name)
+        assert run_bounded(lambda: live.gst._restart_source(source), 5, f"restart of {name}")
+        first = live.frames_rendered
+        _wait(lambda: live.frames_rendered >= first + 10, f"Program frames after restarting {name}")
+    assert live.status().error is None
+
+
+def test_an_mxl_input_reaches_program_unchanged(live: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # On the GPU path the v210 an MXL input delivers comes out of Program bit for bit: unpacked,
+    # composited and packed by shaders. (The CPU path resamples the 4:2:2 chroma on its way
+    # through AYUV, so it is not compared.)
+    if not live.media.gpu:
+        pytest.skip("the CPU path resamples chroma")
+    from gi.repository import Gst
+
+    width, height = live.settings.width, live.settings.height
+    frame = _v210_frame(width, height)
+    _replace_mxl_sources(live, monkeypatch, "appsrc is-live=true format=time do-timestamp=true")
+    live.update_input("cam-1", LogicalInputUpdate(kind=InputKind.mxl_live, group_hint="appsrc"))
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    source = live.gst.pipeline.get_by_name("vsrc_cam-1")
+    received: list[bytes] = []
+
+    def keep(_pad, info):
+        buffer = info.get_buffer()
+        ok, mapped = buffer.map(Gst.MapFlags.READ)
+        if ok:
+            received.append(bytes(mapped.data))
+            buffer.unmap(mapped)
+        return Gst.PadProbeReturn.OK
+
+    live.gst.pipeline.get_by_name("vout").get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, keep)
+    stop = threading.Event()
+
+    def feed() -> None:
+        while not stop.is_set():
+            source.emit("push-buffer", Gst.Buffer.new_wrapped(frame))
+            time.sleep(0.02)
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    try:
+        # Half a second of Program after the first input frames.
+        _wait(lambda: len(received) >= 25, lambda: f"Program frames ({len(received)})")
+    finally:
+        stop.set()
+        feeder.join(1)
+    out = received[-1]
+    assert len(out) == len(frame)
+    codes_in, codes_out = _codes(frame, width, height), _codes(out, width, height)
+    differences = sum(a != b for a, b in zip(codes_in, codes_out))
+    assert differences == 0, f"{differences} of {len(codes_in)} codes differ"
+
+
+def _codes(data: bytes, width: int, height: int) -> list[int]:
+    """The 10-bit codes of the whole 6-pixel groups of each line (not the line's padding)."""
+    words = width // 6 * 4
+    codes = []
+    for row in range(height):
+        for word in struct.unpack_from(f"<{words}I", data, row * v210_stride(width)):
+            codes += (word & 0x3FF, word >> 10 & 0x3FF, word >> 20 & 0x3FF)
+    return codes
 
 
 def test_first_channels_matrix() -> None:

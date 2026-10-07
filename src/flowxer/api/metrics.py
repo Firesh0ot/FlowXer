@@ -42,6 +42,7 @@ def render_prometheus(mixer) -> str:
                 "mxl_revision": settings.resolved_mxl_revision,
                 "gst_mode": gst_mode,
                 "nmos_enabled": str(bool(nmos.get("enabled"))).lower(),
+                "media_path": getattr(getattr(mixer, "media", None), "path", "cpu"),
             },
         ),
         "# HELP flowxer_on_air 1 when the mixer pipeline is running",

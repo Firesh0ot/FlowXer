@@ -295,8 +295,17 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
 | `FLOWXER_MONITOR_FPS` | `10` | GUI monitor pictures (JPEG and WebRTC) taken from the pipeline per second; `0` draws generated cards |
+| `FLOWXER_GPU` | `off` | Video on an NVIDIA GPU: `off` the CPU path, `auto` the GPU path when it works at start (the log says why not), `on` the GPU path or exit 78. See [GPU media path](#gpu-media-path) |
 | `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
 | `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |
+
+### GPU media path
+
+With `FLOWXER_GPU=auto` or `on` (default `off`: the CPU path) the video runs on an NVIDIA GPU through OpenGL (EGL, no display): every source is uploaded once (MXL v210 as its 32-bit words, unpacked by a shader), `glvideomixerelement` does cut, mix, stingers and the keyer, Program is packed to v210 on the GPU and downloaded once, and the GUI monitor pictures are scaled on the GPU. Pictures stay 8-bit Y'CbCr 4:4:4 like the CPU compositor's AYUV. Audio, the HTML keyer (CEF), JPEG encoding and WebRTC stay on the CPU.
+
+At start the mixer checks for `/dev/nvidia*`, `libEGL_nvidia.so.0`, the GL elements, and runs one v210 test frame through the shaders; it must come back unchanged. `auto` falls back to the CPU path and logs the reason; `on` exits with 78. `GET /api/v1/mixer` (`media_path`, `media_path_reason`) and `flowxer_info{media_path="gpu"|"cpu"}` say which path runs.
+
+The container needs one GPU (`nvidia.com/gpu: 1`, a time-sliced share is enough) and `NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute` (`graphics` brings `libEGL_nvidia`). The image carries the glvnd EGL vendor file for it. The mixer sets `GST_GL_PLATFORM=egl`, `GST_GL_WINDOW=egl-device` and `__EGL_VENDOR_LIBRARY_FILENAMES` (NVIDIA only, so Mesa's software renderer cannot stand in) unless they are set.
 
 ### Saved state, export and import
 
