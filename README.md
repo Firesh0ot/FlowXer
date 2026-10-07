@@ -341,6 +341,8 @@ FLOWXER_PROGRAM_AUTOSTART=true
 
 `/readyz` is 200 only when the MXL root is readable, the output domain is writable and, with a registry configured, the node is registered (heartbeat within 12 s).
 
+`/livez` is 503 when the control plane is stuck: an IS-05 activation, a Program start or stop, or an MXL source restart has not finished for 60 s. Each of them is bounded on its own (a source restart waits at most 10 s, a stop 15 s), so only a blocked media pipeline gets there; Kubernetes then restarts the pod. `flowxer_control_plane_busy_seconds` is the age of the oldest running one.
+
 See [docs/nmos.md](docs/nmos.md) for receivers/senders and REST ↔ IS-05.
 
 ### Route a camera to input 1, take it to program, route program out

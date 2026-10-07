@@ -18,7 +18,7 @@ from flowxer import __version__
 from flowxer.api.auth import ApiTokenMiddleware
 from flowxer.api.library_routes import get_mixer as get_library_mixer
 from flowxer.api.library_routes import router as library_router
-from flowxer.api.metrics import ready_payload, render_prometheus
+from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.domain.mxl_domain import DomainError
 from flowxer.engine.mixer import VisionMixer
@@ -183,8 +183,10 @@ def create_app(
         )
 
     @app.get("/livez", include_in_schema=False)
-    def livez() -> dict:
-        return {"status": "live"}
+    async def livez():
+        # async: answered on the event loop, also when the worker threads are all blocked.
+        code, body = live_payload(mixer)
+        return JSONResponse(status_code=code, content=body)
 
     @app.get("/readyz", include_in_schema=False)
     def readyz():

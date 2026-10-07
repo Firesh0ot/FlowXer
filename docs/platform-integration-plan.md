@@ -241,6 +241,16 @@ Node API is up and we are still retrying registration (do not fail the pod
 forever if the registry is briefly down — match fabrics-agent/decklink practice
 and record the exact rule when implementing).
 
+`/livez` (decided on 10.17.40, `fix/program-pts-retarget-hang`): 503 when a
+control-plane operation (IS-05 activation, including waiting for the NMOS lock;
+Program start; Program stop; an MXL source restart) has run for more than 60 s
+(`engine/watchdog.py`). Each one is bounded on its own: a source restart waits
+10 s (stopping mxlsrc can take 5 s: its grain read times out after 5 s), a stop
+15 s, a start takes seconds. 60 s is well above all of them, so normal work never
+trips it; with the usual probe (period 10 s, 3 failures) a hung pod restarts
+about 90 s after the hang. The endpoint is `async` so it answers when the worker
+threads are blocked.
+
 ### 3.8 GPU (item 7)
 
 **After** items 1–6. `FLOWXER_PREVIEW_ENCODER=auto\|cpu\|nvenc` for WHEP only.
@@ -411,3 +421,8 @@ integration and AMWA script in PR 8).
   - `flowxer_frames_rendered_total` counts Program frames at the video sink (it counted JPEG previews).
 - **Monitor pictures** (`feat/monitor-pictures`): the last open point of the lab run. Every source's `tee` and Program (after the compositor) feed an `appsink` at `FLOWXER_MONITOR_FPS` (default 10): `videorate` drops first, then one `videoconvertscale` pass makes the 640×360 RGB picture from the full-size frame; the newest one is kept. `render_monitor` (JPEG and WebRTC) uses it while the pipeline runs and draws the card otherwise. Tested in the GStreamer CI job: the pictures change with the test source's time overlay, black stays black, and the Program monitor follows a cut.
 - **Designer contract** (`feat/designer-structure-env`): the production structure from the environment (§3.10). `FLOWXER_FORMAT`, `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and `FLOWXER_PANELS` win over the saved state at every start, the API refuses to change them (409) and `GET /console` reports them in `pinned`; `FLOWXER_PROGRAM_AUTOSTART` starts Program at process start. NMOS labels: receivers `<input label> Video/Audio`, senders `ME <n> PGM Video/Audio`. The GUI's source ⚙ now sends flows and group hint only when they changed (an unrouted live input could not be saved).
+- **Program timeline, hung routes, frozen inputs** (`fix/program-pts-retarget-hang`, on 10.17.40), from the small platform (Program audio silent at every start, a route that hung the node, two gateway inputs frozen):
+  - Program audio and the 2-frame stall: right after a start the audiomixer and the compositor can start their output over at 0 (`basesink:5` at the sinks: audio `[0, 0.01)` then `[0, 0.02)`, video `[0.04, 0.06)` then `[0, 0.08)`). mxlsink cannot write behind what it wrote and returns an error without a message; the error ran upstream (`queue54` → `asrc_cam-1` → `queue32`, the burst the platform logs) and stopped that essence for good. A probe on the `vout`/`aout` sink pads drops a buffer whose timestamp is not after the last one (audio: that starts before the last one ended). Lab, `fx-stall.sh ok`, 20 starts each: 10.17.40 12/20 with the burst and Program audio dead (0 blocks from `mxl-verify`), fixed 0/20, audio live 20/20, 1–2 buffers dropped in 14/20 starts; `novideo`, `videoonly`, `bothdead` 3/3 at 50 fps with live audio.
+  - Hung route: reproduced on the lab with the platform's layout (4 live inputs, 2 test sources, 1 ME) by re-routing after the burst, cam-3 audio into another domain and back: the second route never answered, then GET /mixer, stop and the NMOS API. gdb: the route's thread waited in `gst_pad_stop_task` for `asrc_cam-3`'s stream lock; that source's thread waited in its queue for an answer to its serialized allocation query (sent after the first route restarted it); the queue's thread waited in the audio input-selector (`sync-streams`), whose active input (cam-1) had stopped in the burst. The restart of a source now flushes the source's branch first (FLUSH_START answers the waiting query and wakes the blocked threads, FLUSH_STOP without a time reset) and runs bounded (10 s; stop 15 s). Unrouting uses `UNROUTED_FLOW`. A GStreamer test reproduces the blocked query (fails without the flush).
+  - Frozen inputs: mxlsrc returns an error for a grain marked `MXL_GRAIN_FLAG_INVALID` and stops for good; mxl-st2110-gateway RX marks incomplete frames that way. Reproduced with a test writer that marks every 250th grain invalid: the input froze on its last picture. A failed MXL source is started again after 1 s (2, 5, 10, 30 s when it fails again within 3 s); `flowxer_input_restarts_total`, `GET /mixer` `error`. A seamless fix (mxlsrc skipping invalid grains) belongs in gst-mxl-rs.
+  - `/livez` watchdog: §3.7.

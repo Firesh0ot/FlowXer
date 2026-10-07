@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from flowxer.engine.pipeline import AUDIO_MAP_PREFIX, MONITOR_PREFIX, PAD_MIX, PAD_PROGRAM, STINGER_ZORDER
+from flowxer.engine.pipeline import (
+    AUDIO_MAP_PREFIX,
+    MONITOR_PREFIX,
+    PAD_MIX,
+    PAD_PROGRAM,
+    STINGER_ZORDER,
+    UNROUTED_FLOW,
+)
 
 log = logging.getLogger(__name__)
 
@@ -14,6 +22,58 @@ log = logging.getLogger(__name__)
 STINGER_LEAD_NS = 100_000_000
 # Frames Program keeps the incoming source on both buses before the B bus is hidden.
 MIX_HANDOVER_FRAMES = 3
+# Program audio buffers may start this much before the end of the last one (timestamp rounding).
+AUDIO_OVERLAP_TOLERANCE_NS = 100_000
+# Dropped Program buffers logged per start; the counters keep counting.
+DROP_LOG_LIMIT = 5
+# A source restart (IS-05 retarget, recovery) waits this long for the source's state changes.
+# Stopping an mxlsrc can take up to 5 s (its grain read times out after 5 s).
+RESTART_TIMEOUT_S = 10.0
+# Program stop waits this long for the pipeline to reach NULL.
+STOP_TIMEOUT_S = 15.0
+# A failed MXL source is started again after these pauses (s); the last one repeats. A source
+# that ran for RECOVERY_RESET_S after it was started again starts over at the first pause (an
+# invalid grain now and then costs a 1 s freeze; a source that fails at once backs off).
+RECOVERY_BACKOFF_S = (1.0, 2.0, 5.0, 10.0, 30.0)
+RECOVERY_RESET_S = 3.0
+MXL_SOURCE_PREFIXES = ("vsrc_", "asrc_")
+
+# Pipelines whose stop did not finish: kept referenced, a pipeline must not be finalized while
+# its threads still run.
+_abandoned: list = []
+
+
+class SourceRestartTimeout(RuntimeError):
+    """A source did not get through its restart in time; its thread may still be blocked."""
+
+
+def run_bounded(work: Callable[[], object], timeout_s: float, what: str, watchdog=None) -> bool:
+    """Run `work` in its own thread and wait at most `timeout_s`. True when it finished.
+
+    A GStreamer state change can block for good (a streaming thread waiting in a serialized
+    query that nobody answers). The caller then goes on and releases its locks; the thread stays
+    registered with the control-plane watchdog until it ends, so /livez reports it."""
+    done = threading.Event()
+    errors: list[BaseException] = []
+    token = watchdog.begin(what) if watchdog is not None else None
+
+    def run() -> None:
+        try:
+            work()
+        except BaseException as exc:  # noqa: BLE001 (handed to the caller)
+            errors.append(exc)
+        finally:
+            done.set()
+            if token is not None:
+                watchdog.end(token)
+
+    threading.Thread(target=run, name=f"bounded: {what}", daemon=True).start()
+    if not done.wait(timeout_s):
+        log.error("%s did not finish within %.0f s", what, timeout_s)
+        return False
+    if errors:
+        raise errors[0]
+    return True
 
 
 def first_channels_matrix(in_channels: int, out_channels: int) -> str:
@@ -66,6 +126,15 @@ class GstRuntime:
         self._on_error = on_error
         # Buffers that reached the Program video sink.
         self.program_frames = 0
+        # Program buffers dropped because they went back in time, per essence.
+        self.program_dropped = {"video": 0, "audio": 0}
+        # ControlPlaneWatchdog for the bounded state changes (set by the mixer).
+        self.watchdog = None
+        # Called with (source element name, reason) when a failed MXL source is started again.
+        self.on_source_restart: Callable[[str, str], None] | None = None
+        # Per MXL source: (failures in a row, monotonic time of the last failure).
+        self._failures: dict[str, tuple[int, float]] = {}
+        self._recovering: set[str] = set()
         self._lock = threading.Lock()
         self._mix: _Mix | None = None
         self._stinger = None
@@ -98,6 +167,7 @@ class GstRuntime:
                 if self._on_error is not None:
                     source = message.src.get_name() if message.src is not None else "pipeline"
                     self._on_error(f"{source}: {err.message}")
+                self._recover_source(message.src, err.message)
             elif message.type == Gst.MessageType.EOS:
                 log.info("GStreamer EOS")
 
@@ -105,7 +175,7 @@ class GstRuntime:
         self._gst = Gst
         self._glib = GLib
         self.pipeline = pipeline
-        self._count_program_frames()
+        self._guard_program_output()
         iterator = pipeline.iterate_recurse()
         while True:
             result, element = iterator.next()
@@ -128,15 +198,22 @@ class GstRuntime:
         self.thread = threading.Thread(target=loop.run, name="gst-mainloop", daemon=True)
         self.thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """Take the pipeline to NULL. False when that did not finish within STOP_TIMEOUT_S: the
+        pipeline is then left behind (its threads are blocked) and the watchdog reports it."""
+        stopped = True
         if self.pipeline is not None and self._gst is not None:
-            self.pipeline.set_state(self._gst.State.NULL)
+            pipeline, null = self.pipeline, self._gst.State.NULL
+            stopped = run_bounded(lambda: pipeline.set_state(null), STOP_TIMEOUT_S, "Program stop", self.watchdog)
+            if not stopped:
+                _abandoned.append(pipeline)
         if self.loop is not None and self.loop.is_running():
             self.loop.quit()
         self.pipeline = None
         self.loop = None
         self._mix = None
         self._stinger = None
+        return stopped
 
     def _on_monitor_sample(self, sink) -> object:
         sample = sink.emit("pull-sample")
@@ -169,17 +246,56 @@ class GstRuntime:
                 return 1_000_000_000 * den // num
         return 20_000_000
 
-    def _count_program_frames(self) -> None:
-        vout = self.pipeline.get_by_name("vout")
-        pad = vout.get_static_pad("sink") if vout is not None else None
-        if pad is None:
-            return
+    def _guard_program_output(self) -> None:
+        """Keep Program going forward in time, and count its frames.
 
-        def count(_pad, _info):
-            self.program_frames += 1
-            return self._gst.PadProbeReturn.OK
+        mxlsink writes each buffer at the MXL index of its timestamp. In the first frames after a
+        start the compositor and the audiomixer can start their output over at 0 (seen at the
+        sinks: video [0.04, 0.06) then [0, 0.08); audio [0, 0.01) then [0, 0.02)). mxlsink cannot
+        write behind what it wrote, returns an error without a message, the error runs upstream and
+        stops that essence for good: Program audio stayed silent, or Program video stopped after a
+        few frames. Such a buffer is dropped before it reaches the sink: a video frame whose
+        timestamp is not after the last one, audio that starts before the last buffer ended.
+        """
+        Gst = self._gst
+        for name, essence in (("vout", "video"), ("aout", "audio")):
+            sink = self.pipeline.get_by_name(name)
+            pad = sink.get_static_pad("sink") if sink is not None else None
+            if pad is not None:
+                pad.add_probe(Gst.PadProbeType.BUFFER, self._program_timeline_probe(essence))
 
-        pad.add_probe(self._gst.PadProbeType.BUFFER, count)
+    def _program_timeline_probe(self, essence: str):
+        Gst = self._gst
+        none = Gst.CLOCK_TIME_NONE
+        last = {"pts": none, "end": none}
+
+        def probe(_pad, info):
+            buffer = info.get_buffer()
+            pts, duration = buffer.pts, buffer.duration
+            if pts != none and last["pts"] != none:
+                if essence == "video":
+                    back = pts <= last["pts"]
+                else:
+                    back = last["end"] != none and pts + AUDIO_OVERLAP_TOLERANCE_NS < last["end"]
+                if back:
+                    self.program_dropped[essence] += 1
+                    if self.program_dropped[essence] <= DROP_LOG_LIMIT:
+                        log.warning(
+                            "Program %s buffer at %.3f s dropped: it is behind the last one (%.3f-%.3f s)",
+                            essence,
+                            pts / 1e9,
+                            last["pts"] / 1e9,
+                            (last["end"] if last["end"] != none else last["pts"]) / 1e9,
+                        )
+                    return Gst.PadProbeReturn.DROP
+            if pts != none:
+                last["pts"] = pts
+                last["end"] = pts + duration if duration != none else none
+            if essence == "video":
+                self.program_frames += 1
+            return Gst.PadProbeReturn.OK
+
+        return probe
 
     def set_active_slot(self, selector_name: str, slot: int) -> None:
         if self.pipeline is None:
@@ -370,15 +486,82 @@ class GstRuntime:
         flow_property = "video-flow-id" if role == "video" else "audio-flow-id"
         if element is None or element.find_property(flow_property) is None:
             return False
-        Gst = self._gst
-        element.set_state(Gst.State.NULL)
-        try:
-            element.set_property(flow_property, flow_id or "")
+
+        def apply() -> None:
+            # Not routed: a flow id that never exists, so the source waits like for a missing flow
+            # (an empty id is not a UUID and made mxlsrc fail).
+            element.set_property(flow_property, flow_id or UNROUTED_FLOW)
             if domain:
                 element.set_property("domain", domain)
-        finally:
-            element.set_state(Gst.State.PLAYING)
+
+        if not run_bounded(
+            lambda: self._restart_source(element, apply), RESTART_TIMEOUT_S, f"retarget of {element_name}", self.watchdog
+        ):
+            raise SourceRestartTimeout(f"{element_name} did not restart within {RESTART_TIMEOUT_S:.0f} s")
+        self._failures.pop(element_name, None)
         return True
+
+    def _restart_source(self, element, apply: Callable[[], None] | None = None) -> None:
+        """Take a source to NULL and back to PLAYING, changing its properties in between.
+
+        Its branch is flushed first. A source that starts again sends a serialized allocation
+        query; when the queue after it cannot hand the query on (the queue's thread waits
+        downstream, e.g. in an input-selector whose active input stopped), the source's thread
+        waits with its stream lock held, and every later state change of the source blocked for
+        good (an IS-05 route hung the control plane on 10.17.40). FLUSH_START answers the
+        waiting query and wakes the blocked threads; FLUSH_STOP makes the branch usable again."""
+        Gst = self._gst
+        src = element.get_static_pad("src")
+        peer = src.get_peer() if src is not None else None
+        if src is not None:
+            src.push_event(Gst.Event.new_flush_start())
+        element.set_state(Gst.State.NULL)
+        if peer is not None:
+            # reset_time false: a running-time reset makes the sinks reset the pipeline's time,
+            # which held Program for seconds.
+            peer.send_event(Gst.Event.new_flush_stop(False))
+        if apply is not None:
+            apply()
+        element.set_state(Gst.State.PLAYING)
+
+    def _recover_source(self, element, reason: str) -> None:
+        """A failed MXL source stays stopped (its input froze on the last picture): start it again
+        after a pause that grows while it keeps failing. mxlsrc stops for good on a grain marked
+        invalid (an ST 2110 gateway writes incomplete frames that way)."""
+        name = element.get_name() if element is not None else ""
+        if (
+            self.pipeline is None
+            or not name.startswith(MXL_SOURCE_PREFIXES)
+            or element.find_property("domain") is None
+            or name in self._recovering
+        ):
+            return
+        failures, started = self._failures.get(name, (0, 0.0))
+        if time.monotonic() - started > RECOVERY_RESET_S:
+            failures = 0
+        delay = RECOVERY_BACKOFF_S[min(failures, len(RECOVERY_BACKOFF_S) - 1)]
+        self._failures[name] = (failures + 1, started)
+        self._recovering.add(name)
+        log.warning("MXL source %s failed (%s); starting it again in %.0f s", name, reason, delay)
+        pipeline = self.pipeline
+
+        def restart() -> None:
+            try:
+                if self.pipeline is pipeline:
+                    run_bounded(lambda: self._restart_source(element), RESTART_TIMEOUT_S, f"restart of {name}", self.watchdog)
+                    self._failures[name] = (self._failures.get(name, (1, 0.0))[0], time.monotonic())
+                    if self.on_source_restart is not None:
+                        self.on_source_restart(name, reason)
+            except Exception:
+                log.exception("starting %s again failed", name)
+            finally:
+                self._recovering.discard(name)
+
+        def later() -> bool:
+            threading.Thread(target=restart, name=f"recover {name}", daemon=True).start()
+            return False
+
+        self._glib.timeout_add(int(delay * 1000), later)
 
 
 def try_start_gst(
