@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     # Bind the Node/Connection APIs. Tests set this false and use TestClient.
     nmos_bind: bool = True
     storage_root: Path = Path("./storage")
+    # Media library (mezzanine + originals). Empty → <storage_root>/library.
+    library_dir: Path | None = None
+    # Optional watched drop folder for auto-ingest (empty disables).
+    import_dir: Path | None = None
+    convert_concurrency: int = Field(default=1, ge=1, le=8)
+    ram_clip_max_s: float = Field(default=20.0, ge=0.0, le=600.0)
+    ram_budget_mb: int = Field(default=4096, ge=64, le=262144)
+    upload_limit_gb: float = Field(default=20.0, ge=0.1, le=500.0)
     # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
     mxl_revision: str = ""
 
@@ -180,6 +188,21 @@ class Settings(BaseSettings):
         return self.storage_root / "graphics"
 
     @property
+    def resolved_library_dir(self) -> Path:
+        if self.library_dir is not None:
+            return Path(self.library_dir)
+        return self.storage_root / "library"
+
+    # Alias used by LibraryService / docs.
+    @property
+    def library_dir_path(self) -> Path:
+        return self.resolved_library_dir
+
+    @property
+    def upload_limit_bytes(self) -> int:
+        return int(self.upload_limit_gb * (1024**3))
+
+    @property
     def frame_rate(self) -> str:
         return f"{self.frame_rate_num}/{self.frame_rate_den}"
 
@@ -218,8 +241,11 @@ def ensure_storage(settings: Settings) -> Settings:
         settings.clips_dir,
         settings.stingers_dir,
         settings.graphics_dir,
+        settings.resolved_library_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)
+    if settings.import_dir is not None:
+        Path(settings.import_dir).mkdir(parents=True, exist_ok=True)
     try:
         ensure_output_domain(
             settings.output_domain,

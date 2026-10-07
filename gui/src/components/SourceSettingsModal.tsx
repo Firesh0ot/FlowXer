@@ -1,29 +1,37 @@
 import { useState } from "react";
-import type { LogicalInput, StingerSlot } from "../api";
+import type { LibraryItem, LogicalInput, StingerSlot } from "../api";
 
 const KINDS = ["test", "black", "mxl_live", "file", "replay"] as const;
 
 export function SourceSettingsModal({
   input,
   clips,
+  libraryClips,
   stingerSlots,
   onClose,
   onSave,
+  onOpenLibrary,
 }: {
   input: LogicalInput;
-  clips: { name: string }[];
+  clips: { name: string; library_item_id?: string | null; ready?: boolean }[];
+  libraryClips: LibraryItem[];
   stingerSlots: StingerSlot[];
   onClose: () => void;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
+  onOpenLibrary: () => void;
 }) {
   const [label, setLabel] = useState(input.label);
   const [kind, setKind] = useState(input.kind);
   const [groupHint, setGroupHint] = useState(input.group_hint ?? "");
   const [videoFlow, setVideoFlow] = useState(input.video?.flow_id ?? "");
   const [audioFlow, setAudioFlow] = useState(input.audio?.flow_id ?? "");
-  const [filePath, setFilePath] = useState(input.file_path ?? clips[0]?.name ?? "");
+  const [libraryItemId, setLibraryItemId] = useState(input.library_item_id ?? "");
+  const [filePath, setFilePath] = useState(input.file_path ?? "");
   const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
+
+  const readyClips = libraryClips.filter((item) => item.ready);
+  const legacyClips = clips.filter((clip) => !clip.library_item_id);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -60,17 +68,46 @@ export function SourceSettingsModal({
           </>
         ) : null}
         {kind === "file" || kind === "replay" ? (
-          <label>
-            Clip
-            <select value={filePath} onChange={(e) => setFilePath(e.target.value)}>
-              <option value="">Select clip</option>
-              {clips.map((clip) => (
-                <option key={clip.name} value={clip.name}>
-                  {clip.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <>
+            <label>
+              Library clip
+              <select
+                value={libraryItemId}
+                onChange={(e) => {
+                  setLibraryItemId(e.target.value);
+                  if (e.target.value) setFilePath("");
+                }}
+              >
+                <option value="">Select library clip</option>
+                {readyClips.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.name}
+                    {item.playback !== "unknown" ? ` (${item.playback})` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Legacy file path
+              <select
+                value={filePath}
+                onChange={(e) => {
+                  setFilePath(e.target.value);
+                  if (e.target.value) setLibraryItemId("");
+                }}
+              >
+                <option value="">None</option>
+                {legacyClips.map((clip) => (
+                  <option key={clip.name} value={clip.name}>
+                    {clip.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button type="button" className="ghost" onClick={onOpenLibrary}>
+              Open clip library…
+            </button>
+          </>
         ) : null}
         <label>
           Auto stinger
@@ -79,6 +116,7 @@ export function SourceSettingsModal({
             {stingerSlots.map((slot) => (
               <option key={slot.id} value={slot.id}>
                 {slot.label}
+                {slot.ready === false ? " (converting)" : ""}
               </option>
             ))}
           </select>
@@ -105,8 +143,14 @@ export function SourceSettingsModal({
                   payload.video = videoFlow ? { flow_id: videoFlow } : null;
                   payload.audio = audioFlow ? { flow_id: audioFlow } : null;
                 }
-                if ((kind === "file" || kind === "replay") && filePath) {
-                  payload.file_path = filePath;
+                if (kind === "file" || kind === "replay") {
+                  if (libraryItemId) {
+                    payload.library_item_id = libraryItemId;
+                    payload.file_path = null;
+                  } else if (filePath) {
+                    payload.file_path = filePath;
+                    payload.library_item_id = null;
+                  }
                 }
                 await onSave(payload);
                 onClose();

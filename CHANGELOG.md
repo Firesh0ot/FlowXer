@@ -25,6 +25,29 @@ in `docs/platform-integration-plan.md` §8.
   own output domain.
 - `deploy/kubernetes/flowxer-pod-network.yaml`; OCI labels `source` and
   `revision`.
+- Media library for clips and stingers: chunked upload (or a TGA folder,
+  ZIP or the watched `FLOWXER_IMPORT_DIR`), background conversion with
+  ffmpeg to a ProRes mezzanine, `/library`, `/uploads` and `/jobs` in the
+  API and File → Clip / Stinger library… in the GUI. Inputs and stinger
+  slots take a `library_item_id`. Legacy `storage/clips` and
+  `storage/stingers` are imported in the background and referenced in place.
+  Settings `FLOWXER_LIBRARY_DIR`, `FLOWXER_IMPORT_DIR`,
+  `FLOWXER_CONVERT_CONCURRENCY`, `FLOWXER_UPLOAD_LIMIT_GB`. Review fixes
+  before the release: a restart or a config import keeps library inputs and
+  slots (they are saved by item id; the whole state was dropped); a stinger
+  that is still converting hard-cuts instead of recursing into a 500; the
+  sound is conformed by ffmpeg, not in the mixer process (about 92 MB per
+  stereo minute); the GUI proxy passes upload chunks (nginx answered 413);
+  chunk sizes, the upload limit and the free disk space are enforced and
+  completing an upload is a rename; a file in the import dir that fails is
+  moved to `.failed/` instead of being retried every 4 s; the legacy import
+  no longer copies everything before the API starts; ffmpeg runs at low
+  CPU and I/O priority and is killed on cancel. Found on the lab: GStreamer
+  read the mezzanine's little-endian float sound as big-endian (silence) and
+  cannot play more than two PCM channels from MOV, so clip sound is now stereo
+  (or mono) big-endian float and stinger mezzanines carry no sound; the queue
+  in front of a file input's video (`FLOWXER_PREROLL_FRAMES`, which did
+  nothing) could take the sound pad and stop the input, and is gone.
 
 ### Changed
 

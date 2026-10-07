@@ -109,6 +109,10 @@ class LogicalInputCreate(BaseModel):
         default=None,
         description="Clip filename under storage/clips for file and replay inputs.",
     )
+    library_item_id: str | None = Field(
+        default=None,
+        description="Media-library clip id. Preferred over file_path when set.",
+    )
     group_hint: str | None = Field(
         default=None,
         description="Optional NMOS grouphint used to auto-discover matching video/audio flows.",
@@ -125,8 +129,8 @@ class LogicalInputCreate(BaseModel):
                 raise ValueError(
                     "mxl_live inputs need a video essence, an audio essence, or a group_hint"
                 )
-        if self.kind == InputKind.file and not self.file_path:
-            raise ValueError("file inputs require file_path")
+        if self.kind == InputKind.file and not self.file_path and not self.library_item_id:
+            raise ValueError("file inputs require file_path or library_item_id")
         return self
 
 
@@ -140,6 +144,7 @@ class LogicalInputUpdate(BaseModel):
     video: VideoEssence | None = None
     audio: AudioEssence | None = None
     file_path: str | None = None
+    library_item_id: str | None = None
     group_hint: str | None = None
     stinger_slot_id: str | None = Field(
         default=None,
@@ -200,8 +205,15 @@ class OverlayUpdate(BaseModel):
 
 
 class ReplayLoadRequest(BaseModel):
-    file_path: str = Field(..., description="Clip filename under storage/clips")
+    file_path: str | None = Field(default=None, description="Clip filename under storage/clips")
+    library_item_id: str | None = Field(default=None, description="Library clip id")
     input_id: str = Field(default="replay", description="Logical replay input to load")
+
+    @model_validator(mode="after")
+    def require_clip_ref(self) -> ReplayLoadRequest:
+        if not self.file_path and not self.library_item_id:
+            raise ValueError("file_path or library_item_id required")
+        return self
 
 
 class ReplayTransitionRequest(BaseModel):
@@ -257,6 +269,8 @@ class StorageClip(BaseModel):
     path: str
     size_bytes: int
     suffix: str
+    library_item_id: str | None = None
+    ready: bool = True
 
 
 class StingerInfo(BaseModel):
@@ -360,6 +374,10 @@ class StingerSlot(BaseModel):
     role: str = Field(description="shared, in, or out")
     label: str
     stinger_id: str = "replay-wipe"
+    library_item_id: str | None = Field(
+        default=None,
+        description="Media-library stinger id. When set, preferred over legacy stinger_id path.",
+    )
     kind: str = Field(default="sequence", description="sequence (TGA) or video")
     media_path: str | None = Field(
         default=None,
@@ -375,6 +393,7 @@ class StingerSlot(BaseModel):
         ge=0,
         description="Frame index when Program switches under the sting. Preferred over cut_ms in the GUI.",
     )
+    ready: bool = Field(default=True, description="False while library mezzanine is converting")
 
 
 class WorkspaceConfig(BaseModel):
@@ -416,6 +435,10 @@ class KeyerUpdate(BaseModel):
 
 class StingerSlotUpdate(BaseModel):
     stinger_id: str | None = None
+    library_item_id: str | None = Field(
+        default=None,
+        description="Assign a library stinger item (clears legacy-only binding when set)",
+    )
     kind: str | None = Field(default=None, description="sequence or video")
     media_path: str | None = Field(
         default=None,
@@ -521,8 +544,79 @@ class ConsoleState(BaseModel):
     webrtc: dict
     clips: list[StorageClip]
     stingers: list[StingerInfo]
+    library: list["LibraryItemOut"] = Field(default_factory=list)
+    jobs: list["ConvertJobOut"] = Field(default_factory=list)
     tally: TallyConfig = Field(default_factory=TallyConfig)
     nmos: dict[str, Any] = Field(
         default_factory=dict,
         description="IS-04/IS-05 node status: registry, node id, per-input receivers.",
     )
+
+
+class LibraryItemOut(BaseModel):
+    id: str
+    kind: str
+    name: str
+    tags: list[str] = Field(default_factory=list)
+    status: str = "missing"
+    ready: bool = False
+    playback: str = "unknown"
+    has_alpha: bool = False
+    cut_frame: int | None = None
+    cut_ms: int | None = None
+    frame_count: int = 0
+    duration_s: float = 0.0
+    thumb_url: str | None = None
+    error: str | None = None
+    source: str = "upload"
+    legacy_path: str | None = None
+    in_use: bool = False
+
+
+class LibraryItemPatch(BaseModel):
+    name: str | None = None
+    tags: list[str] | None = None
+    cut_frame: int | None = Field(default=None, ge=0)
+    cut_ms: int | None = Field(default=None, ge=0)
+
+
+class ConvertOptionsIn(BaseModel):
+    fit: str = "fit"
+    fps_mode: str = "drop"
+    loudness: bool = False
+    crossfade_ms: int = Field(default=0, ge=0, le=2000)
+    map_channels: int = Field(default=0, ge=0, le=2, description="Clip sound: 1 mono, 2 or 0 stereo")
+    sequence_fps: float | None = Field(default=None, gt=0)
+    cut_frame: int | None = Field(default=None, ge=0)
+    cut_ms: int | None = Field(default=None, ge=0)
+    tags: list[str] = Field(default_factory=list)
+
+
+class UploadInitRequest(BaseModel):
+    name: str
+    size: int = Field(..., ge=0)
+    kind: str = Field(default="clip", description="clip or stinger")
+    mode: str = Field(default="video", description="video | image_sequence | zip")
+    options: ConvertOptionsIn = Field(default_factory=ConvertOptionsIn)
+
+
+class UploadInitResponse(BaseModel):
+    id: str
+    chunk_size: int
+    received: list[int] = Field(default_factory=list)
+
+
+class ConvertJobOut(BaseModel):
+    id: str
+    item_id: str
+    format_id: str
+    state: str
+    progress: float = 0.0
+    error: str | None = None
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+class ReconvertRequest(BaseModel):
+    options: ConvertOptionsIn | None = None
