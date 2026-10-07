@@ -109,6 +109,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         mixer.nmos.boot(nmos_listener)
+        if settings.program_autostart:
+            mixer.autostart()
         yield
         mixer.shutdown()
 

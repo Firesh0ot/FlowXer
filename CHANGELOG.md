@@ -7,6 +7,13 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Added
 
+- Production structure from the environment (plan §3.10): `FLOWXER_FORMAT`,
+  `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and
+  `FLOWXER_PANELS` win over the saved state at every start; routes, keyers,
+  stingers and tally stay. The API refuses to change them (409), `GET /console`
+  lists them in `pinned` and the GUI greys them out.
+  `FLOWXER_PROGRAM_AUTOSTART` starts Program at process start. Unset, nothing
+  changes.
 - The GUI monitors (JPEG and WebRTC) show the pipeline's pictures: each
   source and, for the main panel, the mixed Program (`FLOWXER_MONITOR_FPS`,
   default 10). They were generated cards.
@@ -90,6 +97,9 @@ in `docs/platform-integration-plan.md` §8.
 - The status reports a Program without new frames for 3 s in `error`
   ("Program renders no frames …", the state stays `running` = on air), the log
   says it once, and `flowxer_program_stalled` is 1.
+- The source ⚙ in the GUI sends the flows and the group hint only when they
+  changed. Saving the auto-stinger of a live input without a route was 422,
+  and saving a routed one set its domain back to the output domain.
 - `GET /api/v1/preview/jpeg/{stream_id}` answers 404 with the accepted forms
   (`source:<input id>`, `panel:<panel id>:pgm|pvw`) for any other name or an
   input or panel that does not exist. `panel:program` was a 500

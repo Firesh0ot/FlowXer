@@ -100,7 +100,7 @@ class VisionMixer:
         self.library.consumers_fn = self._library_consumers
         self.library.add_listener(self._on_library_job)
         self.inputs: dict[str, LogicalInput] = {}
-        self.workspace = WorkspaceConfig()
+        self.workspace = self._pinned(WorkspaceConfig())
         self.panels: list[MixerPanel] = []
         self.keyers: list[DownstreamKeyer] = []
         self.stinger_slots: list[StingerSlot] = []
@@ -165,7 +165,64 @@ class VisionMixer:
             frame_count=self.settings.stinger_frame_count,
         )
 
+    def _pinned(self, workspace: WorkspaceConfig) -> WorkspaceConfig:
+        """The structure the environment sets (FLOWXER_FORMAT, ...) wins over saved values."""
+        pinned = self.settings.pinned_workspace
+        return workspace.model_copy(update={field: value for field, (value, _) in pinned.items()})
+
+    def _inputs_pinned_by(self) -> str | None:
+        """The variables that set the input list, or None when the API may change it."""
+        pinned = self.settings.pinned_workspace.get("logical_source_count")
+        return pinned[1] if pinned else None
+
+    def _pin_sources(self) -> None:
+        """The inputs the environment sets: live cam-1..N, test-1..M, Black, Replay. Ids,
+        kinds and labels come from the environment; routes, clips and auto-stingers of an
+        input with the same id and kind stay."""
+        plan = [
+            (f"cam-{n}", label, InputKind.mxl_live)
+            for n, label in enumerate(self.settings.live_input_labels, 1)
+        ]
+        plan += [
+            (f"test-{n}", f"Test {n}", InputKind.test)
+            for n in range(1, (self.settings.test_sources or 0) + 1)
+        ]
+        plan += [("black", "Black", InputKind.black), ("replay", "Replay", InputKind.replay)]
+        inputs: dict[str, LogicalInput] = {}
+        for slot, (input_id, label, kind) in enumerate(plan):
+            item = self.inputs.get(input_id)
+            if item is None or item.kind != kind:
+                essences = (
+                    {"video": VideoEssence(), "audio": AudioEssence()}
+                    if kind == InputKind.mxl_live
+                    else {}
+                )
+                item = LogicalInput(
+                    id=input_id,
+                    label=label,
+                    kind=kind,
+                    slot=slot,
+                    stinger_slot_id=item.stinger_slot_id if item else None,
+                    **essences,
+                )
+                self._apply_default_domain(item)
+            item.label = label
+            item.slot = slot
+            inputs[input_id] = item
+        self.inputs = inputs
+        # Buses on an input the environment removed start empty.
+        for name in ("program_input_id", "preview_input_id", "last_live_input_id"):
+            if getattr(self, name) not in inputs:
+                setattr(self, name, None)
+        for panel in self.panels:
+            if panel.program_input_id not in inputs:
+                panel.program_input_id = None
+            if panel.preview_input_id not in inputs:
+                panel.preview_input_id = None
+
     def _sync_sources(self) -> None:
+        if self._inputs_pinned_by():
+            self._pin_sources()
         desired = self.workspace.logical_source_count
         while len(self.inputs) > desired:
             last = self.list_inputs()[-1]
@@ -273,6 +330,9 @@ class VisionMixer:
 
     def apply_workspace(self, payload: WorkspaceUpdate) -> WorkspaceConfig:
         patch = payload.model_dump(exclude_unset=True)
+        for field, (value, variables) in self.settings.pinned_workspace.items():
+            if field in patch and patch[field] != value:
+                raise MixerError(f"{field} is set by {variables} (environment)")
         display_only = set(patch) <= {"source_tile_aspect"}
         if self.state == MixerState.running and not display_only:
             raise MixerError("stop the mixer before changing console layout")
@@ -508,6 +568,8 @@ class VisionMixer:
         self._sync_sources()
 
     def register_input(self, payload: LogicalInputCreate) -> LogicalInput:
+        if pinned := self._inputs_pinned_by():
+            raise MixerError(f"the input list is set by {pinned} (environment)")
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before adding inputs")
         if payload.id in self.inputs:
@@ -522,6 +584,12 @@ class VisionMixer:
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
         current = self.get_input(input_id)
         patch = payload.model_dump(exclude_unset=True)
+        pinned = self._inputs_pinned_by()
+        if pinned and any(
+            field in patch and patch[field] != getattr(current, field)
+            for field in ("label", "kind")
+        ):
+            raise MixerError(f"label and kind of {input_id} are set by {pinned} (environment)")
         if "stinger_slot_id" in patch:
             slot_id = patch["stinger_slot_id"] or None
             if slot_id:
@@ -566,6 +634,8 @@ class VisionMixer:
         return updated
 
     def delete_input(self, input_id: str) -> None:
+        if pinned := self._inputs_pinned_by():
+            raise MixerError(f"the input list is set by {pinned} (environment)")
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before removing inputs")
         if input_id not in self.inputs:
@@ -996,6 +1066,21 @@ class VisionMixer:
         self.nmos.sync_senders_from_outputs()
         self._publish_tally()
         return self.status()
+
+    def autostart(self) -> None:
+        """FLOWXER_PROGRAM_AUTOSTART: ME 1 Program on the first live input (or the first
+        input), Preview on the next one."""
+        inputs = self.list_inputs()
+        ordered = [item for item in inputs if item.kind == InputKind.mxl_live]
+        ordered += [item for item in inputs if item.kind != InputKind.mxl_live]
+        program = ordered[0].id
+        preview = ordered[1].id if len(ordered) > 1 else program
+        try:
+            self.start(MixerStartRequest(program_input_id=program, preview_input_id=preview))
+        except MixerError as exc:
+            log.error("FLOWXER_PROGRAM_AUTOSTART: Program did not start: %s", exc)
+            return
+        log.info("FLOWXER_PROGRAM_AUTOSTART: Program on %s, Preview on %s", program, preview)
 
     def _on_pipeline_error(self, message: str) -> None:
         """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
@@ -1530,7 +1615,7 @@ class VisionMixer:
         if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
             raise MixerError(f"not a {STATE_FORMAT} document")
         try:
-            workspace = WorkspaceConfig(**(data.get("workspace") or {}))
+            workspace = self._pinned(WorkspaceConfig(**(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]

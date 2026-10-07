@@ -194,6 +194,8 @@ export interface ConsoleState {
   jobs?: ConvertJob[];
   tally?: TallyConfig;
   nmos?: NmosStatus;
+  /** Workspace fields set by the environment, with the variables that set them. */
+  pinned?: Partial<Record<keyof WorkspaceConfig, string>>;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };

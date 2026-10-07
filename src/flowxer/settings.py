@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import socket
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from flowxer import __version__
 from flowxer.domain.nmos import output_domain_uuid, seed_short
@@ -11,6 +13,25 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
+
+# 24 logical sources at most, Black and Replay included.
+MAX_PINNED_INPUTS = 22
+
+
+def split_labels(value: str) -> list[str]:
+    """FLOWXER_INPUT_LABELS: a JSON array of strings, or comma-separated."""
+    text = (value or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            labels = json.loads(text)
+        except ValueError as exc:
+            raise ValueError(f"FLOWXER_INPUT_LABELS is not a JSON array: {exc}") from exc
+        if not all(isinstance(label, str) for label in labels):
+            raise ValueError("FLOWXER_INPUT_LABELS must be a JSON array of strings")
+        return [label.strip() for label in labels]
+    return [label.strip() for label in text.split(",")]
 
 
 class Settings(BaseSettings):
@@ -105,7 +126,46 @@ class Settings(BaseSettings):
     webrtc_udp_port_min: int = Field(default=32600, ge=1, le=65535)
     webrtc_udp_port_max: int = Field(default=32631, ge=1, le=65535)
 
+    # Production structure from the platform's designer (docs/platform-integration-plan.md
+    # §3.10). Unset or empty: the saved state and the GUI decide, as before. Set: the
+    # environment wins over the saved state at every start, and the API cannot change it.
+    format: str = ""
+    live_inputs: int | None = Field(default=None, ge=0, le=MAX_PINNED_INPUTS)
+    # JSON array or comma-separated; the rest are "Camera n".
+    input_labels: str = ""
+    test_sources: int | None = Field(default=None, ge=0, le=MAX_PINNED_INPUTS)
+    panels: int | None = Field(default=None, ge=1, le=4)
+    # Start Program after the state is restored: ME 1 on the first live input.
+    program_autostart: bool = False
+
     mxl_domain_deprecated: bool = False
+
+    @field_validator("live_inputs", "test_sources", "panels", mode="before")
+    @classmethod
+    def empty_is_unset(cls, value):
+        # A Kubernetes value rendered as "" means "not set".
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("format")
+    @classmethod
+    def validate_format(cls, value: str) -> str:
+        from flowxer.engine.formats import VIDEO_FORMATS
+
+        value = (value or "").strip()
+        if value and value not in VIDEO_FORMATS:
+            raise ValueError(f"FLOWXER_FORMAT must be one of {', '.join(VIDEO_FORMATS)}")
+        return value
+
+    @field_validator("input_labels")
+    @classmethod
+    def validate_input_labels(cls, value: str) -> str:
+        labels = split_labels(value)
+        if any(not label or len(label) > 128 for label in labels):
+            raise ValueError("FLOWXER_INPUT_LABELS: every label needs 1-128 characters")
+        if len(set(labels)) != len(labels):
+            # The platform finds the NMOS receivers by label.
+            raise ValueError("FLOWXER_INPUT_LABELS: labels must be unique")
+        return value
 
     @field_validator("api_token")
     @classmethod
@@ -135,6 +195,60 @@ class Settings(BaseSettings):
         elif self.mxl_output_domain_dir is None:
             self.mxl_output_domain_dir = self.mxl_root / f"flowxer-{self.seed_short}"
         return self
+
+    @model_validator(mode="after")
+    def resolve_structure(self) -> Settings:
+        labels = split_labels(self.input_labels)
+        live = self.live_inputs or 0
+        if len(labels) > live:
+            raise ValueError(
+                f"FLOWXER_INPUT_LABELS has {len(labels)} labels for {live} live inputs "
+                "(FLOWXER_LIVE_INPUTS)"
+            )
+        if live + (self.test_sources or 0) > MAX_PINNED_INPUTS:
+            raise ValueError(
+                f"FLOWXER_LIVE_INPUTS + FLOWXER_TEST_SOURCES must be at most {MAX_PINNED_INPUTS} "
+                "(with Black and Replay 24 sources)"
+            )
+        if self.format:
+            from flowxer.engine.formats import format_by_id
+
+            fmt = format_by_id(self.format)
+            self.width, self.height = fmt.width, fmt.height
+            self.frame_rate_num, self.frame_rate_den = fmt.frame_rate_num, fmt.frame_rate_den
+        return self
+
+    @property
+    def live_input_labels(self) -> list[str]:
+        """Labels of the live inputs cam-1..N: FLOWXER_INPUT_LABELS, then "Camera n"."""
+        labels = split_labels(self.input_labels)
+        return [
+            labels[index] if index < len(labels) else f"Camera {index + 1}"
+            for index in range(self.live_inputs or 0)
+        ]
+
+    @property
+    def pinned_workspace(self) -> dict[str, tuple[Any, str]]:
+        """Workspace fields the environment sets: field -> (value, variables that set it)."""
+        pinned: dict[str, tuple[Any, str]] = {}
+        if self.format:
+            pinned["format_id"] = (self.format, "FLOWXER_FORMAT")
+        names = [
+            name
+            for name, is_set in (
+                ("FLOWXER_LIVE_INPUTS", self.live_inputs is not None),
+                ("FLOWXER_INPUT_LABELS", bool(split_labels(self.input_labels))),
+                ("FLOWXER_TEST_SOURCES", self.test_sources is not None),
+            )
+            if is_set
+        ]
+        if names:
+            # Live inputs, test sources, then Black and Replay.
+            count = (self.live_inputs or 0) + (self.test_sources or 0) + 2
+            pinned["logical_source_count"] = (count, ", ".join(names))
+        if self.panels is not None:
+            pinned["mixer_panel_count"] = (self.panels, "FLOWXER_PANELS")
+        return pinned
 
     @property
     def resolved_registry_url(self) -> str:

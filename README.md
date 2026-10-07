@@ -285,6 +285,12 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `NMOS_REGISTRY_ADDRESS`, `NMOS_REGISTRY_PORT` | empty | Registration API; or the full URL in `FLOWXER_NMOS_REGISTRY_URL` (e.g. `http://10.0.0.5:3210`) |
 | `NMOS_DNS_SD` / `FLOWXER_NMOS_DNS_SD` | `false` | Not implemented; `true` only logs a warning |
 | `FLOWXER_STATE_DIR` | `/config` | Saved state, see below |
+| `FLOWXER_FORMAT` | empty | Format id: `1080p50`, `1080p25`, `1080p59.94`, `1080p29.97`, `720p50`, `720p59.94`, `2160p50`, `2160p25`. Sets the workspace format, raster and rate. See *Production structure* below |
+| `FLOWXER_LIVE_INPUTS` | empty | Number of `mxl_live` inputs `cam-1`..`cam-N` (0-22) |
+| `FLOWXER_INPUT_LABELS` | empty | Their labels: JSON array or comma-separated, unique; missing ones are `Camera n` |
+| `FLOWXER_TEST_SOURCES` | empty (0 with the inputs set) | Number of `test` inputs `test-1`..`test-M` after the live ones |
+| `FLOWXER_PANELS` | empty | Number of MEs (1-4) |
+| `FLOWXER_PROGRAM_AUTOSTART` | `false` | Start Program at process start (after the state is restored) |
 | `SHUTDOWN_TIMEOUT_S` / `FLOWXER_SHUTDOWN_TIMEOUT_S` | `10` | Open requests get half; the rest is for stopping media and deregistering |
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
@@ -297,6 +303,32 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 The mixer saves its configuration to `FLOWXER_STATE_DIR/state.json` after every successful change through the API and after every IS-05 activation, and loads it on start: inputs, console layout, mixer panels, downstream keyers, stinger slots, tally receivers and the receiver connections. Mount `/config` to keep it across restarts. A file that cannot be read is logged and ignored (the mixer starts with defaults).
 
 `GET /api/v1/config/export` returns the same document; `POST /api/v1/config/import` restores it (409 while the mixer is on-air, 422 when it is invalid). It holds no secrets: the API token only comes from the environment.
+
+### Production structure from the environment
+
+The platform's production designer sets the mixer's structure through the environment, so the inputs and the NMOS labels are known before the pod starts. A variable that is set wins over the saved state at every start; unset (or empty), the saved state and the GUI decide, as before.
+
+| Variables | Set | Example |
+|---|---|---|
+| `FLOWXER_FORMAT` | `format_id`, raster and rate | `1080p50` |
+| `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` | The input list: `logical_source_count` and each input's id, kind and label | `4`; `["Cam 1","Cam 2","Cam 3","Cam 4"]` or `Cam 1,Cam 2,Cam 3,Cam 4`; `0` |
+| `FLOWXER_PANELS` | `mixer_panel_count` | `2` |
+
+With the input list set, the inputs are in this order: `cam-1`..`cam-N` (`mxl_live`, labelled from `FLOWXER_INPUT_LABELS`, the rest `Camera n`), `test-1`..`test-M` (`test`, `Test n`), then `black` (Black) and `replay` (Replay). Live and test inputs together are at most 22 (24 sources). More labels than live inputs, a duplicate or empty label, or an unknown format stop the process with exit code 78.
+
+- **Kept from the saved state:** receiver connections (IS-05), and per input the essences, group hint, clip and auto-stinger when its id and kind stay the same; keyers, stingers, tally and the other workspace fields. Routes of an input the environment removed are dropped; Program or Preview on it starts empty.
+- **API and GUI:** what the environment sets cannot be changed (409, the message names the variable): `PUT /workspace` with another `format_id`, `logical_source_count` or `mixer_panel_count`; `POST` and `DELETE /inputs`; `PATCH /inputs/{id}` with another `label` or `kind`. The current values pass, so a client may send whole documents. `GET /console` lists these fields in `pinned` (field → variables); the GUI greys them out.
+- **Export and import:** the export is unchanged. An imported document gets the environment's structure, as at a start; everything else in it is imported.
+- **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input, senders `ME <n> PGM Video` and `ME <n> PGM Audio` for each ME.
+- `FLOWXER_PROGRAM_AUTOSTART=true` starts Program once the state is restored: ME 1 Program on the first live input (else the first input), Preview on the next one. A start that fails is logged and shown in `GET /mixer`; the process keeps running.
+
+```bash
+FLOWXER_FORMAT=1080p50
+FLOWXER_LIVE_INPUTS=4
+FLOWXER_INPUT_LABELS='["Camera 1","Camera 2","Camera 3","Camera 4"]'
+FLOWXER_PANELS=2
+FLOWXER_PROGRAM_AUTOSTART=true
+```
 
 ### Exit codes
 

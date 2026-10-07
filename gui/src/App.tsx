@@ -283,6 +283,7 @@ export default function App() {
           clips={snapshot.clips}
           libraryClips={(snapshot.library ?? []).filter((item) => item.kind === "clip")}
           stingerSlots={snapshot.stinger_slots}
+          pinnedBy={snapshot.pinned?.logical_source_count}
           onClose={() => setSourceEdit(null)}
           onOpenLibrary={() => {
             setSourceEdit(null);
