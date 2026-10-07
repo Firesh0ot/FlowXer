@@ -16,6 +16,8 @@ from starlette.concurrency import run_in_threadpool
 
 from flowxer import __version__
 from flowxer.api.auth import ApiTokenMiddleware
+from flowxer.api.library_routes import get_mixer as get_library_mixer
+from flowxer.api.library_routes import router as library_router
 from flowxer.api.metrics import ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.domain.mxl_domain import DomainError
@@ -58,7 +60,14 @@ OPENAPI_TAGS = [
     },
     {
         "name": "storage",
-        "description": "Clip store plus TGA-sequence and video stingers.",
+        "description": "Legacy clip store plus TGA-sequence and video stingers.",
+    },
+    {
+        "name": "library",
+        "description": (
+            "Media library: chunked upload, background conversion to intra-frame "
+            "mezzanine, RAM/decode-ahead playback metadata, and conversion jobs."
+        ),
     },
     {
         "name": "replay",
@@ -100,6 +109,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         mixer.nmos.boot(nmos_listener)
+        if settings.program_autostart:
+            mixer.autostart()
         yield
         mixer.shutdown()
 
@@ -115,7 +126,8 @@ def create_app(
             "The media plane is GStreamer. FastAPI is the control plane; "
             "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
             "keyer and a file player with storage access. "
-            "Stingers are TGA sequences or video files; Program cuts at a chosen frame. "
+            "Clips and stingers go through a media library (upload → convert → mezzanine). "
+            "Stingers may also be TGA sequences or video files; Program cuts at a chosen frame. "
             "The operator GUI on port 9620 is a thin client of this API. "
             "TSL UMD 5.0 carries Program/Preview tally and source labels to "
             "Companion, VSM, BFE, Riedel HI, and other listeners. "
@@ -158,8 +170,10 @@ def create_app(
     app.state.settings = settings
     app.state.mixer = mixer
     app.dependency_overrides[get_mixer] = lambda: app.state.mixer
+    app.dependency_overrides[get_library_mixer] = lambda: app.state.mixer
     app.dependency_overrides[get_settings] = lambda: settings
     app.include_router(api_router, prefix="/api/v1")
+    app.include_router(library_router, prefix="/api/v1")
 
     @app.get("/metrics", include_in_schema=False)
     def metrics_root() -> PlainTextResponse:

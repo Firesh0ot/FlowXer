@@ -81,8 +81,16 @@ def monitor_tap(settings: Settings, name: str) -> str:
         "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
         f"! videoconvertscale ! video/x-raw,format=RGB,width={MONITOR_WIDTH},height={MONITOR_HEIGHT},"
         f"pixel-aspect-ratio=1/1,framerate={settings.monitor_fps}/1 "
-        f"! appsink name={name} max-buffers=1 drop=true sync=false"
+        # async=false: a source that never delivers (an MXL flow that is missing or silent) must not
+        # keep the pipeline from PLAYING, or the Program sink waits and Program stops after a frame.
+        f"! appsink name={name} max-buffers=1 drop=true sync=false async=false"
     )
+
+
+# mxlsrc of an mxl_live essence without a route: a flow id that never exists, so the source
+# waits for a route like for a missing flow. A non-UUID id made mxlsrc fail at start, and the
+# failed sound branch kept the pipeline out of PLAYING (Program stopped after one frame).
+UNROUTED_FLOW = "00000000-0000-0000-0000-000000000000"
 
 
 def _video_source_bin(
@@ -94,7 +102,7 @@ def _video_source_bin(
     caps = _v210(settings)
     bgra = _bgra(settings)
     if inp.kind == InputKind.mxl_live:
-        flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else "UNBOUND"
+        flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:video", domain)
         chain = (
             f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} "
@@ -140,7 +148,7 @@ def _audio_source_bin(
 ) -> str:
     caps = _audio(settings)
     if inp.kind == InputKind.mxl_live:
-        flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else "UNBOUND"
+        flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:audio", domain)
         chain = (
             f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "

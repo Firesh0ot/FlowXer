@@ -188,3 +188,35 @@ def test_group_hint_bind_reads_mirror_domain(mixer: VisionMixer) -> None:
     assert bound.video is not None
     assert str(bound.video.flow_id) == "5fbec3b1-1b0f-417d-9059-8b94a47197ed"
     assert bound.video.domain_id == "fff00000-0000-0000-0000-000000000001"
+
+
+def test_a_route_to_the_wrong_domain_finds_its_flow(mixer: VisionMixer) -> None:
+    # Platform 9.16.33: routes without a domain default to the own output domain, which does not
+    # hold the flow; mxlsrc read nothing there. Any domain that holds the flow is used, local first.
+    root = mixer.settings.mxl_root
+    local = root / "cam"
+    mirror = root / "mirror-deck"
+    _write_domain(local, "cccccccc-cccc-cccc-cccc-ccccccccccc1")
+    _write_domain(mirror, "dddddddd-dddd-dddd-dddd-ddddddddddd1")
+    video = "5fbec3b1-1b0f-417d-9059-8b94a47197ed"
+    audio = "339fa87e-fdb0-5ad5-9956-6b82751e0957"
+    _write_flow(local, video, "video/v210", "cam")
+    _write_flow(mirror, video, "video/v210", "cam")
+    _write_flow(mirror, audio, "audio/float32", "deck")
+    mixer.register_input(
+        LogicalInputCreate(
+            id="studio-a",
+            label="Studio A",
+            kind=InputKind.mxl_live,
+            video=VideoEssence(flow_id=video),
+            audio=AudioEssence(flow_id=audio, channels=2),
+        )
+    )
+    created = mixer.get_input("studio-a")
+    assert created.audio is not None and created.audio.domain_id == "flowxer-test"
+    paths = mixer._source_domain_paths()
+    assert Path(paths["studio-a:video"]).resolve() == local.resolve()
+    assert Path(paths["studio-a:audio"]).resolve() == mirror.resolve()
+    # A flow that is nowhere yet stays in the named domain, where it may appear.
+    mixer.apply_nmos_receiver("studio-a", "audio", domain_id=None, flow_id="11111111-2222-3333-4444-555555555555", enabled=True)
+    assert Path(mixer._source_domain_paths()["studio-a:audio"]).resolve() == mixer.settings.output_domain.resolve()

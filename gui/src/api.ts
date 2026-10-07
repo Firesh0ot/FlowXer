@@ -6,6 +6,7 @@ export interface LogicalInput {
   kind: InputKind;
   slot: number;
   file_path?: string | null;
+  library_item_id?: string | null;
   group_hint?: string | null;
   stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;
@@ -35,10 +36,41 @@ export interface StingerSlot {
   role: string;
   label: string;
   stinger_id: string;
+  library_item_id?: string | null;
   kind?: "sequence" | "video";
   media_path?: string | null;
   cut_ms?: number | null;
   cut_frame?: number | null;
+  ready?: boolean;
+}
+
+export interface LibraryItem {
+  id: string;
+  kind: "clip" | "stinger";
+  name: string;
+  tags: string[];
+  status: string;
+  ready: boolean;
+  playback: string;
+  has_alpha: boolean;
+  cut_frame?: number | null;
+  cut_ms?: number | null;
+  frame_count: number;
+  duration_s: number;
+  thumb_url?: string | null;
+  error?: string | null;
+  source: string;
+  legacy_path?: string | null;
+  in_use: boolean;
+}
+
+export interface ConvertJob {
+  id: string;
+  item_id: string;
+  format_id: string;
+  state: string;
+  progress: number;
+  error?: string | null;
 }
 
 export interface StingerInfo {
@@ -156,10 +188,14 @@ export interface ConsoleState {
   mixer: MixerStatus;
   resources: ResourceInfo;
   webrtc: { enabled: boolean; protocol: string };
-  clips: { name: string; path: string }[];
+  clips: { name: string; path: string; library_item_id?: string | null; ready?: boolean }[];
   stingers: StingerInfo[];
+  library?: LibraryItem[];
+  jobs?: ConvertJob[];
   tally?: TallyConfig;
   nmos?: NmosStatus;
+  /** Workspace fields set by the environment, with the variables that set them. */
+  pinned?: Partial<Record<keyof WorkspaceConfig, string>>;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -265,4 +301,85 @@ export const api = {
     }).then((r) => parse<TallyConfig>(r)),
   tallyRefresh: () =>
     fetch("/api/v1/tally/refresh", { method: "POST" }).then((r) => parse<TallyConfig>(r)),
+  library: (kind?: "clip" | "stinger", q = "") => {
+    const params = new URLSearchParams();
+    if (kind) params.set("kind", kind);
+    if (q) params.set("q", q);
+    const qs = params.toString();
+    return fetch(`/api/v1/library${qs ? `?${qs}` : ""}`).then((r) => parse<LibraryItem[]>(r));
+  },
+  libraryDelete: (id: string) =>
+    fetch(`/api/v1/library/${id}`, { method: "DELETE" }).then(async (r) => {
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        throw new Error(typeof body.detail === "string" ? body.detail : r.statusText);
+      }
+    }),
+  libraryReconvert: (id: string) =>
+    fetch(`/api/v1/library/${id}/reconvert`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) =>
+      parse<ConvertJob>(r),
+    ),
+  jobs: () => fetch("/api/v1/jobs").then((r) => parse<ConvertJob[]>(r)),
+  cancelJob: (id: string) =>
+    fetch(`/api/v1/jobs/${id}/cancel`, { method: "POST" }).then((r) => parse<ConvertJob>(r)),
+  uploadInit: (payload: {
+    name: string;
+    size: number;
+    kind: "clip" | "stinger";
+    mode: "video" | "image_sequence" | "zip";
+    options?: Record<string, unknown>;
+  }) =>
+    fetch("/api/v1/uploads", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse<{ id: string; chunk_size: number; received: number[] }>(r)),
+  uploadChunk: async (uploadId: string, index: number, chunk: Blob) => {
+    const response = await fetch(`/api/v1/uploads/${uploadId}/chunks/${index}`, {
+      method: "PUT",
+      body: chunk,
+    });
+    return parse<{ id: string; chunk_size: number; received: number[] }>(response);
+  },
+  uploadComplete: (uploadId: string) =>
+    fetch(`/api/v1/uploads/${uploadId}/complete`, { method: "POST" }).then((r) => parse<LibraryItem>(r)),
+  uploadSequence: async (
+    name: string,
+    files: File[],
+    options?: { sequence_fps?: number; cut_frame?: number; fit?: string },
+  ) => {
+    const body = new FormData();
+    body.set("name", name);
+    if (options?.sequence_fps != null) body.set("sequence_fps", String(options.sequence_fps));
+    if (options?.cut_frame != null) body.set("cut_frame", String(options.cut_frame));
+    if (options?.fit) body.set("fit", options.fit);
+    for (const file of files) body.append("files", file, file.name);
+    const response = await fetch("/api/v1/uploads/sequence", { method: "POST", body });
+    return parse<LibraryItem>(response);
+  },
 };
+
+export async function uploadFileChunked(
+  file: File,
+  kind: "clip" | "stinger",
+  mode: "video" | "zip",
+  options: Record<string, unknown> = {},
+  onProgress?: (ratio: number) => void,
+): Promise<LibraryItem> {
+  const session = await api.uploadInit({
+    name: file.name,
+    size: file.size,
+    kind,
+    mode,
+    options,
+  });
+  const chunkSize = session.chunk_size;
+  const total = Math.max(1, Math.ceil(file.size / chunkSize));
+  for (let index = 0; index < total; index += 1) {
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    await api.uploadChunk(session.id, index, file.slice(start, end));
+    onProgress?.((index + 1) / total);
+  }
+  return api.uploadComplete(session.id);
+}

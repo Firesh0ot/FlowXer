@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -17,8 +19,23 @@ def _paginate(items: list, request: Request) -> list:
     return sliced
 
 
+class _CollapseSlashes:
+    """Route `//` like `/`: the device's control href ends in `/`, and controllers that
+    append `/single/...` to it send `.../v1.2//single/...`. nmos-cpp nodes accept that."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and "//" in scope.get("path", ""):
+            path = re.sub(r"/{2,}", "/", scope["path"])
+            scope = dict(scope, path=path, raw_path=path.encode())
+        await self.app(scope, receive, send)
+
+
 def create_nmos_app(node: NmosNode) -> FastAPI:
     app = FastAPI(title="FlowXer NMOS Node", docs_url=None, redoc_url=None)
+    app.add_middleware(_CollapseSlashes)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

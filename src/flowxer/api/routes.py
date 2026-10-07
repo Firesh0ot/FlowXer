@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from flowxer.api.schemas import (
     ConsoleState,
+    ConvertJobOut,
     DomainInfo,
     DownstreamKeyer,
     ErrorBody,
@@ -42,7 +43,7 @@ from flowxer.domain.mxl_domain import load_domain_info, scan_domains
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
-from flowxer.engine.preview import render_jpeg
+from flowxer.engine.preview import UnknownStream, render_jpeg, resolve_stream
 from flowxer.engine.resources import collect_resources
 from flowxer.engine.tally import TALLY_PRESETS
 from flowxer.engine.webrtc import create_whep_answer, webrtc_available
@@ -443,7 +444,9 @@ def replay_load(
     payload: ReplayLoadRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> LogicalInput:
     try:
-        return mixer.load_clip(payload.input_id, payload.file_path)
+        if payload.library_item_id:
+            return mixer.load_library_clip(payload.input_id, payload.library_item_id)
+        return mixer.load_clip(payload.input_id, payload.file_path or "")
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND if "not found" in str(exc) else status.HTTP_409_CONFLICT)
 
@@ -543,8 +546,13 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
+        library=[mixer.library_item_out(item) for item in mixer.library.list_items()],
+        jobs=[ConvertJobOut(**job.model_dump()) for job in mixer.library.queue.list_jobs()],
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
+        pinned={
+            field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
+        },
     )
 
 
@@ -599,6 +607,11 @@ def get_workspace(mixer: VisionMixer = Depends(get_mixer)) -> WorkspaceConfig:
     response_model=WorkspaceConfig,
     tags=["gui"],
     summary="Apply Settings: raster, source tiles, logical sources, mixer panels, stingers, downstream keyers",
+    description=(
+        "Fields the environment sets (`GET /console` `pinned`) can only be sent with their "
+        "current value; another value is 409."
+    ),
+    responses={409: {"model": ErrorBody}},
 )
 def put_workspace(
     payload: WorkspaceUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -681,8 +694,16 @@ def patch_stinger_slot(
     "/preview/jpeg/{stream_id:path}",
     tags=["gui"],
     summary="JPEG snapshot of a source or ME bus (WebRTC fallback)",
+    description=(
+        "`stream_id` is `source:<input id>` or `panel:<panel id>:pgm|pvw`; any other name is 404."
+    ),
+    responses={404: {"model": ErrorBody}},
 )
 def preview_jpeg(stream_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Response:
+    try:
+        resolve_stream(mixer, stream_id)
+    except UnknownStream as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     payload = render_jpeg(mixer, stream_id)
     return Response(content=payload, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 

@@ -21,6 +21,10 @@ Apache-2.0
 
 MIT
   React, React DOM, Vite (operator GUI)
+  Concepts and conversion/loop-conform semantics adapted from
+  mxl-test-player — https://github.com/LeeO86/mxl-test-player
+  Copyright (c) 2026 Adrian Hilber (MIT). FlowXer reimplements the
+  ideas in Python/GStreamer; no C++ sources were copied.
 
 BSD
   Chromium Embedded Framework (CEF), bundled with gstcefsrc in the mixer image

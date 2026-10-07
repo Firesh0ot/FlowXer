@@ -265,6 +265,24 @@ Node that cannot resolve domains would fail the fabrics agent.
 
 Smaller slices inside 2–3 are allowed if a PR grows past review size.
 
+### 3.10 Production structure from the environment (designer contract)
+
+The platform's production designer sets FlowXer through Kubernetes values and
+plans NMOS links by label (its catalog lists `nmos_ports`), so the structure
+has to be known before the pod starts. Until now it only lived in the saved
+state and the GUI.
+
+| Question | Decision |
+|---|---|
+| Settings | `FLOWXER_FORMAT`, `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS` (JSON array or comma-separated), `FLOWXER_TEST_SOURCES`, `FLOWXER_PANELS`, `FLOWXER_PROGRAM_AUTOSTART`. `FLOWXER_` names only: the platform has no common names for these. Invalid values are exit 78. |
+| Env or saved state | The environment wins at every start, like mxl-st2110-gateway where env beats the config file. Three groups, each set by its own variables: format; input list; panel count. Unset or empty: the saved state decides, so existing deployments do not change. |
+| Kept from the saved state | IS-05 routes, and per input essences, group hint, clip and auto-stinger when id and kind stay; keyers, stingers, tally, the other workspace fields. All of it stays in the export. |
+| Input ids | Live `cam-1..N` (the ids the seeded cameras have today, so saved routes on `cam-n` survive the switch), test `test-1..M` (labels `Test n`, not `Camera n`, so they are not taken for cameras), then `black`, `replay`. `FLOWXER_TEST_SOURCES` is 0 when only the live inputs are set. |
+| Labels | Unique (receivers are found by label); fewer labels than inputs: `Camera n`; more: exit 78. Panels stay `ME n`. |
+| API and GUI | One rule: a field the environment sets may be sent with its current value, another value is 409 naming the variable (`PUT /workspace`, `POST`/`DELETE /inputs`, `PATCH /inputs/{id}` label and kind). `GET /console` `pinned` maps each such workspace field to its variables; the GUI disables them. Not chosen: an `origin` field in `WorkspaceConfig`, which would end up in `state.json` and the export. |
+| Import | Replaces the document's structure with the environment's (as at a start) instead of refusing it, so an export from another mixer still brings its routes and UI state. |
+| Autostart | In the app lifespan after the NMOS node started: ME 1 Program on the first live input (else the first input), Preview on the next. A failed start is logged and stays visible in `GET /mixer`; the process keeps running. |
+
 ---
 
 ## 4. Behaviour to implement (normative for later PRs)
@@ -392,3 +410,4 @@ integration and AMWA script in PR 8).
   - MXL audio: mxlsrc gives an N-channel flow the first N speaker positions, so audioconvert downmixed all 16 test-player channels into Program; unpositioned channels cannot change their count in 1.24 at all. A probe sets a first-channels `mix-matrix` on `audioconvert name=amap_<input>` when the caps arrive, so Program gets channels 1 and 2 of any flow.
   - `flowxer_frames_rendered_total` counts Program frames at the video sink (it counted JPEG previews).
 - **Monitor pictures** (`feat/monitor-pictures`): the last open point of the lab run. Every source's `tee` and Program (after the compositor) feed an `appsink` at `FLOWXER_MONITOR_FPS` (default 10): `videorate` drops first, then one `videoconvertscale` pass makes the 640×360 RGB picture from the full-size frame; the newest one is kept. `render_monitor` (JPEG and WebRTC) uses it while the pipeline runs and draws the card otherwise. Tested in the GStreamer CI job: the pictures change with the test source's time overlay, black stays black, and the Program monitor follows a cut.
+- **Designer contract** (`feat/designer-structure-env`): the production structure from the environment (§3.10). `FLOWXER_FORMAT`, `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and `FLOWXER_PANELS` win over the saved state at every start, the API refuses to change them (409) and `GET /console` reports them in `pinned`; `FLOWXER_PROGRAM_AUTOSTART` starts Program at process start. NMOS labels: receivers `<input label> Video/Audio`, senders `ME <n> PGM Video/Audio`. The GUI's source ⚙ now sends flows and group hint only when they changed (an unrouted live input could not be saved).
