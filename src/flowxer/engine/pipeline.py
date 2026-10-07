@@ -81,7 +81,9 @@ def monitor_tap(settings: Settings, name: str) -> str:
         "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
         f"! videoconvertscale ! video/x-raw,format=RGB,width={MONITOR_WIDTH},height={MONITOR_HEIGHT},"
         f"pixel-aspect-ratio=1/1,framerate={settings.monitor_fps}/1 "
-        f"! appsink name={name} max-buffers=1 drop=true sync=false"
+        # async=false: a source that never delivers (an MXL flow that is missing or silent) must not
+        # keep the pipeline from PLAYING, or the Program sink waits and Program stops after a frame.
+        f"! appsink name={name} max-buffers=1 drop=true sync=false async=false"
     )
 
 

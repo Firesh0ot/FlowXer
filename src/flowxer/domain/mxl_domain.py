@@ -89,6 +89,20 @@ def resolve_domain_path(root: Path, domain_id: str) -> Path | None:
     return None
 
 
+def find_flow_domain(root: Path, flow_id: str) -> Path | None:
+    """The domain under `root` that holds `flow_id`; a local domain wins over a fabrics mirror."""
+    needle = flow_id.strip()
+    if not needle:
+        return None
+    found: Path | None = None
+    for info in scan_domains(root):
+        if (Path(info.path) / f"{needle}.mxl-flow").is_dir():
+            if not info.mirror:
+                return Path(info.path)
+            found = found or Path(info.path)
+    return found
+
+
 def load_domain_info(domain: Path) -> DomainInfo:
     info = _domain_from_dir(domain)
     if info is not None:
