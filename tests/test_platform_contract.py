@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from flowxer import app as app_module
 from flowxer.api.metrics import ready_payload
@@ -297,3 +298,218 @@ def test_program_flow_ids_follow_the_seed(settings: Settings) -> None:
     finally:
         for mixer in mixers:
             mixer.stop()
+
+
+# Production structure from the environment (the platform's designer, plan §3.10).
+
+
+def test_structure_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FLOWXER_FORMAT", "720p50")
+    monkeypatch.setenv("FLOWXER_LIVE_INPUTS", "3")
+    monkeypatch.setenv("FLOWXER_INPUT_LABELS", '["Cam A", "Cam, B"]')
+    monkeypatch.setenv("FLOWXER_TEST_SOURCES", "1")
+    monkeypatch.setenv("FLOWXER_PANELS", "2")
+    monkeypatch.setenv("FLOWXER_PROGRAM_AUTOSTART", "true")
+    settings = Settings(_env_file=None)
+    assert settings.live_input_labels == ["Cam A", "Cam, B", "Camera 3"]
+    assert (settings.width, settings.height, settings.frame_rate) == (1280, 720, "50/1")
+    assert settings.program_autostart is True
+    assert settings.pinned_workspace == {
+        "format_id": ("720p50", "FLOWXER_FORMAT"),
+        "logical_source_count": (
+            6,
+            "FLOWXER_LIVE_INPUTS, FLOWXER_INPUT_LABELS, FLOWXER_TEST_SOURCES",
+        ),
+        "mixer_panel_count": (2, "FLOWXER_PANELS"),
+    }
+
+    monkeypatch.setenv("FLOWXER_INPUT_LABELS", " Cam A , Cam B ")
+    assert Settings(_env_file=None).live_input_labels == ["Cam A", "Cam B", "Camera 3"]
+
+
+def test_structure_settings_unset_or_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("FORMAT", "LIVE_INPUTS", "INPUT_LABELS", "TEST_SOURCES", "PANELS"):
+        monkeypatch.setenv(f"FLOWXER_{name}", "")
+    settings = Settings(_env_file=None)
+    assert settings.pinned_workspace == {}
+    assert settings.program_autostart is False
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"FLOWXER_FORMAT": "1080i50"},
+        {"FLOWXER_PANELS": "5"},
+        {"FLOWXER_PANELS": "0"},
+        {"FLOWXER_LIVE_INPUTS": "23"},
+        {"FLOWXER_LIVE_INPUTS": "20", "FLOWXER_TEST_SOURCES": "3"},
+        {"FLOWXER_LIVE_INPUTS": "1", "FLOWXER_INPUT_LABELS": "A,B"},
+        {"FLOWXER_INPUT_LABELS": "A"},
+        {"FLOWXER_LIVE_INPUTS": "2", "FLOWXER_INPUT_LABELS": "A,A"},
+        {"FLOWXER_LIVE_INPUTS": "3", "FLOWXER_INPUT_LABELS": "A,,B"},
+        {"FLOWXER_LIVE_INPUTS": "2", "FLOWXER_INPUT_LABELS": "[1, 2]"},
+        {"FLOWXER_LIVE_INPUTS": "2", "FLOWXER_INPUT_LABELS": '["A", "B"'},
+    ],
+)
+def test_invalid_structure_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_invalid_format_exits_78(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert _run_exit_code(monkeypatch, tmp_path, FLOWXER_FORMAT="1080i50") == 78
+
+
+def _pin(settings: Settings, **values) -> Settings:
+    # Attributes instead of the environment: the fixture's small raster stays.
+    for name, value in values.items():
+        setattr(settings, name, value)
+    return settings
+
+
+def test_env_structure_seeds_inputs_panels_and_nmos_labels(settings: Settings) -> None:
+    _pin(settings, live_inputs=2, input_labels="Cam A,Cam B", test_sources=1, panels=2)
+    mixer = VisionMixer(settings)
+    inputs = mixer.list_inputs()
+    assert [(item.id, item.kind, item.label) for item in inputs] == [
+        ("cam-1", InputKind.mxl_live, "Cam A"),
+        ("cam-2", InputKind.mxl_live, "Cam B"),
+        ("test-1", InputKind.test, "Test 1"),
+        ("black", InputKind.black, "Black"),
+        ("replay", InputKind.replay, "Replay"),
+    ]
+    assert [item.slot for item in inputs] == [0, 1, 2, 3, 4]
+    assert mixer.workspace.logical_source_count == 5
+    assert [panel.label for panel in mixer.panels] == ["ME 1", "ME 2"]
+    assert [item["label"] for item in mixer.nmos.receivers()] == [
+        "Cam A Video",
+        "Cam A Audio",
+        "Cam B Video",
+        "Cam B Audio",
+    ]
+    assert [item["label"] for item in mixer.nmos.senders()] == [
+        "ME 1 PGM Video",
+        "ME 1 PGM Audio",
+        "ME 2 PGM Video",
+        "ME 2 PGM Audio",
+    ]
+
+
+def test_env_structure_wins_over_saved_state_but_keeps_routes(settings: Settings) -> None:
+    mixer = VisionMixer(_routed_settings(settings))
+    mixer.apply_workspace(
+        WorkspaceUpdate(format_id="1080p25", mixer_panel_count=3, stinger_count=2)
+    )
+    mixer.update_input(
+        "cam-1",
+        LogicalInputUpdate(
+            kind=InputKind.mxl_live, label="Old", video=VideoEssence(), audio=AudioEssence()
+        ),
+    )
+    mixer.update_input("cam-2", LogicalInputUpdate(stinger_slot_id="shared-2"))
+    mixer.replace_tally_receivers([TallyReceiver(id="vsm", label="VSM", host="127.0.0.1")])
+    mixer.update_keyer("dsk-1", title="Breaking")
+    rid = ids.receiver_id(settings.resolved_nmos_seed, "cam-1", "video")
+    response = TestClient(create_nmos_app(mixer.nmos)).patch(
+        f"/x-nmos/connection/v1.2/single/receivers/{rid}/staged",
+        json={
+            "sender_id": SENDER_ID,
+            "master_enable": True,
+            "activation": {"mode": "activate_immediate"},
+            "transport_params": [{"mxl_flow_id": VIDEO_FLOW}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    mixer.set_preview("cam-5")  # starts the mixer
+    mixer.stop()
+    mixer.persist()
+
+    _pin(settings, format="720p50", live_inputs=2, input_labels="Cam A", panels=1)
+    again = VisionMixer(settings)
+    assert [(item.id, item.kind, item.label) for item in again.list_inputs()] == [
+        ("cam-1", InputKind.mxl_live, "Cam A"),
+        ("cam-2", InputKind.mxl_live, "Camera 2"),
+        ("black", InputKind.black, "Black"),
+        ("replay", InputKind.replay, "Replay"),
+    ]
+    assert again.workspace.format_id == "720p50"
+    assert (settings.width, settings.height) == (1280, 720)
+    assert again.workspace.logical_source_count == 4
+    assert len(again.panels) == again.workspace.mixer_panel_count == 1
+    # cam-5 is gone: Preview starts empty.
+    assert again.preview_input_id is None
+    assert again.panels[0].preview_input_id is None
+    # Routes, auto-stingers, stingers, keyers and tally stay from the saved state.
+    active = again.nmos.active(rid, "receivers")
+    assert active["sender_id"] == SENDER_ID
+    assert active["transport_params"][0]["mxl_flow_id"] == VIDEO_FLOW
+    assert str(again.get_input("cam-1").video.flow_id) == VIDEO_FLOW
+    assert again.get_input("cam-2").stinger_slot_id == "shared-2"
+    assert again.workspace.stinger_count == 2
+    assert again.keyers[0].title == "Breaking"
+    assert [item.id for item in again.tally.receivers] == ["vsm"]
+
+
+def test_env_pinned_structure_is_refused_by_the_api(settings: Settings) -> None:
+    _pin(settings, format="720p50", live_inputs=2, input_labels="Cam A", panels=2)
+    mixer = VisionMixer(settings)
+    client = TestClient(app_module.create_app(settings, mixer))
+
+    for patch, variables in (
+        ({"format_id": "1080p25"}, "FLOWXER_FORMAT"),
+        ({"logical_source_count": 8}, "FLOWXER_LIVE_INPUTS, FLOWXER_INPUT_LABELS"),
+        ({"mixer_panel_count": 3}, "FLOWXER_PANELS"),
+    ):
+        response = client.put("/api/v1/workspace", json=patch)
+        assert response.status_code == 409
+        assert variables in response.json()["detail"]
+    response = client.put("/api/v1/workspace", json={"mixer_panel_count": 2, "stinger_count": 2})
+    assert response.status_code == 200, response.text
+
+    created = client.post("/api/v1/inputs", json={"id": "cam-9", "label": "X", "kind": "test"})
+    assert created.status_code == 409
+    assert client.delete("/api/v1/inputs/cam-2").status_code == 409
+    assert client.patch("/api/v1/inputs/cam-1", json={"label": "Other"}).status_code == 409
+    assert client.patch("/api/v1/inputs/cam-1", json={"kind": "test"}).status_code == 409
+    # The GUI sends label and kind with every save: unchanged values pass.
+    response = client.patch(
+        "/api/v1/inputs/cam-1",
+        json={"label": "Cam A", "kind": "mxl_live", "stinger_slot_id": "shared-1"},
+    )
+    assert response.status_code == 200, response.text
+
+    # An import keeps the environment's structure, like a start.
+    exported = client.get("/api/v1/config/export").json()
+    exported["workspace"].update(format_id="1080p25", logical_source_count=8, mixer_panel_count=4)
+    exported["inputs"][0]["label"] = "Imported"
+    assert client.post("/api/v1/config/import", json=exported).status_code == 200
+    assert mixer.workspace.format_id == "720p50"
+    assert mixer.workspace.logical_source_count == 4
+    assert mixer.workspace.mixer_panel_count == 2
+    assert mixer.get_input("cam-1").label == "Cam A"
+    assert mixer.get_input("cam-1").stinger_slot_id == "shared-1"
+
+    assert client.get("/api/v1/console").json()["pinned"] == {
+        "format_id": "FLOWXER_FORMAT",
+        "logical_source_count": "FLOWXER_LIVE_INPUTS, FLOWXER_INPUT_LABELS",
+        "mixer_panel_count": "FLOWXER_PANELS",
+    }
+
+
+def test_program_autostart(settings: Settings) -> None:
+    mixer = VisionMixer(_pin(settings, live_inputs=2, program_autostart=True))
+    with TestClient(app_module.create_app(settings, mixer)):
+        assert mixer.state.value == "running"
+        assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
+        panel = mixer.panels[0]
+        assert (panel.program_input_id, panel.preview_input_id) == ("cam-1", "cam-2")
+    assert mixer.state.value == "idle"
+
+
+def test_program_autostart_without_live_inputs(settings: Settings) -> None:
+    mixer = VisionMixer(_pin(settings, program_autostart=True))
+    with TestClient(app_module.create_app(settings, mixer)):
+        assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
+        assert mixer.get_input("cam-1").kind == InputKind.test

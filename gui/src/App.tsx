@@ -264,6 +264,7 @@ export default function App() {
           input={sourceEdit}
           clips={snapshot.clips}
           stingerSlots={snapshot.stinger_slots}
+          pinnedBy={snapshot.pinned?.logical_source_count}
           onClose={() => setSourceEdit(null)}
           onSave={async (payload) => {
             await api.patchInput(sourceEdit.id, payload);

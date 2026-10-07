@@ -545,6 +545,9 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         stingers=mixer.list_stingers(),
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
+        pinned={
+            field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
+        },
     )
 
 
@@ -599,6 +602,11 @@ def get_workspace(mixer: VisionMixer = Depends(get_mixer)) -> WorkspaceConfig:
     response_model=WorkspaceConfig,
     tags=["gui"],
     summary="Apply Settings: raster, source tiles, logical sources, mixer panels, stingers, downstream keyers",
+    description=(
+        "Fields the environment sets (`GET /console` `pinned`) can only be sent with their "
+        "current value; another value is 409."
+    ),
+    responses={409: {"model": ErrorBody}},
 )
 def put_workspace(
     payload: WorkspaceUpdate, mixer: VisionMixer = Depends(get_mixer)

@@ -7,12 +7,15 @@ export function SourceSettingsModal({
   input,
   clips,
   stingerSlots,
+  pinnedBy,
   onClose,
   onSave,
 }: {
   input: LogicalInput;
   clips: { name: string }[];
   stingerSlots: StingerSlot[];
+  /** Variables that set the inputs' ids, kinds and labels, when the environment does. */
+  pinnedBy?: string;
   onClose: () => void;
   onSave: (payload: Record<string, unknown>) => Promise<void>;
 }) {
@@ -31,11 +34,19 @@ export function SourceSettingsModal({
         <h2>{input.id}</h2>
         <label>
           Name
-          <input value={label} onChange={(e) => setLabel(e.target.value)} />
+          <input
+            value={label}
+            disabled={Boolean(pinnedBy)}
+            onChange={(e) => setLabel(e.target.value)}
+          />
         </label>
         <label>
           Kind
-          <select value={kind} onChange={(e) => setKind(e.target.value as LogicalInput["kind"])}>
+          <select
+            value={kind}
+            disabled={Boolean(pinnedBy)}
+            onChange={(e) => setKind(e.target.value as LogicalInput["kind"])}
+          >
             {KINDS.map((item) => (
               <option key={item} value={item}>
                 {item}
@@ -43,6 +54,9 @@ export function SourceSettingsModal({
             ))}
           </select>
         </label>
+        {pinnedBy ? (
+          <p className="hint">Name and kind are set by the production (environment: {pinnedBy}).</p>
+        ) : null}
         {kind === "mxl_live" ? (
           <>
             <label>
@@ -101,9 +115,15 @@ export function SourceSettingsModal({
                   stinger_slot_id: stingerSlotId || null,
                 };
                 if (kind === "mxl_live") {
-                  payload.group_hint = groupHint || null;
-                  payload.video = videoFlow ? { flow_id: videoFlow } : null;
-                  payload.audio = audioFlow ? { flow_id: audioFlow } : null;
+                  // Only what changed: an unrouted live input has essences without flows, and
+                  // sending null for them would make it invalid; a route keeps its domain.
+                  if (groupHint !== (input.group_hint ?? "")) payload.group_hint = groupHint || null;
+                  if (videoFlow !== (input.video?.flow_id ?? "")) {
+                    payload.video = videoFlow ? { flow_id: videoFlow } : null;
+                  }
+                  if (audioFlow !== (input.audio?.flow_id ?? "")) {
+                    payload.audio = audioFlow ? { flow_id: audioFlow } : null;
+                  }
                 }
                 if ((kind === "file" || kind === "replay") && filePath) {
                   payload.file_path = filePath;

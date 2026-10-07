@@ -526,3 +526,11 @@ class ConsoleState(BaseModel):
         default_factory=dict,
         description="IS-04/IS-05 node status: registry, node id, per-input receivers.",
     )
+    pinned: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Workspace fields set by the environment, with the variables that set them "
+            "(format_id, logical_source_count, mixer_panel_count). The API refuses to change "
+            "them; a pinned logical_source_count also fixes the inputs' ids, kinds and labels."
+        ),
+    )

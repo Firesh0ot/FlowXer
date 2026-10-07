@@ -16,6 +16,7 @@ export function SettingsModal({
 
   const set = (key: keyof WorkspaceConfig, value: string | number) =>
     setForm((current) => ({ ...current, [key]: value }));
+  const pinned = snapshot.pinned ?? {};
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -26,9 +27,19 @@ export function SettingsModal({
           Source tile aspect can change while on-air. Per-stinger media and cut frame are on the ⚙
           next to each stinger. Auto-stinger for a source is on that source’s ⚙.
         </p>
+        {Object.keys(pinned).length ? (
+          <p className="hint">
+            Greyed-out fields are set by the production (environment:{" "}
+            {Object.values(pinned).join(", ")}).
+          </p>
+        ) : null}
         <label>
           Format
-          <select value={form.format_id} onChange={(e) => set("format_id", e.target.value)}>
+          <select
+            value={form.format_id}
+            disabled={Boolean(pinned.format_id)}
+            onChange={(e) => set("format_id", e.target.value)}
+          >
             {snapshot.formats.map((fmt) => (
               <option key={fmt.id} value={fmt.id}>
                 {fmt.label}
@@ -53,6 +64,7 @@ export function SettingsModal({
             min={1}
             max={24}
             value={form.logical_source_count}
+            disabled={Boolean(pinned.logical_source_count)}
             onChange={(e) => set("logical_source_count", Number(e.target.value))}
           />
         </label>
@@ -63,6 +75,7 @@ export function SettingsModal({
             min={1}
             max={4}
             value={form.mixer_panel_count}
+            disabled={Boolean(pinned.mixer_panel_count)}
             onChange={(e) => set("mixer_panel_count", Number(e.target.value))}
           />
         </label>
