@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-
 
 def samples_until_grain(index: int, rate_num: int, rate_den: int, sample_rate: int = 48000) -> int:
     """Truncating integer cadence used by mxl-test-player.
@@ -31,6 +29,11 @@ def crossfade_loop_file(path: Path, channels: int, samples: int, crossfade_sampl
     """Blend the head and the tail of raw interleaved float32 audio so a loop has no click:
     sample i of both becomes head*(1-a) + tail*a with a = i/n. Only the two n-sample windows
     are read and written. Returns False when the file is too short for a crossfade."""
+    # Imported here, not at module level: numpy loaded before GStreamer makes libmxl unwind
+    # with libunwind instead of libgcc, and the exception libmxl throws (and catches) for a
+    # missing flow then crashes the mixer (SIGSEGV at start with an unrouted or missing flow).
+    import numpy as np
+
     n = crossfade_samples
     if channels < 1 or n <= 1 or samples <= n * 2:
         return False
