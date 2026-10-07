@@ -67,6 +67,11 @@ in `docs/platform-integration-plan.md` §8.
 - The status reports a Program without new frames for 3 s in `error`
   ("Program renders no frames …", the state stays `running` = on air), the log
   says it once, and `flowxer_program_stalled` is 1.
+- `GET /api/v1/preview/jpeg/{stream_id}` answers 404 with the accepted forms
+  (`source:<input id>`, `panel:<panel id>:pgm|pvw`) for any other name or an
+  input or panel that does not exist. `panel:program` was a 500
+  (`not enough values to unpack`), `program` a NO SIGNAL picture. A bare input
+  id still works; a WebRTC monitor of an unknown name shows NO SIGNAL.
 - The NMOS node answers paths with a doubled slash. The device's IS-05 control
   href ends in `/`, and a controller that appends `/single/...` to it asked for
   `/x-nmos/connection/v1.2//single/receivers/<id>/active` and got 404 for every

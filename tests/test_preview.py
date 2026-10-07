@@ -69,3 +69,18 @@ def test_pipeline_black_is_black_not_smpte(mixer: VisionMixer) -> None:
     assert "timeoverlay" not in black_line
     cam = next(line for line in description.splitlines() if "vsrc_cam-1" in line)
     assert "pattern=smpte" in cam
+
+
+def test_preview_jpeg_of_an_unknown_name_is_404(client) -> None:
+    for name in ("program", "panel:program", "panel:me-9:pgm", "panel:me-1:out", "source:nope"):
+        response = client.get(f"/api/v1/preview/jpeg/{name}")
+        assert response.status_code == 404, name
+        assert "source:<input id> or panel:<panel id>:pgm|pvw" in response.json()["detail"]
+    for name in ("source:cam-1", "panel:me-1:pvw", "cam-1"):
+        assert client.get(f"/api/v1/preview/jpeg/{name}").status_code == 200, name
+
+
+def test_monitor_of_an_unknown_name_is_a_card(mixer: VisionMixer) -> None:
+    # The WebRTC track keeps drawing when its input or panel is removed.
+    frame = render_monitor(mixer, "panel:program", width=96, height=54)
+    assert frame.size == (96, 54)
