@@ -87,6 +87,12 @@ def monitor_tap(settings: Settings, name: str) -> str:
     )
 
 
+# mxlsrc of an mxl_live essence without a route: a flow id that never exists, so the source
+# waits for a route like for a missing flow. A non-UUID id made mxlsrc fail at start, and the
+# failed sound branch kept the pipeline out of PLAYING (Program stopped after one frame).
+UNROUTED_FLOW = "00000000-0000-0000-0000-000000000000"
+
+
 def _video_source_bin(
     inp: LogicalInput,
     settings: Settings,
@@ -96,7 +102,7 @@ def _video_source_bin(
     caps = _v210(settings)
     bgra = _bgra(settings)
     if inp.kind == InputKind.mxl_live:
-        flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else "UNBOUND"
+        flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:video", domain)
         chain = (
             f"mxlsrc name=vsrc_{inp.id} video-flow-id={flow_id} "
@@ -142,7 +148,7 @@ def _audio_source_bin(
 ) -> str:
     caps = _audio(settings)
     if inp.kind == InputKind.mxl_live:
-        flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else "UNBOUND"
+        flow_id = str(inp.audio.flow_id) if inp.audio and inp.audio.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:audio", domain)
         chain = (
             f"mxlsrc name=asrc_{inp.id} audio-flow-id={flow_id} "
@@ -250,20 +256,18 @@ def build_pipeline_description(
         f"\npgmt. ! {monitor_tap(settings, MONITOR_PROGRAM)}" if settings.monitor_fps else ""
     )
 
-    # async=false: the pipeline is live, so the sinks must not wait for a first buffer to reach
-    # PLAYING; a Program or sound source that delivers nothing would otherwise hold everything.
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout async=false flow-id={output_video_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=vout flow-id={output_video_flow_id} domain={_gst_string(domain)}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
-            f"mxlsink name=aout async=false flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=aout flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
         )
     else:
-        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true async=false"
-        audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true async=false"
+        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"
+        audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true"
 
     # The compositor converts each pad itself and skips a pad whose alpha is 0, so
     # the B bus and an idle keyer cost nothing until they are shown.
@@ -272,11 +276,11 @@ input-selector name=vsel sync-streams=true cache-buffers=true
 input-selector name=vselb sync-streams=true cache-buffers=true
 input-selector name=asel sync-streams=true cache-buffers=true
 input-selector name=aselb sync-streams=true cache-buffers=true
-compositor name=comp background=black emit-signals=true force-live=true
+compositor name=comp background=black emit-signals=true
   {PAD_PROGRAM}::zorder=0
   {PAD_MIX}::zorder=1 {PAD_MIX}::alpha=0.0
   {PAD_KEYER}::zorder=2 {PAD_KEYER}::alpha={overlay_alpha}
-audiomixer name=amix emit-signals=true force-live=true {PAD_PROGRAM}::volume=1.0 {PAD_MIX}::volume=0.0
+audiomixer name=amix emit-signals=true {PAD_PROGRAM}::volume=1.0 {PAD_MIX}::volume=0.0
 
 {video_sources}
 

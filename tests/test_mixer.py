@@ -7,7 +7,11 @@ from flowxer.api.schemas import AudioEssence, InputKind, LogicalInputUpdate, Mix
 from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.api.metrics import render_prometheus
 from flowxer.api.schemas import MixerState
-from flowxer.engine.pipeline import build_pipeline_description, stinger_bin_description
+from flowxer.engine.pipeline import (
+    UNROUTED_FLOW,
+    build_pipeline_description,
+    stinger_bin_description,
+)
 
 
 def test_start_publishes_uncompressed_output_flows(mixer: VisionMixer) -> None:
@@ -65,6 +69,13 @@ def test_pipeline_uses_mxl_elements_when_requested(mixer: VisionMixer) -> None:
     # GUI monitors: one picture per source and one of Program.
     assert "appsink name=mon_cam-1 " in description
     assert "appsink name=mon__program " in description
+    # A source without data must not hold the pipeline out of PLAYING through its monitor.
+    assert "appsink name=mon_cam-1 max-buffers=1 drop=true sync=false async=false" in description
+    # Unrouted mxl_live essences wait on a flow id that never exists ("UNBOUND" made mxlsrc fail).
+    assert f"video-flow-id={UNROUTED_FLOW} " in description
+    assert f"audio-flow-id={UNROUTED_FLOW} " in description
+    # force-live made the mixers drop late buffers: dark frames at the end of fades.
+    assert "force-live" not in description
     mixer.settings.monitor_fps = 0
     without = build_pipeline_description(
         settings=mixer.settings,
