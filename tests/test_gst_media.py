@@ -257,3 +257,72 @@ def test_mxl_stereo_audio_passes_unchanged() -> None:
     frame = struct.pack("<2f", 0.5, -0.5)
     caps = "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2,channel-mask=(bitmask)0x3"
     assert _first_frame(caps, frame * 480, 2) == pytest.approx((0.5, -0.5))
+
+
+def _push(source, pts_ms: float, duration_ms: float, size: int) -> None:
+    from gi.repository import Gst
+
+    buffer = Gst.Buffer.new_wrapped(bytes(size))
+    buffer.pts = int(pts_ms * 1_000_000)
+    buffer.duration = int(duration_ms * 1_000_000)
+    source.emit("push-buffer", buffer)
+
+
+def test_program_buffers_that_go_back_in_time_are_dropped() -> None:
+    # 10.17.40 on the lab and the platform: right after a start the compositor sent [0.04, 0.06) and
+    # then [0, 0.08), the audiomixer [0, 0.01) and then [0, 0.02). mxlsink cannot write behind
+    # what it wrote, failed silently, and Program video or audio stopped for good.
+    from flowxer.engine.gst_runtime import GstRuntime
+
+    runtime = GstRuntime()
+    runtime.start(
+        'appsrc name=v format=time caps="video/x-raw,format=v210,width=48,height=2,framerate=50/1" '
+        "! fakesink name=vout sync=false "
+        'appsrc name=a format=time caps="audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2" '
+        "! fakesink name=aout sync=false"
+    )
+    try:
+        video, audio = runtime.pipeline.get_by_name("v"), runtime.pipeline.get_by_name("a")
+        for pts, duration in ((0, 20), (20, 20), (40, 20), (0, 80), (80, 20), (100, 20)):
+            _push(video, pts, duration, 256)
+        for pts, duration in ((0, 10), (0, 20), (20, 10), (30, 10)):
+            _push(audio, pts, duration, 3840)
+        _wait(lambda: runtime.program_frames == 5, lambda: f"5 Program frames ({runtime.program_frames})")
+        _wait(lambda: runtime.program_dropped == {"video": 1, "audio": 1}, lambda: str(runtime.program_dropped))
+    finally:
+        runtime.stop()
+
+
+def test_a_source_waiting_in_an_allocation_query_can_be_started_again() -> None:
+    # 10.17.40: a retargeted mxlsrc sent its allocation query into its queue, whose thread waited
+    # downstream (an input-selector whose active input had stopped). The source's thread then held
+    # its stream lock, and the next route took the source to NULL and blocked for good under the
+    # NMOS lock. A blocking probe stands in for the waiting input-selector here.
+    from gi.repository import Gst
+
+    from flowxer.engine.gst_runtime import GstRuntime, run_bounded
+
+    runtime = GstRuntime()
+    runtime.start(
+        "videotestsrc name=src is-live=true ! video/x-raw,width=64,height=36,framerate=50/1 "
+        "! queue name=q max-size-buffers=2 leaky=downstream ! identity name=gate ! fakesink sync=false"
+    )
+    try:
+        source = runtime.pipeline.get_by_name("src")
+        blocked = threading.Event()
+
+        def hold(_pad, _info):
+            blocked.set()
+            return Gst.PadProbeReturn.OK
+
+        runtime.pipeline.get_by_name("gate").get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, hold
+        )
+        assert blocked.wait(5), "the branch did not block"
+        # The first restart leaves the source in its allocation query, the second one has to
+        # take it down again. Both must come back.
+        for _ in range(2):
+            assert run_bounded(lambda: runtime._restart_source(source), 5, "restart")
+            time.sleep(0.3)
+    finally:
+        runtime.stop()

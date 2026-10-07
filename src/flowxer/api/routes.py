@@ -38,7 +38,7 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
-from flowxer.api.metrics import ready_payload, render_prometheus
+from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.domain.mxl_domain import load_domain_info, scan_domains
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
@@ -97,9 +97,11 @@ def api_metrics(mixer: VisionMixer = Depends(get_mixer)) -> PlainTextResponse:
     )
 
 
-@router.get("/livez", tags=["system"], summary="Liveness probe (process up)")
-def api_livez() -> dict:
-    return {"status": "live"}
+@router.get("/livez", tags=["system"], summary="Liveness probe: 503 when the control plane is stuck")
+async def api_livez(mixer: VisionMixer = Depends(get_mixer)) -> JSONResponse:
+    # async: answered on the event loop, also when the worker threads are all blocked.
+    code, body = live_payload(mixer)
+    return JSONResponse(status_code=code, content=body)
 
 
 @router.get("/readyz", tags=["system"], summary="Readiness: MXL root and output domain")

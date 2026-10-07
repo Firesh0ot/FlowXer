@@ -70,6 +70,15 @@ def render_prometheus(mixer) -> str:
         "# HELP flowxer_frames_dropped_total Dropped mixer frames",
         "# TYPE flowxer_frames_dropped_total counter",
         _line("flowxer_frames_dropped_total", int(getattr(mixer, "frames_dropped", 0))),
+        "# HELP flowxer_program_buffers_dropped_total Program buffers dropped before mxlsink because they went back in time",
+        "# TYPE flowxer_program_buffers_dropped_total counter",
+        *(
+            _line("flowxer_program_buffers_dropped_total", count, {"essence": essence})
+            for essence, count in (getattr(mixer, "program_dropped", None) or {"video": 0, "audio": 0}).items()
+        ),
+        "# HELP flowxer_control_plane_busy_seconds Age of the oldest running control-plane operation (0: none)",
+        "# TYPE flowxer_control_plane_busy_seconds gauge",
+        _line("flowxer_control_plane_busy_seconds", round(_busy_seconds(mixer), 3)),
         "# HELP flowxer_input_late_grains_total MXL grains arrived late",
         "# TYPE flowxer_input_late_grains_total counter",
         _line("flowxer_input_late_grains_total", int(getattr(mixer, "late_grains", 0))),
@@ -124,6 +133,13 @@ def render_prometheus(mixer) -> str:
     for kind in ("cut", "mix", "stinger"):
         lines.append(_line("flowxer_transitions_total", int(counts.get(kind, 0)), {"type": kind}))
     lines += [
+        "# HELP flowxer_input_restarts_total MXL sources started again after they failed",
+        "# TYPE flowxer_input_restarts_total counter",
+    ]
+    restarts = getattr(mixer, "input_restarts", {}) or {}
+    for (input_id, essence), count in sorted(restarts.items()):
+        lines.append(_line("flowxer_input_restarts_total", count, {"input": input_id, "essence": essence}))
+    lines += [
         "# HELP flowxer_input_state 1 for the current per-essence input state",
         "# TYPE flowxer_input_state gauge",
     ]
@@ -142,6 +158,26 @@ def render_prometheus(mixer) -> str:
                     )
                 )
     return "\n".join(lines) + "\n"
+
+
+def _busy_seconds(mixer) -> float:
+    watchdog = getattr(mixer, "watchdog", None)
+    oldest = watchdog.oldest() if watchdog is not None else None
+    return oldest[1] if oldest else 0.0
+
+
+def live_payload(mixer) -> tuple[int, dict[str, Any]]:
+    """503 when a control-plane operation (IS-05 activation, Program start or stop, a source
+    restart) has run longer than the watchdog allows: the pod needs a restart."""
+    watchdog = getattr(mixer, "watchdog", None)
+    stuck = watchdog.stuck() if watchdog is not None else None
+    if stuck is None:
+        return 200, {"status": "live"}
+    operation, seconds = stuck
+    return 503, {
+        "status": "stuck",
+        "reason": f"{operation} has not finished for {seconds:.0f} s (limit {watchdog.stuck_after_s:.0f} s)",
+    }
 
 
 def ready_payload(mixer) -> tuple[int, dict[str, Any]]:

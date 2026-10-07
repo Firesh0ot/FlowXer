@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -669,7 +670,16 @@ class NmosNode:
                 return outputs.audio_flow_id
         return None
 
+    def _busy(self, operation: str):
+        watchdog = getattr(self.mixer, "watchdog", None)
+        return watchdog.busy(operation) if watchdog is not None else nullcontext()
+
     def patch_staged(self, resource_id: str, side: str, body: dict[str, Any]) -> dict[str, Any]:
+        # Waiting for the lock counts too: an activation that cannot get it is stuck as well.
+        with self._busy("IS-05 activation"):
+            return self._patch_staged(resource_id, side, body)
+
+    def _patch_staged(self, resource_id: str, side: str, body: dict[str, Any]) -> dict[str, Any]:
         resource_id = resource_id.rstrip("/")
         side = side.rstrip("/")
         unknown = sorted(set(body) - STAGED_PATCH_FIELDS)
@@ -819,7 +829,7 @@ class NmosNode:
         self._cancel_scheduled(resource_id)
 
         def _fire() -> None:
-            with self.lock:
+            with self._busy("IS-05 scheduled activation"), self.lock:
                 staged = self._staged.get(resource_id)
                 if not staged:
                     return
