@@ -56,11 +56,11 @@ in `docs/platform-integration-plan.md` §8.
   missing, in another domain than the route says, or a frozen mirror). The
   input's GUI monitor never got a first frame, so the pipeline never reached
   PLAYING and Program stopped after a few frames while the mixer said
-  `running` (small platform: 2–6 frames in 10 h). The pipeline is now set up as
-  the live pipeline it is: the GUI monitor taps and the Program/sound sinks do
-  not wait for a first buffer (`async=false`), and the compositor and the
-  audiomixer always mix on time (`force-live=true`) instead of waiting for a
-  pad without data. Such an input shows black and silence.
+  `running` (small platform: 2–6 frames in 10 h). The GUI monitor taps no
+  longer wait for a first buffer (`async=false`), and an `mxl_live` essence
+  without a route reads a flow id that never exists (nil UUID) instead of
+  `UNBOUND`, which made `mxlsrc` fail at start and held the pipeline the same
+  way. Such an input shows black and silence.
 - A route whose domain does not hold the flow (IS-05 and REST default a
   missing domain to the own output domain) reads the flow from the domain
   below the MXL root that has it, a local domain before a fabrics mirror.
