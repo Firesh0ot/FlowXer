@@ -60,6 +60,7 @@ from flowxer.engine.stinger import (
     StingerPlayer,
     cut_frame_from_ms,
     cut_ms_from_frame,
+    duration_ms_from_frames,
     generate_replay_wipe,
     inspect_stinger,
     list_stingers,
@@ -69,6 +70,8 @@ from flowxer.engine.stinger import (
 from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
 from flowxer.engine.webrtc import webrtc_available
+from flowxer.library.models import LibraryItem, LibraryKind
+from flowxer.library.service import LibraryService
 from flowxer.settings import Settings, ensure_storage
 
 log = logging.getLogger(__name__)
@@ -84,11 +87,16 @@ class MixerError(RuntimeError):
     pass
 
 
+class StingerNotReady(MixerError):
+    """Raised when a library stinger has no mezzanine yet; callers hard-cut instead."""
+
+
 class VisionMixer:
     """Control-plane + media-plane orchestrator for the DMF vision mixer."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.library = LibraryService(settings)
         self.inputs: dict[str, LogicalInput] = {}
         self.workspace = WorkspaceConfig()
         self.panels: list[MixerPanel] = []
@@ -138,6 +146,8 @@ class VisionMixer:
         self._sync_stinger_slots()
         self._store = StateStore(settings.state_dir)
         self._restore_state()
+        self.library.start(self.workspace.format_id, fps=self.settings.fps)
+        self._refresh_stinger_ready_flags()
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -271,7 +281,8 @@ class VisionMixer:
         if aspect not in {None, "16:9", "9:16"}:
             raise MixerError("source_tile_aspect must be 16:9 or 9:16")
         data.update(patch)
-        if data["format_id"] != self.workspace.format_id:
+        format_changed = data["format_id"] != self.workspace.format_id
+        if format_changed:
             fmt = format_by_id(data["format_id"])
             self.settings.width = fmt.width
             self.settings.height = fmt.height
@@ -282,8 +293,12 @@ class VisionMixer:
         self._sync_panels()
         self._sync_keyers()
         self._sync_stinger_slots()
+        if format_changed:
+            # Mixer is off-air here; re-convert library items for the new raster/rate.
+            self.library.set_format(self.workspace.format_id, fps=self.settings.fps)
         self.nmos.reconcile_inputs()
         self._publish_tally()
+        self._refresh_stinger_ready_flags()
         return self.workspace
 
     def get_panel(self, panel_id: str) -> MixerPanel:
@@ -335,6 +350,34 @@ class VisionMixer:
         if payload.label is not None:
             slot.label = payload.label
         slot.kind = kind
+
+        if payload.library_item_id is not None:
+            item = self.library.get(payload.library_item_id)
+            if item is None or item.kind != LibraryKind.stinger:
+                raise MixerError(f"unknown library stinger {payload.library_item_id}")
+            if slot.library_item_id and slot.library_item_id != item.id:
+                self.library.mark_free(slot.library_item_id, f"slot:{slot.id}")
+            slot.library_item_id = item.id
+            slot.stinger_id = item.name or item.id
+            self.library.mark_in_use(item.id, f"slot:{slot.id}")
+            info = self._stinger_info_from_library(item)
+            slot.kind = info.kind
+            slot.media_path = info.media_path
+            if payload.cut_frame is not None or payload.cut_ms is not None:
+                updated = self.library.patch(
+                    item.id,
+                    cut_frame=payload.cut_frame,
+                    cut_ms=payload.cut_ms,
+                )
+                slot.cut_frame = updated.cut_frame
+                slot.cut_ms = updated.cut_ms
+            else:
+                slot.cut_frame = info.cut_frame
+                slot.cut_ms = info.cut_ms
+            slot.ready = info.frame_count > 0 and bool(
+                self.library.mezzanine_path(item.id, self.workspace.format_id)
+            )
+            return slot
 
         if kind == "video" and payload.media_path:
             video = Path(payload.media_path)
@@ -429,7 +472,15 @@ class VisionMixer:
         return self.settings.default_stinger
 
     def _info_for_slot(self, slot: StingerSlot | None, stinger_id: str | None = None) -> StingerInfo:
-        info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
+        if slot is not None and slot.library_item_id:
+            item = self.library.get(slot.library_item_id)
+            if item is None:
+                raise StingerNotReady(f"library stinger {slot.library_item_id} missing")
+            info = self._stinger_info_from_library(item)
+            if not self.library.mezzanine_path(item.id, self.workspace.format_id):
+                raise StingerNotReady(f"library stinger {item.id} not ready")
+        else:
+            info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
         if slot is None:
             return info
         fps = info.fps or self.settings.fps
@@ -474,7 +525,11 @@ class VisionMixer:
             if slot_id:
                 self.get_stinger_slot(slot_id)
             patch["stinger_slot_id"] = slot_id
-        if self.state == MixerState.running and payload.file_path is None:
+        library_item_id = patch.get("library_item_id", None)
+        changing_media = payload.file_path is not None or (
+            "library_item_id" in patch and patch.get("library_item_id") is not None
+        )
+        if self.state == MixerState.running and not changing_media:
             # Live metadata updates are allowed; topology changes are not.
             data = current.model_dump()
             for field in ("label", "kind", "video", "audio", "group_hint", "stinger_slot_id"):
@@ -486,14 +541,18 @@ class VisionMixer:
             self.nmos.sync_from_rest(input_id)
             self._publish_tally()
             return updated
-        if self.state == MixerState.running and payload.file_path is not None:
+        if self.state == MixerState.running and changing_media:
             if current.kind not in {InputKind.file, InputKind.replay}:
                 raise MixerError("only file/replay inputs can change clip while on-air")
-            return self.load_clip(input_id, payload.file_path)
+            if library_item_id:
+                return self.load_library_clip(input_id, library_item_id)
+            return self.load_clip(input_id, payload.file_path or "")
         data = current.model_dump()
         data.update(patch)
         updated = LogicalInput(**data)
-        if updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
+        if updated.library_item_id:
+            updated = self._apply_library_clip(updated)
+        elif updated.kind in {InputKind.file, InputKind.replay} and updated.file_path:
             updated.file_path = self._resolve_clip(updated.file_path)
         self._apply_default_domain(updated)
         self.inputs[input_id] = updated
@@ -594,6 +653,15 @@ class VisionMixer:
             )
 
     def _resolve_file_path(self, payload: LogicalInputCreate) -> LogicalInputCreate:
+        if payload.library_item_id:
+            item = self.library.get(payload.library_item_id)
+            if item is None or item.kind != LibraryKind.clip:
+                raise MixerError(f"unknown library clip {payload.library_item_id}")
+            mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
+            path = str(mezz) if mezz else "_unassigned"
+            return payload.model_copy(
+                update={"library_item_id": item.id, "file_path": path}
+            )
         if payload.kind in {InputKind.file, InputKind.replay} and payload.file_path:
             if payload.file_path != "_unassigned":
                 return payload.model_copy(update={"file_path": self._resolve_clip(payload.file_path)})
@@ -607,6 +675,113 @@ class VisionMixer:
         if not candidate.exists():
             raise MixerError(f"clip not found: {file_path}")
         return str(candidate)
+
+    def _apply_library_clip(self, item: LogicalInput) -> LogicalInput:
+        lib = self.library.get(item.library_item_id or "")
+        if lib is None or lib.kind != LibraryKind.clip:
+            raise MixerError(f"unknown library clip {item.library_item_id}")
+        consumer = f"input:{item.id}"
+        if item.library_item_id:
+            # Clear previous consumers for this input id only.
+            for other_id in list(self.library.consumers(item.library_item_id)):
+                if other_id == consumer:
+                    self.library.mark_free(item.library_item_id, consumer)
+        self.library.mark_in_use(lib.id, consumer)
+        mezz = self.library.mezzanine_path(lib.id, self.workspace.format_id)
+        item.library_item_id = lib.id
+        item.file_path = str(mezz) if mezz else "_unassigned"
+        return item
+
+    def load_library_clip(self, input_id: str, library_item_id: str) -> LogicalInput:
+        target = self.get_input(input_id)
+        if target.kind not in {InputKind.file, InputKind.replay}:
+            raise MixerError(f"input {input_id} cannot play files")
+        if target.library_item_id and target.library_item_id != library_item_id:
+            self.library.mark_free(target.library_item_id, f"input:{input_id}")
+        target.library_item_id = library_item_id
+        return self._apply_library_clip(target)
+
+    def library_item_out(self, item: LibraryItem):
+        from flowxer.api.schemas import LibraryItemOut
+
+        fmt = self.workspace.format_id
+        conv = item.conversion_for(fmt)
+        thumb = self.library.store.thumb_path(item.id)
+        return LibraryItemOut(
+            id=item.id,
+            kind=item.kind.value,
+            name=item.name,
+            tags=list(item.tags),
+            status=conv.status.value,
+            ready=item.is_ready(fmt),
+            playback=conv.playback,
+            has_alpha=item.has_alpha or conv.has_alpha,
+            cut_frame=item.cut_frame if item.cut_frame is not None else conv.cut_frame,
+            cut_ms=item.cut_ms if item.cut_ms is not None else conv.cut_ms,
+            frame_count=conv.frames or int(item.original.get("frame_count") or 0),
+            duration_s=conv.duration_s,
+            thumb_url=f"/api/v1/library/{item.id}/thumb.jpg" if thumb.is_file() else None,
+            error=conv.error,
+            source=item.source,
+            legacy_path=item.legacy_path,
+            in_use=self.library.is_in_use(item.id),
+        )
+
+    def _stinger_info_from_library(self, item: LibraryItem) -> StingerInfo:
+        fmt = self.workspace.format_id
+        conv = item.conversion_for(fmt)
+        mezz = self.library.mezzanine_path(item.id, fmt)
+        frames = conv.frames or int(item.original.get("frame_count") or 0)
+        fps = self.settings.fps
+        cut_frame = item.cut_frame if item.cut_frame is not None else (conv.cut_frame or frames // 2)
+        cut_ms = item.cut_ms if item.cut_ms is not None else (
+            conv.cut_ms if conv.cut_ms is not None else cut_ms_from_frame(cut_frame, fps)
+        )
+        # Prefer mezzanine video path; fall back to legacy sequence dir for not-ready items.
+        if mezz is not None:
+            kind = "video"
+            media_path = str(mezz)
+            path = str(mezz.parent)
+        elif item.original.get("source_kind") == "sequence":
+            kind = "sequence"
+            seq = self.library.store.item_dir(item.id) / (item.original.get("path") or "sequence")
+            media_path = str(seq)
+            path = str(seq)
+        else:
+            kind = "video"
+            media_path = str(self.library.store.item_dir(item.id) / (item.original.get("path") or ""))
+            path = str(self.library.store.item_dir(item.id))
+        return StingerInfo(
+            id=item.name or item.id,
+            path=path,
+            frame_count=max(frames, 0),
+            cut_frame=cut_frame or 0,
+            pattern=str(item.original.get("pattern") or "frame_%05d.tga"),
+            width=int(item.original.get("width") or self.settings.width),
+            height=int(item.original.get("height") or self.settings.height),
+            has_alpha=bool(item.has_alpha or conv.has_alpha),
+            kind=kind,
+            media_path=media_path,
+            cut_ms=cut_ms or 0,
+            duration_ms=duration_ms_from_frames(frames, fps) if frames else 0,
+            fps=fps,
+        )
+
+    def _refresh_stinger_ready_flags(self) -> None:
+        for slot in self.stinger_slots:
+            if slot.library_item_id:
+                slot.ready = bool(self.library.mezzanine_path(slot.library_item_id, self.workspace.format_id))
+            else:
+                slot.ready = True
+
+    def _find_library_stinger(self, stinger_id: str) -> LibraryItem | None:
+        direct = self.library.get(stinger_id)
+        if direct and direct.kind == LibraryKind.stinger:
+            return direct
+        for item in self.library.list_items(kind=LibraryKind.stinger):
+            if item.name == stinger_id or item.legacy_path == f"stingers/{stinger_id}":
+                return item
+        return None
 
     # ── storage ──────────────────────────────────────────────────────────────
 
@@ -622,16 +797,45 @@ class VisionMixer:
                         "suffix": path.suffix.lower(),
                     }
                 )
+        # Also expose ready library clips for the console picker.
+        for item in self.library.list_items(kind=LibraryKind.clip):
+            mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
+            clips.append(
+                {
+                    "name": f"lib:{item.name}",
+                    "path": str(mezz) if mezz else "",
+                    "size_bytes": mezz.stat().st_size if mezz else 0,
+                    "suffix": ".mov",
+                    "library_item_id": item.id,
+                    "ready": bool(mezz),
+                }
+            )
         return clips
 
     def list_stingers(self) -> list[StingerInfo]:
-        return list_stingers(self.settings.stingers_dir)
+        items = list(list_stingers(self.settings.stingers_dir))
+        seen = {item.id for item in items}
+        for lib in self.library.list_items(kind=LibraryKind.stinger):
+            info = self._stinger_info_from_library(lib)
+            # Prefer library view when it shadows a legacy id of the same name.
+            if info.id in seen:
+                items = [info if existing.id == info.id else existing for existing in items]
+            else:
+                items.append(info)
+                seen.add(info.id)
+        return items
 
     def get_stinger(self, stinger_id: str) -> StingerInfo:
         try:
             require_safe_id(stinger_id, what="stinger id")
         except SecurityError as exc:
             raise MixerError(str(exc)) from exc
+        lib = self._find_library_stinger(stinger_id)
+        if lib is not None:
+            info = self._stinger_info_from_library(lib)
+            if not self.library.mezzanine_path(lib.id, self.workspace.format_id) and info.frame_count == 0:
+                raise StingerNotReady(f"stinger {stinger_id} not ready")
+            return info
         info = inspect_stinger(self.settings.stingers_dir, stinger_id, fps=self.settings.fps)
         if info is None or not info.frame_count:
             raise MixerError(f"unknown stinger {stinger_id}")
@@ -816,6 +1020,10 @@ class VisionMixer:
             self.stop()
         except Exception:
             log.exception("stopping the media pipeline failed")
+        try:
+            self.library.stop()
+        except Exception:
+            log.exception("stopping the media library failed")
         self.tally.close()
         self.nmos.shutdown()
         if self.settings.mxl_cleanup_on_exit:
@@ -1054,6 +1262,9 @@ class VisionMixer:
         target = self.get_input(input_id)
         if target.kind not in {InputKind.file, InputKind.replay}:
             raise MixerError(f"input {input_id} cannot play files")
+        if target.library_item_id:
+            self.library.mark_free(target.library_item_id, f"input:{input_id}")
+            target.library_item_id = None
         resolved = self._resolve_clip(file_path)
         target.file_path = resolved
         return target
@@ -1093,7 +1304,29 @@ class VisionMixer:
                 if item.stinger_id == stinger_id:
                     slot = item
                     break
-        info = self._info_for_slot(slot, stinger_id)
+        try:
+            info = self._info_for_slot(slot, stinger_id)
+        except StingerNotReady as exc:
+            log.warning("stinger not ready — hard cut: %s", exc)
+            self._refresh_stinger_ready_flags()
+            return self.take(
+                target_input_id,
+                transition=TransitionType.cut,
+                panel_id=panel_id or (self.panels[0].id if self.panels else "me-1"),
+            )
+        # Library mezzanine path preferred; require a playable media path.
+        if info.kind == "video" and info.media_path:
+            mezz_ready = Path(info.media_path).is_file()
+            if not mezz_ready and (slot and slot.library_item_id):
+                log.warning(
+                    "stinger %s mezzanine missing — hard cut",
+                    slot.library_item_id,
+                )
+                return self.take(
+                    target_input_id,
+                    transition=TransitionType.cut,
+                    panel_id=panel_id or (self.panels[0].id if self.panels else "me-1"),
+                )
         self.get_input(target_input_id)
         panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
         outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id

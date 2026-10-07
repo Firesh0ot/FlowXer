@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from flowxer.api.schemas import (
     ConsoleState,
+    ConvertJobOut,
     DomainInfo,
     DownstreamKeyer,
     ErrorBody,
@@ -443,7 +444,9 @@ def replay_load(
     payload: ReplayLoadRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> LogicalInput:
     try:
-        return mixer.load_clip(payload.input_id, payload.file_path)
+        if payload.library_item_id:
+            return mixer.load_library_clip(payload.input_id, payload.library_item_id)
+        return mixer.load_clip(payload.input_id, payload.file_path or "")
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND if "not found" in str(exc) else status.HTTP_409_CONFLICT)
 
@@ -543,6 +546,8 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
+        library=[mixer.library_item_out(item) for item in mixer.library.list_items()],
+        jobs=[ConvertJobOut(**job.model_dump()) for job in mixer.library.queue.list_jobs()],
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
     )
