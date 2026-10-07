@@ -36,6 +36,7 @@ from flowxer.api.schemas import (
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import (
+    find_flow_domain,
     DomainError,
     ensure_output_domain,
     flows_by_group_hint_in_root,
@@ -71,6 +72,8 @@ from flowxer.engine.webrtc import webrtc_available
 from flowxer.settings import Settings, ensure_storage
 
 log = logging.getLogger(__name__)
+# A running Program without a new frame for this long is reported in the status (error).
+PROGRAM_STALL_S = 3.0
 
 CLIP_SUFFIXES = {".mp4", ".mov", ".mkv", ".ts", ".mxf", ".wav", ".m4a"}
 # A mix (take with transition mix) without a duration.
@@ -106,6 +109,9 @@ class VisionMixer:
         self.last_transition: str = "cut"
         # Program frames of earlier runs; frames_rendered adds the running pipeline's.
         self._frames_before = 0
+        # (frames_rendered, monotonic time) when Program last advanced; a stall is reported in status().
+        self._frame_mark: tuple[int, float] = (0, 0.0)
+        self._stall_logged = False
         self.frames_dropped = 0
         self.late_grains = 0
         self.resyncs = 0
@@ -568,10 +574,7 @@ class VisionMixer:
         if self.gst is None:
             return
         src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
-        path = None
-        if resolved_domain:
-            found = resolve_domain_path(self.settings.mxl_root, str(resolved_domain))
-            path = str(found) if found else str((self.settings.mxl_root / str(resolved_domain)).resolve())
+        path = self._mxl_source_path(input_id, role, resolved_domain, str(parsed_flow) if parsed_flow else "")
         try:
             if not enabled or parsed_flow is None:
                 applied = self.gst.retarget_mxl_source(src_name, None, path, role)
@@ -752,6 +755,8 @@ class VisionMixer:
 
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
+        self._frame_mark = (self.frames_rendered, time.monotonic())
+        self._stall_logged = False
         self.program_input_id = request.program_input_id or self._default_program_id()
         self.preview_input_id = request.preview_input_id or self.program_input_id
         self.last_live_input_id = self.program_input_id
@@ -769,6 +774,24 @@ class VisionMixer:
         """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
         self.error = message
         self.pipeline_errors += 1
+
+    def program_stalled_s(self) -> float | None:
+        """Seconds without a new Program frame while on air with GStreamer; None while frames flow."""
+        if self.state != MixerState.running or self.gst is None:
+            return None
+        frames = self.frames_rendered
+        now = time.monotonic()
+        if frames != self._frame_mark[0]:
+            self._frame_mark = (frames, now)
+            self._stall_logged = False
+            return None
+        idle = now - self._frame_mark[1]
+        if idle < PROGRAM_STALL_S:
+            return None
+        if not self._stall_logged:
+            self._stall_logged = True
+            log.warning("Program renders no frames (%s so far, none for %.0f s); check the Program input's source", frames, idle)
+        return idle
 
     @property
     def frames_rendered(self) -> int:
@@ -811,29 +834,35 @@ class VisionMixer:
     def _source_domain_paths(self) -> dict[str, str]:
         """Map `{input_id}:video|audio` to an mxlsrc `domain` filesystem path."""
         output = str(self.settings.output_domain.resolve())
-        root = self.settings.mxl_root
         paths: dict[str, str] = {}
         for item in self.list_inputs():
             if item.kind != InputKind.mxl_live:
                 continue
             for role, essence in (("video", item.video), ("audio", item.audio)):
                 domain_id = getattr(essence, "domain_id", None) if essence else None
-                if not domain_id:
-                    paths[f"{item.id}:{role}"] = output
-                    continue
-                resolved = resolve_domain_path(root, str(domain_id))
-                if resolved is None:
-                    log.warning(
-                        "MXL domain id %s for input %s %s not found under %s",
-                        domain_id,
-                        item.id,
-                        role,
-                        root,
-                    )
-                    paths[f"{item.id}:{role}"] = str((root / str(domain_id)).resolve())
-                else:
-                    paths[f"{item.id}:{role}"] = str(resolved)
+                flow_id = str(essence.flow_id) if essence is not None and essence.flow_id else ""
+                paths[f"{item.id}:{role}"] = self._mxl_source_path(item.id, role, domain_id, flow_id) or output
         return paths
+
+    def _mxl_source_path(self, input_id: str, role: str, domain_id: str | None, flow_id: str) -> str | None:
+        """mxlsrc `domain` path for a routed essence. A route that names no domain or the wrong one
+        (REST and IS-05 default it to the own output domain) still finds its flow: the named domain
+        when it holds the flow, else any domain below the root that does (local before mirror),
+        else the named domain, where the flow may still appear. None without a domain."""
+        root = self.settings.mxl_root
+        resolved = resolve_domain_path(root, str(domain_id)) if domain_id else None
+        if flow_id and (resolved is None or not (resolved / f"{flow_id}.mxl-flow").is_dir()):
+            holder = find_flow_domain(root, flow_id)
+            if holder is not None:
+                if domain_id and resolved != holder:
+                    log.info("MXL flow %s for input %s %s is in %s, not in domain %s", flow_id, input_id, role, holder, domain_id)
+                return str(holder)
+        if not domain_id:
+            return None
+        if resolved is None:
+            log.warning("MXL domain id %s for input %s %s not found under %s", domain_id, input_id, role, root)
+            return str((root / str(domain_id)).resolve())
+        return str(resolved)
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
@@ -1343,7 +1372,7 @@ class VisionMixer:
             video_format=self.settings.video_media_type,
             audio_format=self.settings.audio_media_type,
             pipeline=self.pipeline,
-            error=self.error,
+            error=self._status_error(),
             workspace=self.workspace.model_dump(),
             panels=[panel.model_dump() for panel in self.panels],
             keyers=[keyer.model_dump() for keyer in self.keyers],
@@ -1353,6 +1382,13 @@ class VisionMixer:
             last_transition=self.last_transition,
             nmos=self.nmos.status(),
         )
+
+    def _status_error(self) -> str | None:
+        # The state stays "running" (on air: the GUI's on-air switch and start() depend on it).
+        stalled = self.program_stalled_s()
+        if stalled is not None and self.error is None:
+            return f"Program renders no frames (none for {stalled:.0f} s)"
+        return self.error
 
     def domain_flows(self):
         return list_flows_in_root(self.settings.mxl_root)

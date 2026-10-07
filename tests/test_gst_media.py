@@ -238,6 +238,36 @@ def test_routing_an_input_whose_kind_changed_on_air_does_not_block(live: VisionM
     _wait(lambda: live.frames_rendered >= first + 10, "Program frames after the routes")
 
 
+def test_program_runs_while_its_input_delivers_nothing(live: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Platform 9.16.33: Program was an mxl_live input whose flows were not where the routes said, so
+    # its mxlsrc delivered nothing. That input's GUI monitor appsink never prerolled, the pipeline never
+    # reached PLAYING, and Program stopped after a few frames while the mixer said "running".
+    from flowxer.engine import pipeline as pipeline_module
+
+    real_video = pipeline_module._video_source_bin
+    real_audio = pipeline_module._audio_source_bin
+
+    def dead_video(inp, settings, domain, domain_paths):
+        if inp.kind != InputKind.mxl_live:
+            return real_video(inp, settings, domain, domain_paths)
+        caps = pipeline_module._v210(settings)
+        return f"appsrc name=vsrc_{inp.id} is-live=true format=time ! {caps} ! " + pipeline_module._buses("v", inp, settings)
+
+    def dead_audio(inp, settings, domain, domain_paths):
+        if inp.kind != InputKind.mxl_live:
+            return real_audio(inp, settings, domain, domain_paths)
+        caps = pipeline_module._audio(settings)
+        return f"appsrc name=asrc_{inp.id} is-live=true format=time ! {caps} ! " + pipeline_module._buses("a", inp, settings)
+
+    monkeypatch.setattr(pipeline_module, "_video_source_bin", dead_video)
+    monkeypatch.setattr(pipeline_module, "_audio_source_bin", dead_audio)
+    live.update_input("cam-1", LogicalInputUpdate(kind=InputKind.mxl_live, group_hint="nothing-here"))
+    status = live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    assert status.backend == "gstreamer", status.error
+    _wait(lambda: live.frames_rendered >= 50, lambda: f"Program frames with a silent input on Program ({live.frames_rendered})")
+    assert live.status().error is None
+
+
 def test_first_channels_matrix() -> None:
     assert first_channels_matrix(3, 2) == (
         "<<(float)1.0, (float)0.0, (float)0.0>, <(float)0.0, (float)1.0, (float)0.0>>"
