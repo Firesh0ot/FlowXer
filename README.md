@@ -123,17 +123,18 @@ The operator GUI is a client of `/api/v1`. Every console action has a matching r
 | Settings → Console layout… | `PUT /workspace` (`source_tile_aspect` is display-only and may change on-air) |
 | Source left click (PVW) | `POST /mixer/preview` |
 | Source right click (PGM) | `POST /mixer/take` |
-| Source ⚙ (name, kind, clip, auto-stinger) | `PATCH /inputs/{id}` (`stinger_slot_id`) |
+| Source ⚙ (name, kind, clip, auto-stinger) | `PATCH /inputs/{id}` (`library_item_id` or `file_path`, `stinger_slot_id`) |
 | DSK ON/OFF | `PATCH /keyers/{id}` (`enabled`) |
 | Stinger chip (Preview → Program) | `POST /stinger/play` (`flip_flop: true`, `panel_id`) |
-| Stinger ⚙ (media, cut frame) | `PATCH /stinger-slots/{id}` (`cut_frame`) |
+| Stinger ⚙ (media, cut frame) | `PATCH /stinger-slots/{id}` (`library_item_id` or `stinger_id`, `cut_frame`) |
+| File → Clip / Stinger library… | `GET /library`, `POST /uploads`, `GET /jobs` |
 | Cut / Fade / Fade to Black / Wipe | `POST /mixer/cut`, `/fade`, `/fade-to-black`, `/wipe` |
 | Tally → Receivers… | `PUT /tally/receivers` |
 | Tally send now | `POST /tally/refresh` |
 | Preview pictures | `POST /webrtc/whep/{stream_id}` or `GET /preview/jpeg/{stream_id}` |
 | NMOS (IS-04/IS-05) | Node API on **3252** — see [docs/nmos.md](docs/nmos.md) |
 
-API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `GET /config/export`, `POST /config/import`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). The GUI loads a clip through `PATCH /inputs/{id}` `file_path` rather than `/replay/load`. DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
+API-only (no GUI control yet): `GET /health`, `/config`, `/domain`, `/domain/flows`; `GET /config/export`, `POST /config/import`; `POST`/`DELETE /inputs`; `GET /mixer`; `GET`/`POST /overlay` (legacy overlay vs per-keyer PATCH); `GET /storage/clips` and `/storage/stingers`; `POST /replay/load`, `/replay/take`, `/replay/return`; `POST /stinger/tick` (tests / simulate). Library: `GET/PATCH/DELETE /library/{id}`, `POST /library/{id}/reconvert`, chunked `POST /uploads` + `PUT …/chunks/{n}` + `POST …/complete`, `POST /uploads/sequence` (TGA folder), `GET /jobs`, `POST /jobs/{id}/cancel`. The GUI prefers `PATCH /inputs/{id}` `library_item_id` (legacy `file_path` still works). DSK URL / title / subtitle are on `PATCH /keyers/{id}` but the console only toggles enabled.
 
 Useful calls (through the GUI proxy on **9620**; mixer `:9610` is loopback-only):
 
@@ -189,13 +190,16 @@ Register live MXL inputs **before** starting the mixer. Essence `media_type` is 
 Compose pulls the images published from `main` to GHCR (`latest`, or set `FLOWXER_IMAGE_TAG`).
 
 ```bash
-mkdir -p storage/clips
-# optional: copy a clip next to the mixer
+mkdir -p storage/clips storage/library storage/import
+# optional: copy a clip next to the mixer (auto-imported into the library on start)
 # cp /path/to/sizzle.ts storage/clips/
+# or drop files into storage/import for watched ingest
 
 docker compose pull
 docker compose up
 ```
+
+The mixer image already includes `ffmpeg` for background mezzanine conversion. Library env knobs: `FLOWXER_LIBRARY_DIR`, `FLOWXER_IMPORT_DIR`, `FLOWXER_CONVERT_CONCURRENCY` (default 1), `FLOWXER_RAM_CLIP_MAX_S` (20), `FLOWXER_RAM_BUDGET_MB` (4096), `FLOWXER_PREROLL_FRAMES` (25), `FLOWXER_UPLOAD_LIMIT_GB` (20).
 
 Images:
 
@@ -369,11 +373,30 @@ Mixer OpenAPI on that process is `http://127.0.0.1:9610/docs`. Start the GUI in 
 cd gui && npm run dev
 ```
 
+## Media library
+
+Clips and stingers share one ingest path: **upload → background conversion → intra-frame mezzanine → play**. Heavy work happens at ingest; playback reads mezzanine (short items may be marked RAM, longer ones use GStreamer decode-ahead with `FLOWXER_PREROLL_FRAMES`).
+
+Layout under `FLOWXER_LIBRARY_DIR` (default `storage/library/`):
+
+```
+<id>/
+  item.json
+  original… or sequence/
+  mezz-<format>.mov      # ProRes 422 HQ (clips) or ProRes 4444 with alpha (stingers)
+  thumb.jpg
+  convert.log
+```
+
+Upload via the operator GUI (**File → Clip / Stinger library…**) or HTTP (`POST /uploads` chunked, or `POST /uploads/sequence` for a TGA folder). Options include fit/fill, sequence framerate, and cut frame. Files already in `storage/clips` or `storage/stingers/<id>/` are imported non-destructively on start. Changing the mixer format (off-air) re-queues conversion for every item.
+
+A stinger that is still converting never blocks the mixer: `/stinger/play` and auto-stinger fall back to a hard cut and log a warning.
+
 ## Stinger convention
 
-Each stinger slot can use a **TGA sequence** or a **video file**, and has a **cut frame** — the moment Program switches while the sting covers the picture. The GUI field is **Cut at (frame)** (`cut_frame`); `cut_ms` is stored alongside for the mixer clock. Every playback decodes the stinger again on its own compositor pad, and Program switches when the cut frame reaches the compositor.
+Each stinger slot can use a **library item**, a legacy **TGA sequence**, or a **video file**, and has a **cut frame** — the moment Program switches while the sting covers the picture. The GUI field is **Cut at (frame)** (`cut_frame`); `cut_ms` is stored alongside for the mixer clock. Prefer library assignment (`library_item_id`): the slot is preloaded from mezzanine (ProRes 4444 keeps alpha for the compositor). Legacy paths remain supported.
 
-Place sequences under `storage/stingers/<id>/`:
+Place legacy sequences under `storage/stingers/<id>/` (still imported into the library on start):
 
 ```
 frame_00000.tga
@@ -382,7 +405,7 @@ frame_00001.tga
 stinger.json   # { "kind": "sequence", "frame_count", "cut_frame", "cut_ms", "pattern": "frame_%05d.tga" }
 ```
 
-Video stingers live in the same tree (`kind: "video"` plus `media_path`).
+Video stingers live in the same tree (`kind: "video"` plus `media_path`). TGA folders and ZIP uploads are validated (natural sort, gap detection, Zip-Slip / bomb limits, alpha warning).
 
 Triggering:
 
