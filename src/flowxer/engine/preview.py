@@ -116,11 +116,12 @@ def render_monitor(
     live = _live_picture(mixer, stream_id, width, height)
     if live is not None:
         return live
-    input_id, _tally, _badge = _resolve_stream(mixer, stream_id)
     try:
+        input_id, _tally, _badge = resolve_stream(mixer, stream_id)
         source = mixer.get_input(input_id) if input_id else None
     except Exception:
-        source = None
+        # A WebRTC monitor whose input or panel was removed keeps running.
+        input_id, source = stream_id, None
     if source is None:
         return _draw_missing(width, height, input_id or "NO SIGNAL")
     key = f"{source.id}:{source.kind.value}:{source.label}:{source.file_path}:{width}x{height}"
@@ -136,7 +137,7 @@ def _live_picture(mixer, stream_id: str, width: int, height: int) -> Image.Image
         name = MONITOR_PROGRAM
     else:
         try:
-            input_id, _tally, _badge = _resolve_stream(mixer, stream_id)
+            input_id, _tally, _badge = resolve_stream(mixer, stream_id)
         except Exception:
             return None
         name = f"{MONITOR_PREFIX}{input_id}"
@@ -157,20 +158,34 @@ def render_jpeg(mixer, stream_id: str, *, width: int = 640, height: int = 360, q
     return buf.getvalue()
 
 
-def _resolve_stream(mixer, stream_id: str) -> tuple[str | None, str, str]:
-    """Return (input_id, tally, badge). Tally is GUI chrome only — not burned into the picture."""
-    if stream_id.startswith("source:"):
-        input_id = stream_id.split(":", 1)[1]
+class UnknownStream(LookupError):
+    """A monitor name that is not `source:<input id>` or `panel:<panel id>:pgm|pvw`."""
+
+
+def resolve_stream(mixer, stream_id: str) -> tuple[str | None, str, str]:
+    """Return (input_id, tally, badge). Tally is GUI chrome only — not burned into the picture.
+
+    Raises UnknownStream for a malformed name or an input or panel that does not exist."""
+    kind, _, rest = stream_id.partition(":")
+    if kind == "source" and rest in mixer.inputs:
         tally = "off"
-        if any(p.program_input_id == input_id for p in mixer.panels):
+        if any(p.program_input_id == rest for p in mixer.panels):
             tally = "pgm"
-        elif any(p.preview_input_id == input_id for p in mixer.panels):
+        elif any(p.preview_input_id == rest for p in mixer.panels):
             tally = "pvw"
-        return input_id, tally, "SRC"
-    if stream_id.startswith("panel:"):
-        _, panel_id, bus = stream_id.split(":", 2)
-        panel = mixer.get_panel(panel_id)
-        if bus == "pgm":
-            return panel.program_input_id, "pgm", f"{panel.label} PGM"
-        return panel.preview_input_id, "pvw", f"{panel.label} PVW"
-    return stream_id, "off", stream_id
+        return rest, tally, "SRC"
+    if kind == "panel":
+        panel_id, _, bus = rest.partition(":")
+        for panel in mixer.panels:
+            if panel.id != panel_id:
+                continue
+            if bus == "pgm":
+                return panel.program_input_id, "pgm", f"{panel.label} PGM"
+            if bus == "pvw":
+                return panel.preview_input_id, "pvw", f"{panel.label} PVW"
+    if stream_id in mixer.inputs:
+        # A bare input id, as before.
+        return stream_id, "off", stream_id
+    raise UnknownStream(
+        f"unknown monitor {stream_id!r}: use source:<input id> or panel:<panel id>:pgm|pvw"
+    )
