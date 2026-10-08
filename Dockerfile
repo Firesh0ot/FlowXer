@@ -57,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-libav \
         gstreamer1.0-x \
+        gstreamer1.0-gl \
         libgdk-pixbuf2.0-0 \
         fonts-dejavu-core \
         ffmpeg \
@@ -87,6 +88,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxshmfence1 \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
+
+# FLOWXER_GPU: GStreamer GL uses EGL without a display. The NVIDIA container toolkit
+# mounts libEGL_nvidia but not its glvnd vendor file; without a GPU the file is unused.
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+    && printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}\n' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
 
 COPY --from=mxl-builder /opt/mxl /opt/mxl
 COPY --from=cef-builder /opt/gstcef /opt/gstcef
