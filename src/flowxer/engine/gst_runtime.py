@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from flowxer.engine.gpu import fragment_for
 from flowxer.engine.pipeline import (
     AUDIO_MAP_PREFIX,
     MONITOR_PREFIX,
@@ -138,10 +139,13 @@ class GstRuntime:
         self._lock = threading.Lock()
         self._mix: _Mix | None = None
         self._stinger = None
+        self._gpu_width: int | None = None
         # Newest GUI monitor picture per appsink name: (width, height, RGB bytes).
         self.monitors: dict[str, tuple[int, int, bytes]] = {}
 
-    def start(self, description: str, audio_channels: int = 2) -> None:
+    def start(self, description: str, audio_channels: int = 2, gpu_width: int | None = None) -> None:
+        """`gpu_width`: the GPU path's raster width; its glshader elements get their
+        fragment shaders (flowxer.engine.gpu.fragment_for) before the pipeline starts."""
         import gi
 
         gi.require_version("Gst", "1.0")
@@ -176,6 +180,8 @@ class GstRuntime:
         self._glib = GLib
         self.pipeline = pipeline
         self._guard_program_output()
+        self._gpu_width = gpu_width
+        self._set_shaders(pipeline)
         iterator = pipeline.iterate_recurse()
         while True:
             result, element = iterator.next()
@@ -197,6 +203,18 @@ class GstRuntime:
         self.loop = loop
         self.thread = threading.Thread(target=loop.run, name="gst-mainloop", daemon=True)
         self.thread.start()
+
+    def _set_shaders(self, bin_) -> None:
+        if not self._gpu_width:
+            return
+        iterator = bin_.iterate_recurse()
+        while True:
+            result, element = iterator.next()
+            if result != self._gst.IteratorResult.OK:
+                break
+            fragment = fragment_for(element.get_name(), self._gpu_width)
+            if fragment is not None:
+                element.set_property("fragment", fragment)
 
     def stop(self) -> bool:
         """Take the pipeline to NULL. False when that did not finish within STOP_TIMEOUT_S: the
@@ -401,6 +419,7 @@ class GstRuntime:
         # Ghost only the last queue: decodebin's output pad appears later, and an
         # automatic ghost of the then-unlinked videoconvert sink would take its link.
         stinger = Gst.parse_bin_from_description(description, False)
+        self._set_shaders(stinger)
         stinger.add_pad(Gst.GhostPad.new("src", stinger.get_by_name("stingerq").get_static_pad("src")))
         pad = comp.request_pad_simple("sink_%u")
         pad.set_property("zorder", STINGER_ZORDER)
@@ -565,12 +584,15 @@ class GstRuntime:
 
 
 def try_start_gst(
-    description: str, on_error: Callable[[str], None] | None = None, audio_channels: int = 2
+    description: str,
+    on_error: Callable[[str], None] | None = None,
+    audio_channels: int = 2,
+    gpu_width: int | None = None,
 ) -> tuple[GstRuntime | None, str]:
     """Start the pipeline. Returns the runtime, or None and the reason it failed."""
     try:
         runtime = GstRuntime(on_error)
-        runtime.start(description, audio_channels)
+        runtime.start(description, audio_channels, gpu_width)
         return runtime, ""
     except Exception as exc:
         log.error("GStreamer pipeline failed to start: %s", exc)

@@ -46,6 +46,7 @@ from flowxer.domain.mxl_domain import (
 )
 from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import format_by_id
+from flowxer.engine.gpu import MEDIA_PATH_CPU, NO_NVIDIA_DEVICE, MediaPath, select_media_path
 from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
 from flowxer.engine.overlay import Html5Overlay
 from flowxer.engine.pipeline import PAD_KEYER, build_pipeline_description, stinger_bin_description
@@ -100,6 +101,9 @@ class VisionMixer:
         self.library = LibraryService(settings)
         self.library.consumers_fn = self._library_consumers
         self.library.add_listener(self._on_library_job)
+        # FLOWXER_GPU, decided once at start; `on` without a working GPU raises
+        # GpuUnavailableError (exit 78).
+        self.media = self._select_media_path()
         self.inputs: dict[str, LogicalInput] = {}
         self.workspace = self._pinned(WorkspaceConfig())
         self.panels: list[MixerPanel] = []
@@ -157,6 +161,20 @@ class VisionMixer:
         self._restore_state()
         self.library.start(self.workspace.format_id, fps=self.settings.fps)
         self.refresh_library_bindings()
+
+    def _select_media_path(self) -> MediaPath:
+        if self.settings.simulate or self.settings.gst_mode == "simulate":
+            return MediaPath(MEDIA_PATH_CPU, "simulated media")
+        media = select_media_path(self.settings.gpu)
+        if media.gpu:
+            log.info("media path: gpu (%s)", media.reason)
+        elif self.settings.gpu == "auto":
+            # On a node without a GPU this is the normal case, elsewhere worth a look.
+            report = log.info if media.reason == NO_NVIDIA_DEVICE else log.warning
+            report("media path: cpu (FLOWXER_GPU=auto, the GPU path is not available: %s)", media.reason)
+        else:
+            log.info("media path: cpu (%s)", media.reason)
+        return media
 
     # ── catalog ──────────────────────────────────────────────────────────────
 
@@ -1045,6 +1063,7 @@ class VisionMixer:
             use_mxl_sink=use_mxl,
             use_cefsrc=use_cef,
             domain_paths=self._source_domain_paths(),
+            gpu=self.media.gpu,
         )
         self.pipeline = description
 
@@ -1052,7 +1071,12 @@ class VisionMixer:
         self.gst = None
         self.error = None
         if not force_sim and capabilities["gstreamer"]:
-            self.gst, reason = try_start_gst(description, self._on_pipeline_error, self.settings.audio_channels)
+            self.gst, reason = try_start_gst(
+                description,
+                self._on_pipeline_error,
+                self.settings.audio_channels,
+                self.settings.width if self.media.gpu else None,
+            )
             if self.gst is None:
                 # Never fall back to the simulator when GStreamer is installed: the
                 # API would report on-air while nothing reaches MXL.
@@ -1479,7 +1503,7 @@ class VisionMixer:
             # Each frame that reaches the compositor advances the player, so Program
             # cuts on the stinger's own cut frame.
             self.gst.play_stinger(
-                stinger_bin_description(info.model_dump(), self.settings),
+                stinger_bin_description(info.model_dump(), self.settings, gpu=self.media.gpu),
                 on_frame=lambda: self._stinger_frame(player),
                 on_end=lambda: self._stinger_ended(player),
             )
@@ -1773,6 +1797,8 @@ class VisionMixer:
             wipe_armed=bool(self.panels[0].wipe_armed) if self.panels else False,
             last_transition=self.last_transition,
             nmos=self.nmos.status(),
+            media_path=self.media.path,
+            media_path_reason=self.media.reason,
         )
 
     def _status_error(self) -> str | None:
