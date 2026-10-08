@@ -69,6 +69,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
+from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
@@ -123,6 +124,12 @@ class VisionMixer:
         self._frame_mark: tuple[int, float] = (0, 0.0)
         self._stall_logged = False
         self.frames_dropped = 0
+        # Program buffers dropped because they went back in time (earlier runs), per essence.
+        self._program_dropped_before = {"video": 0, "audio": 0}
+        # MXL sources started again after they failed, per (input id, essence).
+        self.input_restarts: dict[tuple[str, str], int] = {}
+        # Operations that need the control plane; /livez fails when one is stuck.
+        self.watchdog = ControlPlaneWatchdog()
         self.late_grains = 0
         self.resyncs = 0
         self.pipeline_errors = 0
@@ -709,11 +716,10 @@ class VisionMixer:
             return
         src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
         path = self._mxl_source_path(input_id, role, resolved_domain, str(parsed_flow) if parsed_flow else "")
+        target = str(parsed_flow) if enabled and parsed_flow is not None else None
         try:
-            if not enabled or parsed_flow is None:
-                applied = self.gst.retarget_mxl_source(src_name, None, path, role)
-            else:
-                applied = self.gst.retarget_mxl_source(src_name, str(parsed_flow), path, role)
+            log.info("input %s (%s): %s reads %s in %s", input_id, role, src_name, target or "nothing (not routed)", path)
+            applied = self.gst.retarget_mxl_source(src_name, target, path, role)
             if not applied and self.state == MixerState.running:
                 log.info(
                     "input %s (%s): the running pipeline does not read it from MXL; the route applies at the next start",
@@ -726,6 +732,7 @@ class VisionMixer:
                 src_name,
                 exc,
             )
+            self.error = f"input {input_id} ({role}): {exc}"
 
     def _resolve_file_path(self, payload: LogicalInputCreate) -> LogicalInputCreate:
         if payload.library_item_id:
@@ -936,6 +943,10 @@ class VisionMixer:
     # ── mixer lifecycle ──────────────────────────────────────────────────────
 
     def start(self, request: MixerStartRequest | None = None) -> MixerStatus:
+        with self.watchdog.busy("Program start"):
+            return self._start(request)
+
+    def _start(self, request: MixerStartRequest | None = None) -> MixerStatus:
         request = request or MixerStartRequest()
         if self.state == MixerState.running:
             raise MixerError("mixer is already running")
@@ -1050,6 +1061,9 @@ class VisionMixer:
                 self.error = f"GStreamer pipeline failed: {reason}"
                 raise MixerError(self.error)
 
+        if self.gst is not None:
+            self.gst.watchdog = self.watchdog
+            self.gst.on_source_restart = self._on_source_restart
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
         self._frame_mark = (self.frames_rendered, time.monotonic())
@@ -1110,11 +1124,40 @@ class VisionMixer:
         """Frames that reached the Program video sink (none in simulate)."""
         return self._frames_before + (self.gst.program_frames if self.gst is not None else 0)
 
+    def _on_source_restart(self, element_name: str, reason: str) -> None:
+        """A failed MXL source (vsrc_<input> / asrc_<input>) was started again."""
+        role = "video" if element_name.startswith("vsrc_") else "audio"
+        key = (element_name.split("_", 1)[1], role)
+        self.input_restarts[key] = self.input_restarts.get(key, 0) + 1
+        self.error = f"input {key[0]} {role}: the MXL source failed ({reason}) and was started again"
+
+    @property
+    def program_dropped(self) -> dict[str, int]:
+        """Program buffers dropped because they went back in time, per essence."""
+        running = self.gst.program_dropped if self.gst is not None else {}
+        return {essence: count + running.get(essence, 0) for essence, count in self._program_dropped_before.items()}
+
     def stop(self) -> MixerStatus:
+        with self.watchdog.busy("Program stop"):
+            return self._stop()
+
+    def _stop(self) -> MixerStatus:
+        stopped = True
         if self.gst is not None:
             self._frames_before += self.gst.program_frames
-            self.gst.stop()
+            for essence, count in self.gst.program_dropped.items():
+                self._program_dropped_before[essence] += count
+            stopped = self.gst.stop()
             self.gst = None
+        if not stopped:
+            # The pipeline's threads are blocked; it is left behind. The watchdog fails /livez
+            # while the stop thread stays blocked, so the pod is restarted.
+            self.state = MixerState.error
+            self.backend = "idle"
+            self.error = "Program did not stop: the media pipeline is blocked"
+            self.stinger_player = None
+            self._publish_tally()
+            return self.status()
         self.state = MixerState.idle
         self.backend = "idle"
         self.stinger_player = None

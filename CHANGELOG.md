@@ -82,6 +82,29 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- Program audio stayed silent after a start (platform: every start), and now
+  and then Program video stopped after 2 frames. Right after a start the
+  audiomixer and the compositor can start their output over at 0 (audio
+  `[0, 0.01)` then `[0, 0.02)`); mxlsink cannot write behind what it wrote,
+  failed without a message, and the error stopped that essence for good. A
+  Program buffer that goes back in time is now dropped before mxlsink
+  (`flowxer_program_buffers_dropped_total{essence}`, a log line).
+- An IS-05 route could hang the node: GET /mixer, the NMOS API and stop timed
+  out until the pod was restarted. A retargeted source's allocation query
+  waited in its queue, whose thread waited in an input-selector whose active
+  input had stopped; the next route of that source then blocked for good under
+  the NMOS lock. A source restart now flushes the source's branch first and
+  waits at most 10 s (stop at most 15 s), then logs and reports an error
+  instead of holding the lock. Unrouting gives mxlsrc the unrouted flow id
+  (`00000000-…`) instead of an empty one. Each route is logged.
+- An input froze on its last picture when its mxlsrc failed: mxlsrc stops for
+  good on a grain marked invalid, which an ST 2110 gateway writes for an
+  incomplete frame. A failed MXL source is started again after 1 s (longer
+  when it fails again at once), `flowxer_input_restarts_total{input,essence}`
+  counts it and `GET /mixer` `error` names it.
+- `/livez` fails (503) when an IS-05 activation, Program start or stop or a
+  source restart has not finished for 60 s, so Kubernetes restarts a hung pod.
+  `flowxer_control_plane_busy_seconds` shows the oldest running one.
 - Program keeps running when an input delivers nothing (an MXL flow that is
   missing, in another domain than the route says, or a frozen mirror). The
   input's GUI monitor never got a first frame, so the pipeline never reached
