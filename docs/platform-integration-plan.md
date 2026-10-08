@@ -227,6 +227,7 @@ record it here. Simulate-mode unit tests cover the state machine without GST.
 | `FLOWXER_WEBRTC_PUBLIC_IP` | host management IP | ICE host candidate. |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | TBD, avoid 23500–23599 | aiortc `RTCIceServer` / transport port range. |
 | `FLOWXER_API_TOKEN` | empty | **Required on the platform.** |
+| `FLOWXER_GPU` | `off` | Media path, §3.8: `off` CPU, `auto` GPU when it works at start, `on` GPU or exit 78. |
 
 GUI does not load CDN assets today; keep it that way.
 
@@ -251,10 +252,62 @@ trips it; with the usual probe (period 10 s, 3 failures) a hung pod restarts
 about 90 s after the hang. The endpoint is `async` so it answers when the worker
 threads are blocked.
 
-### 3.8 GPU (item 7)
+### 3.8 GPU (item 7) — **optional GPU media path, `FLOWXER_GPU`**
 
-**After** items 1–6. `FLOWXER_PREVIEW_ENCODER=auto\|cpu\|nvenc` for WHEP only.
-Compositing stays CPU. Image must run without a GPU.
+Planned first: `FLOWXER_PREVIEW_ENCODER` for WHEP only, compositing on the CPU.
+Changed (deviation, `feat/gpu-path`): on the platform the mixer needed 4.5–7
+CPU cores for 1080p50 with 4 live MXL inputs and reached only 28–34 fps on a
+loaded i9-9900K node, while the node's RTX A4000 idled. So the video moves to
+the GPU, the image still runs without one:
+
+- `FLOWXER_GPU=auto|on|off` (default `off`), decided once at start.
+  `auto` takes the GPU path when it works, else the CPU path, and logs why;
+  `on` exits with 78 without it; `off` is the CPU path, its pipeline
+  description byte for byte the one before. `flowxer_info{media_path}` and
+  `media_path` / `media_path_reason` in `GET /api/v1/mixer`.
+- **OpenGL through EGL, not CUDA.** GStreamer 1.24 (Ubuntu 24.04) has no
+  `cudacompositor` and no `nvjpegenc`; `glvideomixerelement` has the
+  compositor's pad properties (alpha, zorder) and the aggregator signals the
+  mixes use, so cut, mix, stingers and the keyer work unchanged. EGL needs no
+  display: `GST_GL_PLATFORM=egl`, `GST_GL_WINDOW=egl-device`, and only
+  NVIDIA's glvnd vendor (`__EGL_VENDOR_LIBRARY_FILENAMES`) so that Mesa's
+  software renderer cannot stand in (the image runs an Xvfb for CEF; GLX there
+  is software).
+- **v210 in shaders.** Neither the GL nor the CUDA converters know v210.
+  `capssetter` relabels an MXL frame as an RGBA image a quarter of the line
+  stride wide (one texel = one 32-bit v210 word; no copy, mxlsrc adds no video
+  meta and mxlsink copies raw bytes), `glupload` uploads it once, a `glshader`
+  unpacks the 10-bit fields. `identity drop-allocation=true` keeps
+  capssetter's allocation query (still with the v210 caps) from glupload: its
+  GL pool for v210 aborted the process when a source renegotiated (the first
+  fade on the lab). Program is packed the same way and downloaded
+  once. Between them the pictures are 8-bit Y'CbCr 4:4:4 with alpha in RGBA
+  textures, the samples of the CPU path's AYUV compositor (no RGB matrix);
+  keyer, stinger and test sources are RGB and converted by a shader (BT.709).
+  The mixer background is transparent and the pack shader puts legal black
+  where nothing was drawn. A v210 input reaches Program bit for bit for codes
+  that 8 bits hold (test in `tests/test_gst_media.py`).
+- **Probe.** At start: `/dev/nvidia*`, the glvnd vendor file for
+  `libEGL_nvidia.so.0` (the image carries it: the container toolkit mounts the
+  library, not the file), `libEGL_nvidia` loadable (driver capability
+  `graphics`), the GL elements (`gstreamer1.0-gl`), then one v210 test frame
+  through both shaders, which must come back unchanged.
+- **First frames back in time.** glvideomixerelement, like the compositor, can
+  start its output over at 0 in the first frames; on the GPU path that stopped
+  Program in about 4 of 10 starts on the lab. #69's guard at the `vout`/`aout`
+  sinks (`_guard_program_output`) covers both paths, so the GPU path has no
+  guard of its own; `flowxer_program_buffers_dropped_total` counts for both.
+- **#69 on the GPU path:** a source restart (IS-05 retarget, recovery of a
+  failed mxlsrc) flushes the branch through the GL elements and renegotiates;
+  `drop-allocation` keeps the restarted source from getting a GL pool for v210.
+- **Stays on the CPU:** audio, the HTML keyer (CEF renders in software), JPEG
+  encoding of the monitor pictures (640×360, downloaded from the GPU) and the
+  WebRTC encoder (aiortc).
+- **Platform:** `nvidia.com/gpu: 1` (a time-sliced share is enough) and
+  `NVIDIA_DRIVER_CAPABILITIES=graphics,video,compute`, as for
+  mxl-browser-source, plus `FLOWXER_GPU=auto` or `on`. The default is `off`:
+  without the setting nothing changes, no NVIDIA library is loaded (#66: a
+  library loaded before GStreamer can change how libmxl unwinds).
 
 ### 3.9 PR sequence (deviation: item 2 before item 1)
 
@@ -371,6 +424,7 @@ state and the GUI.
 | `FLOWXER_HOST` 0.0.0.0 today | Default **127.0.0.1**; bridge Compose overrides. |
 | Make GHCR public in-repo | Document the GitHub UI step; cannot toggle from git. |
 | AMWA BCP-007-03 reject unknown domains | **Accept** + `waiting` (on-demand), unconstrained receiver params. |
+| GPU only for the WHEP encoder, compositing on the CPU | **Optional GPU media path** (`FLOWXER_GPU`, §3.8): upload, composite and pack on the GPU; WHEP stays aiortc. |
 
 ---
 
@@ -426,3 +480,14 @@ integration and AMWA script in PR 8).
   - Hung route: reproduced on the lab with the platform's layout (4 live inputs, 2 test sources, 1 ME) by re-routing after the burst, cam-3 audio into another domain and back: the second route never answered, then GET /mixer, stop and the NMOS API. gdb: the route's thread waited in `gst_pad_stop_task` for `asrc_cam-3`'s stream lock; that source's thread waited in its queue for an answer to its serialized allocation query (sent after the first route restarted it); the queue's thread waited in the audio input-selector (`sync-streams`), whose active input (cam-1) had stopped in the burst. The restart of a source now flushes the source's branch first (FLUSH_START answers the waiting query and wakes the blocked threads, FLUSH_STOP without a time reset) and runs bounded (10 s; stop 15 s). Unrouting uses `UNROUTED_FLOW`. A GStreamer test reproduces the blocked query (fails without the flush).
   - Frozen inputs: mxlsrc returns an error for a grain marked `MXL_GRAIN_FLAG_INVALID` and stops for good; mxl-st2110-gateway RX marks incomplete frames that way. Reproduced with a test writer that marks every 250th grain invalid: the input froze on its last picture. A failed MXL source is started again after 1 s (2, 5, 10, 30 s when it fails again within 3 s); `flowxer_input_restarts_total`, `GET /mixer` `error`. A seamless fix (mxlsrc skipping invalid grains) belongs in gst-mxl-rs.
   - `/livez` watchdog: §3.7.
+- **GPU media path** (`feat/gpu-path`, §3.8): `FLOWXER_GPU=auto|on|off` (default `off`), on 10.17.40. Lab iptv-web-lab-1 (2× Xeon Gold 6136, NVIDIA A16 GPU 3, driver 595.84), 4 live MXL inputs from the test player (1080p50 v210, 16 ch) + 4 test/black inputs + the CEF keyer on, GUI monitors at 10/s; mixer container cores (cgroup, 30 s), Program measured by `flowxer_frames_rendered_total` and from outside by `mxl-verify`:
+
+  | Case | CPU path (`off`) | GPU path |
+  |---|---|---|
+  | On air | 4.35 cores, 50.0 grains/s | 3.01 cores, 50.3 grains/s, GPU 70 % SM |
+  | + a 1 s fade every 2 s | 4.29 (p95 5.62), 48.4 grains/s | 2.69 (p95 3.43), 49.7 grains/s |
+  | + 6 JPEG monitors at ~10/s | 4.80, 50.2 grains/s | 3.29, 50.0 grains/s |
+  | + 4 WebRTC previews | 4.99, 50.0 grains/s | 3.89, 49.9 grains/s |
+
+  Cut, mix, Wipe (armed stinger), a stinger and the DSK (CEF lower third) checked on Program frames read back from MXL and on the GUI monitor; Program keeps moving through a fade. Lab stall check (`ok`, `novideo`, `videoonly`, `bothdead`): 50 fps on both paths, no crash with missing flows on the GPU path. `tests/test_gst_media.py` runs every media test on both paths (GPU cases skipped without a GPU); new: a fade between two pool-negotiating "MXL" sources (aborted before `drop-allocation`) and v210 through Program bit for bit. The A16 has a quarter of the RTX A4000's shader throughput, so the platform node's GPU load should be well lower. Still on the CPU: CEF, audio, mxlsrc/mxlsink copies, test sources, JPEG and WebRTC encoding (aiortc); NVENC for WebRTC is the next step.
+  - Rebased on 11.18.41 (#69): the GPU path uses #69's Program guard (its own one is gone), its bounded source restarts with branch flush, MXL source recovery and the `/livez` watchdog; a new media test restarts "MXL" sources on air on both paths. Lab with the 11.18.41 image plus this package: `FLOWXER_GPU` unset gives the same pipeline description as 11.18.41 (byte for byte, `GET /mixer`); stall check on the GPU path `ok` 6/6, `novideo` 2/2, `videoonly` 2/2 at 50 fps with Program audio and no stream errors (the guard dropped 1–2 buffers in 5 of 6 `ok` starts); the platform-layout hang repro (re-routes after start, cam-3 audio into another domain and back) ran clean; on air 3.04 cores (GPU) and 4.17 (CPU), 50 grains/s.

@@ -331,6 +331,9 @@ class MixerStatus(BaseModel):
     wipe_armed: bool = False
     last_transition: str = "cut"
     nmos: dict[str, Any] = Field(default_factory=dict)
+    # FLOWXER_GPU: "gpu" or "cpu", and why (the reason of a fallback).
+    media_path: str = "cpu"
+    media_path_reason: str = ""
 
 
 class HealthResponse(BaseModel):

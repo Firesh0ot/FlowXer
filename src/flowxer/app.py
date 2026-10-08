@@ -21,6 +21,7 @@ from flowxer.api.library_routes import router as library_router
 from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.domain.mxl_domain import DomainError
+from flowxer.engine.gpu import GpuUnavailableError
 from flowxer.engine.mixer import VisionMixer
 from flowxer.listen import bind_listener
 from flowxer.settings import Settings, get_settings
@@ -259,6 +260,9 @@ def run() -> None:
         app = create_app(settings, nmos_listener=nmos_listener)
     except DomainError as exc:
         log.error("invalid MXL output domain: %s", exc)
+        sys.exit(EXIT_CONFIG)
+    except GpuUnavailableError as exc:
+        log.error("%s", exc)
         sys.exit(EXIT_CONFIG)
     log.info("FlowXer %s listening on %s:%s", __version__, settings.host, settings.port)
     # Open requests get half of SHUTDOWN_TIMEOUT_S; the rest is for stopping media,

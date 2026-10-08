@@ -5,7 +5,7 @@ import logging
 import socket
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from flowxer import __version__
 from flowxer.domain.nmos import output_domain_uuid, seed_short
@@ -109,6 +109,9 @@ class Settings(BaseSettings):
 
     # "auto" uses GStreamer when mxlsrc/mxlsink (or a local fallback) is present.
     gst_mode: str = "auto"
+    # Video on an NVIDIA GPU (OpenGL through EGL): "off" (default) the CPU path, "auto"
+    # the GPU path when it works at start, "on" the GPU path or exit 78 (flowxer.engine.gpu).
+    gpu: Literal["auto", "on", "off"] = "off"
     simulate: bool = False
 
     overlay_url: str = "http://127.0.0.1:9610/graphics/lower-third.html"
@@ -166,6 +169,11 @@ class Settings(BaseSettings):
             # The platform finds the NMOS receivers by label.
             raise ValueError("FLOWXER_INPUT_LABELS: labels must be unique")
         return value
+
+    @field_validator("gpu", mode="before")
+    @classmethod
+    def normalize_gpu(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
     @field_validator("api_token")
     @classmethod
