@@ -414,7 +414,8 @@ state and the GUI.
 4. **GHCR visibility** — needs a human in GitHub package settings.
 5. **Multiple ME program buses** — today one PGM compositor. Senders are
    created per panel; extra MEs still share one program bus until a future
-   change. Record if the lab expects otherwise.
+   change. Record if the lab expects otherwise. Design for every ME rendering
+   its own Program and ME re-entry (task R): `docs/me-reentry.md`.
 6. **Input kind name `clip`** — prompt says clip/file player. Code uses
    `file` / `replay`. No rename; no receivers on either.
 
