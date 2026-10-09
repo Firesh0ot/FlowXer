@@ -88,6 +88,10 @@ class TallyExport:
         self._retry_at = 0.0
         self._logged_at = -LOG_EVERY_S
         self._closed = False
+        # For /metrics: packets sent, failed sends, wall-clock time of the last good send.
+        self.packets_sent = 0
+        self.send_errors = 0
+        self.last_success = 0.0
         self._wake = threading.Event()
         log.info("FLOWXER_TALLY_TSL: raw tally to %s", self.target)
         self._thread = threading.Thread(target=self._run, name="tally-tsl", daemon=True)
@@ -112,8 +116,11 @@ class TallyExport:
             if now >= self._retry_at:
                 try:
                     snapshot = self._snapshot()
-                    self._send(self._packets(snapshot, now))
+                    packets = self._packets(snapshot, now)
+                    self._send(packets)
                     self._failures = 0
+                    self.packets_sent += len(packets)
+                    self.last_success = time.time()
                     # A mix that ran at `now` is sent again when it ends.
                     ends = [me.transition[2] for me in snapshot.mes if me.transition and me.transition[2]]
                     next_send = min([next_send] + [end for end in ends if end > now])
@@ -154,6 +161,7 @@ class TallyExport:
     def _fail(self, exc: Exception) -> None:
         self._disconnect()
         self._failures += 1
+        self.send_errors += 1
         pause = RETRY_BACKOFF_S[min(self._failures, len(RETRY_BACKOFF_S)) - 1]
         now = time.monotonic()
         self._retry_at = now + pause

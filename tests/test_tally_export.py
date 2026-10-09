@@ -10,6 +10,7 @@ import time
 import pytest
 from pydantic import ValidationError
 
+from flowxer.api.metrics import render_prometheus
 from flowxer.api.schemas import InputKind, LogicalInputCreate, MixerStartRequest, TransitionType, WorkspaceUpdate
 from flowxer.engine import tally_export
 from flowxer.engine.mixer import VisionMixer
@@ -253,6 +254,10 @@ def test_export_over_udp(settings: Settings, monkeypatch: pytest.MonkeyPatch) ->
         refreshed, decoded = _receive(receiver, 1)
         assert 0.3 < refreshed - ended < 1.0
         assert {item["text"]: item["lh"] for item in decoded["messages"]}["Cam 2"] == TALLY_RED
+        metrics = render_prometheus(mixer)
+        assert "flowxer_tally_export_send_errors_total 0\n" in metrics
+        assert mixer.tally_export.packets_sent >= 5
+        assert time.time() - mixer.tally_export.last_success < 1.0
     finally:
         mixer.shutdown()
     try:
@@ -289,6 +294,11 @@ def test_export_resolves_the_name_again_and_logs_once(monkeypatch: pytest.Monkey
     assert decoded["messages"][0]["lh"] == TALLY_RED
     assert names[:4] == ["mxl-tally.example"] * 4
     assert len(caplog.records) == 1
+    assert export.send_errors == 3
+
+
+def test_export_metrics_only_when_configured(mixer: VisionMixer) -> None:
+    assert "flowxer_tally_export" not in render_prometheus(mixer)
 
 
 def _unwrap(stream: bytes) -> list[bytes]:

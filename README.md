@@ -50,7 +50,7 @@ flowchart LR
 - **Logical inputs** virtually bundle a video essence and an audio essence into one mixer source (camera, clip, replay, test, black).
 - **Storage access** plays files from `storage/clips` (`.mp4`, `.ts`, `.mov`, `.mxf`, …) as uncompressed v210 + float32.
 - **HTML5 graphics overlay** keys a page over program (`cefsrc` in the mixer image, Pillow fallback if that plugin did not load). A sample lower-third is served at `/graphics/lower-third.html`.
-- **Stingers** play a **TGA sequence with alpha** or a **video file**. At the cut frame the mixer switches Program, then finishes the sting. A source can be assigned an auto-stinger so Take/Cut plays that slot; otherwise Wipe arms the next Cut.
+- **Stingers** play a **TGA sequence with alpha** or a **video file**. At the cut frame the mixer switches Program, then finishes the sting. A source can be assigned an auto-stinger so Take/Cut plays that slot; otherwise Wipe arms the next Cut. Only ME 1 renders: a stinger on ME 2..4 switches that ME at once, without the media, and leaves ME 1's Program and stinger alone.
 - **Tally / UMD** sends TSL UMD Protocol 5.0 (UDP, or TCP with DLE/STX) to receivers such as Bitfocus Companion, Lawo VSM, BFE Commander, and Riedel HI. Program = right-hand red, Preview = left-hand green, label = source name.
 - Runs in **Docker** (`vision-mixer` + `gui` services) with a shared MXL domain volume.
 
@@ -494,7 +494,7 @@ For the platform's tally calculator, which works out from this raw tally what is
 
 | TSL field | FlowXer |
 |-----------|---------|
-| SCREEN | ME: 1..4 in panel order. ME 2..4 are tallied from their own Program and Preview (only ME 1 renders) |
+| SCREEN | ME: 1..4 in panel order. ME 2..4 are tallied from their own Program and Preview (only ME 1 renders; a stinger there switches at once) |
 | INDEX | Input number, see below |
 | LH tally | Red: the input is on the ME's Program, or it is the outgoing or the incoming source of a mix (Fade, Fade to Black, take with mix) or a stinger (Wipe, auto-stinger, replay) while the transition runs |
 | RH tally | Green: the input is on the ME's Preview |
@@ -506,6 +506,7 @@ For the platform's tally calculator, which works out from this raw tally what is
 - **Lights nothing:** the downstream keyers (HTML graphics; no key takes its fill from an input) and the stinger media.
 - **When:** each update holds every input of every ME, the ones that are off included. It goes out on each change (also when a mix or stinger starts and ends) and every second. While Program is stopped every lamp is off; the last update at shutdown says so.
 - **Transport:** a packet holds at most 2048 bytes; a larger update is split. Over TCP each packet is wrapped in DLE/STX … DLE/ETX with DLE stuffing. The host name is resolved when the export connects and again after a failure, so a Service that does not exist yet at start is found later. After a failure (name not found, connection refused) the export tries again after 1, 2, 5, then every 10 s and logs at most once a minute. A thread of its own takes the state and sends; takes and the media pipeline do not wait for it.
+- **Metrics** (`/metrics`, only while the export is set): `flowxer_tally_export_packets_total`, `flowxer_tally_export_send_errors_total` and `flowxer_tally_export_last_success_timestamp_seconds` (Unix time of the last good send, 0 before the first).
 
 ## License
 
