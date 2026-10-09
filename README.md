@@ -291,6 +291,7 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `FLOWXER_TEST_SOURCES` | empty (0 with the inputs set) | Number of `test` inputs `test-1`..`test-M` after the live ones |
 | `FLOWXER_PANELS` | empty | Number of MEs (1-4) |
 | `FLOWXER_PROGRAM_AUTOSTART` | `false` | Start Program at process start (after the state is restored) |
+| `FLOWXER_TALLY_TSL` | empty | Raw tally of every ME for the platform's tally calculator: `udp://host:port` or `tcp://host:port`. Empty: off. See [Raw tally export](#raw-tally-export-flowxer_tally_tsl) |
 | `SHUTDOWN_TIMEOUT_S` / `FLOWXER_SHUTDOWN_TIMEOUT_S` | `10` | Open requests get half; the rest is for stopping media and deregistering |
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
@@ -486,6 +487,25 @@ FlowXer is a TSL UMD Protocol 5.0 **sender**. Each configured receiver gets one 
 | Text tally | Program red, Preview green, both amber |
 
 Presets: Bitfocus Companion, Lawo VSM, BFE Commander, Riedel HI (human interface Broadcast Controller), or Custom.
+
+### Raw tally export (`FLOWXER_TALLY_TSL`)
+
+For the platform's tally calculator, which works out from this raw tally what is on air further down. It is independent of the receivers above. `FLOWXER_TALLY_TSL=udp://host:port` (for example `udp://mxl-tally.mxl-platform.svc.cluster.local:8910`) or `tcp://host:port` (`8911`); unset, nothing is sent. The mixer process sends the packets itself, so their source address is the pod IP (the calculator tells the mixers apart by it).
+
+| TSL field | FlowXer |
+|-----------|---------|
+| SCREEN | ME: 1..4 in panel order. ME 2..4 are tallied from their own Program and Preview (only ME 1 renders) |
+| INDEX | Input number, see below |
+| LH tally | Red: the input is on the ME's Program, or it is the outgoing or the incoming source of a mix (Fade, Fade to Black, take with mix) or a stinger (Wipe, auto-stinger, replay) while the transition runs |
+| RH tally | Green: the input is on the ME's Preview |
+| Text tally | Off |
+| Brightness | 3 |
+| TEXT | Input label, UTF-16LE (FLAGS bit 0) |
+
+- **INDEX:** at start the inputs are numbered from 0 in slot order: with the production structure from the environment `cam-1`..`cam-N`, `test-1`..`test-M`, `black`, `replay`. An input added later (`POST /inputs`, only without that structure) gets the next number. A number stays with its input while the process runs: removing an input renumbers the slots, not the TSL numbers, and its number is not given to another input. After a restart the numbering starts again from the slots. 1000 + ME is kept free for an ME re-entry; FlowXer sends none.
+- **Lights nothing:** the downstream keyers (HTML graphics; no key takes its fill from an input) and the stinger media.
+- **When:** each update holds every input of every ME, the ones that are off included. It goes out on each change (also when a mix or stinger starts and ends) and every second. While Program is stopped every lamp is off; the last update at shutdown says so.
+- **Transport:** a packet holds at most 2048 bytes; a larger update is split. Over TCP each packet is wrapped in DLE/STX … DLE/ETX with DLE stuffing. The host name is resolved when the export connects and again after a failure, so a Service that does not exist yet at start is found later. After a failure (name not found, connection refused) the export tries again after 1, 2, 5, then every 10 s and logs at most once a minute. A thread of its own takes the state and sends; takes and the media pipeline do not wait for it.
 
 ## License
 
