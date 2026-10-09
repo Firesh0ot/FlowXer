@@ -231,7 +231,7 @@ Point `FLOWXER_MXL_ROOT` at the host tmpfs that holds one directory per domain (
 
 `FLOWXER_MXL_DOMAIN` remains a deprecated alias that restores the old single-domain layout (Compose still uses it for local demos). The mixer image no longer bakes a fixed `domain_def.json` id. `FLOWXER_READ_OFFSET_GRAINS` is accepted but ignored: gst-mxl-rs `mxlsrc` has no read-offset property and sits at the live edge.
 
-`cefsrc` starts a private Xvfb when `DISPLAY` is unset, with the sandbox off (`GST_CEF_CHROME_EXTRA_FLAGS`).
+`cefsrc` starts a private Xvfb when `DISPLAY` is unset, with the sandbox off (`GST_CEF_CHROME_EXTRA_FLAGS`). The image preloads `libmallinfo-shim.so` (`LD_PRELOAD`): CEF runs inside the mixer process and stops it when glibc's `mallinfo()` wraps above 2 GiB of malloc; the shim caps the values (`docker/mallinfo-shim.c`).
 
 ## Running on an MXL platform
 
