@@ -1314,23 +1314,26 @@ class VisionMixer:
     def _attach_waiting_sources(self, runtime: GstRuntime) -> None:
         root = self.settings.mxl_root
         for (input_id, role), domain_id in list(self._missing_domains.items()):
-            item = self.inputs.get(input_id)
-            essence = getattr(item, role, None) if item is not None and item.kind == InputKind.mxl_live else None
-            if essence is None or str(essence.domain_id) != domain_id:
-                # Routed elsewhere or no longer an MXL input.
-                self._missing_domains.pop((input_id, role), None)
-                continue
-            flow_id = str(essence.flow_id) if essence.flow_id else ""
-            if resolve_domain_path(root, domain_id) is None and not (flow_id and find_flow_domain(root, flow_id)):
-                continue
-            path = self._mxl_source_path(input_id, role, domain_id, flow_id)
-            src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
-            log.info("MXL domain %s appeared: input %s (%s) reads %s in %s", domain_id, input_id, role, flow_id, path)
-            try:
-                runtime.retarget_mxl_source(src_name, flow_id or None, path, role)
-            except Exception as exc:
-                log.warning("input %s (%s): reading the appeared domain failed (program continues): %s", input_id, role, exc)
-                self.error = f"input {input_id} ({role}): {exc}"
+            # IS-05 activations change the route and retarget under this lock: check and move
+            # the source under it too, or an activation in between was undone by the old route.
+            with self.nmos.lock:
+                item = self.inputs.get(input_id)
+                essence = getattr(item, role, None) if item is not None and item.kind == InputKind.mxl_live else None
+                if essence is None or str(essence.domain_id) != domain_id:
+                    # Routed elsewhere or no longer an MXL input.
+                    self._missing_domains.pop((input_id, role), None)
+                    continue
+                flow_id = str(essence.flow_id) if essence.flow_id else ""
+                if resolve_domain_path(root, domain_id) is None and not (flow_id and find_flow_domain(root, flow_id)):
+                    continue
+                path = self._mxl_source_path(input_id, role, domain_id, flow_id)
+                src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
+                log.info("MXL domain %s appeared: input %s (%s) reads %s in %s", domain_id, input_id, role, flow_id, path)
+                try:
+                    runtime.retarget_mxl_source(src_name, flow_id or None, path, role)
+                except Exception as exc:
+                    log.warning("input %s (%s): reading the appeared domain failed (program continues): %s", input_id, role, exc)
+                    self.error = f"input {input_id} ({role}): {exc}"
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
