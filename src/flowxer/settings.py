@@ -6,6 +6,7 @@ import socket
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from flowxer import __version__
 from flowxer.domain.nmos import output_domain_uuid, seed_short
@@ -140,6 +141,9 @@ class Settings(BaseSettings):
     panels: int | None = Field(default=None, ge=1, le=4)
     # Start Program after the state is restored: ME 1 on the first live input.
     program_autostart: bool = False
+    # Raw tally per ME for the platform's tally calculator (flowxer.engine.tally_export):
+    # udp://host:port or tcp://host:port. Empty: off.
+    tally_tsl: str = ""
 
     mxl_domain_deprecated: bool = False
 
@@ -168,6 +172,20 @@ class Settings(BaseSettings):
         if len(set(labels)) != len(labels):
             # The platform finds the NMOS receivers by label.
             raise ValueError("FLOWXER_INPUT_LABELS: labels must be unique")
+        return value
+
+    @field_validator("tally_tsl")
+    @classmethod
+    def validate_tally_tsl(cls, value: str) -> str:
+        value = (value or "").strip()
+        if value:
+            parsed = urlsplit(value)
+            try:
+                port = parsed.port
+            except ValueError:
+                port = None
+            if parsed.scheme not in {"udp", "tcp"} or not parsed.hostname or not port or parsed.path.strip("/"):
+                raise ValueError("FLOWXER_TALLY_TSL must be udp://host:port or tcp://host:port")
         return value
 
     @field_validator("gpu", mode="before")
@@ -257,6 +275,14 @@ class Settings(BaseSettings):
         if self.panels is not None:
             pinned["mixer_panel_count"] = (self.panels, "FLOWXER_PANELS")
         return pinned
+
+    @property
+    def tally_tsl_target(self) -> tuple[str, str, int] | None:
+        """FLOWXER_TALLY_TSL as (transport, host, port), or None when it is unset."""
+        if not self.tally_tsl:
+            return None
+        parsed = urlsplit(self.tally_tsl)
+        return parsed.scheme, parsed.hostname, parsed.port
 
     @property
     def resolved_registry_url(self) -> str:

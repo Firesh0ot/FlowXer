@@ -7,6 +7,12 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Added
 
+- `FLOWXER_TALLY_TSL=udp://host:port` (or `tcp://`): the raw tally of every ME
+  for the platform's tally calculator, TSL UMD 5.0 from the mixer process.
+  SCREEN is the ME, INDEX the input (slot order at start, stable while the
+  process runs), LH red on Program and for both sources of a running mix or
+  stinger, RH green on Preview, the label in UTF-16. Sent on each change and
+  every second; unset, nothing is sent.
 - Production structure from the environment (plan §3.10): `FLOWXER_FORMAT`,
   `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and
   `FLOWXER_PANELS` win over the saved state at every start; routes, keyers,

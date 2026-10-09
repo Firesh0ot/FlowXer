@@ -70,6 +70,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
+from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.engine.webrtc import webrtc_available
 from flowxer.library.models import LibraryItem, LibraryKind
@@ -155,6 +156,10 @@ class VisionMixer:
         self._autostart_done = threading.Event()
         self._stinger_clock: threading.Thread | None = None
         self.tally = TallyService()
+        # FLOWXER_TALLY_TSL, started at the end of __init__.
+        self.tally_export: TallyExport | None = None
+        # Panel id -> (outgoing, incoming, monotonic end) of its last mix, for the raw tally.
+        self._mixes: dict[str, tuple[str | None, str, float]] = {}
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -175,6 +180,8 @@ class VisionMixer:
         self._restore_state()
         self.library.start(self.workspace.format_id, fps=self.settings.fps)
         self.refresh_library_bindings()
+        if settings.tally_tsl_target is not None:
+            self.tally_export = TallyExport(*settings.tally_tsl_target, self._tally_snapshot)
 
     def _select_media_path(self) -> MediaPath:
         if self.settings.simulate or self.settings.gst_mode == "simulate":
@@ -618,6 +625,7 @@ class VisionMixer:
         self._apply_default_domain(logical)
         self.inputs[logical.id] = logical
         self.nmos.sync_from_rest(logical.id)
+        self._publish_tally()
         return logical
 
     def update_input(self, input_id: str, payload: LogicalInputUpdate) -> LogicalInput:
@@ -683,6 +691,7 @@ class VisionMixer:
         for slot, item in enumerate(self.inputs.values()):
             item.slot = slot
         self.nmos.reconcile_inputs()
+        self._publish_tally()
 
     def get_input(self, input_id: str) -> LogicalInput:
         try:
@@ -1242,6 +1251,8 @@ class VisionMixer:
         except Exception:
             log.exception("stopping the media library failed")
         self.tally.close()
+        if self.tally_export is not None:
+            self.tally_export.close()
         self.nmos.shutdown()
         if self.settings.mxl_cleanup_on_exit:
             remove_output_domain(
@@ -1495,6 +1506,11 @@ class VisionMixer:
         self.transition_counts[kind] = self.transition_counts.get(kind, 0) + 1
         if flip_flop and outgoing and outgoing != target.id:
             panel.preview_input_id = outgoing
+        if transition == TransitionType.mix:
+            end = time.monotonic() + (duration_ms or DEFAULT_MIX_MS) / 1000
+            self._mixes[panel.id] = (outgoing, target.id, end)
+        else:
+            self._mixes.pop(panel.id, None)
         if panel.id == (self.panels[0].id if self.panels else panel.id):
             self.program_input_id = target.id
             if flip_flop and outgoing and outgoing != target.id:
@@ -1587,6 +1603,7 @@ class VisionMixer:
             panel_id=panel.id,
         )
         self.stinger_player = player
+        self._export_tally()
         if self.gst is not None:
             # Each frame that reaches the compositor advances the player, so Program
             # cuts on the stinger's own cut frame.
@@ -1643,6 +1660,7 @@ class VisionMixer:
             self._publish_tally()
         if "complete" in snapshot["events"]:
             self.stinger_player = None
+            self._export_tally()
         return self.status()
 
     def _arm_stinger_clock(self) -> None:
@@ -1705,11 +1723,37 @@ class VisionMixer:
         return self._publish_tally()
 
     def _publish_tally(self) -> list[TallyReceiverStatus]:
+        self._export_tally()
         try:
             return self.tally.publish(self)
         except Exception as exc:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
+
+    def _export_tally(self) -> None:
+        """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it.
+        Called alone at the start and end of a stinger (no change for the API's receivers)."""
+        if self.tally_export is not None:
+            self.tally_export.changed()
+
+    def _tally_snapshot(self) -> TallySnapshot:
+        """Program, Preview and the running mix or stinger of each ME (lamps off while Program
+        is stopped). Called by the export thread."""
+        running = self.state == MixerState.running
+        player = self.stinger_player
+        mes = []
+        for panel in list(self.panels):
+            if not running:
+                mes.append(MeTally())
+                continue
+            transition = self._mixes.get(panel.id)
+            if player is not None and not player.done and player.panel_id == panel.id:
+                transition = (player.outgoing_input_id, player.target_input_id, None)
+            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition))
+        return TallySnapshot(
+            inputs=tuple((item.id, item.label) for item in self.list_inputs()),
+            mes=tuple(mes),
+        )
 
     # ── saved state and config export/import ─────────────────────────────────
 
