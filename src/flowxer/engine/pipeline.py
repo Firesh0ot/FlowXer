@@ -369,20 +369,19 @@ def build_pipeline_description(
         f"\npgmt. ! {tap(MONITOR_PROGRAM, settings.monitor_fps)}" if settings.monitor_fps else ""
     )
 
-    # qos=true: the sink measures how late each frame is; GstRuntime keeps Program on the TAI
+    # Video sink qos=true: it measures how late each frame is; GstRuntime keeps Program on the TAI
     # timeline from that (the compositor skips frames when it is late).
-    on_time = "qos=true"
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout {on_time} flow-id={output_video_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=vout qos=true flow-id={output_video_flow_id} domain={_gst_string(domain)}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
             f"mxlsink name=aout flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
         )
     else:
-        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true {on_time}"
+        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true qos=true"
         audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true"
 
     compositor = "compositor name=comp background=black"
