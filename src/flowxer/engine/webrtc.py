@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -103,6 +104,7 @@ async def ice_udp_port_range(port_min: int, port_max: int):
 
 async def create_whep_answer(mixer, stream_id: str, offer_sdp: str) -> str:
     from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc.mediastreams import VIDEO_CLOCK_RATE, VIDEO_TIME_BASE, MediaStreamError
     from aiortc.rtcrtpsender import RTCRtpSender
     from av import VideoFrame
 
@@ -124,12 +126,28 @@ async def create_whep_answer(mixer, stream_id: str, offer_sdp: str) -> str:
     except ImportError:  # pragma: no cover
         from aiortc.mediastreams import VideoStreamTrack
 
+    # One frame per monitor picture: the pictures change FLOWXER_MONITOR_FPS times a second, and at
+    # aiortc's 30 frames/s every peer encoded each one about three times.
+    fps = int(getattr(mixer.settings, "monitor_fps", 0) or 0) or 10
+
     class MixerTrack(VideoStreamTrack):
         kind = "video"
 
         def __init__(self) -> None:
             super().__init__()
             self._stream_id = stream_id
+
+        async def next_timestamp(self):
+            # VideoStreamTrack.next_timestamp (aiortc 1.9) at `fps` instead of 30 frames/s.
+            if self.readyState != "live":
+                raise MediaStreamError
+            if hasattr(self, "_timestamp"):
+                self._timestamp += VIDEO_CLOCK_RATE // fps
+                await asyncio.sleep(self._start + self._timestamp / VIDEO_CLOCK_RATE - time.time())
+            else:
+                self._start = time.time()
+                self._timestamp = 0
+            return self._timestamp, VIDEO_TIME_BASE
 
         async def recv(self):
             pts, time_base = await self.next_timestamp()

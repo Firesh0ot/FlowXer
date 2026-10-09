@@ -74,6 +74,19 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Changed
 
+- Test sources, Black and a Replay or file input without a clip are made
+  once and repeated live (`imagefreeze`); on the GPU path they are uploaded
+  once. Each of them drew every 1080p50 frame on the CPU (about half a core
+  on the platform) and uploaded it (12–19 % of the GL thread). The colour bars
+  no longer carry the running time. Their GUI monitor picture is taken once
+  a second.
+- GPU path: the HTML keyer's BGRA frames go up as RGBA bytes and its shader
+  swaps red and blue (no `glcolorconvert` pass: 7–9 % of the GL thread).
+- WebRTC previews send `FLOWXER_MONITOR_FPS` frames per second (the rate
+  the monitor pictures change) instead of aiortc's 30; every peer encoded
+  each picture three times.
+- `flowxer_frames_dropped_total` counts the Program frames the mixer skipped
+  because it was late (it was always 0).
 - A stinger (Wipe, auto-stinger, stinger take) on ME 2..4 switches that ME at
   once without playing the media. It used to play over ME 1 and switch ME 1's
   rendered Program at its cut (ME 1's panel and tally kept the old source),
@@ -102,6 +115,20 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- Program fell behind real time on a busy node (platform vmix, 13.20.43, GPU
+  path): the mixer made 48.6–48.8 frames/s, its timestamps ran on without
+  gaps, and `mxlsink` wrote each frame at the MXL index of its timestamp, so
+  Program fell 1.4 grains per second further behind TAI (5–8 s after a few
+  minutes; the multiviewer froze). A stall had the same effect for good
+  (lab: 1.4–2.6 s behind after 10 WebRTC previews connected). The Program sink
+  now measures each frame's lateness (`qos=true`); a frame more than two
+  frames late makes the compositor skip to real time plus three frames, so
+  Program keeps to the TAI timeline with gaps and the compositor waits for
+  its inputs again. Skipped frames are counted in
+  `flowxer_frames_dropped_total` and logged once per burst. Program audio
+  was not late and is unchanged. GStreamer's own QoS (with or without
+  `max-lateness`) was tried first: after a 1 s stall it kept the compositor
+  at the edge of real time and Program at 1 to 33 frames/s.
 - Program did not start after a node reboot (platform vmix): the fabrics
   agent had not recreated its mirror domains yet, `mxlsrc` failed on the
   missing domain directory, the pipeline did not reach PLAYING and

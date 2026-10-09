@@ -85,12 +85,47 @@ def test_gpu_description_uploads_each_source_once_and_downloads_program_once(ful
     assert program.count("gldownload") == 1
     assert "glshader name=gpu_pack ! video/x-raw(memory:GLMemory),format=RGBA,width=1280,height=1080" in program
     assert 'capssetter replace=true caps="video/x-raw,format=v210,width=1920,height=1080' in program
-    assert program.endswith('mxlsink name=vout flow-id=11111111-1111-1111-1111-111111111111 domain="/Volumes/mxl/out"')
+    assert program.endswith(
+        'mxlsink name=vout qos=true flow-id=11111111-1111-1111-1111-111111111111 domain="/Volumes/mxl/out"'
+    )
     # Monitors: scaled on the GPU, only the small picture is downloaded.
     assert "videoconvertscale" not in description
     assert description.count("gldownload") == 1 + video_inputs + 1
-    # The keyer is BGRA and converted on the GPU too.
-    assert "! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA ! glshader name=gpu_yuv_html5" in description
+    # The keyer's BGRA bytes go up as an RGBA image; its shader swaps red and blue back.
+    assert (
+        '! capssetter replace=true caps="video/x-raw,format=RGBA,width=1920,height=1080,framerate=50/1" '
+        "! identity drop-allocation=true ! glupload ! glshader name=gpu_bgra_html5 "
+    ) in description
+    assert gpu.fragment_for("gpu_bgra_html5", 1920) == gpu.BGRA_TO_YUV
+    assert "texture2D(tex, v_texcoord).bgra;" in gpu.BGRA_TO_YUV
+
+
+@pytest.mark.parametrize("gpu_path", [False, True])
+def test_program_video_sink_keeps_to_the_timeline(full_hd: VisionMixer, gpu_path: bool) -> None:
+    # Platform vmix on a busy node: the mixer made 48.7 frames/s, its timestamps ran on without
+    # gaps, and mxlsink wrote each frame at the MXL index of its timestamp: Program fell 1.4 grains
+    # per second further behind TAI. The sink now measures each frame's lateness (QoS), and the
+    # runtime makes the compositor skip from that.
+    program = next(line for line in _description(full_hd, gpu_path=gpu_path).splitlines() if line.startswith("comp. !"))
+    assert "mxlsink name=vout qos=true flow-id=" in program
+
+
+@pytest.mark.parametrize("gpu_path", [False, True])
+def test_black_bars_and_an_empty_replay_are_stills(full_hd: VisionMixer, gpu_path: bool) -> None:
+    # Platform vmix: test-1, test-2, Black and the idle Replay each drew 1080p50 on the CPU (about
+    # half a core each) and, on the GPU path, uploaded every frame (12 % of the GL thread each).
+    # They are made once; imagefreeze repeats the frame live, the monitor takes it once a second.
+    lines = _description(full_hd, gpu_path=gpu_path).splitlines()
+    for input_id in ("cam-2", "black", "replay"):
+        source = next(line for line in lines if line.startswith(f"videotestsrc name=vsrc_{input_id} "))
+        assert "num-buffers=1 !" in source
+        assert "! imagefreeze is-live=true ! " in source
+        assert "timeoverlay" not in source
+        if gpu_path:
+            assert source.index("glupload") < source.index("imagefreeze")
+        assert "framerate=1/1" in next(line for line in lines if f"appsink name=mon_{input_id} " in line)
+    assert "imagefreeze" not in next(line for line in lines if line.startswith("mxlsrc name=vsrc_cam-1 "))
+    assert "framerate=10/1" in next(line for line in lines if "appsink name=mon_cam-1 " in line)
 
 
 def test_cpu_description_has_no_gl_elements(full_hd: VisionMixer) -> None:
