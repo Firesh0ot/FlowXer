@@ -461,3 +461,23 @@ def test_a_source_waiting_in_an_allocation_query_can_be_started_again() -> None:
             time.sleep(0.3)
     finally:
         runtime.stop()
+
+
+def test_a_pipeline_that_did_not_start_leaves_nothing_behind() -> None:
+    # Platform vmix: the autostart pipeline failed (an mxlsrc on a missing MXL domain). Its bus
+    # watch stayed on the default main context, and the next start's main loop delivered its
+    # errors: the status said "asrc_cam-1: … state change failed …" right after a good start.
+    from flowxer.engine.gst_runtime import GstRuntime
+
+    errors: list[str] = []
+    failed = GstRuntime(errors.append)
+    with pytest.raises(RuntimeError, match="src_cam-1: "):
+        failed.start(f"filesrc name=src_cam-1 location=/nonexistent/{uuid4()} ! fakesink")
+    assert failed.pipeline is None
+    runtime = GstRuntime()
+    runtime.start("videotestsrc is-live=true ! fakesink")
+    try:
+        time.sleep(0.5)
+    finally:
+        runtime.stop()
+    assert errors == []
