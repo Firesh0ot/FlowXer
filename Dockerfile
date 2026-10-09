@@ -29,6 +29,9 @@ ENV GSTCEFSRC_REPO=${GSTCEFSRC_REPO} \
     GSTCEFSRC_REF=${GSTCEFSRC_REF}
 COPY docker/build-cef.sh /tmp/build-cef.sh
 RUN chmod +x /tmp/build-cef.sh && /tmp/build-cef.sh
+# Saturating mallinfo() for libcef (docker/mallinfo-shim.c), preloaded below.
+COPY docker/mallinfo-shim.c /tmp/mallinfo-shim.c
+RUN gcc -O2 -Wall -Werror -shared -fPIC -o /opt/gstcef/libmallinfo-shim.so /tmp/mallinfo-shim.c
 
 FROM ${UBUNTU}
 
@@ -100,7 +103,8 @@ COPY --from=cef-builder /opt/gstcef /opt/gstcef
 RUN printf '/opt/mxl/lib\n/opt/gstcef\n' > /etc/ld.so.conf.d/flowxer-media.conf \
     && ldconfig \
     && test -f /opt/mxl/gst/libgstmxl.so \
-    && test -f /opt/gstcef/libgstcef.so
+    && test -f /opt/gstcef/libgstcef.so \
+    && test -f /opt/gstcef/libmallinfo-shim.so
 
 WORKDIR /app
 
@@ -122,6 +126,9 @@ ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer
 # no-sandbox: CEF in a container. disable-*-update: no runtime downloads (lab proxy).
 ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader,disable-background-networking,disable-component-update,disable-sync,no-first-run,disable-default-apps,disable-extensions,disable-breakpad
 ENV GST_CEF_CACHE_LOCATION=/tmp/cef-cache
+# libcef's legacy mallinfo() wraps above 2 GiB of malloc and Chromium's memory dumps
+# then stop the mixer (SIGILL, exit 132); the shim caps the values instead.
+ENV LD_PRELOAD=/opt/gstcef/libmallinfo-shim.so
 ENV HOME=/tmp
 ENV FLOWXER_HOST=127.0.0.1
 ENV FLOWXER_PORT=9610
