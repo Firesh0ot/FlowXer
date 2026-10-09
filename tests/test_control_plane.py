@@ -143,12 +143,15 @@ def test_an_activation_that_cannot_retarget_releases_the_node(settings, monkeypa
 
 def test_stop_that_does_not_finish_reports_an_error(settings) -> None:
     mixer = VisionMixer(settings)
-    mixer.gst = SimpleNamespace(program_frames=5, program_dropped={"video": 1, "audio": 2}, stop=lambda: False)
+    mixer.gst = SimpleNamespace(
+        program_frames=5, program_dropped={"video": 1, "audio": 2}, late_frames=3, stop=lambda: False
+    )
     status = mixer.stop()
     assert status.state.value == "error"
     assert "did not stop" in status.error
     assert mixer.gst is None
     assert mixer.program_dropped == {"video": 1, "audio": 2}
+    assert mixer.frames_dropped == 3
 
 
 def test_livez_fails_while_the_control_plane_is_stuck(client: TestClient, mixer: VisionMixer) -> None:

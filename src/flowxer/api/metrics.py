@@ -68,7 +68,7 @@ def render_prometheus(mixer) -> str:
         "# HELP flowxer_program_stalled 1 while on air without a new Program frame for 3 s",
         "# TYPE flowxer_program_stalled gauge",
         _line("flowxer_program_stalled", int(mixer.program_stalled_s() is not None) if hasattr(mixer, "program_stalled_s") else 0),
-        "# HELP flowxer_frames_dropped_total Dropped mixer frames",
+        "# HELP flowxer_frames_dropped_total Program frames skipped to stay on the MXL timeline (mixer late)",
         "# TYPE flowxer_frames_dropped_total counter",
         _line("flowxer_frames_dropped_total", int(getattr(mixer, "frames_dropped", 0))),
         "# HELP flowxer_program_buffers_dropped_total Program buffers dropped before mxlsink because they went back in time",
