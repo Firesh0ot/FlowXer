@@ -7,6 +7,13 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Added
 
+- `FLOWXER_TALLY_TSL=udp://host:port` (or `tcp://`): the raw tally of every ME
+  for the platform's tally calculator, TSL UMD 5.0 from the mixer process.
+  SCREEN is the ME, INDEX the input (slot order at start, stable while the
+  process runs), LH red on Program and for both sources of a running mix or
+  stinger, RH green on Preview, the label in UTF-16. Sent on each change and
+  every second; unset, nothing is sent. `/metrics` counts its packets and
+  failed sends and gives the time of the last good send.
 - Production structure from the environment (plan §3.10): `FLOWXER_FORMAT`,
   `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and
   `FLOWXER_PANELS` win over the saved state at every start; routes, keyers,
@@ -67,6 +74,10 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Changed
 
+- A stinger (Wipe, auto-stinger, stinger take) on ME 2..4 switches that ME at
+  once without playing the media. It used to play over ME 1 and switch ME 1's
+  rendered Program at its cut (ME 1's panel and tally kept the old source),
+  and it ended a stinger running on ME 1.
 - The compositor works in AYUV instead of BGRA (no RGB round trip for
   Program).
 - `flowxer_frames_rendered_total` counts Program frames at the video output.
@@ -91,6 +102,21 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- Program did not start after a node reboot (platform vmix): the fabrics
+  agent had not recreated its mirror domains yet, `mxlsrc` failed on the
+  missing domain directory, the pipeline did not reach PLAYING and
+  `FLOWXER_PROGRAM_AUTOSTART` gave up after one try (state `error`, 0 fps,
+  until an operator started Program). An input routed to a domain that does
+  not exist now waits in the own output domain (black and silence) and reads
+  its flow once the domain appears (checked every 2 s); Program runs
+  throughout. The autostart tries again after 2, 5, 10, then every 30 s until
+  Program runs or an operator starts or stops it, and logs each attempt.
+- After a start that failed, the next start reported an old error
+  ("asrc_cam-1: GStreamer error: state change failed and some element failed
+  to post a proper error message …"): the pipeline that did not start kept its
+  bus watch, and the next pipeline's main loop delivered its errors (and
+  restarted its failed source). It is now taken to NULL and its watch
+  removed; the start error names the failed element.
 - The mixer stopped with exit 132 every 10–25 minutes on the platform's vmix
   (8 inputs, GPU path, keyer on): SIGILL in `libcef.so`, thread `MemoryInfra`.
   CEF reads the malloc totals with glibc's legacy `mallinfo()`, whose `int`

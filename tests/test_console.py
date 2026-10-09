@@ -3,7 +3,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from flowxer.api.schemas import MixerStartRequest, WorkspaceUpdate
+from flowxer.api.schemas import MixerStartRequest, TransitionType, WorkspaceUpdate
 from flowxer.engine.mixer import MixerError, VisionMixer
 
 
@@ -228,6 +228,33 @@ def test_stinger_play_flip_flops_preview_to_program(mixer: VisionMixer) -> None:
     mixer.advance_stinger(max(remaining, 0))
     assert mixer.program_input_id == "cam-2"
     assert mixer.preview_input_id == "cam-1"
+
+
+def test_stinger_on_another_me_leaves_me_1_and_its_stinger_alone(mixer: VisionMixer) -> None:
+    # Only ME 1 renders: a Wipe or stinger take on ME 2 switches ME 2 at once, without media.
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.set_wipe()
+    mixer.cut()
+    player = mixer.stinger_player
+    assert player is not None
+    mixer.set_preview("cam-4", panel_id="me-2")
+    mixer.take("cam-3", panel_id="me-2")
+    mixer.set_wipe(panel_id="me-2")
+    mixer.cut(panel_id="me-2")
+    me_2 = mixer.get_panel("me-2")
+    assert (me_2.program_input_id, me_2.preview_input_id) == ("cam-4", "cam-3")
+    assert me_2.wipe_armed is False
+    assert me_2.last_transition == "stinger"
+    mixer.take("cam-1", TransitionType.stinger, panel_id="me-2")
+    assert mixer.get_panel("me-2").program_input_id == "cam-1"
+    assert mixer.stinger_player is player and not player.done
+    assert mixer.program_input_id == "cam-1"
+    mixer.advance_stinger(player.info.frame_count)
+    assert mixer.stinger_player is None
+    assert mixer.program_input_id == mixer.panels[0].program_input_id == "cam-2"
+    assert mixer.get_panel("me-2").program_input_id == "cam-1"
 
 
 def test_source_auto_stinger_on_take_and_cut(mixer: VisionMixer) -> None:

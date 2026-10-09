@@ -198,7 +198,14 @@ class GstRuntime:
                 element.connect("samples-selected", self._on_samples_selected)
         ret = pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("failed to set GStreamer pipeline to PLAYING")
+            # The pipeline that did not start goes to NULL and its bus watch away: the watch sat on
+            # the default main context, and the next start's main loop delivered its stale errors
+            # (the status said "asrc_cam-1: … state change failed …" right after a good start).
+            message = bus.pop_filtered(Gst.MessageType.ERROR)
+            reason = f"{message.src.get_name()}: {message.parse_error()[0].message}" if message is not None else ""
+            bus.remove_signal_watch()
+            self.stop()
+            raise RuntimeError("failed to set GStreamer pipeline to PLAYING" + (f" ({reason})" if reason else ""))
 
         self.loop = loop
         self.thread = threading.Thread(target=loop.run, name="gst-mainloop", daemon=True)

@@ -121,6 +121,21 @@ def render_prometheus(mixer) -> str:
             "flowxer_tally_send_errors_total",
             int(getattr(mixer.tally, "send_errors", 0)),
         ),
+    ]
+    export = getattr(mixer, "tally_export", None)
+    if export is not None:
+        lines += [
+            "# HELP flowxer_tally_export_packets_total TSL packets sent to FLOWXER_TALLY_TSL",
+            "# TYPE flowxer_tally_export_packets_total counter",
+            _line("flowxer_tally_export_packets_total", export.packets_sent),
+            "# HELP flowxer_tally_export_send_errors_total Failed sends to FLOWXER_TALLY_TSL",
+            "# TYPE flowxer_tally_export_send_errors_total counter",
+            _line("flowxer_tally_export_send_errors_total", export.send_errors),
+            "# HELP flowxer_tally_export_last_success_timestamp_seconds Unix time of the last good send (0: none yet)",
+            "# TYPE flowxer_tally_export_last_success_timestamp_seconds gauge",
+            _line("flowxer_tally_export_last_success_timestamp_seconds", export.last_success),
+        ]
+    lines += [
         "# HELP flowxer_process_cpu_percent Process CPU percent",
         "# TYPE flowxer_process_cpu_percent gauge",
         _line("flowxer_process_cpu_percent", float(resources.get("cpu_percent") or 0)),
