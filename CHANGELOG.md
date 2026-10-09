@@ -91,6 +91,15 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- The mixer stopped with exit 132 every 10–25 minutes on the platform's vmix
+  (8 inputs, GPU path, keyer on): SIGILL in `libcef.so`, thread `MemoryInfra`.
+  CEF reads the malloc totals with glibc's legacy `mallinfo()`, whose `int`
+  fields wrap once the process holds 2 GiB or more from malloc, and Chromium's
+  memory metrics (a memory dump at random times, every 30 min on average)
+  check them and abort. With that layout the mixer holds 1.6–1.8 GiB from
+  malloc, mostly CPU copies of GStreamer GL textures that are never touched,
+  so RSS stays far lower. The image now preloads a `mallinfo()` that caps the
+  values instead (`docker/mallinfo-shim.c`, `LD_PRELOAD`).
 - Program audio stayed silent after a start (platform: every start), and now
   and then Program video stopped after 2 frames. Right after a start the
   audiomixer and the compositor can start their output over at 0 (audio

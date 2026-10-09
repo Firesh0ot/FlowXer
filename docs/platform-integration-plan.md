@@ -211,6 +211,14 @@ record it here. Simulate-mode unit tests cover the state machine without GST.
 - `USER 1000:1000`. Own `/storage`, CEF cache, `/tmp` bits we write.
 - No runtime network for CEF downloads. HTML keyer URLs remain the operator's
   problem.
+- CEF runs inside the mixer process (`cefsrc`). Its `libcef.so` (built against
+  glibc < 2.33) reads the malloc totals with the legacy `mallinfo()`, whose
+  `int` fields wrap above 2 GiB, and Chromium's memory dumps check them
+  (`MallocDumpProvider`: a negative value is SIGILL). The image preloads
+  `docker/mallinfo-shim.c` (`LD_PRELOAD`), a `mallinfo()` that caps the values.
+  Not chosen: glibc tunables (the totals are live allocations, not cached free
+  memory), `--test-memory-log-delay-in-minutes` (stops only the periodic dump),
+  CEF in a process of its own (the larger change). Lab numbers: §8.
 - GHCR **public**: this repo cannot flip package visibility. Document
   `ghcr.io/firesh0ot/flowxer-vision-mixer` / `flowxer-gui` → Package settings →
   Change visibility → Public. Tags: keep `{version}` + `latest`, add `git-<sha>`.
