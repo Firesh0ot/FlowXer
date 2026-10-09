@@ -163,3 +163,53 @@ def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:
     assert "flowxer_program_stalled 0" in render_prometheus(mixer)
     mixer.gst = None
     mixer.state = MixerState.idle
+
+
+def test_program_autostart_tries_again_until_program_runs(
+    mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Platform vmix after a node reboot: the first start failed and Program stayed off until an
+    # operator started it two minutes later.
+    import flowxer.engine.mixer as mixer_module
+
+    monkeypatch.setattr(mixer_module, "AUTOSTART_BACKOFF_S", (0.01, 0.02))
+    start = mixer._start
+    attempts: list[int] = []
+
+    def flaky(request=None):
+        attempts.append(1)
+        if len(attempts) < 3:
+            mixer.state = MixerState.error
+            raise MixerError("GStreamer pipeline failed: failed to set GStreamer pipeline to PLAYING")
+        return start(request)
+
+    monkeypatch.setattr(mixer, "_start", flaky)
+    caplog.set_level("INFO", logger="flowxer.engine.mixer")
+    mixer.autostart()
+    deadline = time.monotonic() + 5
+    while mixer.state != MixerState.running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert mixer.state == MixerState.running
+    assert len(attempts) == 3
+    messages = [record.getMessage() for record in caplog.records if "AUTOSTART" in record.getMessage()]
+    assert "attempt 1, next in 0 s" in messages[0]
+    assert "attempt 2" in messages[1]
+    assert messages[2].endswith("(attempt 3)")
+
+
+def test_a_stop_ends_the_program_autostart_attempts(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    import flowxer.engine.mixer as mixer_module
+
+    monkeypatch.setattr(mixer_module, "AUTOSTART_BACKOFF_S", (0.05,))
+    attempts: list[int] = []
+
+    def failing(request=None):
+        attempts.append(1)
+        raise MixerError("GStreamer pipeline failed")
+
+    monkeypatch.setattr(mixer, "_start", failing)
+    mixer.autostart()
+    mixer.stop()
+    count = len(attempts)
+    time.sleep(0.3)
+    assert len(attempts) == count <= 2

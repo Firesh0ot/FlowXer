@@ -83,6 +83,15 @@ PROGRAM_STALL_S = 3.0
 CLIP_SUFFIXES = {".mp4", ".mov", ".mkv", ".ts", ".mxf", ".wav", ".m4a"}
 # A mix (take with transition mix) without a duration.
 DEFAULT_MIX_MS = 400
+# An input whose MXL domain is missing (a fabrics mirror after a node reboot) is checked this often.
+DOMAIN_WATCH_S = 2.0
+# FLOWXER_PROGRAM_AUTOSTART tries again after these pauses (s) while Program does not start; the
+# last one repeats.
+AUTOSTART_BACKOFF_S = (2.0, 5.0, 10.0, 30.0)
+
+
+def _autostart_pause(attempt: int) -> float:
+    return AUTOSTART_BACKOFF_S[min(attempt, len(AUTOSTART_BACKOFF_S)) - 1]
 
 
 class MixerError(RuntimeError):
@@ -139,6 +148,11 @@ class VisionMixer:
         self.pipeline_errors = 0
         self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
         self._lock = threading.RLock()
+        # (input id, essence) -> MXL domain id of a route whose domain is missing; the source waits
+        # in the own output domain until it appears.
+        self._missing_domains: dict[tuple[str, str], str] = {}
+        # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
+        self._autostart_done = threading.Event()
         self._stinger_clock: threading.Thread | None = None
         self.tally = TallyService()
         from flowxer.nmos.service import NmosNode
@@ -961,7 +975,8 @@ class VisionMixer:
     # ── mixer lifecycle ──────────────────────────────────────────────────────
 
     def start(self, request: MixerStartRequest | None = None) -> MixerStatus:
-        with self.watchdog.busy("Program start"):
+        # The lock: an autostart attempt and an operator's start must not both build a pipeline.
+        with self._lock, self.watchdog.busy("Program start"):
             return self._start(request)
 
     def _start(self, request: MixerStartRequest | None = None) -> MixerStatus:
@@ -1088,8 +1103,10 @@ class VisionMixer:
         if self.gst is not None:
             self.gst.watchdog = self.watchdog
             self.gst.on_source_restart = self._on_source_restart
+            threading.Thread(target=self._watch_domains, args=(self.gst,), name="mxl-domain-watch", daemon=True).start()
         self.backend = "gstreamer" if self.gst else "simulate"
         self.state = MixerState.running
+        self._autostart_done.set()
         self._frame_mark = (self.frames_rendered, time.monotonic())
         self._stall_logged = False
         self.program_input_id = request.program_input_id or self._default_program_id()
@@ -1113,12 +1130,36 @@ class VisionMixer:
         ordered += [item for item in inputs if item.kind != InputKind.mxl_live]
         program = ordered[0].id
         preview = ordered[1].id if len(ordered) > 1 else program
+        if not self._autostart_attempt(program, preview, 1):
+            threading.Thread(
+                target=self._autostart_retry, args=(program, preview), name="program-autostart", daemon=True
+            ).start()
+
+    def _autostart_retry(self, program: str, preview: str) -> None:
+        """Program did not start: try again after growing pauses until it runs, an operator
+        starts or stops it, or the process ends."""
+        attempt = 1
+        while not self._autostart_done.wait(_autostart_pause(attempt)):
+            attempt += 1
+            if self._autostart_attempt(program, preview, attempt):
+                return
+
+    def _autostart_attempt(self, program: str, preview: str, attempt: int) -> bool:
+        """One FLOWXER_PROGRAM_AUTOSTART start. True when Program runs (also when it already ran)."""
         try:
             self.start(MixerStartRequest(program_input_id=program, preview_input_id=preview))
         except MixerError as exc:
-            log.error("FLOWXER_PROGRAM_AUTOSTART: Program did not start: %s", exc)
-            return
-        log.info("FLOWXER_PROGRAM_AUTOSTART: Program on %s, Preview on %s", program, preview)
+            if self.state == MixerState.running:
+                return True
+            log.error(
+                "FLOWXER_PROGRAM_AUTOSTART: Program did not start (attempt %d, next in %.0f s): %s",
+                attempt,
+                _autostart_pause(attempt),
+                exc,
+            )
+            return False
+        log.info("FLOWXER_PROGRAM_AUTOSTART: Program on %s, Preview on %s (attempt %d)", program, preview, attempt)
+        return True
 
     def _on_pipeline_error(self, message: str) -> None:
         """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
@@ -1166,6 +1207,7 @@ class VisionMixer:
             return self._stop()
 
     def _stop(self) -> MixerStatus:
+        self._autostart_done.set()
         stopped = True
         if self.gst is not None:
             self._frames_before += self.gst.program_frames
@@ -1218,6 +1260,7 @@ class VisionMixer:
         """Map `{input_id}:video|audio` to an mxlsrc `domain` filesystem path."""
         output = str(self.settings.output_domain.resolve())
         paths: dict[str, str] = {}
+        self._missing_domains.clear()
         for item in self.list_inputs():
             if item.kind != InputKind.mxl_live:
                 continue
@@ -1231,7 +1274,13 @@ class VisionMixer:
         """mxlsrc `domain` path for a routed essence. A route that names no domain or the wrong one
         (REST and IS-05 default it to the own output domain) still finds its flow: the named domain
         when it holds the flow, else any domain below the root that does (local before mirror),
-        else the named domain, where the flow may still appear. None without a domain."""
+        else the named domain, where the flow may still appear. None without a domain.
+
+        A named domain that does not exist (yet: a fabrics mirror after a node reboot) made
+        mxlsrc fail at start, and Program did not start. The source waits in the own output
+        domain instead (the flow is not there: black and silence); _watch_domains moves it when
+        the domain appears."""
+        self._missing_domains.pop((input_id, role), None)
         root = self.settings.mxl_root
         resolved = resolve_domain_path(root, str(domain_id)) if domain_id else None
         if flow_id and (resolved is None or not (resolved / f"{flow_id}.mxl-flow").is_dir()):
@@ -1243,9 +1292,45 @@ class VisionMixer:
         if not domain_id:
             return None
         if resolved is None:
-            log.warning("MXL domain id %s for input %s %s not found under %s", domain_id, input_id, role, root)
-            return str((root / str(domain_id)).resolve())
+            log.warning(
+                "MXL domain id %s for input %s %s not found under %s; the input waits for it (black and silence)",
+                domain_id,
+                input_id,
+                role,
+                root,
+            )
+            self._missing_domains[(input_id, role)] = str(domain_id)
+            return str(self.settings.output_domain.resolve())
         return str(resolved)
+
+    def _watch_domains(self, runtime: GstRuntime) -> None:
+        """While `runtime` runs Program: sources that wait for a missing MXL domain read their
+        flow once the domain (or the flow in another domain) appears."""
+        while self.gst is runtime:
+            time.sleep(DOMAIN_WATCH_S)
+            if self.gst is runtime and self._missing_domains:
+                self._attach_waiting_sources(runtime)
+
+    def _attach_waiting_sources(self, runtime: GstRuntime) -> None:
+        root = self.settings.mxl_root
+        for (input_id, role), domain_id in list(self._missing_domains.items()):
+            item = self.inputs.get(input_id)
+            essence = getattr(item, role, None) if item is not None and item.kind == InputKind.mxl_live else None
+            if essence is None or str(essence.domain_id) != domain_id:
+                # Routed elsewhere or no longer an MXL input.
+                self._missing_domains.pop((input_id, role), None)
+                continue
+            flow_id = str(essence.flow_id) if essence.flow_id else ""
+            if resolve_domain_path(root, domain_id) is None and not (flow_id and find_flow_domain(root, flow_id)):
+                continue
+            path = self._mxl_source_path(input_id, role, domain_id, flow_id)
+            src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
+            log.info("MXL domain %s appeared: input %s (%s) reads %s in %s", domain_id, input_id, role, flow_id, path)
+            try:
+                runtime.retarget_mxl_source(src_name, flow_id or None, path, role)
+            except Exception as exc:
+                log.warning("input %s (%s): reading the appeared domain failed (program continues): %s", input_id, role, exc)
+                self.error = f"input {input_id} ({role}): {exc}"
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():

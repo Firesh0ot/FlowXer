@@ -220,3 +220,71 @@ def test_a_route_to_the_wrong_domain_finds_its_flow(mixer: VisionMixer) -> None:
     # A flow that is nowhere yet stays in the named domain, where it may appear.
     mixer.apply_nmos_receiver("studio-a", "audio", domain_id=None, flow_id="11111111-2222-3333-4444-555555555555", enabled=True)
     assert Path(mixer._source_domain_paths()["studio-a:audio"]).resolve() == mixer.settings.output_domain.resolve()
+
+
+class _Retargets:
+    """Enough of a GstRuntime for _attach_waiting_sources: records the retargets."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None, str | None, str]] = []
+
+    def retarget_mxl_source(self, element_name: str, flow_id: str | None, domain: str | None, role: str) -> bool:
+        self.calls.append((element_name, flow_id, domain, role))
+        return True
+
+
+def test_a_route_to_a_missing_domain_waits_and_attaches_when_it_appears(mixer: VisionMixer) -> None:
+    # Platform vmix after a node reboot: the fabrics mirror domains were not there yet, mxlsrc
+    # failed on the missing directory and Program did not start. The source now waits in the own
+    # output domain and reads its flow once the domain appears.
+    root = mixer.settings.mxl_root
+    missing = "abcdef00-0000-4000-8000-000000000001"
+    video = "5fbec3b1-1b0f-417d-9059-8b94a47197ed"
+    mixer.register_input(
+        LogicalInputCreate(
+            id="studio-a",
+            label="Studio A",
+            kind=InputKind.mxl_live,
+            video=VideoEssence(flow_id=video, domain_id=missing),
+            audio=AudioEssence(flow_id="339fa87e-fdb0-5ad5-9956-6b82751e0957", domain_id=missing, channels=2),
+        )
+    )
+    paths = mixer._source_domain_paths()
+    output = mixer.settings.output_domain.resolve()
+    assert Path(paths["studio-a:video"]) == output
+    assert Path(paths["studio-a:audio"]) == output
+    runtime = _Retargets()
+    mixer._attach_waiting_sources(runtime)
+    assert runtime.calls == []
+
+    mirror = root / "mirror-cam"
+    _write_domain(mirror, missing, extra={"x-mxl-fabrics-agent": {}})
+    mixer._attach_waiting_sources(runtime)
+    assert sorted(runtime.calls) == [
+        ("asrc_studio-a", "339fa87e-fdb0-5ad5-9956-6b82751e0957", str(mirror.resolve()), "audio"),
+        ("vsrc_studio-a", video, str(mirror.resolve()), "video"),
+    ]
+    assert mixer._missing_domains == {}
+    mixer._attach_waiting_sources(runtime)
+    assert len(runtime.calls) == 2
+
+
+def test_a_waiting_source_that_was_routed_elsewhere_is_left_alone(mixer: VisionMixer) -> None:
+    missing = "abcdef00-0000-4000-8000-000000000002"
+    mixer.register_input(
+        LogicalInputCreate(
+            id="studio-a",
+            label="Studio A",
+            kind=InputKind.mxl_live,
+            video=VideoEssence(flow_id="5fbec3b1-1b0f-417d-9059-8b94a47197ed", domain_id=missing),
+        )
+    )
+    mixer._source_domain_paths()
+    assert ("studio-a", "video") in mixer._missing_domains
+    item = mixer.get_input("studio-a")
+    item.video = item.video.model_copy(update={"domain_id": "flowxer-test"})
+    _write_domain(mixer.settings.mxl_root / "late", missing)
+    runtime = _Retargets()
+    mixer._attach_waiting_sources(runtime)
+    assert runtime.calls == []
+    assert mixer._missing_domains == {}

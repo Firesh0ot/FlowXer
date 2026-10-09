@@ -91,6 +91,21 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- Program did not start after a node reboot (platform vmix): the fabrics
+  agent had not recreated its mirror domains yet, `mxlsrc` failed on the
+  missing domain directory, the pipeline did not reach PLAYING and
+  `FLOWXER_PROGRAM_AUTOSTART` gave up after one try (state `error`, 0 fps,
+  until an operator started Program). An input routed to a domain that does
+  not exist now waits in the own output domain (black and silence) and reads
+  its flow once the domain appears (checked every 2 s); Program runs
+  throughout. The autostart tries again after 2, 5, 10, then every 30 s until
+  Program runs or an operator starts or stops it, and logs each attempt.
+- After a start that failed, the next start reported an old error
+  ("asrc_cam-1: GStreamer error: state change failed and some element failed
+  to post a proper error message …"): the pipeline that did not start kept its
+  bus watch, and the next pipeline's main loop delivered its errors (and
+  restarted its failed source). It is now taken to NULL and its watch
+  removed; the start error names the failed element.
 - The mixer stopped with exit 132 every 10–25 minutes on the platform's vmix
   (8 inputs, GPU path, keyer on): SIGILL in `libcef.so`, thread `MemoryInfra`.
   CEF reads the malloc totals with glibc's legacy `mallinfo()`, whose `int`

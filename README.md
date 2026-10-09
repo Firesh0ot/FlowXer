@@ -329,7 +329,7 @@ With the input list set, the inputs are in this order: `cam-1`..`cam-N` (`mxl_li
 - **API and GUI:** what the environment sets cannot be changed (409, the message names the variable): `PUT /workspace` with another `format_id`, `logical_source_count` or `mixer_panel_count`; `POST` and `DELETE /inputs`; `PATCH /inputs/{id}` with another `label` or `kind`. The current values pass, so a client may send whole documents. `GET /console` lists these fields in `pinned` (field → variables); the GUI greys them out.
 - **Export and import:** the export is unchanged. An imported document gets the environment's structure, as at a start; everything else in it is imported.
 - **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input, senders `ME <n> PGM Video` and `ME <n> PGM Audio` for each ME.
-- `FLOWXER_PROGRAM_AUTOSTART=true` starts Program once the state is restored: ME 1 Program on the first live input (else the first input), Preview on the next one. A start that fails is logged and shown in `GET /mixer`; the process keeps running.
+- `FLOWXER_PROGRAM_AUTOSTART=true` starts Program once the state is restored: ME 1 Program on the first live input (else the first input), Preview on the next one. A start that fails is logged and shown in `GET /mixer`, and tried again after 2, 5, 10, then every 30 s until Program runs or an operator starts or stops it; the process keeps running. An input routed to an MXL domain that does not exist yet (a fabrics mirror after a node reboot) shows black and silence and reads its flow once the domain appears.
 
 ```bash
 FLOWXER_FORMAT=1080p50
