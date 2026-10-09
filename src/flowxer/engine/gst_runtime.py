@@ -27,6 +27,12 @@ MIX_HANDOVER_FRAMES = 3
 AUDIO_OVERLAP_TOLERANCE_NS = 100_000
 # Dropped Program buffers logged per start; the counters keep counting.
 DROP_LOG_LIMIT = 5
+# Program video later than this at its sink makes the compositor skip to real time, plus a margin
+# so that it waits for its inputs again (frames). Skipped frames are logged once per burst: a skip
+# after LATE_BURST_GAP_S without one starts a new burst.
+LATE_LIMIT_FRAMES = 2
+SKIP_MARGIN_FRAMES = 3
+LATE_BURST_GAP_S = 10.0
 # A source restart (IS-05 retarget, recovery) waits this long for the source's state changes.
 # Stopping an mxlsrc can take up to 5 s (its grain read times out after 5 s).
 RESTART_TIMEOUT_S = 10.0
@@ -129,6 +135,10 @@ class GstRuntime:
         self.program_frames = 0
         # Program buffers dropped because they went back in time, per essence.
         self.program_dropped = {"video": 0, "audio": 0}
+        # Program frames the compositor skipped because it was late (_late_probe), and when the
+        # last one was counted.
+        self.late_frames = 0
+        self._late_at = float("-inf")
         # ControlPlaneWatchdog for the bounded state changes (set by the mixer).
         self.watchdog = None
         # Called with (source element name, reason) when a failed MXL source is started again.
@@ -281,6 +291,9 @@ class GstRuntime:
         stops that essence for good: Program audio stayed silent, or Program video stopped after a
         few frames. Such a buffer is dropped before it reaches the sink: a video frame whose
         timestamp is not after the last one, audio that starts before the last buffer ended.
+
+        A gap between two video frames is frames the compositor skipped because it was late
+        (_late_probe); they count as late frames.
         """
         Gst = self._gst
         for name, essence in (("vout", "video"), ("aout", "audio")):
@@ -288,6 +301,11 @@ class GstRuntime:
             pad = sink.get_static_pad("sink") if sink is not None else None
             if pad is not None:
                 pad.add_probe(Gst.PadProbeType.BUFFER, self._program_timeline_probe(essence))
+        comp = self.pipeline.get_by_name("comp")
+        vout = self.pipeline.get_by_name("vout")
+        if comp is not None and vout is not None:
+            pad = vout.get_static_pad("sink")
+            pad.add_probe(Gst.PadProbeType.EVENT_UPSTREAM, self._late_probe(comp))
 
     def _program_timeline_probe(self, essence: str):
         Gst = self._gst
@@ -313,6 +331,10 @@ class GstRuntime:
                             (last["end"] if last["end"] != none else last["pts"]) / 1e9,
                         )
                     return Gst.PadProbeReturn.DROP
+                if essence == "video" and last["end"] != none and duration not in (none, 0):
+                    skipped = (pts - last["end"] + duration // 2) // duration
+                    if skipped > 0:
+                        self._count_late(skipped)
             if pts != none:
                 last["pts"] = pts
                 last["end"] = pts + duration if duration != none else none
@@ -321,6 +343,48 @@ class GstRuntime:
             return Gst.PadProbeReturn.OK
 
         return probe
+
+    def _late_probe(self, comp):
+        """Keep the compositor on real time, from the lateness the Program sink measures (qos=true).
+
+        mxlsink writes a frame at the MXL index of its timestamp, and the compositor's timestamps
+        run on without gaps. A compositor that fell behind (a stall, more work than the node gives
+        it) then works without waiting and never catches up: Program 1.4 s behind TAI after a stall
+        on the lab, 48.7 frames/s and a growing lag on the platform's vmix (13.20.43). GStreamer's
+        own QoS only skips up to the frame that is due now, so the compositor stayed at that edge,
+        late for good (lab: 4 to 33 frames/s after a 1 s stall). Here a frame more than
+        LATE_LIMIT_FRAMES late makes it skip to real time plus SKIP_MARGIN_FRAMES; it then waits for
+        its inputs again. The frames still on their way are not acted on, and the sink's own QoS
+        events go no further."""
+        Gst = self._gst
+        state = {"frame": 0, "until": 0}
+
+        def probe(_pad, info):
+            event = info.get_event()
+            if event is None or event.type != Gst.EventType.QOS:
+                return Gst.PadProbeReturn.OK
+            kind, proportion, diff, timestamp = event.parse_qos()
+            frame = state["frame"] = state["frame"] or self.frame_ns()
+            if diff > LATE_LIMIT_FRAMES * frame and timestamp >= state["until"]:
+                skip = diff + SKIP_MARGIN_FRAMES * frame
+                state["until"] = timestamp + skip
+                qos = Gst.Event.new_qos(kind, proportion, skip, timestamp)
+                comp.get_static_pad("src").send_event(qos)
+            return Gst.PadProbeReturn.DROP
+
+        return probe
+
+    def _count_late(self, frames: int) -> None:
+        """Program frames skipped because the mixer was late; one log line per burst."""
+        now = time.monotonic()
+        if now - self._late_at > LATE_BURST_GAP_S:
+            log.warning(
+                "Program is late: frames are skipped to keep it on the MXL timeline (%d so far, "
+                "flowxer_frames_dropped_total)",
+                self.late_frames + frames,
+            )
+        self._late_at = now
+        self.late_frames += frames
 
     def set_active_slot(self, selector_name: str, slot: int) -> None:
         if self.pipeline is None:

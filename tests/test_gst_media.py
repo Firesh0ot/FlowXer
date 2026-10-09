@@ -173,20 +173,101 @@ def _mean(image) -> float:
 
 
 def test_monitors_show_the_pictures_of_the_pipeline(live: VisionMixer) -> None:
-    from flowxer.engine.preview import render_monitor
+    from flowxer.engine.preview import _draw_source, render_monitor
 
     live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="black"))
     names = {"mon_cam-1", "mon_black", "mon__program"}
     _wait(lambda: names <= set(live.gst.monitors), lambda: f"monitor pictures ({sorted(live.gst.monitors)})")
-    # Live pictures: the test source's time overlay changes them, a card would not.
-    first = render_monitor(live, "source:cam-1").tobytes()
-    time.sleep(0.5)
-    assert render_monitor(live, "source:cam-1").tobytes() != first
+    # The pipeline's picture of the test source, not its generated card.
+    card = _draw_source(live.get_input("cam-1"), 640, 360)
+    assert render_monitor(live, "source:cam-1").tobytes() != card.tobytes()
+    # New Program pictures keep coming.
+    first = live.gst.monitors["mon__program"]
+    _wait(lambda: live.gst.monitors["mon__program"] is not first, "a new Program monitor picture")
     assert _mean(render_monitor(live, "source:black")) < 10
     assert _mean(render_monitor(live, "panel:me-1:pgm")) > 50
     # The Program monitor shows the mixed output: it follows a cut.
     live.take("black")
     _wait(lambda: _mean(render_monitor(live, "panel:me-1:pgm")) < 10, "black on the Program monitor")
+
+
+def test_a_late_mixer_skips_frames_and_keeps_program_on_time(live: VisionMixer) -> None:
+    # Platform vmix on a busy node: the compositor made 48.7 frames/s, its timestamps ran on without
+    # gaps and mxlsink wrote each frame at the MXL index of its timestamp, ever further behind TAI
+    # (5-8 s after a few minutes). Now the compositor skips frames when it is late.
+    from gi.repository import Gst
+
+    live.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    _wait(lambda: live.frames_rendered >= 10, "the first Program frames")
+    pipeline = live.gst.pipeline
+    clock, base = pipeline.get_clock(), pipeline.get_base_time()
+    late = {}
+
+    def slow(_pad, _info):
+        time.sleep(0.03)  # the compositor manages about 33 frames/s
+        return Gst.PadProbeReturn.OK
+
+    def lateness(_pad, info, essence):
+        late[essence] = (clock.get_time() - base - info.get_buffer().pts) / Gst.SECOND
+        return Gst.PadProbeReturn.OK
+
+    comp = pipeline.get_by_name("comp").get_static_pad("src")
+    slowing = comp.add_probe(Gst.PadProbeType.BUFFER, slow)
+    for name, essence in (("vout", "video"), ("aout", "audio")):
+        pipeline.get_by_name(name).get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, lateness, essence)
+    time.sleep(3)
+    # Without the skips video would be about 1 s behind by now (10 ms more per frame).
+    assert late["video"] < 0.2, late
+    assert late["audio"] < 0.2, late
+    assert live.frames_dropped > 10
+    # Once the compositor is fast again, Program runs at the mixer rate (GStreamer's own QoS kept a
+    # compositor that had fallen behind at the edge of real time, late for good).
+    comp.remove_probe(slowing)
+    time.sleep(1)
+    first, dropped = live.frames_rendered, live.frames_dropped
+    time.sleep(2)
+    assert (live.frames_rendered - first) / 2 >= 45
+    assert live.frames_dropped - dropped <= 5
+    assert late["video"] < 0.2, late
+
+
+def _ycbcr(data: bytes, width: int, x: int, y: int) -> tuple[int, int, int]:
+    """10-bit Y', Cb, Cr of pixel (x, y) in a v210 frame (the chroma of its pixel pair)."""
+    group, phase = divmod(x, 6)
+    w = struct.unpack_from("<4I", data, y * v210_stride(width) + group * 16)
+    fields = [(word & 0x3FF, word >> 10 & 0x3FF, word >> 20 & 0x3FF) for word in w]
+    cb, y0, cr = fields[0]
+    y1, cb1, y2 = fields[1]
+    cr1, y3, cb2 = fields[2]
+    y4, cr2, y5 = fields[3]
+    return [(y0, cb, cr), (y1, cb, cr), (y2, cb1, cr1), (y3, cb1, cr1), (y4, cb2, cr2), (y5, cb2, cr2)][phase]
+
+
+def test_the_keyer_keeps_its_colours(live: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The GPU path uploads the keyer's BGRA bytes as an RGBA image and swaps red and blue in its
+    # shader. The fallback lower third (no CEF) has a cyan bar (0, 196, 255, alpha 230) at x 80..92.
+    from gi.repository import Gst
+
+    from flowxer.engine import mixer as mixer_module
+
+    backend = mixer_module.probe_backend
+    monkeypatch.setattr(mixer_module, "probe_backend", lambda: {**backend(), "cefsrc": False})
+    live.start(MixerStartRequest(program_input_id="black", preview_input_id="cam-1"))
+    live.update_keyer("dsk-1", enabled=True)
+    frames: list[bytes] = []
+
+    def keep(_pad, info):
+        ok, mapped = info.get_buffer().map(Gst.MapFlags.READ)
+        if ok:
+            frames.append(bytes(mapped.data))
+            info.get_buffer().unmap(mapped)
+        return Gst.PadProbeReturn.OK
+
+    live.gst.pipeline.get_by_name("vout").get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, keep)
+    _wait(lambda: len(frames) >= 25, "Program frames")
+    luma, cb, cr = _ycbcr(frames[-1], live.settings.width, 86, 50)
+    # Cyan at 90 % over black: about Y' 556, Cb 676, Cr 192 (red and blue swapped: Cb < 512 < Cr).
+    assert 450 < luma < 650 and cb > 600 and cr < 300, (luma, cb, cr)
 
 
 def _first_frame(caps: str, samples: bytes, out_channels: int) -> tuple[float, ...]:

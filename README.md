@@ -78,7 +78,7 @@ The GUI is a **separate React service** (Vite + TypeScript) so the mixer contain
 - how many logical sources, mixer panels (MEs), stinger slots, and downstream keyers
 - stingers: same media for in and out, or separate in/out
 
-The gear on each **source** (`PATCH /inputs/{id}`) sets name, kind, MXL flow UUIDs, clip, and **Auto stinger** — which slot plays when that source is taken to Program or Cut from Preview. Other sources stay hard cuts. Kind **black** is a black video frame (not a test card).
+The gear on each **source** (`PATCH /inputs/{id}`) sets name, kind, MXL flow UUIDs, clip, and **Auto stinger** — which slot plays when that source is taken to Program or Cut from Preview. Other sources stay hard cuts. Kind **black** is a black video frame (not a test card), kind **test** SMPTE colour bars; both (and a replay or file input without a clip) are one picture, made once and repeated.
 
 The gear on each **stinger** (`PATCH /stinger-slots/{id}`) picks a TGA sequence or video and **Cut at (frame)**. Pressing the stinger chip plays that slot with `flip_flop` so Preview becomes Program (`POST /stinger/play`).
 
@@ -227,6 +227,8 @@ The mixer image builds these from source. You do not compile them yourself:
 
 When those plugins load, Program is published as MXL `video/v210` and `audio/float32`, and the HTML overlay uses `cefsrc`. If a plugin is missing, the mixer falls back to `fakesink` and a Pillow lower-third.
 
+`mxlsink` writes each Program frame at the MXL grain index of its timestamp. When the mixer falls behind real time (a busy node, a stall), it skips frames instead of writing them ever later: a frame more than two frames late makes the compositor jump to real time plus three frames. Program then has gaps but stays on the TAI timeline; `flowxer_frames_dropped_total` counts the skipped frames and the log has one line per burst.
+
 Point `FLOWXER_MXL_ROOT` at the host tmpfs that holds one directory per domain (for example `/Volumes/mxl`). FlowXer writes Program into `FLOWXER_MXL_OUTPUT_DOMAIN_DIR` (default `<root>/flowxer-<seed-short>`) and **never** into `mirror-*` directories. `mxlsrc` `domain=` is a filesystem path: the mixer scans `domain_def.json` `id` fields on every resolve, including fabrics mirrors.
 
 `FLOWXER_MXL_DOMAIN` remains a deprecated alias that restores the old single-domain layout (Compose still uses it for local demos). The mixer image no longer bakes a fixed `domain_def.json` id. `FLOWXER_READ_OFFSET_GRAINS` is accepted but ignored: gst-mxl-rs `mxlsrc` has no read-offset property and sits at the live edge.
@@ -295,7 +297,7 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `SHUTDOWN_TIMEOUT_S` / `FLOWXER_SHUTDOWN_TIMEOUT_S` | `10` | Open requests get half; the rest is for stopping media and deregistering |
 | `FLOWXER_WEBRTC_PUBLIC_IP` | `FLOWXER_NMOS_HOST_IP` | ICE host candidate |
 | `FLOWXER_WEBRTC_UDP_PORT_MIN/MAX` | `32600` / `32631` | |
-| `FLOWXER_MONITOR_FPS` | `10` | GUI monitor pictures (JPEG and WebRTC) taken from the pipeline per second; `0` draws generated cards |
+| `FLOWXER_MONITOR_FPS` | `10` | GUI monitor pictures (JPEG and WebRTC) taken from the pipeline per second (black and colour bars: once a second); WebRTC previews send this many frames per second; `0` draws generated cards |
 | `FLOWXER_GPU` | `off` | Video on an NVIDIA GPU: `off` the CPU path, `auto` the GPU path when it works at start (the log says why not), `on` the GPU path or exit 78. See [GPU media path](#gpu-media-path) |
 | `FLOWXER_API_TOKEN` | empty | **Required on the platform** |
 | `FLOWXER_MXL_REVISION` | image pin `218ddaa` | Also `io.dmf.mxl.revision` |

@@ -84,17 +84,27 @@ def _buses(kind: str, inp: LogicalInput, settings: Settings, gpu: bool = False) 
     )
     if kind == "v" and settings.monitor_fps:
         tap = gpu_monitor_tap if gpu else monitor_tap
-        chain += f"\n{tee}. ! {tap(settings, MONITOR_PREFIX + inp.id)}"
+        # A still never changes: its picture is taken once a second.
+        fps = 1 if _is_still(inp) else settings.monitor_fps
+        chain += f"\n{tee}. ! {tap(MONITOR_PREFIX + inp.id, fps)}"
     return chain
 
 
-def monitor_tap(settings: Settings, name: str) -> str:
+def _is_still(inp: LogicalInput) -> bool:
+    """Black, colour bars, and a file or replay input without a clip: one frame, repeated."""
+    if inp.kind in {InputKind.black, InputKind.test}:
+        return True
+    location = inp.file_path or "_unassigned"
+    return inp.kind != InputKind.mxl_live and location.endswith("_unassigned")
+
+
+def monitor_tap(name: str, fps: int) -> str:
     """Branch to a GUI monitor: the rate drops first, then one conversion pass
     scales the full-size frame straight to the small RGB picture."""
     return (
         "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
         f"! videoconvertscale ! video/x-raw,format=RGB,width={MONITOR_WIDTH},height={MONITOR_HEIGHT},"
-        f"pixel-aspect-ratio=1/1,framerate={settings.monitor_fps}/1 "
+        f"pixel-aspect-ratio=1/1,framerate={fps}/1 "
         # async=false: a source that never delivers (an MXL flow that is missing or silent) must not
         # keep the pipeline from PLAYING, or the Program sink waits and Program stops after a frame.
         f"! appsink name={name} max-buffers=1 drop=true sync=false async=false"
@@ -107,13 +117,13 @@ def monitor_tap(settings: Settings, name: str) -> str:
 UNROUTED_FLOW = "00000000-0000-0000-0000-000000000000"
 
 
-def gpu_monitor_tap(settings: Settings, name: str) -> str:
+def gpu_monitor_tap(name: str, fps: int) -> str:
     """GPU path: the rate drops first, then a shader makes the small RGB picture
     from the full-size frame on the GPU; only the picture is downloaded."""
     return (
         "queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true "
         f"! glshader name={gpu_path.MONITOR_SHADER_PREFIX}{name} "
-        f"! {gpu_path.gl_caps(MONITOR_WIDTH, MONITOR_HEIGHT, f'{settings.monitor_fps}/1')} "
+        f"! {gpu_path.gl_caps(MONITOR_WIDTH, MONITOR_HEIGHT, f'{fps}/1')} "
         "! gldownload ! videoconvert ! video/x-raw,format=RGB,pixel-aspect-ratio=1/1 "
         f"! appsink name={name} max-buffers=1 drop=true sync=false async=false"
     )
@@ -131,6 +141,11 @@ def _gpu_video_source(
     rgba = _rgba(settings)
     gl = _gl(settings)
     to_gpu = f"glupload ! glshader name={gpu_path.YUV_PREFIX}{inp.id} ! {gl} ! "
+    # Black and colour bars are made, uploaded and converted once; imagefreeze repeats the frame.
+    still = (
+        f"num-buffers=1 ! {rgba} ! {to_gpu}imagefreeze is-live=true "
+        f"! {gpu_path.gl_caps(settings.width, settings.height, settings.frame_rate)} ! "
+    )
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:video", domain)
@@ -149,17 +164,13 @@ def _gpu_video_source(
     if inp.kind == InputKind.black:
         return (
             f"videotestsrc name=vsrc_{inp.id} pattern=black "
-            f"foreground-color=0xFF000000 background-color=0xFF000000 is-live=true "
-            f"! {rgba} ! {to_gpu}"
+            f"foreground-color=0xFF000000 background-color=0xFF000000 {still}"
         )
     if inp.kind == InputKind.test:
-        return (
-            f"videotestsrc name=vsrc_{inp.id} pattern=smpte is-live=true "
-            f"! timeoverlay ! {rgba} ! {to_gpu}"
-        )
+        return f"videotestsrc name=vsrc_{inp.id} pattern=smpte {still}"
     location = inp.file_path or "_unassigned"
     if location.endswith("_unassigned") or location == "_unassigned":
-        return f"videotestsrc name=vsrc_{inp.id} pattern=black is-live=true ! {rgba} ! {to_gpu}"
+        return f"videotestsrc name=vsrc_{inp.id} pattern=black {still}"
     return (
         f'filesrc name=vsrc_{inp.id} location="{location}" '
         f"! decodebin name=vdec_{inp.id} "
@@ -185,6 +196,8 @@ def _video_source_bin(
 ) -> str:
     caps = _v210(settings)
     bgra = _bgra(settings)
+    # Black and colour bars are made once; imagefreeze repeats the frame live at the mixer rate.
+    still = f"num-buffers=1 ! {caps} ! imagefreeze is-live=true ! {caps} ! "
     if inp.kind == InputKind.mxl_live:
         flow_id = str(inp.video.flow_id) if inp.video and inp.video.flow_id else UNROUTED_FLOW
         src_domain = domain_paths.get(f"{inp.id}:video", domain)
@@ -197,22 +210,15 @@ def _video_source_bin(
     elif inp.kind == InputKind.black:
         chain = (
             f"videotestsrc name=vsrc_{inp.id} pattern=black "
-            f"foreground-color=0xFF000000 background-color=0xFF000000 is-live=true "
-            f"! {caps} ! "
+            f"foreground-color=0xFF000000 background-color=0xFF000000 {still}"
         )
     elif inp.kind == InputKind.test:
-        chain = (
-            f"videotestsrc name=vsrc_{inp.id} pattern=smpte is-live=true "
-            f"! timeoverlay ! {caps} ! "
-        )
+        chain = f"videotestsrc name=vsrc_{inp.id} pattern=smpte {still}"
     else:
         # file / replay: decode any container, convert to uncompressed v210, run as live.
         location = inp.file_path or "_unassigned"
         if location.endswith("_unassigned") or location == "_unassigned":
-            chain = (
-                f"videotestsrc name=vsrc_{inp.id} pattern=black is-live=true "
-                f"! {caps} ! "
-            )
+            chain = f"videotestsrc name=vsrc_{inp.id} pattern=black {still}"
         else:
             chain = (
                 f'filesrc name=vsrc_{inp.id} location="{location}" '
@@ -349,29 +355,33 @@ def build_pipeline_description(
         )
 
     if gpu:
-        # The keyer is BGRA: glcolorconvert swaps it to RGBA on the GPU for the shader.
+        # The keyer is BGRA: its bytes go up as an RGBA image (capssetter, no copy) and the shader
+        # swaps red and blue as it converts (a glcolorconvert pass cost the GL thread 7 %, 1080p50).
         overlay_bin = overlay_bin.replace(
             f"! comp.{PAD_KEYER}",
-            "! glupload ! glcolorconvert ! video/x-raw(memory:GLMemory),format=RGBA "
-            f"! glshader name={gpu_path.YUV_PREFIX}html5 ! {_gl(settings)} ! comp.{PAD_KEYER}",
+            f'! capssetter replace=true caps="{_rgba(settings)}" ! identity drop-allocation=true '
+            f"! glupload ! glshader name={gpu_path.BGRA_PREFIX}html5 ! {_gl(settings)} "
+            f"! comp.{PAD_KEYER}",
         )
 
     tap = gpu_monitor_tap if gpu else monitor_tap
     program_monitor = (
-        f"\npgmt. ! {tap(settings, MONITOR_PROGRAM)}" if settings.monitor_fps else ""
+        f"\npgmt. ! {tap(MONITOR_PROGRAM, settings.monitor_fps)}" if settings.monitor_fps else ""
     )
 
+    # Video sink qos=true: it measures how late each frame is; GstRuntime keeps Program on the TAI
+    # timeline from that (the compositor skips frames when it is late).
     if use_mxl_sink:
         video_sink = (
             f"videoconvert ! {v210} ! queue ! "
-            f"mxlsink name=vout flow-id={output_video_flow_id} domain={_gst_string(domain)}"
+            f"mxlsink name=vout qos=true flow-id={output_video_flow_id} domain={_gst_string(domain)}"
         )
         audio_sink = (
             f"queue ! {audio} ! "
             f"mxlsink name=aout flow-id={output_audio_flow_id} domain={_gst_string(domain)}"
         )
     else:
-        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true"
+        video_sink = f"videoconvert ! {v210} ! queue ! fakesink name=vout sync=true qos=true"
         audio_sink = f"queue ! {audio} ! fakesink name=aout sync=true"
 
     compositor = "compositor name=comp background=black"

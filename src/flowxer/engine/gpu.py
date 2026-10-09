@@ -29,10 +29,11 @@ MEDIA_PATH_CPU = "cpu"
 # shader after parsing (fragment_for).
 UNPACK_PREFIX = "gpu_unpack_"
 YUV_PREFIX = "gpu_yuv_"
+BGRA_PREFIX = "gpu_bgra_"
 PACK_PREFIX = "gpu_pack"
 MONITOR_SHADER_PREFIX = "gpu_mon_"
 
-REQUIRED_ELEMENTS = ("capssetter", "glupload", "glcolorconvert", "glshader", "glvideomixerelement", "gldownload")
+REQUIRED_ELEMENTS = ("capssetter", "glupload", "glshader", "glvideomixerelement", "gldownload")
 EGL_VENDOR_DIRS = ("/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d")
 PROBE_TIMEOUT_S = 10.0
 
@@ -166,9 +167,11 @@ void main() {{
 """
 
 
-RGB_TO_YUV = _HEADER + f"""
+def _to_yuv(texel: str) -> str:
+    """Fragment: RGB + alpha (the texel read by `texel`) to Y'CbCr + alpha."""
+    return _HEADER + f"""
 void main() {{
-    vec4 c = texture2D(tex, v_texcoord);
+    vec4 c = {texel};
     float y = {KR} * c.r + {1.0 - KR - KB:.4f} * c.g + {KB} * c.b;
     gl_FragColor = vec4(
         (16.0 + 219.0 * y) / 255.0,
@@ -177,6 +180,11 @@ void main() {{
         c.a);
 }}
 """
+
+
+RGB_TO_YUV = _to_yuv("texture2D(tex, v_texcoord)")
+# The HTML keyer's BGRA bytes, uploaded as an RGBA image: red and blue are swapped back.
+BGRA_TO_YUV = _to_yuv("texture2D(tex, v_texcoord).bgra")
 
 
 def monitor_rgb(width: int, height: int) -> str:
@@ -205,6 +213,8 @@ def fragment_for(name: str, width: int) -> str | None:
         return unpack_v210(width)
     if name.startswith(YUV_PREFIX):
         return RGB_TO_YUV
+    if name.startswith(BGRA_PREFIX):
+        return BGRA_TO_YUV
     if name.startswith(PACK_PREFIX):
         return pack_v210(width)
     if name.startswith(MONITOR_SHADER_PREFIX):

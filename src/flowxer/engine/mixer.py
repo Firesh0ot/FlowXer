@@ -137,7 +137,9 @@ class VisionMixer:
         # (frames_rendered, monotonic time) when Program last advanced; a stall is reported in status().
         self._frame_mark: tuple[int, float] = (0, 0.0)
         self._stall_logged = False
-        self.frames_dropped = 0
+        # Program frames skipped because the mixer was late (earlier runs); frames_dropped adds the
+        # running pipeline's.
+        self._frames_dropped_before = 0
         # Program buffers dropped because they went back in time (earlier runs), per essence.
         self._program_dropped_before = {"video": 0, "audio": 0}
         # MXL sources started again after they failed, per (input id, essence).
@@ -1206,6 +1208,11 @@ class VisionMixer:
         self.error = f"input {key[0]} {role}: the MXL source failed ({reason}) and was started again"
 
     @property
+    def frames_dropped(self) -> int:
+        """Program frames skipped because the mixer was late (to stay on the MXL timeline)."""
+        return self._frames_dropped_before + (self.gst.late_frames if self.gst is not None else 0)
+
+    @property
     def program_dropped(self) -> dict[str, int]:
         """Program buffers dropped because they went back in time, per essence."""
         running = self.gst.program_dropped if self.gst is not None else {}
@@ -1220,6 +1227,7 @@ class VisionMixer:
         stopped = True
         if self.gst is not None:
             self._frames_before += self.gst.program_frames
+            self._frames_dropped_before += self.gst.late_frames
             for essence, count in self.gst.program_dropped.items():
                 self._program_dropped_before[essence] += count
             stopped = self.gst.stop()
