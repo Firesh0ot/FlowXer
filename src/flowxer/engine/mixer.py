@@ -1570,6 +1570,12 @@ class VisionMixer:
     ) -> MixerStatus:
         if self.state != MixerState.running:
             self.start(MixerStartRequest())
+        panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
+        if panel.id != self.panels[0].id:
+            # Only ME 1 renders (one compositor, one stinger player): a stinger on another ME
+            # switches that ME at once and leaves ME 1's Program and running stinger alone.
+            self._put_on_program(panel, target_input_id, TransitionType.stinger, flip_flop=flip_flop)
+            return self.status()
         if self.stinger_player and not self.stinger_player.done:
             remaining = self.stinger_player.info.frame_count - self.stinger_player.frame + 1
             self.advance_stinger(max(remaining, 1))
@@ -1582,7 +1588,6 @@ class VisionMixer:
                     slot = item
                     break
         self.get_input(target_input_id)
-        panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
         try:
             info = self._info_for_slot(slot, stinger_id)
         except StingerNotReady as exc:

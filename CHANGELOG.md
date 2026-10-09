@@ -12,7 +12,8 @@ in `docs/platform-integration-plan.md` §8.
   SCREEN is the ME, INDEX the input (slot order at start, stable while the
   process runs), LH red on Program and for both sources of a running mix or
   stinger, RH green on Preview, the label in UTF-16. Sent on each change and
-  every second; unset, nothing is sent.
+  every second; unset, nothing is sent. `/metrics` counts its packets and
+  failed sends and gives the time of the last good send.
 - Production structure from the environment (plan §3.10): `FLOWXER_FORMAT`,
   `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_TEST_SOURCES` and
   `FLOWXER_PANELS` win over the saved state at every start; routes, keyers,
@@ -73,6 +74,10 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Changed
 
+- A stinger (Wipe, auto-stinger, stinger take) on ME 2..4 switches that ME at
+  once without playing the media. It used to play over ME 1 and switch ME 1's
+  rendered Program at its cut (ME 1's panel and tally kept the old source),
+  and it ended a stinger running on ME 1.
 - The compositor works in AYUV instead of BGRA (no RGB round trip for
   Program).
 - `flowxer_frames_rendered_total` counts Program frames at the video output.
