@@ -167,6 +167,100 @@ v210 reference; mxl-webrtc-monitor (MIT): the MediaMTX config and the NVENC sett
 mxl-replay: the TAI loop rule (re-implemented on MXL's own index formulas, no code copied:
 mxl-replay is GPL-3.0).
 
-## Measurements
+## Measurements (P1a, lab, 2026-10-10)
 
-See the end of this file (filled in from the lab runs).
+Lab host iptv-web-lab-1: NVIDIA A16 GPU 0 (one GA107 of the board, PCIe Gen4 **x4** link),
+driver 595.84, 2 × Xeon Gold 6136 (48 threads). Image `fxeng:p1` (318 MB). 1080p50, L = 2,
+4 MEs, 8 inputs: test player Out 1–4, replay PGM and PVW, a lab pattern writer, the browser
+source (v210a, fill only). Mosaic on (no viewers yet). Numbers from `/status` (CUDA events,
+average/maximum of the last 5 s window) and from the host (`/proc`, `nvidia-smi`).
+
+### Functional check
+
+36 of 36 checks passed, read back from the MXL outputs: on every ME, Program and Preview
+routing, Cut, Auto over 50 grains (the mix factor of the Program grains rises by 0.02 per
+grain), a Preview change during a Mix refused, the buses swapped after the Mix; re-entry
+ME 2 → ME 1 gives the same picture in the same output grain; ME 2 may not take `me1` or
+`me2`. Output grain *i* equals the source's grain *i − 2* byte for byte (yuv16).
+GPU self-test: yuv16 round trip and dissolve exact, rgba16f round trip exact on the test
+picture, dissolve within 1 code.
+
+### Against the success criteria
+
+| Criterion | Target | Quiet (120 s) | Bounded load, host 81 % (120 s) |
+|---|---|---|---|
+| Output rate, every output | 50.0 fps | 50.03 | 50.03 |
+| Skipped / late output grains | 0 on a quiet host | 0 / 0 | 0 / 0 |
+| Output lag | ≤ L + 1 = 3 grains | 2.0 (max 2); commit 10.5 ms (max 12.0) into the grain's window | 2.0 (max 2); 11.2 ms (max 16.3) |
+| GPU time per output grain | ≤ 8 ms (budget 20) | render 3.4 (max 4.2); + download 10.3 (max 11.8) | 3.4; 10.4 (max 11.5) |
+| Engine CPU | ≤ 1.5 cores | 0.13 cores | 0.10 cores |
+| NVENC | one session | 1 session, 3 % | 1 session, 3 % |
+
+The render work is 3.4 ms. The rest is PCIe DMA: the A16's GPUs run on a x4 link
+(6.4 GB/s measured), so writing 8 outputs back (8 × 5.5 MB) takes 6.9 ms and uploading 8 inputs
+another 7.6 ms (on the input streams, in the other direction, overlapping). An RTX A4000 has
+a x16 link. NVML's "GPU utilization" (78 %) counts this copy time; the CUDA event times are
+the meaningful numbers.
+
+Unattended run before that (dev build of the same code, quiet, no viewers): 3 h 54 min,
+703 008 grains on every output, lag 2.0 grains throughout, 0 skips after the first second (the
+6 start-up skips are gone since the writer page-locks its grains before the first grain).
+
+### GPU time per stage (ms, average / maximum, yuv16)
+
+| Stage | 4 MEs | 1 ME |
+|---|---|---|
+| Upload, per input (own stream, overlapping) | 0.95 / 4.5 | 0.90 / 3.5 |
+| Unpack (the inputs the MEs use) | 1.21 / 1.25 (8 inputs) | 0.32 / 0.36 (2 inputs) |
+| ME render (PGM + PVW), each | 0.22 / 0.25 | 0.22 |
+| Pack to v210 (all outputs) | 0.70 / 0.75 (8 outputs) | 0.19 (2 outputs) |
+| Mosaic (every second grain: 1.3 when drawn) | 0.64 / 1.30 | 0.41 / 0.83 |
+| Download into the MXL grains | 6.87 / 7.81 | 1.83 / 2.06 |
+| Render total / render + download | 3.41 / 10.28 | 1.13 / 2.96 |
+| Mosaic encode (NVENC, wall time in `fx-encode`) | 2.6 per mosaic frame | 2.8 |
+
+### Working format
+
+| | yuv16 | rgba16f |
+|---|---|---|
+| Unpack (8 inputs) | 1.21 ms | 4.94 ms |
+| ME render, each | 0.22 ms | 0.41 ms |
+| Pack (8 outputs) | 0.70 ms | 1.19 ms |
+| Render total | 3.41 ms | 8.39 ms |
+| GPU memory (process) | 769 MiB | 897 MiB |
+| Round trip | lossless | within 2 codes (measured max 0) |
+
+yuv16 is the default; rgba16f only where an effect needs RGB.
+
+### GPU memory per ME count (process, `nvidia-smi`; yuv16, mosaic on)
+
+| MEs | 1 | 2 | 3 | 4 | 4, no mosaic |
+|---|---|---|---|---|---|
+| Process | 613 MiB | 665 MiB | 717 MiB | 769 MiB | 718 MiB |
+| Engine buffers | 459 MB | | | 602 MB | |
+
+About 52 MiB per ME (PGM/PVW bus buffers and 3 grains of output in flight); the rest is the CUDA
+context, the 8 input rings (8 grains each) and NVENC.
+
+### CPU per thread (percent of one core, quiet, 4 MEs)
+
+`fx-encode` 3.7, `fx-in1..8` 3.1 together, CUDA event handler 2.1, `fx-writer` 2.1,
+`fx-render` 1.5; process 0.13 cores.
+
+### Against FlowXer 14.21.46
+
+Same host and GPU (A16 GPU 0), one after the other; FlowXer with `fx-mi.sh` (vmix layout:
+cam-1..4 = test player Out 1–4, internal test-1/2, black, replay; 1 ME, GPU path, CEF overlay
+and DSK on). Same bounded load (40 busy threads, 35-core quota).
+
+| | Engine P1: 4 MEs, 8 inputs, mosaic | FlowXer 14.21.46: 1 ME |
+|---|---|---|
+| Output rate, quiet / load | 50.03 / 50.03 fps | 50.13 / 50.06 fps |
+| CPU, quiet / load | 0.13 / 0.10 cores | 3.14 / 2.88 cores (container) |
+| Busiest thread, quiet / load | `fx-encode` 3.7 % | GL thread (`gstglcontext`) 98.7 % / 84.5 % |
+| GPU utilization (NVML) | 78 % (mostly DMA) | 63 % |
+| GPU memory | 769 MiB | about 1110 MiB (device) |
+
+FlowXer's single GL thread is at its limit with one ME; the engine renders four MEs with
+PGM + PVW and the mosaic at about 4 % of FlowXer's CPU. (FlowXer also renders a CEF overlay,
+a DSK and internal sources; the engine has no keyers yet.)
