@@ -260,6 +260,17 @@ mxl-replay: the TAI loop rule (re-implemented on MXL's own index formulas, no co
 mxl-replay is GPL-3.0); FlowXer's own TSL 5.0 export (`src/flowxer/engine/tsl.py`): the raw
 tally format.
 
+## Changes from DESIGN.md
+
+- The writer thread, not the render thread, opens the MXL grains and queues the downloads:
+  an MXL writer has one open grain at a time, so one thread owns all writers.
+- Added to P1 for the drop-in test on small (user decision): configurable output flow ids,
+  PGM audio (DESIGN.md had audio in a later phase), the control page, black input slots, the
+  raw TSL tally.
+- The preview follows the platform's preview contract (`PREVIEW_*`), with a bundled MediaMTX
+  when no shared one is given.
+- A stalled input holds its last grain until it comes back (configurable).
+
 ## Measurements (P1a, lab, 2026-10-10)
 
 Lab host iptv-web-lab-1: NVIDIA A16 GPU 0 (one GA107 of the board, PCIe Gen4 **x4** link),
@@ -387,3 +398,43 @@ equal-power curve within 0.0001 of the level (−3 dB in the middle) and is sile
 A UDP listener decoded 37 packets in 9 s (one per ME per second plus changes): after ME 1
 Program = `me2` and a Cut on ME 2 it showed SCREEN 1 with INDEX 1002 (ME 2) red and SCREEN 2
 with the new Program red and Preview green.
+
+### An input that stalls or is re-created
+
+Input 7 fed by a test writer (`mxl-flow-writer`) that ends, restarts, is killed and restarts
+again, shown on ME 4 Program: when the writer ends (MXL deletes its flow) the input re-opens,
+reports `flow_not_found` and holds its last grain (counted as `late`, audio silent and counted);
+when the writer re-creates the flow the input runs again; when the writer is killed the flow
+stays, the input reports `no_signal` and holds; a writer that opens the left flow again is
+picked up without a re-open. The outputs kept 50 fps with 0 skipped grains throughout.
+
+## P1b: mosaic, viewers, soak (lab, 2026-10-10)
+
+Image `fxeng:p1` (= `proto-5db091f7`), A16 GPU 3, own MediaMTX, everything as in P1a plus PGM
+audio on all 4 MEs.
+
+- **Control page in Edge** (from a laptop over the VPN): 16 `<video>` elements on one WHEP
+  session, all playing 1920×1080 cropped to their tiles with `object-view-box`; PVW and CUT
+  buttons switch the ME and the tally colours follow.
+- **10 WHEP viewers** (aiortc, decoding, on the lab host): one NVENC session (3 %), MediaMTX
+  lists 10 readers, every viewer decodes 25.0 fps.
+- **30 min soak** with the 10 viewers and an operator loop (a Cut or a 25-grain Auto on a
+  rotating ME every 15 s):
+
+| | Result | Target |
+|---|---|---|
+| Output rate, every output | 50.0 fps | 50.0 |
+| Skipped / late / failed grains | 0 / 0 / 0 | 0 |
+| Output lag | 2.0 grains (max 2); commit 10.4 ms (max 12.1) into the window | ≤ 3 grains |
+| GPU render / render + download | 3.41 ms / 10.23 ms (max 11.85) | ≤ 8 ms render |
+| Engine CPU | 0.12 cores | ≤ 1.5 |
+| Container CPU (engine + MediaMTX serving 10 viewers) | 0.45 cores | |
+| NVENC | 1 session, 3.2 % | 1 session |
+| Mosaic | 25.0 fps, 45 706 frames, 2 dropped (encoder start) | 25 fps |
+| GPU memory | 769 MiB | |
+
+The same container then ran on unattended: 3 h 54 min in total, 701 959 grains on every
+output (video and PGM audio), 0 skipped, 2 late grains at start-up, lag 2.0 throughout, the
+mosaic encoder connected once with 0 errors, the own MediaMTX never restarted. The replay
+outputs it reads have gaps of their own (157 and 166 invalid grains); the engine held the last
+grain and counted them per input.
