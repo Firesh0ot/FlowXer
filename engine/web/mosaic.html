@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowXer engine mosaic</title>
+<style>
+  :root { color-scheme: dark; --bg: #111418; --panel: #1b2027; --text: #e6e9ee; --muted: #8a94a3; --ok: #3fb950; --bad: #f85149; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  #status { color: var(--muted); margin-bottom: 12px; white-space: pre-wrap; }
+  #status.bad { color: var(--bad); }
+  .row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  figure { margin: 0; background: var(--panel); border-radius: 6px; overflow: hidden; }
+  figcaption { padding: 4px 8px; color: var(--muted); font-size: 12px; }
+  video { display: block; width: 100%; height: auto; background: #000; }
+  @media (max-width: 700px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>FlowXer engine: preview mosaic</h1>
+<div id="status">connecting…</div>
+<div class="row" id="main"></div>
+<div class="grid" id="tiles"></div>
+<script>
+// One WHEP session; every <video> shows the same MediaStream (decoded once) and crops its
+// tile with CSS object-view-box. ?viewers=N opens N independent WHEP sessions (load test).
+const params = new URLSearchParams(location.search);
+const viewers = Math.max(1, Math.min(32, parseInt(params.get('viewers') || '1', 10)));
+const statusEl = document.getElementById('status');
+const sessions = [];
+
+function setStatus(text, bad) {
+  statusEl.textContent = text;
+  statusEl.className = bad ? 'bad' : '';
+}
+
+async function whep(url) {
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  const stream = new Promise((resolve) => { pc.ontrack = (ev) => resolve(ev.streams[0] || new MediaStream([ev.track])); });
+  await pc.setLocalDescription(await pc.createOffer());
+  // Send the offer with all candidates (no trickle).
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const done = () => { if (pc.iceGatheringState === 'complete') resolve(); };
+    pc.addEventListener('icegatheringstatechange', done);
+    setTimeout(resolve, 2000);
+  });
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+  if (!res.ok) throw new Error('WHEP ' + res.status + ' ' + (await res.text()));
+  await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+  return { pc, stream: await stream, frames: 0, fps: 0 };
+}
+
+function tileVideo(stream, tile, map) {
+  const fig = document.createElement('figure');
+  const video = document.createElement('video');
+  video.muted = true; video.autoplay = true; video.playsInline = true;
+  const right = map.width - tile.x - tile.w, bottom = map.height - tile.y - tile.h;
+  video.style.objectViewBox = `inset(${tile.y}px ${right}px ${bottom}px ${tile.x}px)`;
+  video.style.aspectRatio = `${tile.w} / ${tile.h}`;
+  video.srcObject = stream;
+  video.dataset.tile = tile.id;
+  const cap = document.createElement('figcaption');
+  cap.textContent = `${tile.label} (${tile.id})`;
+  fig.append(video, cap);
+  return fig;
+}
+
+async function poll() {
+  const parts = [];
+  for (const [i, s] of sessions.entries()) {
+    const stats = await s.pc.getStats();
+    stats.forEach((r) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        s.fps = r.framesDecoded - s.frames;
+        s.frames = r.framesDecoded;
+        s.size = `${r.frameWidth || 0}x${r.frameHeight || 0}`;
+      }
+    });
+    parts.push(`#${i + 1} ${s.pc.connectionState} ${s.fps} fps`);
+  }
+  const videos = document.querySelectorAll('video');
+  const playing = [...videos].filter((v) => v.readyState >= 2).length;
+  setStatus(`${sessions.length} WHEP session(s), ${sessions[0]?.size || '?'}; ${playing}/${videos.length} <video> playing; ` + parts.join(', '));
+}
+
+(async () => {
+  try {
+    const map = await (await fetch('mosaic/map')).json();
+    // PREVIEW_WHEP_URL, else the engine's own MediaMTX on this host.
+    const base = map.whep_base || `${location.protocol}//${location.hostname}:${map.whep_port}`;
+    const url = `${base}/${map.path}/whep`;
+    if (!CSS.supports('object-view-box', 'inset(0px)')) {
+      setStatus('This browser has no CSS object-view-box (Chrome/Edge 104+): tiles are not cropped.', true);
+    }
+    for (let i = 0; i < viewers; i++) sessions.push(await whep(url));
+    const stream = sessions[0].stream;
+    const main = document.getElementById('main');
+    const grid = document.getElementById('tiles');
+    for (const id of ['me1-pgm', 'me1-pvw']) {
+      const tile = map.tiles.find((t) => t.id === id);
+      if (tile) main.append(tileVideo(stream, tile, map));
+    }
+    for (const tile of map.tiles) grid.append(tileVideo(stream, tile, map));
+    const whole = { id: 'mosaic', label: 'Whole mosaic', x: 0, y: 0, w: map.width, h: map.height };
+    grid.append(tileVideo(stream, whole, map));
+    setInterval(poll, 1000);
+  } catch (err) {
+    setStatus(String(err), true);
+  }
+})();
+</script>
+</body>
+</html>
