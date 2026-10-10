@@ -1,43 +1,62 @@
 # syntax=docker/dockerfile:1
 
-# Mixer image. MXL (libmxl + mxlsrc/mxlsink) and the HTML keyer (gstcefsrc)
-# are compiled in this build. No separate SDK checkout is required.
+# Mixer image: FlowXer's control plane (Python: API, state, NMOS, tally, library) and its media
+# engine (C++/CUDA, engine/), which the control plane starts as a child process. The engine
+# needs an NVIDIA GPU at run time (NVIDIA_DRIVER_CAPABILITIES below).
+#
+# Pins as in mxl-multiviewer / mxl-replay: CUDA 12.8.2 on Ubuntu 24.04, MXL 218ddaa. FFmpeg is
+# Ubuntu's (NVENC for the preview mosaic, NVDEC for clips: loaded from the driver at run time).
+# libcudart is linked statically; libcuda, NVENC, NVDEC and NVML come from the NVIDIA container
+# toolkit when the container starts with a GPU.
 
+# Must precede the first FROM.
 ARG UBUNTU=ubuntu:24.04
-ARG MXL_REPO=https://github.com/dmf-mxl/mxl.git
+ARG CUDA_IMAGE=nvidia/cuda:12.8.2-devel-ubuntu24.04
+# The engine starts this MediaMTX itself when no shared one is given (PREVIEW_PUBLISH_URL unset).
+ARG MEDIAMTX_IMAGE=bluenviron/mediamtx:1.20.1
 ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
-ARG RUST_TOOLCHAIN=1.92
-ARG GSTCEFSRC_REPO=https://github.com/centricular/gstcefsrc.git
-ARG GSTCEFSRC_REF=b63340852fc93b0ab67b07200e1ff44f59ba6769
 
-FROM ${UBUNTU} AS mxl-builder
-ARG DEBIAN_FRONTEND=noninteractive
-ARG MXL_REPO
+FROM ${MEDIAMTX_IMAGE} AS mediamtx
+
+FROM ${CUDA_IMAGE} AS engine-deps
 ARG MXL_REF
-ARG RUST_TOOLCHAIN
-ENV MXL_REPO=${MXL_REPO} \
-    MXL_REF=${MXL_REF} \
-    RUST_TOOLCHAIN=${RUST_TOOLCHAIN}
-COPY docker/build-mxl.sh /tmp/build-mxl.sh
-RUN chmod +x /tmp/build-mxl.sh && /tmp/build-mxl.sh
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build git pkg-config curl zip unzip tar ca-certificates \
+        libavcodec-dev libavformat-dev libavutil-dev nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 https://github.com/microsoft/vcpkg /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+ENV VCPKG_ROOT=/opt/vcpkg
+RUN git init /tmp/mxl \
+    && git -C /tmp/mxl remote add origin https://github.com/dmf-mxl/mxl.git \
+    && git -C /tmp/mxl fetch --depth 1 origin "${MXL_REF}" \
+    && git -C /tmp/mxl checkout FETCH_HEAD
+COPY engine/docker/mxl-vcpkg.json /tmp/mxl-manifest/vcpkg.json
+RUN BASELINE="$(git -C /opt/vcpkg rev-parse HEAD)" \
+    && sed -i "1a\\  \"builtin-baseline\": \"${BASELINE}\"," /tmp/mxl-manifest/vcpkg.json
+RUN cmake -S /tmp/mxl -B /tmp/mxl/build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+        -DVCPKG_MANIFEST_DIR=/tmp/mxl-manifest \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF -DBUILD_UTILS=OFF -DBUILD_DOCS=OFF \
+        -DMXL_ENABLE_FABRICS_OFI=OFF \
+        -DCMAKE_INSTALL_PREFIX=/opt/mxl \
+    && cmake --build /tmp/mxl/build -j"$(nproc)" \
+    && cmake --install /tmp/mxl/build
 
-FROM ${UBUNTU} AS cef-builder
-ARG DEBIAN_FRONTEND=noninteractive
-ARG GSTCEFSRC_REPO
-ARG GSTCEFSRC_REF
-ENV GSTCEFSRC_REPO=${GSTCEFSRC_REPO} \
-    GSTCEFSRC_REF=${GSTCEFSRC_REF}
-COPY docker/build-cef.sh /tmp/build-cef.sh
-RUN chmod +x /tmp/build-cef.sh && /tmp/build-cef.sh
-# Saturating mallinfo() for libcef (docker/mallinfo-shim.c), preloaded below.
-COPY docker/mallinfo-shim.c /tmp/mallinfo-shim.c
-RUN gcc -O2 -Wall -Werror -shared -fPIC -o /opt/gstcef/libmallinfo-shim.so /tmp/mallinfo-shim.c
+FROM engine-deps AS engine-build
+COPY engine /src
+# The unit tests need no GPU; the kernels are checked on a GPU host with --selftest.
+RUN cmake -S /src -B /src/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="/opt/mxl;/tmp/mxl/build/vcpkg_installed/x64-linux" \
+    && cmake --build /src/build -j"$(nproc)" \
+    && /src/build/fxeng-tests
 
 FROM ${UBUNTU}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG FLOWXER_VERSION=0.1.0
-ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7
+ARG MXL_REF
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.version=$FLOWXER_VERSION
 LABEL org.opencontainers.image.licenses="Apache-2.0"
@@ -45,66 +64,25 @@ LABEL org.opencontainers.image.source="https://github.com/Firesh0ot/FlowXer"
 LABEL org.opencontainers.image.revision=$VCS_REF
 LABEL io.dmf.mxl.revision=$MXL_REF
 
+# ffmpeg: the library's conversions (and the libav* the engine links); fonts for generated
+# stinger and still pictures.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
         python3-venv \
-        python3-gi \
-        python3-gi-cairo \
-        python3-cairo \
-        gir1.2-gstreamer-1.0 \
-        gir1.2-gst-plugins-base-1.0 \
-        gstreamer1.0-tools \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-libav \
-        gstreamer1.0-x \
-        gstreamer1.0-gl \
-        libgdk-pixbuf2.0-0 \
-        fonts-dejavu-core \
         ffmpeg \
-        libopus0 \
-        libvpx9 \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
+        fonts-dejavu-core \
         curl \
         ca-certificates \
-        libnss3 \
-        libnspr4 \
-        libatk1.0-0t64 \
-        libatk-bridge2.0-0t64 \
-        libcups2t64 \
-        libdrm2 \
-        libgbm1 \
-        libgtk-3-0t64 \
-        libpango-1.0-0 \
-        libcairo2 \
-        libasound2t64 \
-        libx11-6 \
-        libx11-xcb1 \
-        libxcb1 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxext6 \
-        libxfixes3 \
-        libxkbcommon0 \
-        libxrandr2 \
-        libxshmfence1 \
-        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
-# FLOWXER_GPU: GStreamer GL uses EGL without a display. The NVIDIA container toolkit
-# mounts libEGL_nvidia but not its glvnd vendor file; without a GPU the file is unused.
-RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
-    && printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}\n' \
-        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
-
-COPY --from=mxl-builder /opt/mxl /opt/mxl
-COPY --from=cef-builder /opt/gstcef /opt/gstcef
-RUN printf '/opt/mxl/lib\n/opt/gstcef\n' > /etc/ld.so.conf.d/flowxer-media.conf \
-    && ldconfig \
-    && test -f /opt/mxl/gst/libgstmxl.so \
-    && test -f /opt/gstcef/libgstcef.so \
-    && test -f /opt/gstcef/libmallinfo-shim.so
+COPY --from=engine-build /opt/mxl/lib/ /usr/local/lib/
+COPY --from=engine-build /src/build/flowxer-engine /usr/local/bin/flowxer-engine
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+RUN ldconfig && flowxer-engine --version
 
 WORKDIR /app
 
@@ -114,31 +92,24 @@ COPY configs /app/configs
 COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN pip3 install --no-cache-dir --break-system-packages /app \
-    && pip3 install --no-cache-dir --break-system-packages 'aiortc==1.9.0' \
     && python3 -c "import flowxer" \
     && chmod +x /entrypoint.sh \
-    && mkdir -p /storage/clips /storage/stingers /storage/graphics /tmp/cef-cache \
-    && printf '%s\n' "$MXL_REF" > /opt/mxl/REF \
-    && chown -R 1000:1000 /storage /tmp/cef-cache
+    && mkdir -p /storage/clips /storage/stingers /storage/library /tmp/flowxer-engine \
+    && mkdir -p /opt/mxl && printf '%s\n' "$MXL_REF" > /opt/mxl/REF \
+    && chown -R 1000:1000 /storage /tmp/flowxer-engine
 
-ENV LD_LIBRARY_PATH=/opt/mxl/lib:/opt/gstcef
-ENV GST_PLUGIN_PATH=/opt/mxl/gst:/opt/gstcef:/usr/lib/x86_64-linux-gnu/gstreamer-1.0
-# no-sandbox: CEF in a container. disable-*-update: no runtime downloads (lab proxy).
-ENV GST_CEF_CHROME_EXTRA_FLAGS=no-sandbox,disable-dev-shm-usage,use-gl=angle,use-angle=swiftshader,disable-background-networking,disable-component-update,disable-sync,no-first-run,disable-default-apps,disable-extensions,disable-breakpad
-ENV GST_CEF_CACHE_LOCATION=/tmp/cef-cache
-# libcef's legacy mallinfo() wraps above 2 GiB of malloc and Chromium's memory dumps
-# then stop the mixer (SIGILL, exit 132); the shim caps the values instead.
-ENV LD_PRELOAD=/opt/gstcef/libmallinfo-shim.so
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ENV HOME=/tmp
 ENV FLOWXER_HOST=127.0.0.1
 ENV FLOWXER_PORT=9610
 ENV FLOWXER_MXL_ROOT=/Volumes/mxl
 ENV FLOWXER_STORAGE_ROOT=/storage
 ENV FLOWXER_MXL_REVISION=$MXL_REF
-ENV FLOWXER_OVERLAY_URL=http://127.0.0.1:9610/graphics/lower-third.html
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 9610 3252 3253
+# 9610 API, 3252/3253 NMOS; the engine's own MediaMTX (without PREVIEW_PUBLISH_URL): 8989 WHEP,
+# 8988 HLS, 8289/udp+tcp ICE. The engine's control port (9630) is on localhost only.
+EXPOSE 9610 3252 3253 8989 8988 8289 8289/udp
 VOLUME ["/Volumes/mxl", "/storage", "/config"]
 USER 1000:1000
 ENTRYPOINT ["/entrypoint.sh"]

@@ -102,7 +102,7 @@ def test_state_survives_a_restart(settings: Settings) -> None:
     mixer.apply_workspace(WorkspaceUpdate(logical_source_count=4, source_tile_aspect="9:16"))
     mixer.update_input("cam-1", LogicalInputUpdate(label="Studio A"))
     mixer.replace_tally_receivers([TallyReceiver(id="vsm", label="VSM", host="127.0.0.1")])
-    mixer.update_keyer("dsk-1", title="Breaking")
+    mixer.update_keyer("dsk-1", label="Graphics")
     mixer.persist()
     assert (settings.state_dir / "state.json").is_file()
 
@@ -112,8 +112,7 @@ def test_state_survives_a_restart(settings: Settings) -> None:
     assert len(again.inputs) == 4
     assert again.get_input("cam-1").label == "Studio A"
     assert [item.id for item in again.tally.receivers] == ["vsm"]
-    assert again.keyers[0].title == "Breaking"
-    assert again.overlay.title == "Breaking"
+    assert again.keyers[0].label == "Graphics"
 
 
 def test_broken_state_file_starts_with_defaults(settings: Settings) -> None:
@@ -145,7 +144,7 @@ def test_config_export_and_import(client: TestClient, mixer: VisionMixer) -> Non
 
     assert client.post("/api/v1/config/import", json={"format": "other"}).status_code == 422
     escape = json.loads(json.dumps(exported))
-    escape["inputs"][0].update(kind="file", file_path="../../../../etc/passwd")
+    escape["inputs"][0].update(kind="clip_player", library_item_id="../../../../etc")
     assert client.post("/api/v1/config/import", json=escape).status_code == 422
     assert mixer.workspace.logical_source_count == 5
 
@@ -307,7 +306,7 @@ def test_structure_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FLOWXER_FORMAT", "720p50")
     monkeypatch.setenv("FLOWXER_LIVE_INPUTS", "3")
     monkeypatch.setenv("FLOWXER_INPUT_LABELS", '["Cam A", "Cam, B"]')
-    monkeypatch.setenv("FLOWXER_TEST_SOURCES", "1")
+    monkeypatch.setenv("FLOWXER_CLIP_PLAYERS", "1")
     monkeypatch.setenv("FLOWXER_PANELS", "2")
     monkeypatch.setenv("FLOWXER_PROGRAM_AUTOSTART", "true")
     settings = Settings(_env_file=None)
@@ -317,8 +316,8 @@ def test_structure_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.pinned_workspace == {
         "format_id": ("720p50", "FLOWXER_FORMAT"),
         "logical_source_count": (
-            6,
-            "FLOWXER_LIVE_INPUTS, FLOWXER_INPUT_LABELS, FLOWXER_TEST_SOURCES",
+            5,
+            "FLOWXER_LIVE_INPUTS, FLOWXER_INPUT_LABELS, FLOWXER_CLIP_PLAYERS",
         ),
         "mixer_panel_count": (2, "FLOWXER_PANELS"),
     }
@@ -328,7 +327,7 @@ def test_structure_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_structure_settings_unset_or_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("FORMAT", "LIVE_INPUTS", "INPUT_LABELS", "TEST_SOURCES", "PANELS"):
+    for name in ("FORMAT", "LIVE_INPUTS", "INPUT_LABELS", "CLIP_PLAYERS", "PANELS", "RENDER_MES"):
         monkeypatch.setenv(f"FLOWXER_{name}", "")
     settings = Settings(_env_file=None)
     assert settings.pinned_workspace == {}
@@ -341,8 +340,11 @@ def test_structure_settings_unset_or_empty(monkeypatch: pytest.MonkeyPatch) -> N
         {"FLOWXER_FORMAT": "1080i50"},
         {"FLOWXER_PANELS": "5"},
         {"FLOWXER_PANELS": "0"},
-        {"FLOWXER_LIVE_INPUTS": "23"},
-        {"FLOWXER_LIVE_INPUTS": "20", "FLOWXER_TEST_SOURCES": "3"},
+        {"FLOWXER_LIVE_INPUTS": "24"},
+        {"FLOWXER_LIVE_INPUTS": "20", "FLOWXER_CLIP_PLAYERS": "4"},
+        {"FLOWXER_RENDER_MES": "5"},
+        {"FLOWXER_LATENCY": "0"},
+        {"FLOWXER_LATENCY": "11"},
         {"FLOWXER_LIVE_INPUTS": "1", "FLOWXER_INPUT_LABELS": "A,B"},
         {"FLOWXER_INPUT_LABELS": "A"},
         {"FLOWXER_LIVE_INPUTS": "2", "FLOWXER_INPUT_LABELS": "A,A"},
@@ -370,30 +372,32 @@ def _pin(settings: Settings, **values) -> Settings:
 
 
 def test_env_structure_seeds_inputs_panels_and_nmos_labels(settings: Settings) -> None:
-    _pin(settings, live_inputs=2, input_labels="Cam A,Cam B", test_sources=1, panels=2)
+    _pin(settings, live_inputs=2, input_labels="Cam A,Cam B", clip_players=1, panels=2)
     mixer = VisionMixer(settings)
     inputs = mixer.list_inputs()
     assert [(item.id, item.kind, item.label) for item in inputs] == [
         ("cam-1", InputKind.mxl_live, "Cam A"),
         ("cam-2", InputKind.mxl_live, "Cam B"),
-        ("test-1", InputKind.test, "Test 1"),
+        ("clip-1", InputKind.clip_player, "Clip 1"),
         ("black", InputKind.black, "Black"),
-        ("replay", InputKind.replay, "Replay"),
     ]
-    assert [item.slot for item in inputs] == [0, 1, 2, 3, 4]
-    assert mixer.workspace.logical_source_count == 5
+    assert [item.slot for item in inputs] == [0, 1, 2, 3]
+    assert mixer.workspace.logical_source_count == 4
     assert [panel.label for panel in mixer.panels] == ["ME 1", "ME 2"]
     assert [item["label"] for item in mixer.nmos.receivers()] == [
         "Cam A Video",
         "Cam A Audio",
         "Cam B Video",
         "Cam B Audio",
+        "DSK 1 Key",
     ]
     assert [item["label"] for item in mixer.nmos.senders()] == [
         "ME 1 PGM Video",
         "ME 1 PGM Audio",
+        "ME 1 PVW Video",
         "ME 2 PGM Video",
         "ME 2 PGM Audio",
+        "ME 2 PVW Video",
     ]
 
 
@@ -410,7 +414,7 @@ def test_env_structure_wins_over_saved_state_but_keeps_routes(settings: Settings
     )
     mixer.update_input("cam-2", LogicalInputUpdate(stinger_slot_id="shared-2"))
     mixer.replace_tally_receivers([TallyReceiver(id="vsm", label="VSM", host="127.0.0.1")])
-    mixer.update_keyer("dsk-1", title="Breaking")
+    mixer.update_keyer("dsk-1", label="Graphics")
     rid = ids.receiver_id(settings.resolved_nmos_seed, "cam-1", "video")
     response = TestClient(create_nmos_app(mixer.nmos)).patch(
         f"/x-nmos/connection/v1.2/single/receivers/{rid}/staged",
@@ -432,11 +436,10 @@ def test_env_structure_wins_over_saved_state_but_keeps_routes(settings: Settings
         ("cam-1", InputKind.mxl_live, "Cam A"),
         ("cam-2", InputKind.mxl_live, "Camera 2"),
         ("black", InputKind.black, "Black"),
-        ("replay", InputKind.replay, "Replay"),
     ]
     assert again.workspace.format_id == "720p50"
     assert (settings.width, settings.height) == (1280, 720)
-    assert again.workspace.logical_source_count == 4
+    assert again.workspace.logical_source_count == 3
     assert len(again.panels) == again.workspace.mixer_panel_count == 1
     # cam-5 is gone: Preview starts empty.
     assert again.preview_input_id is None
@@ -448,7 +451,7 @@ def test_env_structure_wins_over_saved_state_but_keeps_routes(settings: Settings
     assert str(again.get_input("cam-1").video.flow_id) == VIDEO_FLOW
     assert again.get_input("cam-2").stinger_slot_id == "shared-2"
     assert again.workspace.stinger_count == 2
-    assert again.keyers[0].title == "Breaking"
+    assert again.keyers[0].label == "Graphics"
     assert [item.id for item in again.tally.receivers] == ["vsm"]
 
 
@@ -486,7 +489,7 @@ def test_env_pinned_structure_is_refused_by_the_api(settings: Settings) -> None:
     exported["inputs"][0]["label"] = "Imported"
     assert client.post("/api/v1/config/import", json=exported).status_code == 200
     assert mixer.workspace.format_id == "720p50"
-    assert mixer.workspace.logical_source_count == 4
+    assert mixer.workspace.logical_source_count == 3
     assert mixer.workspace.mixer_panel_count == 2
     assert mixer.get_input("cam-1").label == "Cam A"
     assert mixer.get_input("cam-1").stinger_slot_id == "shared-1"
@@ -512,4 +515,4 @@ def test_program_autostart_without_live_inputs(settings: Settings) -> None:
     mixer = VisionMixer(_pin(settings, program_autostart=True))
     with TestClient(app_module.create_app(settings, mixer)):
         assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
-        assert mixer.get_input("cam-1").kind == InputKind.test
+        assert mixer.get_input("cam-1").kind == InputKind.mxl_live

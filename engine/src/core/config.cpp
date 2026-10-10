@@ -1,7 +1,5 @@
 #include "core/config.hpp"
 
-#include "core/mosaic_map.hpp"
-
 #include <nlohmann/json.hpp>
 
 #include <fstream>
@@ -96,44 +94,46 @@ std::string field(nlohmann::json const& item, char const* key)
     return it != item.end() && it->is_string() ? it->get<std::string>() : std::string{};
 }
 
-std::vector<InputConfig> parseInputs(std::string const& text)
+nlohmann::json parseArray(std::string const& key, std::string const& text)
 {
     if (text.empty())
     {
-        throw ConfigError("FLOWXER_ENGINE_INPUTS: required (JSON array of {domain, video_flow, audio_flow, label})");
+        return nlohmann::json::array();
     }
-    nlohmann::json list;
-    try
+    nlohmann::json list = nlohmann::json::parse(text, nullptr, false);
+    if (list.is_discarded() || !list.is_array())
     {
-        list = nlohmann::json::parse(text);
+        throw ConfigError(key + ": a JSON array");
     }
-    catch (std::exception const& ex)
-    {
-        throw ConfigError("FLOWXER_ENGINE_INPUTS: " + std::string(ex.what()));
-    }
-    if (!list.is_array() || list.empty() || list.size() > static_cast<std::size_t>(kMaxInputs))
-    {
-        throw ConfigError("FLOWXER_ENGINE_INPUTS: an array of 1.." + std::to_string(kMaxInputs) + " inputs");
-    }
-    std::vector<InputConfig> inputs;
     for (auto const& item : list)
     {
         if (!item.is_object())
         {
-            throw ConfigError("FLOWXER_ENGINE_INPUTS: every input is an object");
+            throw ConfigError(key + ": every entry is a JSON object");
         }
+    }
+    return list;
+}
+
+// FLOWXER_ENGINE_INPUTS: [{"label", "domain", "video_flow", "audio_flow", "audio_domain"}], the
+// live inputs in slot order. The routes are optional: FlowXer routes the inputs at run time.
+std::vector<InputConfig> parseInputs(std::string const& text)
+{
+    std::vector<InputConfig> inputs;
+    for (auto const& item : parseArray("FLOWXER_ENGINE_INPUTS", text))
+    {
         InputConfig input;
-        input.domain = field(item, "domain");
-        // "video_flow"/"audio_flow"; "flow"/"audio" are accepted too.
-        input.flow = item.contains("video_flow") ? field(item, "video_flow") : field(item, "flow");
         input.label = field(item, "label");
-        input.audioFlow = item.contains("audio_flow") ? field(item, "audio_flow") : field(item, "audio");
-        input.audioDomain = field(item, "audio_domain");
-        if (input.audioDomain.empty())
+        input.video.domain = field(item, "domain");
+        // "video_flow"/"audio_flow"; "flow"/"audio" are accepted too.
+        input.video.flow = item.contains("video_flow") ? field(item, "video_flow") : field(item, "flow");
+        input.audio.flow = item.contains("audio_flow") ? field(item, "audio_flow") : field(item, "audio");
+        input.audio.domain = field(item, "audio_domain");
+        if (input.audio.domain.empty())
         {
-            input.audioDomain = input.domain;
+            input.audio.domain = input.video.domain;
         }
-        if ((!input.flow.empty() && input.domain.empty()) || (!input.audioFlow.empty() && input.audioDomain.empty()))
+        if ((!input.video.flow.empty() && input.video.domain.empty()) || (!input.audio.flow.empty() && input.audio.domain.empty()))
         {
             throw ConfigError("FLOWXER_ENGINE_INPUTS: input " + std::to_string(inputs.size() + 1) + " has a flow but no \"domain\"");
         }
@@ -145,23 +145,67 @@ std::vector<InputConfig> parseInputs(std::string const& text)
     }
     return inputs;
 }
-// FLOWXER_ENGINE_OUTPUTS: [{"me": 1, "domain", "domain_id", "pgm_video", "pgm_audio", "pvw_video"}],
-// every field optional; MEs not listed take the defaults.
+
+// FLOWXER_ENGINE_PLAYERS: [{"label"}], the clip players in slot order.
+std::vector<PlayerConfig> parsePlayers(std::string const& text)
+{
+    std::vector<PlayerConfig> players;
+    for (auto const& item : parseArray("FLOWXER_ENGINE_PLAYERS", text))
+    {
+        PlayerConfig player;
+        player.label = field(item, "label");
+        if (player.label.empty())
+        {
+            player.label = "Clip " + std::to_string(players.size() + 1);
+        }
+        players.push_back(std::move(player));
+    }
+    return players;
+}
+
+// FLOWXER_ENGINE_KEYS: [{"label", "domain", "flow", "me"}], one DSK per key input.
+std::vector<KeyConfig> parseKeys(std::string const& text, int mes)
+{
+    std::vector<KeyConfig> keys;
+    for (auto const& item : parseArray("FLOWXER_ENGINE_KEYS", text))
+    {
+        KeyConfig key;
+        key.label = field(item, "label");
+        key.route.domain = field(item, "domain");
+        key.route.flow = field(item, "flow");
+        if (key.label.empty())
+        {
+            key.label = "DSK " + std::to_string(keys.size() + 1) + " Key";
+        }
+        if (item.contains("me"))
+        {
+            if (!item["me"].is_number_integer() || item["me"].get<int>() < 1 || item["me"].get<int>() > mes)
+            {
+                throw ConfigError("FLOWXER_ENGINE_KEYS: \"me\" must be 1.." + std::to_string(mes));
+            }
+            key.me = item["me"].get<int>();
+        }
+        if (!key.route.flow.empty() && key.route.domain.empty())
+        {
+            throw ConfigError("FLOWXER_ENGINE_KEYS: key " + std::to_string(keys.size() + 1) + " has a flow but no \"domain\"");
+        }
+        keys.push_back(std::move(key));
+    }
+    if (keys.size() > static_cast<std::size_t>(kMaxKeys))
+    {
+        throw ConfigError("FLOWXER_ENGINE_KEYS: at most " + std::to_string(kMaxKeys) + " key inputs");
+    }
+    return keys;
+}
+
+// FLOWXER_ENGINE_OUTPUTS: [{"me": 1, "domain", "domain_id", "pgm_video", "pgm_audio", "pvw_video",
+// "label", "group"}], every field but "me" optional; MEs not listed take the defaults.
 std::vector<OutputConfig> parseOutputs(std::string const& value, int mes, std::string const& domain, std::string const& domainId)
 {
-    std::vector<OutputConfig> outputs(static_cast<std::size_t>(mes), OutputConfig{domain, domainId, {}, {}, {}});
-    if (value.empty())
+    std::vector<OutputConfig> outputs(static_cast<std::size_t>(mes), OutputConfig{domain, domainId, {}, {}, {}, {}, {}});
+    for (auto const& item : parseArray("FLOWXER_ENGINE_OUTPUTS", value))
     {
-        return outputs;
-    }
-    nlohmann::json list = nlohmann::json::parse(value, nullptr, false);
-    if (list.is_discarded() || !list.is_array())
-    {
-        throw ConfigError("FLOWXER_ENGINE_OUTPUTS: a JSON array of {me, domain, domain_id, pgm_video, pgm_audio, pvw_video}");
-    }
-    for (auto const& item : list)
-    {
-        if (!item.is_object() || !item.contains("me") || !item["me"].is_number_integer())
+        if (!item.contains("me") || !item["me"].is_number_integer())
         {
             throw ConfigError("FLOWXER_ENGINE_OUTPUTS: every entry needs \"me\" (1.." + std::to_string(mes) + ")");
         }
@@ -183,6 +227,8 @@ std::vector<OutputConfig> parseOutputs(std::string const& value, int mes, std::s
         out.pgmVideo = field(item, "pgm_video");
         out.pgmAudio = field(item, "pgm_audio");
         out.pvwVideo = field(item, "pvw_video");
+        out.label = field(item, "label");
+        out.group = field(item, "group");
     }
     return outputs;
 }
@@ -252,8 +298,14 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     }
     Config cfg;
     cfg.inputs = parseInputs(get(values, "FLOWXER_ENGINE_INPUTS", ""));
+    cfg.players = parsePlayers(get(values, "FLOWXER_ENGINE_PLAYERS", ""));
+    if (cfg.inputs.size() + cfg.players.size() > static_cast<std::size_t>(kMaxSources))
+    {
+        throw ConfigError("FLOWXER_ENGINE_INPUTS + FLOWXER_ENGINE_PLAYERS: at most " + std::to_string(kMaxSources) + " sources");
+    }
     cfg.mes = getInt(values, "FLOWXER_ENGINE_MES", cfg.mes, 1, kMaxMes);
-    cfg.latency = getInt(values, "FLOWXER_ENGINE_LATENCY", cfg.latency, 1, 8);
+    cfg.keys = parseKeys(get(values, "FLOWXER_ENGINE_KEYS", ""), cfg.mes);
+    cfg.latency = getInt(values, "FLOWXER_ENGINE_LATENCY", cfg.latency, 1, kMaxLatency);
     cfg.format = get(values, "FLOWXER_ENGINE_FORMAT", cfg.format);
     if (!parseFormat(cfg.format, cfg.width, cfg.height, cfg.rate))
     {
@@ -262,12 +314,9 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     cfg.outputDomain = get(values, "FLOWXER_ENGINE_OUTPUT_DOMAIN", cfg.outputDomain);
     cfg.outputDomainId = get(values, "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID", cfg.outputDomainId);
     cfg.outputs = parseOutputs(get(values, "FLOWXER_ENGINE_OUTPUTS", ""), cfg.mes, cfg.outputDomain, cfg.outputDomainId);
+    cfg.pvwOutputs = getBool(values, "FLOWXER_ENGINE_PVW_OUTPUTS", cfg.pvwOutputs);
     cfg.audioChannels = getInt(values, "FLOWXER_ENGINE_AUDIO_CHANNELS", cfg.audioChannels, 1, 64);
-    cfg.tallyTsl = get(values, "FLOWXER_TALLY_TSL", cfg.tallyTsl);
-    if (!cfg.tallyTsl.empty() && cfg.tallyTsl.rfind("udp://", 0) != 0 && cfg.tallyTsl.rfind("tcp://", 0) != 0)
-    {
-        throw ConfigError("FLOWXER_TALLY_TSL: udp://host:port or tcp://host:port, is " + cfg.tallyTsl);
-    }
+    cfg.audioWaitMs = getInt(values, "FLOWXER_ENGINE_AUDIO_WAIT_MS", cfg.audioWaitMs, 0, 40);
     cfg.label = get(values, "FLOWXER_ENGINE_LABEL", cfg.label);
     cfg.workFormat = get(values, "FLOWXER_ENGINE_WORK_FORMAT", cfg.workFormat);
     if (cfg.workFormat != "yuv16" && cfg.workFormat != "rgba16f")

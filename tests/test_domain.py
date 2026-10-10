@@ -14,7 +14,6 @@ from flowxer.domain.mxl_domain import (
     scan_domains,
 )
 from flowxer.engine.mixer import VisionMixer
-from flowxer.engine.pipeline import build_pipeline_description
 from flowxer.settings import Settings
 
 
@@ -130,9 +129,17 @@ def test_deprecated_mxl_domain_sets_root_and_output(tmp_path: Path, caplog: pyte
     assert "FLOWXER_MXL_DOMAIN is deprecated" in caplog.text
 
 
-def test_live_input_mxlsrc_uses_resolved_domain_path(mixer: VisionMixer, tmp_path: Path) -> None:
+def _record_engine(mixer: VisionMixer) -> list[tuple[str, str, dict]]:
+    """The commands the mixer would send to a running engine."""
+    calls: list[tuple[str, str, dict]] = []
+    mixer._engine_call = lambda method, path, body, client=None: calls.append((method, path, body))
+    return calls
+
+
+def test_a_live_input_is_routed_to_the_resolved_domain_path(mixer: VisionMixer, tmp_path: Path) -> None:
     other = mixer.settings.mxl_root / "cam"
     _write_domain(other, "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+    _write_flow(other, "5fbec3b1-1b0f-417d-9059-8b94a47197ed", "video/v210", "cam")
     mixer.register_input(
         LogicalInputCreate(
             id="studio-a",
@@ -149,20 +156,15 @@ def test_live_input_mxlsrc_uses_resolved_domain_path(mixer: VisionMixer, tmp_pat
             ),
         )
     )
-    description = build_pipeline_description(
-        settings=mixer.settings,
-        inputs=mixer.list_inputs(),
-        overlay_url=mixer.overlay.url,
-        overlay_enabled=False,
-        output_video_flow_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-        output_audio_flow_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-        domain=str(mixer.settings.output_domain),
-        use_mxl_sink=True,
-        use_cefsrc=False,
-        domain_paths=mixer._source_domain_paths(),
-    )
-    assert f'domain="{other.resolve()}"' in description
-    assert f'domain="{mixer.settings.output_domain.resolve()}"' in description
+    item = mixer.get_input("studio-a")
+    # The engine gets the domain directory and the flow id.
+    assert mixer._essence_route(item, "video") == {"domain": str(other.resolve()), "flow": "5fbec3b1-1b0f-417d-9059-8b94a47197ed"}
+    assert mixer._essence_route(item, "audio")["domain"] == str(other.resolve())
+    calls = _record_engine(mixer)
+    mixer._push_route(item)
+    # Live inputs are in1..N in slot order: studio-a comes after the cameras.
+    live = [i.id for i in mixer.list_inputs() if i.kind == InputKind.mxl_live]
+    assert calls[-1][1] == f"/input/{live.index('studio-a') + 1}"
 
 
 def test_group_hint_bind_reads_mirror_domain(mixer: VisionMixer) -> None:
@@ -192,7 +194,7 @@ def test_group_hint_bind_reads_mirror_domain(mixer: VisionMixer) -> None:
 
 def test_a_route_to_the_wrong_domain_finds_its_flow(mixer: VisionMixer) -> None:
     # Platform 9.16.33: routes without a domain default to the own output domain, which does not
-    # hold the flow; mxlsrc read nothing there. Any domain that holds the flow is used, local first.
+    # hold the flow. Any domain that holds the flow is used, local first.
     root = mixer.settings.mxl_root
     local = root / "cam"
     mirror = root / "mirror-deck"
@@ -214,59 +216,49 @@ def test_a_route_to_the_wrong_domain_finds_its_flow(mixer: VisionMixer) -> None:
     )
     created = mixer.get_input("studio-a")
     assert created.audio is not None and created.audio.domain_id == "flowxer-test"
-    paths = mixer._source_domain_paths()
-    assert Path(paths["studio-a:video"]).resolve() == local.resolve()
-    assert Path(paths["studio-a:audio"]).resolve() == mirror.resolve()
+    assert Path(mixer._essence_route(created, "video")["domain"]).resolve() == local.resolve()
+    assert Path(mixer._essence_route(created, "audio")["domain"]).resolve() == mirror.resolve()
     # A flow that is nowhere yet stays in the named domain, where it may appear.
+    calls = _record_engine(mixer)
     mixer.apply_nmos_receiver("studio-a", "audio", domain_id=None, flow_id="11111111-2222-3333-4444-555555555555", enabled=True)
-    assert Path(mixer._source_domain_paths()["studio-a:audio"]).resolve() == mixer.settings.output_domain.resolve()
+    assert Path(calls[-1][2]["audio"]["domain"]).resolve() == mixer.settings.output_domain.resolve()
+    assert calls[-1][2]["audio"]["flow"] == "11111111-2222-3333-4444-555555555555"
 
 
-class _Retargets:
-    """Enough of a GstRuntime for _attach_waiting_sources: records the retargets."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str | None, str | None, str]] = []
-
-    def retarget_mxl_source(self, element_name: str, flow_id: str | None, domain: str | None, role: str) -> bool:
-        self.calls.append((element_name, flow_id, domain, role))
-        return True
-
-
-def test_a_route_to_a_missing_domain_waits_and_attaches_when_it_appears(mixer: VisionMixer) -> None:
-    # Platform vmix after a node reboot: the fabrics mirror domains were not there yet, mxlsrc
-    # failed on the missing directory and Program did not start. The source now waits in the own
-    # output domain and reads its flow once the domain appears.
+def test_a_route_to_a_missing_domain_waits_and_is_routed_when_it_appears(mixer: VisionMixer) -> None:
+    # Platform vmix after a node reboot: the fabrics mirror domains were not there yet. The
+    # input is not routed until the domain appears, then it reads its flow.
     root = mixer.settings.mxl_root
     missing = "abcdef00-0000-4000-8000-000000000001"
     video = "5fbec3b1-1b0f-417d-9059-8b94a47197ed"
+    audio = "339fa87e-fdb0-5ad5-9956-6b82751e0957"
     mixer.register_input(
         LogicalInputCreate(
             id="studio-a",
             label="Studio A",
             kind=InputKind.mxl_live,
             video=VideoEssence(flow_id=video, domain_id=missing),
-            audio=AudioEssence(flow_id="339fa87e-fdb0-5ad5-9956-6b82751e0957", domain_id=missing, channels=2),
+            audio=AudioEssence(flow_id=audio, domain_id=missing, channels=2),
         )
     )
-    paths = mixer._source_domain_paths()
-    output = mixer.settings.output_domain.resolve()
-    assert Path(paths["studio-a:video"]) == output
-    assert Path(paths["studio-a:audio"]) == output
-    runtime = _Retargets()
-    mixer._attach_waiting_sources(runtime)
-    assert runtime.calls == []
+    calls = _record_engine(mixer)
+    mixer._push_route(mixer.get_input("studio-a"))
+    assert calls[-1][2] == {"video": {"domain": "", "flow": ""}, "audio": {"domain": "", "flow": ""}}
+    assert set(mixer._missing_domains) == {("studio-a", "video"), ("studio-a", "audio")}
+    mixer._attach_waiting_sources()
+    assert len(calls) == 1
 
     mirror = root / "mirror-cam"
     _write_domain(mirror, missing, extra={"x-mxl-fabrics-agent": {}})
-    mixer._attach_waiting_sources(runtime)
-    assert sorted(runtime.calls) == [
-        ("asrc_studio-a", "339fa87e-fdb0-5ad5-9956-6b82751e0957", str(mirror.resolve()), "audio"),
-        ("vsrc_studio-a", video, str(mirror.resolve()), "video"),
-    ]
+    mixer._attach_waiting_sources()
+    assert calls[-1][2] == {
+        "video": {"domain": str(mirror.resolve()), "flow": video},
+        "audio": {"domain": str(mirror.resolve()), "flow": audio},
+    }
     assert mixer._missing_domains == {}
-    mixer._attach_waiting_sources(runtime)
-    assert len(runtime.calls) == 2
+    count = len(calls)
+    mixer._attach_waiting_sources()
+    assert len(calls) == count
 
 
 def test_a_waiting_source_that_was_routed_elsewhere_is_left_alone(mixer: VisionMixer) -> None:
@@ -279,12 +271,12 @@ def test_a_waiting_source_that_was_routed_elsewhere_is_left_alone(mixer: VisionM
             video=VideoEssence(flow_id="5fbec3b1-1b0f-417d-9059-8b94a47197ed", domain_id=missing),
         )
     )
-    mixer._source_domain_paths()
+    calls = _record_engine(mixer)
+    mixer._push_route(mixer.get_input("studio-a"))
     assert ("studio-a", "video") in mixer._missing_domains
     item = mixer.get_input("studio-a")
-    item.video = item.video.model_copy(update={"domain_id": "flowxer-test"})
+    item.video = item.video.model_copy(update={"flow_id": None})
     _write_domain(mixer.settings.mxl_root / "late", missing)
-    runtime = _Retargets()
-    mixer._attach_waiting_sources(runtime)
-    assert runtime.calls == []
+    mixer._attach_waiting_sources()
+    assert len(calls) == 1
     assert mixer._missing_domains == {}

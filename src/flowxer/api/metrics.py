@@ -30,7 +30,9 @@ def render_prometheus(mixer) -> str:
         resources = {}
     nmos = mixer.nmos.status() if getattr(mixer, "nmos", None) else {}
     on_air = 1 if getattr(mixer.state, "value", mixer.state) == "running" else 0
-    gst_mode = mixer.backend if mixer.backend != "idle" else settings.gst_mode
+    engine = getattr(mixer, "engine", None)
+    engine_status = (engine.status if engine is not None else None) or {}
+    engine_info = engine_status.get("engine") or {}
     lines = [
         "# HELP flowxer_info FlowXer build and mode",
         "# TYPE flowxer_info gauge",
@@ -40,9 +42,9 @@ def render_prometheus(mixer) -> str:
             {
                 "version": settings.version,
                 "mxl_revision": settings.resolved_mxl_revision,
-                "gst_mode": gst_mode,
+                "media": "simulate" if settings.simulate else "engine",
                 "nmos_enabled": str(bool(nmos.get("enabled"))).lower(),
-                "media_path": getattr(getattr(mixer, "media", None), "path", "cpu"),
+                "engine_version": engine_info.get("version", ""),
             },
         ),
         "# HELP flowxer_on_air 1 when the mixer pipeline is running",
@@ -62,43 +64,32 @@ def render_prometheus(mixer) -> str:
             1 if mixer.preview_input_id else 0,
             {"input": mixer.preview_input_id or ""},
         ),
-        "# HELP flowxer_frames_rendered_total Program frames that reached the video output",
+        "# HELP flowxer_frames_rendered_total Program grains the engine wrote",
         "# TYPE flowxer_frames_rendered_total counter",
         _line("flowxer_frames_rendered_total", int(getattr(mixer, "frames_rendered", 0))),
         "# HELP flowxer_program_stalled 1 while on air without a new Program frame for 3 s",
         "# TYPE flowxer_program_stalled gauge",
         _line("flowxer_program_stalled", int(mixer.program_stalled_s() is not None) if hasattr(mixer, "program_stalled_s") else 0),
-        "# HELP flowxer_frames_dropped_total Program frames skipped to stay on the MXL timeline (mixer late)",
+        "# HELP flowxer_frames_dropped_total Output grains skipped to stay on the TAI grid (engine late)",
         "# TYPE flowxer_frames_dropped_total counter",
         _line("flowxer_frames_dropped_total", int(getattr(mixer, "frames_dropped", 0))),
-        "# HELP flowxer_program_buffers_dropped_total Program buffers dropped before mxlsink because they went back in time",
-        "# TYPE flowxer_program_buffers_dropped_total counter",
-        *(
-            _line("flowxer_program_buffers_dropped_total", count, {"essence": essence})
-            for essence, count in (getattr(mixer, "program_dropped", None) or {"video": 0, "audio": 0}).items()
-        ),
+        "# HELP flowxer_engine_up 1 while the media engine answers",
+        "# TYPE flowxer_engine_up gauge",
+        _line("flowxer_engine_up", 1 if engine is not None and engine.ready else 0),
+        "# HELP flowxer_engine_restarts_total Media engine restarts after it exited (this Program run)",
+        "# TYPE flowxer_engine_restarts_total counter",
+        _line("flowxer_engine_restarts_total", int(engine.restarts) if engine is not None else 0),
+        "# HELP flowxer_latency_grains Fixed processing latency (FLOWXER_LATENCY)",
+        "# TYPE flowxer_latency_grains gauge",
+        _line("flowxer_latency_grains", settings.latency),
+        "# HELP flowxer_recommended_latency_grains The latency that covers the latest input arrival seen",
+        "# TYPE flowxer_recommended_latency_grains gauge",
+        _line("flowxer_recommended_latency_grains", int(engine_info.get("recommended_latency_grains") or 0)),
         "# HELP flowxer_control_plane_busy_seconds Age of the oldest running control-plane operation (0: none)",
         "# TYPE flowxer_control_plane_busy_seconds gauge",
         _line("flowxer_control_plane_busy_seconds", round(_busy_seconds(mixer), 3)),
-        "# HELP flowxer_input_late_grains_total MXL grains arrived late",
-        "# TYPE flowxer_input_late_grains_total counter",
-        _line("flowxer_input_late_grains_total", int(getattr(mixer, "late_grains", 0))),
-        "# HELP flowxer_input_resyncs_total MXL reader resyncs",
-        "# TYPE flowxer_input_resyncs_total counter",
-        _line("flowxer_input_resyncs_total", int(getattr(mixer, "resyncs", 0))),
-        "# HELP flowxer_pipeline_errors_total GStreamer pipeline error messages",
-        "# TYPE flowxer_pipeline_errors_total counter",
-        _line("flowxer_pipeline_errors_total", int(getattr(mixer, "pipeline_errors", 0))),
-        "# HELP flowxer_webrtc_peers Active WHEP peers",
-        "# TYPE flowxer_webrtc_peers gauge",
     ]
-    try:
-        from flowxer.engine.webrtc import peer_count
-
-        peers = peer_count()
-    except Exception:
-        peers = 0
-    lines.append(_line("flowxer_webrtc_peers", peers))
+    lines += _input_lines(mixer)
     lines += [
         "# HELP flowxer_nmos_registry_up 1 when the last registry heartbeat succeeded",
         "# TYPE flowxer_nmos_registry_up gauge",
@@ -149,13 +140,6 @@ def render_prometheus(mixer) -> str:
     for kind in ("cut", "mix", "stinger"):
         lines.append(_line("flowxer_transitions_total", int(counts.get(kind, 0)), {"type": kind}))
     lines += [
-        "# HELP flowxer_input_restarts_total MXL sources started again after they failed",
-        "# TYPE flowxer_input_restarts_total counter",
-    ]
-    restarts = getattr(mixer, "input_restarts", {}) or {}
-    for (input_id, essence), count in sorted(restarts.items()):
-        lines.append(_line("flowxer_input_restarts_total", count, {"input": input_id, "essence": essence}))
-    lines += [
         "# HELP flowxer_input_state 1 for the current per-essence input state",
         "# TYPE flowxer_input_state gauge",
     ]
@@ -173,7 +157,36 @@ def render_prometheus(mixer) -> str:
                         {"input": item.id, "essence": role, "state": candidate},
                     )
                 )
-    return "\n".join(lines) + "\n"
+    text = "\n".join(lines) + "\n"
+    # The engine's own metrics (flowxer_engine_*: GPU time per stage, inputs by engine name).
+    if engine is not None:
+        text += engine.metrics()
+    return text
+
+
+def _input_lines(mixer) -> list[str]:
+    """Per input (FlowXer ids): how late its grains arrive (ms after their TAI time, the 5 s
+    maximum and average), and grains or audio blocks that were missing."""
+    runtime = mixer.source_runtime() if hasattr(mixer, "source_runtime") else {}
+    lines = [
+        "# HELP flowxer_input_arrival_ms How late an input's grains arrive after their TAI time (video), how far its audio head is behind TAI (audio)",
+        "# TYPE flowxer_input_arrival_ms gauge",
+    ]
+    missing = [
+        "# HELP flowxer_input_missing_total Output grains without the input's grain (video) or samples (audio), start-up windows not counted",
+        "# TYPE flowxer_input_missing_total counter",
+    ]
+    for input_id, entry in sorted(runtime.items()):
+        for essence, key in (("video", "arrival_ms"), ("audio", "audio_lag_ms")):
+            value = entry.get(key)
+            if not isinstance(value, dict):
+                continue
+            for stat in ("avg", "max"):
+                lines.append(_line("flowxer_input_arrival_ms", value.get(stat, 0), {"input": input_id, "essence": essence, "stat": stat}))
+        if "missing" in entry:
+            missing.append(_line("flowxer_input_missing_total", int(entry.get("missing") or 0), {"input": input_id, "essence": "video"}))
+            missing.append(_line("flowxer_input_missing_total", int(entry.get("audio_missing") or 0), {"input": input_id, "essence": "audio"}))
+    return lines + missing
 
 
 def _busy_seconds(mixer) -> float:

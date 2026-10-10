@@ -105,7 +105,7 @@ export interface MixerStatus {
   frame_rate: string;
   video_format: string;
   stinger: { phase: string; id?: string | null };
-  webrtc_enabled: boolean;
+  webrtc_enabled?: boolean;
   wipe_armed?: boolean;
   last_transition?: string;
   error?: string | null;
@@ -187,7 +187,7 @@ export interface ConsoleState {
   stinger_slots: StingerSlot[];
   mixer: MixerStatus;
   resources: ResourceInfo;
-  webrtc: { enabled: boolean; protocol: string };
+  webrtc?: { enabled: boolean; protocol: string };
   clips: { name: string; path: string; library_item_id?: string | null; ready?: boolean }[];
   stingers: StingerInfo[];
   library?: LibraryItem[];

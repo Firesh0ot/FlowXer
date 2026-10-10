@@ -1,5 +1,7 @@
-// Engine settings from the environment, optionally from a JSON file (FLOWXER_ENGINE_CONFIG;
-// same key names, the environment wins). P1 has no NMOS: inputs are MXL domain + flow id.
+// Engine settings from a JSON file (FLOWXER_ENGINE_CONFIG, written by FlowXer's control plane)
+// and the environment (same key names; the environment wins). FlowXer starts the engine with
+// the structure (inputs, clip players, key inputs, MEs, output flows) and routes the inputs at
+// run time over the control API.
 #pragma once
 
 #include "core/tai.hpp"
@@ -16,22 +18,43 @@ struct ConfigError : std::runtime_error
     using std::runtime_error::runtime_error;
 };
 
+// An MXL route: domain directory + flow id. An empty flow is "not routed".
+struct Route
+{
+    std::string domain;
+    std::string flow;
+
+    bool operator==(Route const& other) const
+    {
+        return domain == other.domain && flow == other.flow;
+    }
+};
+
 struct InputConfig
 {
-    // MXL domain directory, e.g. /Volumes/mxl/player-lab.
-    std::string domain;
-    // Video flow id ("video_flow"); empty: the input is black (keeps its slot, e.g. for the
-    // TSL numbering).
-    std::string flow;
     std::string label;
-    // Audio flow id ("audio_flow", float32), in audioDomain (default: domain); empty: silence.
-    std::string audioDomain;
-    std::string audioFlow;
+    // Initial routes (FlowXer routes the inputs at run time; IS-05).
+    Route video;
+    Route audio;
+};
+
+struct PlayerConfig
+{
+    std::string label;
+};
+
+// A key input (v210a fill + key in one flow) and the DSK that keys it over an ME's outputs.
+struct KeyConfig
+{
+    std::string label;
+    Route route;
+    // The ME whose Program (and Preview) the DSK keys (P2: ME 1).
+    int me = 1;
 };
 
 // The MXL flows of one ME. An empty id is generated (stable for domain + ME + kind); an id
-// that already exists in the domain is opened (MXL create-or-open), so the engine can take
-// over the flows of a stopped mixer.
+// that already exists in the domain is opened (MXL create-or-open), so the engine takes over
+// the flows of a stopped mixer and their readers keep reading.
 struct OutputConfig
 {
     std::string domain;
@@ -40,13 +63,26 @@ struct OutputConfig
     std::string pgmVideo;
     std::string pgmAudio;
     std::string pvwVideo;
+    // Flow labels "<label> PGM Video" etc. and NMOS group hint "<group>:Video"; empty: the
+    // engine's label and "ME<m>".
+    std::string label;
+    std::string group;
 };
+
+constexpr int kMaxMes = 4;
+// Live inputs and clip players together (with Black 24 sources, as FlowXer's console).
+constexpr int kMaxSources = 23;
+constexpr int kMaxKeys = 4;
+constexpr int kMaxLatency = 10;
 
 struct Config
 {
     std::vector<InputConfig> inputs;
-    int mes = 4;
-    int latency = 2;
+    std::vector<PlayerConfig> players;
+    std::vector<KeyConfig> keys;
+    // Rendering MEs (1-4); every one renders every grain.
+    int mes = 1;
+    int latency = 4;
     std::string format = "1080p50";
     int width = 1920;
     int height = 1080;
@@ -56,12 +92,12 @@ struct Config
     std::string outputDomainId;
     // One entry per ME (FLOWXER_ENGINE_OUTPUTS), filled with the defaults.
     std::vector<OutputConfig> outputs;
+    // PVW video flows; false: PVW is rendered for the mosaic only, never downloaded.
+    bool pvwOutputs = true;
     // PGM audio channels of a flow the engine creates (an existing flow keeps its own).
     int audioChannels = 2;
-    // Raw TSL 5.0 tally (udp://host:port or tcp://host:port); empty: off.
-    std::string tallyTsl;
-    // Name prefix of the output flow labels ("<label> ME1 PGM").
-    std::string label = "FlowXer engine";
+    // Prefix of generated flow labels.
+    std::string label = "FlowXer";
     // Internal working format: yuv16 (10-bit 4:2:2 in 16-bit planes) or rgba16f.
     std::string workFormat = "yuv16";
     int gpu = 0;
@@ -70,13 +106,15 @@ struct Config
     // An input that stops (a stalled or re-created mirror) holds its last grain this long,
     // then turns black; 0: holds it until grains come again.
     int holdGrains = 0;
+    // Longest wait (ms) for input audio that is not there yet when its grain is written.
+    int audioWaitMs = 8;
     bool mosaic = true;
     int mosaicFps = 25;
     int mosaicKbps = 6000;
     // Preview contract (platform spec 11.5): publish to a shared MediaMTX at publishUrl
     // (RTSP), or run an own MediaMTX when it is empty. Streams are <pathPrefix>/<stream>.
     std::string publishUrl;
-    std::string pathPrefix = "flowxer-engine";
+    std::string pathPrefix = "flowxer";
     // Public bases the UI plays from (<base>/<prefix>/<stream>/whep or /index.m3u8);
     // empty: the own MediaMTX on the page's host.
     std::string whepBase;

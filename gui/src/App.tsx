@@ -65,7 +65,7 @@ export default function App() {
   }
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
-  const webrtc = snapshot.webrtc.enabled;
+  const webrtc = snapshot.webrtc?.enabled ?? false;
 
   return (
     <div className="console">

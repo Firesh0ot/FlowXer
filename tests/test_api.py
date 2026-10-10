@@ -20,7 +20,10 @@ def test_logical_input_bundles_video_and_audio_essences(mixer: VisionMixer) -> N
     assert created.audio is not None
     assert created.video.media_type == "video/v210"
     assert created.audio.media_type == "audio/float32"
-    assert created.slot == len(mixer.inputs) - 1
+    # Live inputs come before the clip players and Black (slot = TSL INDEX).
+    live = [item for item in mixer.list_inputs() if item.kind == InputKind.mxl_live]
+    assert created.slot == len(live) - 1
+    assert mixer.get_input("black").slot == len(mixer.inputs) - 1
 
 
 def test_rejects_compressed_video_media_type() -> None:
@@ -32,23 +35,26 @@ def test_rejects_compressed_video_media_type() -> None:
         raise AssertionError("compressed video must be rejected")
 
 
-def test_file_input_requires_existing_clip(mixer: VisionMixer, tmp_path) -> None:
+def test_clip_player_requires_a_library_item(mixer: VisionMixer, tmp_path) -> None:
     try:
         mixer.register_input(
             LogicalInputCreate(
-                id="clip-1",
-                label="Clip 1",
-                kind=InputKind.file,
-                file_path="missing.mp4",
+                id="clip-9",
+                label="Clip 9",
+                kind=InputKind.clip_player,
+                library_item_id="missing",
             )
         )
     except MixerError as exc:
-        assert "clip not found" in str(exc)
+        assert "unknown library clip or still" in str(exc)
     else:
-        raise AssertionError("missing clip must be rejected")
+        raise AssertionError("a missing library item must be rejected")
+    # An empty clip player is fine (it shows black).
+    empty = mixer.register_input(LogicalInputCreate(id="clip-9", label="Clip 9", kind=InputKind.clip_player))
+    assert empty.library_item_id is None
 
 
-def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
+def test_openapi_documents_the_mixer(client: TestClient) -> None:
     spec = client.get("/openapi.json").json()
     paths = spec["paths"]
     for path in (
@@ -56,12 +62,13 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
         "/api/v1/inputs",
         "/api/v1/mixer/start",
         "/api/v1/mixer/take",
-        "/api/v1/overlay",
         "/api/v1/storage/clips",
         "/api/v1/storage/stingers",
-        "/api/v1/replay/take",
-        "/api/v1/replay/return",
         "/api/v1/stinger/play",
+        "/api/v1/players/{input_id}/{action}",
+        "/api/v1/keyers/{keyer_id}/auto",
+        "/api/v1/preview",
+        "/api/v1/engine",
         "/api/v1/stinger-slots/{slot_id}",
         "/api/v1/mixer/cut",
         "/api/v1/mixer/fade",
@@ -76,6 +83,8 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
         "/api/v1/tally/refresh",
     ):
         assert path in paths, path
+    for removed in ("/api/v1/overlay", "/api/v1/replay/take", "/api/v1/webrtc/whep/{stream_id}", "/api/v1/preview/jpeg/{stream_id}"):
+        assert removed not in paths, removed
     tags = {tag["name"] for tag in spec["tags"]}
     assert "stinger" in tags
     assert "gui" in tags
@@ -85,6 +94,8 @@ def test_openapi_documents_mixer_and_replay(client: TestClient) -> None:
     assert "flip_flop" in components["StingerPlayRequest"]["properties"]
     assert "source_tile_aspect" in components["WorkspaceConfig"]["properties"]
     assert "stinger_slot_id" in components["LogicalInput"]["properties"]
+    assert {"loop", "play_on_cut", "library_item_id"} <= set(components["LogicalInput"]["properties"])
+    assert "me_outputs" in components["MixerStatus"]["properties"]
     assert "cut_frame" in components["StingerSlotUpdate"]["properties"]
     assert "ResourceInfo" in components
     assert "TallyReceiver" in components
@@ -111,12 +122,12 @@ def test_control_surface_and_docs(client: TestClient) -> None:
     assert "FlowXer" in home.text
     docs = client.get("/docs")
     assert docs.status_code == 200
-    graphics = client.get("/graphics/lower-third.html")
-    assert graphics.status_code == 200
+    # The CEF overlay's sample page is gone with the overlay.
+    assert client.get("/graphics/lower-third.html").status_code == 404
 
 
 def test_invalid_input_patch_is_422_not_500(client: TestClient) -> None:
     # mxl_live without essences or group hint is invalid once merged into the input.
-    response = client.patch("/api/v1/inputs/cam-1", json={"kind": "mxl_live"})
+    response = client.patch("/api/v1/inputs/black", json={"kind": "mxl_live"})
     assert response.status_code == 422
     assert "group_hint" in response.text

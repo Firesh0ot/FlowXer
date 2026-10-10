@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 class LibraryKind(str, Enum):
     clip = "clip"
+    # A still image: a clip player shows it as a frame memory.
+    still = "still"
     stinger = "stinger"
 
 

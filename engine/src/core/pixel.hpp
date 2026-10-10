@@ -18,6 +18,13 @@ FXENG_HD constexpr int v210RowBytes(int width)
     return ((width + 47) / 48) * 128;
 }
 
+// Bytes per line of the key plane of v210a (after the fill): three 10-bit samples per 32-bit
+// little-endian word (bits 0-9, 10-19, 20-29), lines padded to whole words (MXL Architecture.md).
+FXENG_HD constexpr int keyPlaneRowBytes(int width)
+{
+    return ((width + 2) / 3) * 4;
+}
+
 FXENG_HD inline std::uint16_t clamp10(float v)
 {
     if (v < 0.f)

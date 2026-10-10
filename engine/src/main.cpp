@@ -1,4 +1,4 @@
-// flowxer-engine: the FlowXer mix engine prototype (P1). See engine/README.md.
+// flowxer-engine: FlowXer's media engine, started and driven by FlowXer's control plane. See engine/README.md.
 #include "core/config.hpp"
 #include "engine/api.hpp"
 #include "engine/engine.hpp"
@@ -40,23 +40,32 @@ std::map<std::string, std::string> environment()
 // What the engine will read and write (flow ids that are empty here are generated at start).
 nlohmann::json configSummary(fxeng::Config const& cfg)
 {
+    auto const route = [](fxeng::Route const& r) { return nlohmann::json{{"domain", r.domain}, {"flow", r.flow}}; };
     nlohmann::json inputs = nlohmann::json::array();
     for (auto const& in : cfg.inputs)
     {
-        inputs.push_back({{"label", in.label}, {"domain", in.domain}, {"video_flow", in.flow.empty() ? "(black)" : in.flow}, {"audio_domain", in.audioDomain},
-            {"audio_flow", in.audioFlow}});
+        inputs.push_back({{"label", in.label}, {"video", route(in.video)}, {"audio", route(in.audio)}});
+    }
+    nlohmann::json players = nlohmann::json::array();
+    for (auto const& player : cfg.players)
+    {
+        players.push_back({{"label", player.label}});
+    }
+    nlohmann::json keys = nlohmann::json::array();
+    for (auto const& key : cfg.keys)
+    {
+        keys.push_back({{"label", key.label}, {"me", key.me}, {"route", route(key.route)}});
     }
     nlohmann::json outputs = nlohmann::json::array();
     for (std::size_t m = 0; m < cfg.outputs.size(); ++m)
     {
         auto const& o = cfg.outputs[m];
         outputs.push_back({{"me", m + 1}, {"domain", o.domain}, {"domain_id", o.domainId}, {"pgm_video", o.pgmVideo}, {"pgm_audio", o.pgmAudio},
-            {"pvw_video", o.pvwVideo}});
+            {"pvw_video", cfg.pvwOutputs ? nlohmann::json(o.pvwVideo) : nlohmann::json(nullptr)}, {"label", o.label}, {"group", o.group}});
     }
-    return {{"format", cfg.format}, {"mes", cfg.mes}, {"latency_grains", cfg.latency}, {"inputs", inputs}, {"outputs", outputs},
-        {"audio_channels", cfg.audioChannels}, {"http", cfg.httpBind + ":" + std::to_string(cfg.httpPort)},
-        {"preview", {{"mode", cfg.ownMediamtx() ? "own" : "shared"}, {"publish", cfg.rtspBase() + "/" + cfg.streamPath("mosaic")}, {"whep_base", cfg.whepBase}}},
-        {"tally_tsl", cfg.tallyTsl}};
+    return {{"format", cfg.format}, {"mes", cfg.mes}, {"latency_grains", cfg.latency}, {"inputs", inputs}, {"players", players}, {"keys", keys},
+        {"outputs", outputs}, {"pvw_outputs", cfg.pvwOutputs}, {"audio_channels", cfg.audioChannels}, {"http", cfg.httpBind + ":" + std::to_string(cfg.httpPort)},
+        {"preview", {{"mode", cfg.ownMediamtx() ? "own" : "shared"}, {"publish", cfg.rtspBase() + "/" + cfg.streamPath("mosaic")}, {"whep_base", cfg.whepBase}}}};
 }
 
 int selfTest()
@@ -101,7 +110,7 @@ int main(int argc, char** argv)
             return selfTest();
         }
     }
-    // MXL keeps one descriptor per grain: 8 inputs and 8 outputs pass Docker's soft limit.
+    // MXL keeps one descriptor per grain: many inputs and outputs pass Docker's soft limit.
     rlimit files{};
     if (getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur < files.rlim_max)
     {

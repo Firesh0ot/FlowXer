@@ -153,17 +153,6 @@ def test_clip_audio_is_conformed_by_ffmpeg(tmp_path: Path):
     assert silence[silence.index("-af") + 1] == "pan=2c|c0=c0,apad=whole_len=960,atrim=end_sample=960"
 
 
-def test_file_input_video_branch_links_decodebin_to_videoconvert():
-    """decodebin must be followed by an element that only takes video, or gst-launch may
-    link the sound pad there and stop the input (a bare queue did that)."""
-    from flowxer.api.schemas import LogicalInput
-    from flowxer.engine.pipeline import _video_source_bin
-
-    settings = Settings(simulate=True)
-    clip = LogicalInput(id="replay", label="Replay", kind=InputKind.replay, slot=0, file_path="/x/mezz.mov")
-    assert "! decodebin name=vdec_replay ! videoconvert " in _video_source_bin(clip, settings, "d", {})
-
-
 def test_samples_until_grain_5994_cadence():
     # 60000/1001 → 800, then 801 repeating in the classic pattern.
     sizes = [samples_in_grain(i, 60000, 1001) for i in range(6)]
@@ -322,7 +311,7 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
     fmt = mixer.workspace.format_id
     _ready_item(mixer, "clipaaa00001", LibraryKind.clip, "clip one.mov")
     _ready_item(mixer, "stingaaa0001", LibraryKind.stinger, "My Sting.zip")
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id="clipaaa00001"))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="clipaaa00001"))
     slot_id = mixer.stinger_slots[0].id
     slot = mixer.configure_stinger_slot(slot_id, StingerSlotUpdate(library_item_id="stingaaa0001", cut_frame=5))
     assert slot.stinger_id == "stingaaa0001"  # the item id, never its display name
@@ -347,14 +336,14 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
     mixer.library.stop()
 
     saved = json.loads((settings.state_dir / "state.json").read_text(encoding="utf-8"))
-    replay = next(item for item in saved["inputs"] if item["id"] == "replay")
-    assert replay["library_item_id"] == "clipaaa00001" and "file_path" not in replay
+    player = next(item for item in saved["inputs"] if item["id"] == "clip-1")
+    assert player["library_item_id"] == "clipaaa00001" and "file_path" not in player
     assert "media_path" not in saved["stinger_slots"][0]
 
     again = VisionMixer(settings)
     mezz = again.library.store.mezz_path("clipaaa00001", fmt)
-    assert again.get_input("replay").library_item_id == "clipaaa00001"
-    assert again.get_input("replay").file_path == str(mezz)
+    assert again.get_input("clip-1").library_item_id == "clipaaa00001"
+    assert again._player_media(again.get_input("clip-1"))["path"] == str(mezz)
     restored = again.get_stinger_slot(slot_id)
     assert restored.library_item_id == "stingaaa0001"
     assert restored.stinger_id == "stingaaa0001"
@@ -369,11 +358,11 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
 
     client = TestClient(_app(settings, again))
     exported = client.get("/api/v1/config/export").json()
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": None})
-    assert again.get_input("replay").file_path == "_unassigned"
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": None})
+    assert again._player_media(again.get_input("clip-1"))["path"] == ""
     response = client.post("/api/v1/config/import", json=exported)
     assert response.status_code == 200, response.text
-    assert again.get_input("replay").file_path == str(mezz)
+    assert again._player_media(again.get_input("clip-1"))["path"] == str(mezz)
     assert again.get_stinger_slot(slot_id).ready
     again.library.stop()
 
@@ -402,10 +391,10 @@ def test_label_patch_on_library_slot_keeps_the_item(client, mixer):
 
 def test_library_delete_in_use_409(client, mixer):
     _ready_item(mixer, "busyaaa00001", LibraryKind.clip, "busy.mov")
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id="busyaaa00001"))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="busyaaa00001"))
     response = client.delete("/api/v1/library/busyaaa00001")
     assert response.status_code == 409
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id=None))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id=None))
     assert client.delete("/api/v1/library/busyaaa00001").status_code == 204
     assert client.get("/api/v1/library/busyaaa00001").status_code == 404
 
@@ -419,27 +408,26 @@ def test_invalid_library_ids_are_404(client):
 # ── finding 2: a stinger that is not ready cuts without recursion ────────────
 
 
-def test_not_ready_auto_stinger_hard_cuts(client, mixer):
+def test_auto_stinger_sources_cut(client, mixer):
+    # Stingers come back in P3: a source with an auto-stinger is taken with a cut.
     _ready_item(mixer, "clipaaa00001", LibraryKind.clip, "clip.mov")
     _ready_item(mixer, "stingbbb0002", LibraryKind.stinger, "pending", ready=False)
     slot_id = mixer.stinger_slots[0].id
     response = client.patch(f"/api/v1/stinger-slots/{slot_id}", json={"library_item_id": "stingbbb0002"})
     assert response.json()["ready"] is False
-    for input_id in ("replay", "cam-1"):
+    for input_id in ("clip-1", "cam-1"):
         assert client.patch(f"/api/v1/inputs/{input_id}", json={"stinger_slot_id": slot_id}).status_code == 200
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": "clipaaa00001"})
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": "clipaaa00001"})
 
-    response = client.post("/api/v1/mixer/take", json={"input_id": "replay", "transition": "cut"})
+    response = client.post("/api/v1/mixer/take", json={"input_id": "clip-1", "transition": "cut"})
     assert response.status_code == 200, response.text
-    assert mixer.program_input_id == "replay"
-    assert mixer.stinger_player is None
+    assert mixer.program_input_id == "clip-1"
 
     assert client.post("/api/v1/mixer/preview", json={"input_id": "cam-1"}).status_code == 200
     response = client.post("/api/v1/mixer/cut", json={})
     assert response.status_code == 200, response.text
     assert mixer.program_input_id == "cam-1"
-    assert mixer.preview_input_id == "replay"  # flip-flop like a plain cut
-
+    assert mixer.preview_input_id == "clip-1"  # flip-flop like a plain cut
 
 def test_stinger_not_ready_hard_cut(client, mixer):
     _ready_item(mixer, "pendaaa00001", LibraryKind.stinger, "pending-sting", ready=False)
@@ -460,15 +448,17 @@ def test_stinger_not_ready_hard_cut(client, mixer):
 
 def test_conversion_end_refreshes_inputs_and_slots(client, mixer):
     _ready_item(mixer, "clipccc00003", LibraryKind.clip, "late.mov", ready=False)
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": "clipccc00003"})
-    assert mixer.get_input("replay").file_path == "_unassigned"
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": "clipccc00003"})
+    assert mixer._player_media(mixer.get_input("clip-1"))["path"] == ""
     _ready_item(mixer, "clipccc00003", LibraryKind.clip, "late.mov")
+    calls = []
+    mixer.engine = type("Engine", (), {"ready": True})()
+    mixer._engine_call = lambda method, path, body, client=None: calls.append((method, path, body))
     mixer._on_library_job(type("Job", (), {"state": "done", "format_id": mixer.workspace.format_id})())
-    assert mixer.get_input("replay").file_path.endswith("mezz-1080p50.mov")
-
-
-# ── finding 4: GUI proxy and TGA folder uploads ──────────────────────────────
-
+    mixer.engine = None
+    # The engine loads the clip as soon as it is converted.
+    assert calls[-1][1] == "/player/1/load"
+    assert calls[-1][2]["path"] == mixer._player_media(mixer.get_input("clip-1"))["path"] != ""
 
 def test_gui_proxy_passes_upload_chunks():
     conf = (Path(__file__).parents[1] / "gui" / "nginx.conf").read_text(encoding="utf-8")

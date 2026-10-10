@@ -34,6 +34,20 @@ struct NextIndex
 // the current grain without counting.
 NextIndex nextOutputIndex(std::uint64_t next, std::uint64_t current);
 
+// The latency L (grains) that covers an input arriving `lagGrains` after its TAI time: output
+// grain i is rendered from half a grain before its TAI time and needs input grain i - L, so
+// L >= lag + 0.5; a tenth of a grain of margin, at least 1.
+inline int latencyFor(double lagGrains)
+{
+    double const need = (lagGrains < 0 ? 0.0 : lagGrains) + 0.5 + 0.1;
+    int latency = static_cast<int>(need);
+    if (static_cast<double>(latency) < need)
+    {
+        ++latency;
+    }
+    return latency < 1 ? 1 : latency;
+}
+
 // The input grain that output grain `output` is composed from (fixed latency L).
 inline std::uint64_t inputIndexFor(std::uint64_t output, int latency)
 {

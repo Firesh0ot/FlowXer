@@ -15,7 +15,10 @@ def test_kubernetes_manifest_is_host_network_non_root() -> None:
     assert "/readyz" in text
     assert "/Volumes/mxl" in text
     assert "FLOWXER_MIXER_URL" in text
-    assert "FLOWXER_WEBRTC_UDP_PORT_MIN" in text
+    # The media engine: a GPU, NVENC/NVDEC, no GStreamer settings.
+    assert "nvidia.com/gpu: 1" in text
+    assert "compute,video,utility" in text
+    assert "FLOWXER_GST_MODE" not in text and "FLOWXER_WEBRTC" not in text
     assert "hostPort:" not in text
     monitor = (ROOT / "deploy" / "kubernetes" / "servicemonitor.yaml").read_text(encoding="utf-8")
     assert "kind: ServiceMonitor" in monitor
@@ -74,10 +77,9 @@ def test_ci_runs_amwa_on_pull_requests() -> None:
     assert "./.github/actions/nmos-testing" in stage
 
 
-def test_mxl_build_fetches_short_sha_via_release_branch() -> None:
-    script = (ROOT / "docker" / "build-mxl.sh").read_text(encoding="utf-8")
-    assert 'git fetch --depth 1 origin "${MXL_REF}"' in script
-    assert "release/v1.1" in script
-    assert "couldn't find remote ref" in script
+def test_mxl_build_fetches_the_full_sha() -> None:
+    # GitHub refuses to fetch an abbreviated SHA: the image pins the full one.
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "ARG MXL_REF=218ddaa0a08c12ffe75fc475ae65aa3d9eef16d7" in dockerfile
+    assert 'git -C /tmp/mxl fetch --depth 1 origin "${MXL_REF}"' in dockerfile
+    assert "-DMXL_ENABLE_FABRICS_OFI=OFF" in dockerfile

@@ -9,10 +9,19 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class InputKind(str, Enum):
     mxl_live = "mxl_live"
-    file = "file"
-    replay = "replay"
-    test = "test"
+    clip_player = "clip_player"
     black = "black"
+
+
+# Input kinds of FlowXer before the engine: test sources and file/replay inputs are clip players
+# now (saved states, exports and API clients that still send them).
+LEGACY_INPUT_KINDS = {"test": "clip_player", "file": "clip_player", "replay": "clip_player"}
+
+
+def _migrate_kind(data):
+    if isinstance(data, dict) and data.get("kind") in LEGACY_INPUT_KINDS:
+        data = dict(data, kind=LEGACY_INPUT_KINDS[data["kind"]])
+    return data
 
 
 class MixerState(str, Enum):
@@ -98,20 +107,21 @@ class AudioEssence(BaseModel):
 
 
 class LogicalInputCreate(BaseModel):
-    """Register a logical mixer input that virtually bundles video + audio essences."""
+    """Register a logical mixer input: a live input (video + audio essences on MXL), a clip
+    player (a clip or a still from the library) or Black."""
 
     id: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     label: str = Field(..., min_length=1, max_length=128)
     kind: InputKind
     video: VideoEssence | None = None
     audio: AudioEssence | None = None
-    file_path: str | None = Field(
-        default=None,
-        description="Clip filename under storage/clips for file and replay inputs.",
-    )
     library_item_id: str | None = Field(
         default=None,
-        description="Media-library clip id. Preferred over file_path when set.",
+        description="Clip player: the library clip or still it plays (none: black).",
+    )
+    loop: bool = Field(default=False, description="Clip player: start the clip again at its end.")
+    play_on_cut: bool = Field(
+        default=False, description="Clip player: play when the player is taken to an ME's Program."
     )
     group_hint: str | None = Field(
         default=None,
@@ -122,6 +132,11 @@ class LogicalInputCreate(BaseModel):
         description="Stinger slot played when this source is taken to Program or Cut from Preview.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_kind(cls, data):
+        return _migrate_kind(data)
+
     @model_validator(mode="after")
     def validate_kind_payload(self) -> LogicalInputCreate:
         if self.kind == InputKind.mxl_live:
@@ -129,13 +144,15 @@ class LogicalInputCreate(BaseModel):
                 raise ValueError(
                     "mxl_live inputs need a video essence, an audio essence, or a group_hint"
                 )
-        if self.kind == InputKind.file and not self.file_path and not self.library_item_id:
-            raise ValueError("file inputs require file_path or library_item_id")
         return self
 
 
 class LogicalInput(LogicalInputCreate):
-    slot: int = Field(..., ge=0, description="GStreamer input-selector sink index")
+    slot: int = Field(
+        ...,
+        ge=0,
+        description="Source number from 0 (the TSL INDEX): live inputs, clip players, then Black.",
+    )
 
 
 class LogicalInputUpdate(BaseModel):
@@ -143,16 +160,22 @@ class LogicalInputUpdate(BaseModel):
     kind: InputKind | None = None
     video: VideoEssence | None = None
     audio: AudioEssence | None = None
-    file_path: str | None = None
     library_item_id: str | None = None
+    loop: bool | None = None
+    play_on_cut: bool | None = None
     group_hint: str | None = None
     stinger_slot_id: str | None = Field(
         default=None,
         description=(
             "Stinger slot played when this source is taken to Program or Cut from Preview. "
-            "Null disables auto-stinger."
+            "Null disables auto-stinger. Stingers come back in P3; until then such a take is a cut."
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_kind(cls, data):
+        return _migrate_kind(data)
 
 
 class MixerStartRequest(BaseModel):
@@ -160,15 +183,15 @@ class MixerStartRequest(BaseModel):
     group_hint: str | None = None
     program_input_id: str | None = Field(
         default=None,
-        description="Logical input placed on program at start. Defaults to the first live/test input.",
+        description="Logical input placed on ME 1 Program at start. Defaults to the first live input.",
     )
     preview_input_id: str | None = None
-    overlay_enabled: bool = False
-    overlay_url: str | None = None
 
 
 class TakeRequest(BaseModel):
-    input_id: str
+    input_id: str = Field(
+        ..., description="A logical input, or me-<n> for the Program of a higher ME (re-entry)"
+    )
     transition: TransitionType = TransitionType.cut
     duration_ms: int = Field(default=0, ge=0, le=10000)
     stinger_id: str | None = None
@@ -176,7 +199,9 @@ class TakeRequest(BaseModel):
 
 
 class PreviewRequest(BaseModel):
-    input_id: str
+    input_id: str = Field(
+        ..., description="A logical input, or me-<n> for the Program of a higher ME (re-entry)"
+    )
     panel_id: str = Field(default="me-1", description="Mixer panel (ME) to arm on preview")
 
 
@@ -194,34 +219,12 @@ class PanelTransitionRequest(BaseModel):
     )
 
 
-class OverlayUpdate(BaseModel):
-    enabled: bool | None = None
-    url: str | None = Field(
-        default=None,
-        description="HTML5 graphics URL composited by cefsrc (or the built-in renderer fallback).",
-    )
-    title: str | None = None
-    subtitle: str | None = None
+class PlayerCueRequest(BaseModel):
+    frame: int = Field(default=0, ge=0, description="Frame of the clip to show (0 = the first)")
 
 
-class ReplayLoadRequest(BaseModel):
-    file_path: str | None = Field(default=None, description="Clip filename under storage/clips")
-    library_item_id: str | None = Field(default=None, description="Library clip id")
-    input_id: str = Field(default="replay", description="Logical replay input to load")
-
-    @model_validator(mode="after")
-    def require_clip_ref(self) -> ReplayLoadRequest:
-        if not self.file_path and not self.library_item_id:
-            raise ValueError("file_path or library_item_id required")
-        return self
-
-
-class ReplayTransitionRequest(BaseModel):
-    stinger_id: str = Field(default="replay-wipe")
-    input_id: str | None = Field(
-        default=None,
-        description="Replay input to take. Defaults to the registered replay input.",
-    )
+class KeyerAutoRequest(BaseModel):
+    duration_ms: int = Field(default=500, ge=1, le=10000, description="Fade on or off over this time")
 
 
 class StingerPlayRequest(BaseModel):
@@ -289,14 +292,6 @@ class StingerInfo(BaseModel):
     fps: float = 50.0
 
 
-class OverlayStatus(BaseModel):
-    enabled: bool
-    url: str
-    title: str
-    subtitle: str
-    renderer: str
-
-
 class OutputFlows(BaseModel):
     video_flow_id: str
     audio_flow_id: str
@@ -307,6 +302,15 @@ class OutputFlows(BaseModel):
     nmos_audio: dict[str, Any]
 
 
+class MeOutputs(BaseModel):
+    """The MXL flows of one rendering ME (output domain: FlowXer's)."""
+
+    panel_id: str
+    pgm_video_flow_id: str
+    pgm_audio_flow_id: str
+    pvw_video_flow_id: str | None = None
+
+
 class MixerStatus(BaseModel):
     state: MixerState
     backend: str
@@ -314,26 +318,29 @@ class MixerStatus(BaseModel):
     preview_input_id: str | None
     last_live_input_id: str | None
     program_bus: ProgramBus
-    overlay: OverlayStatus
     stinger: dict[str, Any]
-    outputs: OutputFlows | None
+    outputs: OutputFlows | None = Field(default=None, description="ME 1 Program flows")
+    me_outputs: list[MeOutputs] = Field(
+        default_factory=list, description="PGM video and audio and PVW video of every rendering ME"
+    )
+    render_mes: int = Field(default=1, description="The first n MEs render (FLOWXER_RENDER_MES)")
+    latency_grains: int = Field(default=4, description="FLOWXER_LATENCY")
     raster: str
     frame_rate: str
     video_format: str
     audio_format: str
-    pipeline: str | None = None
     error: str | None = None
     workspace: dict[str, Any] | None = None
     panels: list[dict[str, Any]] = Field(default_factory=list)
     keyers: list[dict[str, Any]] = Field(default_factory=list)
     stinger_slots: list[dict[str, Any]] = Field(default_factory=list)
-    webrtc_enabled: bool = False
     wipe_armed: bool = False
     last_transition: str = "cut"
     nmos: dict[str, Any] = Field(default_factory=dict)
-    # FLOWXER_GPU: "gpu" or "cpu", and why (the reason of a fallback).
-    media_path: str = "cpu"
-    media_path_reason: str = ""
+    engine: dict[str, Any] = Field(
+        default_factory=dict,
+        description="The media engine: process state, restarts, fps, latency and its recommendation",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -343,9 +350,8 @@ class HealthResponse(BaseModel):
     mxl_domain: str
     mxl_root: str = ""
     mxl_output_domain_id: str = ""
-    gstreamer: bool
-    mxl_plugins: bool
     simulate: bool
+    engine: str = Field(default="stopped", description="State of the media engine process")
     mxl_revision: str = ""
 
 
@@ -364,12 +370,12 @@ class MixerPanel(BaseModel):
 
 
 class DownstreamKeyer(BaseModel):
+    """A downstream keyer on ME 1: keys its key input (a v210a fill + key MXL flow, NMOS
+    receiver "<label> Key") over ME 1 Program and Preview."""
+
     id: str
     label: str
-    enabled: bool = False
-    url: str = ""
-    title: str = "FLOWXER"
-    subtitle: str = "DMF Vision Mixer"
+    enabled: bool = Field(default=False, description="On air")
 
 
 class StingerSlot(BaseModel):
@@ -408,7 +414,9 @@ class WorkspaceConfig(BaseModel):
         description="shared = one TGA sequence for in and out; separate = dedicated in/out stingers",
     )
     stinger_count: int = Field(default=1, ge=1, le=8)
-    downstream_keyer_count: int = Field(default=1, ge=0, le=8)
+    downstream_keyer_count: int = Field(
+        default=1, ge=0, le=8, description="Downstream keyers on ME 1 (this version has at most one)"
+    )
     source_tile_aspect: str = Field(
         default="16:9",
         description="Operator source-tile picture ratio: 16:9 (landscape) or 9:16 (portrait).",
@@ -429,10 +437,7 @@ class WorkspaceUpdate(BaseModel):
 
 
 class KeyerUpdate(BaseModel):
-    enabled: bool | None = None
-    url: str | None = None
-    title: str | None = None
-    subtitle: str | None = None
+    enabled: bool | None = Field(default=None, description="On or off at the next frame")
     label: str | None = None
 
 
@@ -544,7 +549,17 @@ class ConsoleState(BaseModel):
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
     resources: ResourceInfo
-    webrtc: dict
+    preview: dict[str, Any] = Field(
+        default_factory=dict,
+        description="The preview mosaic (one WebRTC/HLS stream) and its tile map, as GET /preview",
+    )
+    sources: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Per input id what the engine reports: state, arrival lag (video and audio, ms), "
+            "clip player state"
+        ),
+    )
     clips: list[StorageClip]
     stingers: list[StingerInfo]
     library: list["LibraryItemOut"] = Field(default_factory=list)
