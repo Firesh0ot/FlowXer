@@ -1086,14 +1086,19 @@ struct Engine::Impl
     {
         {
             std::lock_guard lock{in.mu};
+            // The start-up window begins with the command: the render thread may need a grain
+            // of the new route before the input thread has opened it.
             if (!(in.video == video))
             {
                 in.video = video;
+                in.recent.clear();
+                in.graceUntil.store(graceFromNow());
                 in.videoGen.fetch_add(1);
             }
             if (audio != nullptr && !(in.audio == *audio))
             {
                 in.audio = *audio;
+                in.audioGraceUntil.store(graceFromNow());
                 in.audioGen.fetch_add(1);
             }
         }

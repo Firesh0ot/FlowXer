@@ -216,6 +216,9 @@ class EngineRuntime:
                 reader.start()
                 self._wait_ready(process)
                 code = process.wait()
+                # The engine's own children (its MediaMTX) are in its process group: a crashed
+                # engine must not leave them holding the ports of the next one.
+                self._kill_group(process)
                 reader.join(timeout=2)
                 with self._lock:
                     self._process = None
@@ -276,6 +279,16 @@ class EngineRuntime:
             process.kill()
             process.wait(timeout=5)
         except OSError:
+            pass
+
+    @staticmethod
+    def _kill_group(process: subprocess.Popen) -> None:
+        """Ends what is left of the engine's process group (it was started in a session of its own)."""
+        if not hasattr(os, "killpg"):
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
 
     def _forward_log(self, process: subprocess.Popen) -> None:
