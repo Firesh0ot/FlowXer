@@ -1,13 +1,15 @@
 # flowxer-engine (prototype P1)
 
-A C++17/CUDA mix engine for the next FlowXer version. It reads up to 8 MXL v210 inputs,
-renders 4 MEs (Program and Preview) every grain on the GPU, writes PGM + PVW of every ME back
-to MXL, and publishes one preview mosaic (NVENC H.264 → MediaMTX → WHEP). The design is
-[DESIGN.md](DESIGN.md); this file says how to build, run and configure it, and what was
-measured.
+A C++17/CUDA mix engine for the next FlowXer version. It reads up to 8 MXL v210 inputs (with
+their audio), renders 4 MEs (Program and Preview) every grain on the GPU, writes PGM video +
+audio and PVW video of every ME back to MXL, and publishes one preview mosaic (NVENC H.264 →
+MediaMTX → WHEP). A small control page drives it. The design is [DESIGN.md](DESIGN.md); this
+file says how to build, run and configure it, and what was measured.
 
-P1 has no NMOS, no audio, no GUI integration: inputs come from configuration and it is
-controlled over a small HTTP API. The Python control plane drives it in P2.
+P1 has no NMOS and no designer integration: inputs and outputs are MXL flow ids from the
+configuration, and it is controlled over a small HTTP API and its page. It can stand in for a
+FlowXer instance by taking over that instance's output flow ids (see [Drop-in for a FlowXer
+instance](#drop-in-for-a-flowxer-instance)). The Python control plane drives it in P2.
 
 ## How it works
 
@@ -15,7 +17,9 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
 
 - **Input threads** (`fx-in1` … `fx-in8`), one per input: wait for the next grain of their
   MXL flow, copy it once to the GPU (a direct DMA from the page-locked MXL memory, on the
-  input's own CUDA stream) and keep the newest few grains in a small ring.
+  input's own CUDA stream) and keep the newest few grains in a small ring. A flow that stalls
+  keeps its last grain on screen (counted as late); a re-created flow (FLOW_INVALID) is
+  opened again; a missing one is retried.
 - **Render thread** (`fx-render`): wakes when output grain *i* becomes the current grain on
   the TAI grid and composes it from input grains *i − L* (fixed latency, `L` = 2 by default).
   It unpacks each input that an ME uses once, renders ME 4 → ME 1 (so ME 1 can take ME 2's
@@ -24,29 +28,50 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   When it is late it skips to the current grain and counts the skip; it never slides.
 - **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
   queues the DMA download straight into the MXL grain on a separate download stream, waits
-  for each copy and commits. Upload, render and download of consecutive grains overlap on
-  their streams.
+  for each copy and commits. Then it writes the PGM audio of grain *i* (see below). Upload,
+  render and download of consecutive grains overlap on their streams.
 - **Encode thread** (`fx-encode`): copies the NV12 mosaic into an NVENC frame on the GPU,
   encodes it (one session, whatever the number of viewers) and sends it over RTSP/TCP to
   MediaMTX: the platform's shared one (`PREVIEW_PUBLISH_URL`) or, without it, the MediaMTX
   the engine starts itself (bundled in the image; restarted if it exits).
+- **Tally thread** (`fx-tally`, only with `FLOWXER_TALLY_TSL`): the raw TSL 5.0 tally of every
+  ME, on each change and once a second.
 - **Stats thread** (`fx-stats`): CPU per thread and GPU/NVENC load once a second; watches the
   own MediaMTX.
 
-Ownership is simple: each MXL reader belongs to its input thread, every MXL writer to the
-writer thread. Grains in flight between render and writer are bounded (3 slots); input frames
-come from a fixed pool per input and go back only after the downloads that read them are done.
-Every wait sleeps (blocking CUDA sync, futex waits in MXL, condition variables): no busy loops.
+Ownership is simple: each MXL reader belongs to its input thread (video) or to the writer
+thread (audio), every MXL writer to the writer thread. Grains in flight between render and
+writer are bounded (3 slots); input frames come from a fixed pool per input and go back only
+after the downloads that read them are done. Every wait sleeps (blocking CUDA sync, futex
+waits in MXL, condition variables): no busy loops.
 
 ### MEs
 
 - Sources: `in1`..`in8` and `me2`..`me4`. ME *m* may take the Program of ME *n* only when
   *n > m* (re-entry, 0 frames, no loops possible).
 - Program renders every grain into its own bus buffer (a copy, or the dissolve during a Mix);
-  Preview renders the preview source. Both are written to MXL as `<label> ME<m> PGM` and
-  `<label> ME<m> PVW`.
+  Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
+  `<label> ME<m> PVW`).
 - Cut swaps Program and Preview at the next grain. Auto (Mix) dissolves over N grains, then
   swaps. Its progress follows the grain index, so skipped grains do not stretch it.
+- An input without a video flow is a black slot. It keeps the numbering (the TSL tally and the
+  operator's habits), e.g. a camera that is not connected.
+
+### PGM audio (audio follows video)
+
+- Each ME's PGM audio is the audio of its Program source: an input's audio flow, or the PGM
+  audio of the re-entered ME. Preview has no audio; the mosaic has none.
+- During a Mix the two sources crossfade with **equal power** (gains cos and sin of t·90°, so
+  two unrelated sources keep their loudness; −3 dB each in the middle). t ramps sample by
+  sample through each grain, so there are no steps.
+- Same TAI grid and latency as the video: the audio of output grain *i* (48 kHz samples of
+  grain *i*'s time span) is the input audio of grain *i − L*. A/V stay aligned as they came in.
+- float32, 48 kHz. Channels: those of the output flow (`FLOWXER_ENGINE_AUDIO_CHANNELS`, default
+  2, for a flow the engine creates; an existing flow keeps its own); input channels beyond that
+  are dropped, missing ones are silent.
+- CPU only, in the writer thread: 0.05 ms per grain for 4 MEs. A source whose audio is not
+  there (stalled, missing) is silent for that grain and counted; a skipped video grain still
+  gets its audio, so the audio flow has no holes.
 
 ### Working format
 
@@ -62,13 +87,17 @@ docker run --rm --gpus all flowxer-engine:p1 --selftest   # GPU kernels against 
 ```
 
 The image is CUDA 12.8.2 / Ubuntu 24.04 with MXL 218ddaa (as the multiviewer and replay
-images) and Ubuntu's FFmpeg (`h264_nvenc`). The GPU, NVENC and NVML come from the NVIDIA
-container toolkit: run with a GPU and `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`
+images), Ubuntu's FFmpeg (`h264_nvenc`) and MediaMTX 1.20.1. The GPU, NVENC and NVML come from
+the NVIDIA container toolkit: run with a GPU and `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`
 (the image sets it).
 
+CI: `.github/workflows/engine-proto.yml` builds it on every push to `proto/mix-engine` that
+touches `engine/` and pushes `ghcr.io/firesh0ot/flowxer-engine:proto-<short sha>` and
+`:proto-latest`. It is separate from FlowXer's dev/stage/main workflows (no version bump).
+
 Without Docker: CMake ≥ 3.24, a CUDA toolkit, MXL installed (`CMAKE_PREFIX_PATH`),
-`libavcodec/libavformat/libavutil`, `uuid` and nlohmann-json. `-DFXENG_BUILD_ENGINE=OFF`
-builds only the unit tests (`fxeng-tests`), which need none of these.
+`libavcodec/libavformat/libavutil` and nlohmann-json. `-DFXENG_BUILD_ENGINE=OFF` builds only
+the unit tests (`fxeng-tests`), which need none of these except nlohmann-json.
 
 ## Run
 
@@ -77,10 +106,24 @@ it runs its own MediaMTX for the mosaic (self-contained); on the platform it pub
 shared one.
 
 ```bash
-docker run -d --name fxeng-engine --network host --user 1000:1000 --gpus '"device=0"'   -v /Volumes/mxl:/Volumes/mxl   -e FLOWXER_ENGINE_INPUTS='[{"domain":"/Volumes/mxl/player","flow":"<flow id>","label":"Cam 1"}, ...]'   flowxer-engine:p1
+docker run -d --name fxeng-engine --network host --user 1000:1000 --gpus '"device=0"' \
+  -v /Volumes/mxl:/Volumes/mxl \
+  -e FLOWXER_ENGINE_INPUTS='[{"domain":"/Volumes/mxl/player","video_flow":"<id>","audio_flow":"<id>","label":"Cam 1"}, ...]' \
+  -e FLOWXER_ENGINE_HTTP_BIND=0.0.0.0 \
+  flowxer-engine:p1
+docker run --rm -e FLOWXER_ENGINE_CONFIG=/cfg/engine.json -v $PWD:/cfg flowxer-engine:p1 --check   # resolved config
 ```
 
-Then:
+The control page is `http://<host>:9630/`: one row of input pictures, and per ME its Preview
+and Program pictures, PGM and PVW bus buttons (inputs, and the higher MEs for re-entry), CUT,
+AUTO with a duration in grains and the Mix progress. Red = Program, green = Preview, amber =
+the incoming source of a running Mix. It plays one WHEP session of the mosaic and shows each
+picture as a `<video>` on that one `MediaStream`, cropped with CSS `object-view-box: inset(…)`
+from `GET /mosaic/map` (Chrome/Edge 104+). No authentication: bind it to localhost (default)
+or a protected address. `/mosaic` is the plain test page (`?viewers=10` opens 10 independent
+WHEP sessions).
+
+The API with curl:
 
 ```bash
 curl -s localhost:9630/status | jq .output
@@ -90,36 +133,35 @@ curl -s -X POST localhost:9630/me/1/program -d '{"source":"me2"}'   # re-entry
 curl -s -X POST localhost:9630/me/2/cut
 ```
 
-The test page is `http://<host>:9630/mosaic` (needs `FLOWXER_ENGINE_HTTP_BIND=0.0.0.0`, or
-a tunnel). It opens one WHEP session at `<PREVIEW_WHEP_URL or own MediaMTX>/<prefix>/mosaic/whep`
-and shows the same `MediaStream` in one `<video>` per tile, each cropped with CSS
-`object-view-box: inset(…)` from `GET /mosaic/map` (Chrome/Edge 104+). `?viewers=10` opens 10
-independent WHEP sessions.
-
 ## Configuration
 
-Environment variables (or the same keys in a JSON file named by `FLOWXER_ENGINE_CONFIG`; the
-environment wins).
+Environment variables, or the same keys in a JSON file named by `FLOWXER_ENGINE_CONFIG`
+(arrays as JSON, numbers as numbers; the environment wins). `flowxer-engine --check` prints
+what the engine will read and write. Example: [examples/friday-night-show-vmix1.json](examples/friday-night-show-vmix1.json).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLOWXER_ENGINE_INPUTS` | (required) | JSON array of 1–8 `{"domain": "<MXL domain dir>", "flow": "<flow id>", "label": "…"}` |
+| `FLOWXER_ENGINE_INPUTS` | (required) | JSON array of 1–8 `{"label", "domain", "video_flow", "audio_flow", "audio_domain"}`: `domain` is the MXL domain directory; no `video_flow` = black slot; no `audio_flow` = silent; `audio_domain` defaults to `domain` |
 | `FLOWXER_ENGINE_MES` | `4` | MEs (1–4), all rendering every grain |
 | `FLOWXER_ENGINE_LATENCY` | `2` | L: output grain *i* is made from input grains *i − L* (1–8) |
 | `FLOWXER_ENGINE_FORMAT` | `1080p50` | `720p`/`1080p`/`2160p` with `25`, `2997`, `30`, `50`, `5994`, `60`; inputs must match |
-| `FLOWXER_ENGINE_OUTPUT_DOMAIN` | `/Volumes/mxl/flowxer-engine` | own MXL output domain (created) |
-| `FLOWXER_ENGINE_LABEL` | `FlowXer engine` | prefix of the output flow labels |
+| `FLOWXER_ENGINE_OUTPUT_DOMAIN` | `/Volumes/mxl/flowxer-engine` | MXL output domain directory of the MEs (created if missing) |
+| `FLOWXER_ENGINE_OUTPUT_DOMAIN_ID` | (generated) | `id` written to `domain_def.json` when the engine creates the domain (BCP-007-03 fields id, label, description, tags); an existing file is kept |
+| `FLOWXER_ENGINE_OUTPUTS` | (generated) | JSON array of `{"me", "domain", "domain_id", "pgm_video", "pgm_audio", "pvw_video"}`, all but `me` optional; an empty id is generated (stable for domain + ME + kind) |
+| `FLOWXER_ENGINE_AUDIO_CHANNELS` | `2` | channels of a PGM audio flow the engine creates |
+| `FLOWXER_ENGINE_LABEL` | `FlowXer engine` | prefix of the labels of the flows the engine creates |
 | `FLOWXER_ENGINE_WORK_FORMAT` | `yuv16` | `yuv16` or `rgba16f` |
 | `FLOWXER_ENGINE_GPU` | `0` | CUDA device index (inside the container) |
-| `FLOWXER_ENGINE_HTTP_BIND` | `127.0.0.1` | control API / metrics / test page address |
-| `FLOWXER_ENGINE_HTTP_PORT` | `9630` | its port |
-| `FLOWXER_ENGINE_HOLD_GRAINS` | `25` | a stalled input holds its last grain this long, then black |
+| `FLOWXER_ENGINE_HTTP_BIND` | `127.0.0.1` | control page, API, metrics: address |
+| `FLOWXER_ENGINE_HTTP_PORT` | `9630` | and port |
+| `FLOWXER_ENGINE_HOLD_GRAINS` | `0` | a stalled input holds its last grain this long, then black; 0 = until it comes back |
 | `FLOWXER_ENGINE_MOSAIC` | `true` | preview mosaic on/off |
 | `FLOWXER_ENGINE_MOSAIC_FPS` | `25` | mosaic frame rate (every second grain at 50p) |
 | `FLOWXER_ENGINE_MOSAIC_KBPS` | `6000` | NVENC bit rate (CBR) |
+| `FLOWXER_TALLY_TSL` | (empty) | raw TSL 5.0 tally, `udp://host:port` or `tcp://host:port`, as FlowXer's (below) |
 | `PREVIEW_PUBLISH_URL` | (empty) | shared MediaMTX to publish to (RTSP, e.g. `rtsp://mxl-mediamtx.mxl-platform.svc:8554`); empty: start the own MediaMTX |
 | `PREVIEW_PATH_PREFIX` | `flowxer-engine` | stream path prefix (`<production>/<function>`); the mosaic is `<prefix>/mosaic` |
-| `PREVIEW_WHEP_URL` | (empty) | public WHEP base: the page plays `<base>/<prefix>/mosaic/whep`; empty: own MediaMTX on the page's host |
+| `PREVIEW_WHEP_URL` | (empty) | public WHEP base: the pages play `<base>/<prefix>/mosaic/whep`; empty: own MediaMTX on the page's host |
 | `PREVIEW_HLS_URL` | (empty) | public HLS base (`<base>/<prefix>/mosaic/index.m3u8`); empty: own MediaMTX |
 | `MEDIAMTX_RTSP_PORT` | `8654` | own MediaMTX: RTSP ingest, localhost only |
 | `MEDIAMTX_WHEP_PORT` | `8989` | own MediaMTX: WHEP |
@@ -134,16 +176,27 @@ environment wins).
 
 | Port | What | Notes |
 |---|---|---|
-| 9630/tcp | control API, `/status`, `/metrics`, `/mosaic` | localhost by default |
+| 9630/tcp | control page, API, `/status`, `/metrics`, `/mosaic` | localhost by default |
 | 8654/tcp | own MediaMTX RTSP ingest | localhost only; not used with `PREVIEW_PUBLISH_URL` |
 | 8989/tcp | own MediaMTX WHEP | browsers |
 | 8988/tcp | own MediaMTX HLS | browsers |
 | 8289/udp+tcp | own MediaMTX ICE | browsers |
 | 9897/tcp | own MediaMTX API | localhost only |
 
-With `PREVIEW_PUBLISH_URL` set only 9630 is used. The defaults avoid FlowXer (9610/9620), the
-multiviewer (8110) and mxl-webrtc-monitor (8100, MediaMTX 8554/8888/8889/8189/9997/9998).
-RTMP, SRT and MoQ are off in the own MediaMTX.
+With `PREVIEW_PUBLISH_URL` set only 9630 is used (plus the outgoing TSL tally). The defaults
+avoid FlowXer (9610/9620), the multiviewer (8110) and mxl-webrtc-monitor (8100, MediaMTX
+8554/8888/8889/8189/9997/9998). RTMP, SRT and MoQ are off in the own MediaMTX.
+
+### Raw tally (`FLOWXER_TALLY_TSL`)
+
+The same contract as FlowXer's raw tally export (FlowXer README, "Raw tally export"), so the
+platform's tally calculator keeps working: TSL UMD 5.0, SCREEN = ME, INDEX = input slot from 0
+in configuration order (1000 + n for the re-entered Program of ME n), LH red on Program (both
+sources while a Mix runs), RH green on Preview, text tally off, brightness 3, TEXT = the input
+label in UTF-16LE. Every ME with all its sources, on each change and once a second; at most
+2048 bytes per packet; TCP with DLE/STX framing. After a failed send it retries after 1, 2, 5,
+then every 10 s (a UDP listener that is not up yet is not a failure). `/status` → `tally`
+counts packets and errors.
 
 ## API
 
@@ -153,10 +206,49 @@ RTMP, SRT and MoQ are off in the own MediaMTX.
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
 | `POST /me/{m}/cut` | – | the ME |
 | `POST /me/{m}/auto` | `{"frames": 25}` (1–1000) | the ME; 409 while a Mix runs |
-| `GET /status` | – | per-ME state, timing (GPU ms per stage, lag), counters, inputs, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream) |
+| `GET /` | – | the control page |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs (video and audio state), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio`, `tally` |
 | `GET /metrics` | – | Prometheus text (`flowxer_engine_*`) |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /mosaic` | – | the test page |
+
+## Drop-in for a FlowXer instance
+
+The engine can take over a FlowXer instance's outputs, so its consumers (multiviewer, monitor,
+replay) keep receiving without new IS-05 activations: they are activated on MXL flow ids.
+
+- Set `FLOWXER_ENGINE_OUTPUTS` ME 1 `pgm_video`/`pgm_audio` (and the domain) to the FlowXer
+  instance's Program flows; give the other outputs new ids in the same domain.
+- **One writer at a time.** Stop FlowXer first. The engine refuses to start (exit 75, "has an
+  active writer") while another process still writes one of its output flows.
+- The engine **opens the flows FlowXer left** (MXL create-or-open: same flow, same inode,
+  `existing: true` in `/status`); the old flow directories need not be removed. Readers see new
+  grains on the flow they already have open. The existing flow must be v210 in the engine's
+  format (video) and 48 kHz float32 (audio; its channel count is used).
+- **Rollback:** stop the engine (it releases its writers; MXL deletes the flows when the last
+  writer goes), start FlowXer: it creates the flows again and readers re-open them
+  (FLOW_INVALID), as after any FlowXer restart.
+- No NMOS in P1: the engine registers no senders. The PGM flow ids stay the same, so
+  activations made to FlowXer's senders keep working; the registry no longer lists them while
+  FlowXer is down.
+- Mirrors (fabrics) only carry grains while some receiver on the node is routed to them. If a
+  mirror stalls the engine holds its last grain and counts it (`late`); if it is re-created the
+  input opens it again.
+
+Lab check (`fxeng-dropin.sh`): see [Drop-in on the lab](#drop-in-on-the-lab) below.
+
+### friday-night-show vmix1 on small
+
+[examples/friday-night-show-vmix1.json](examples/friday-night-show-vmix1.json) maps vmix1
+(FlowXer 14.21.46, mxl-host-03): inputs Camera 1 and 2 (fabrics mirror domain
+`95c0b941…`), Camera 3 (browser source), black slots for Camera 4, Test 1/2, Black and Replay
+(the FlowXer slot order, so the TSL numbering stays); ME 1 PGM video/audio = vmix1's
+`42a6614e…`/`429c984c…` in `/Volumes/mxl/friday-night-show-vmix1` (domain `9528879f…`);
+new ids for ME 1 PVW and ME 2–4; preview to the platform's MediaMTX; the raw tally to
+`mxl-tally`. Use it as `FLOWXER_ENGINE_CONFIG` (or as env). The Deployment needs: the MXL
+root hostPath at `/Volumes/mxl`, uid/gid 1000, the nvidia runtime with one GPU slot,
+`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`, and port 9630 reachable for the control
+page (Service or port-forward).
 
 ## Reuse and attribution
 
@@ -165,7 +257,8 @@ mxl-multiviewer (Apache-2.0): CUDA v210 sample addressing, page-locked MXL grain
 MXL reader handling (resync on TOO_LATE, re-open on FLOW_INVALID), the HTTP server, the CPU
 v210 reference; mxl-webrtc-monitor (MIT): the MediaMTX config and the NVENC settings;
 mxl-replay: the TAI loop rule (re-implemented on MXL's own index formulas, no code copied:
-mxl-replay is GPL-3.0).
+mxl-replay is GPL-3.0); FlowXer's own TSL 5.0 export (`src/flowxer/engine/tsl.py`): the raw
+tally format.
 
 ## Measurements (P1a, lab, 2026-10-10)
 
@@ -264,3 +357,33 @@ and DSK on). Same bounded load (40 busy threads, 35-core quota).
 FlowXer's single GL thread is at its limit with one ME; the engine renders four MEs with
 PGM + PVW and the mosaic at about 4 % of FlowXer's CPU. (FlowXer also renders a CEF overlay,
 a DSK and internal sources; the engine has no keyers yet.)
+
+## Drop-in, audio and tally (lab, 2026-10-10)
+
+### Drop-in on the lab
+
+FlowXer 14.21.46 (`fx-mi.sh`, vmix layout, A16 GPU 3) writes ME 1 PGM video + audio into its
+domain; a multiviewer 1.3.0 reads them on input 1 (IS-05 activation with the MXL flow ids).
+
+| Step | Flows | Multiviewer input 1 |
+|---|---|---|
+| FlowXer running | created by FlowXer | video running, audio −18.6 dBFS (the test tone) |
+| Engine started while FlowXer runs | untouched | unchanged; the engine exits 75 ("has an active writer") |
+| FlowXer stopped (`docker compose stop`) | stay (same inodes) | no signal |
+| Engine started on the same ids | opened (`existing: true`), same inodes | running again 2.5 s after the engine start (its start-up included), audio −18.5 dBFS |
+| Rollback: engine stopped, FlowXer started | deleted with the engine's writers, re-created by FlowXer | running, −18.7 dBFS |
+| FlowXer killed (`docker kill`) | stay | no signal |
+| Engine started | opened, same inodes | running, −18.5 dBFS |
+
+### PGM audio on the lab
+
+Read back from the ME 1 PGM audio flow: the test player's tone passes without gaps (sine fit
+residual 2·10⁻⁴ across block borders); an Auto over 50 grains to a silent source follows the
+equal-power curve within 0.0001 of the level (−3 dB in the middle) and is silent after exactly
+50 grains; Cut back brings the tone again. Audio costs 0.05 ms CPU per grain.
+
+### TSL tally on the lab
+
+A UDP listener decoded 37 packets in 9 s (one per ME per second plus changes): after ME 1
+Program = `me2` and a Cut on ME 2 it showed SCREEN 1 with INDEX 1002 (ME 2) red and SCREEN 2
+with the new Program red and Preview green.

@@ -7,6 +7,7 @@
 #include "engine/log.hpp"
 
 #include <cuda_runtime_api.h>
+#include <nlohmann/json.hpp>
 #include <pthread.h>
 #include <sys/resource.h>
 
@@ -36,6 +37,28 @@ std::map<std::string, std::string> environment()
     return env;
 }
 
+// What the engine will read and write (flow ids that are empty here are generated at start).
+nlohmann::json configSummary(fxeng::Config const& cfg)
+{
+    nlohmann::json inputs = nlohmann::json::array();
+    for (auto const& in : cfg.inputs)
+    {
+        inputs.push_back({{"label", in.label}, {"domain", in.domain}, {"video_flow", in.flow.empty() ? "(black)" : in.flow}, {"audio_domain", in.audioDomain},
+            {"audio_flow", in.audioFlow}});
+    }
+    nlohmann::json outputs = nlohmann::json::array();
+    for (std::size_t m = 0; m < cfg.outputs.size(); ++m)
+    {
+        auto const& o = cfg.outputs[m];
+        outputs.push_back({{"me", m + 1}, {"domain", o.domain}, {"domain_id", o.domainId}, {"pgm_video", o.pgmVideo}, {"pgm_audio", o.pgmAudio},
+            {"pvw_video", o.pvwVideo}});
+    }
+    return {{"format", cfg.format}, {"mes", cfg.mes}, {"latency_grains", cfg.latency}, {"inputs", inputs}, {"outputs", outputs},
+        {"audio_channels", cfg.audioChannels}, {"http", cfg.httpBind + ":" + std::to_string(cfg.httpPort)},
+        {"preview", {{"mode", cfg.ownMediamtx() ? "own" : "shared"}, {"publish", cfg.rtspBase() + "/" + cfg.streamPath("mosaic")}, {"whep_base", cfg.whepBase}}},
+        {"tally_tsl", cfg.tallyTsl}};
+}
+
 int selfTest()
 {
     char const* gpu = std::getenv("FLOWXER_ENGINE_GPU");
@@ -53,11 +76,19 @@ int selfTest()
 
 int main(int argc, char** argv)
 {
+    bool checkOnly = false;
     for (int i = 1; i < argc; ++i)
     {
+        if (std::strcmp(argv[i], "--check") == 0)
+        {
+            checkOnly = true;
+            continue;
+        }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0)
         {
-            std::cout << "flowxer-engine " << FXENG_VERSION << "\nUsage: flowxer-engine [--selftest]\nSettings come from the environment; see engine/README.md.\n";
+            std::cout << "flowxer-engine " << FXENG_VERSION << "\nUsage: flowxer-engine [--selftest | --check]\n"
+                      << "Settings come from the environment (or FLOWXER_ENGINE_CONFIG); see engine/README.md.\n"
+                      << "--check prints the resolved inputs, outputs and preview settings and exits.\n";
             return 0;
         }
         if (std::strcmp(argv[i], "--version") == 0)
@@ -86,6 +117,11 @@ int main(int argc, char** argv)
     {
         fxeng::logError("config", {{"error", ex.what()}});
         return 78;
+    }
+    if (checkOnly)
+    {
+        std::cout << configSummary(cfg).dump(2) << "\n";
+        return 0;
     }
     // SIGINT/SIGTERM go to sigwait below: block them before any thread starts.
     sigset_t signals;

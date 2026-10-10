@@ -1,6 +1,7 @@
 #include "engine/api.hpp"
 
 #include "engine/engine.hpp"
+#include "control_page.hpp"
 #include "mosaic_page.hpp"
 
 #include <nlohmann/json.hpp>
@@ -117,7 +118,11 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "application/json", engine.mosaicMapJson()};
         }
-        if (request.path == "/" || request.path == "/mosaic")
+        if (request.path == "/")
+        {
+            return HttpResponse{200, "text/html; charset=utf-8", kControlPage};
+        }
+        if (request.path == "/mosaic")
         {
             return HttpResponse{200, "text/html; charset=utf-8", kMosaicPage};
         }

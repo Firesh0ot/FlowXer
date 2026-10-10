@@ -1,13 +1,16 @@
 #include "test.hpp"
 
+#include "core/audio.hpp"
 #include "core/config.hpp"
 #include "core/mixer.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
+#include "core/tsl.hpp"
 #include "core/v210.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -335,7 +338,8 @@ TEST(config_defaults_and_errors)
     CHECK_EQ(other.mes, 2);
     CHECK(configThrows({}));
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", "[]"}}));
-    CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", R"([{"domain":"/x"}])"}}));
+    // An input without a flow is a black slot.
+    CHECK(loadConfig({{"FLOWXER_ENGINE_INPUTS", R"([{"domain":"/x"}])"}}).inputs[0].flow.empty());
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_MES", "5"}}));
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_LATENCY", "two"}}));
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_FORMAT", "1080i50"}}));
@@ -358,4 +362,122 @@ TEST(preview_contract)
     CHECK(shared.streamPath("mosaic") == "show/vmix1/mosaic");
     CHECK(shared.whepBase == "https://preview.example/whep");
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"PREVIEW_PUBLISH_URL", "http://x:8554"}}));
+}
+
+// ---- drop-in: flows, audio, tally --------------------------------------------------------
+
+TEST(outputs_and_input_audio)
+{
+    std::string const inputs = R"([{"domain":"/d","flow":"v1","audio":"a1","label":"Cam 1"},{"label":"black"},{"domain":"/d","flow":"v3","audio":"a3","audio_domain":"/e"}])";
+    auto const cfg = loadConfig({{"FLOWXER_ENGINE_INPUTS", inputs},
+        {"FLOWXER_ENGINE_MES", "2"},
+        {"FLOWXER_ENGINE_OUTPUT_DOMAIN", "/Volumes/mxl/out"},
+        {"FLOWXER_ENGINE_OUTPUTS", R"([{"me":1,"domain":"/Volumes/mxl/vmix1","domain_id":"fba22e51-0000-4000-8000-000000000000","pgm_video":"3924b34c-4532-57ab-8e21-cb87bccfa4e3","pgm_audio":"5ac3feb3-0d22-5835-8b07-fe175fc4d640"}])"}});
+    CHECK(cfg.inputs[0].audioFlow == "a1" && cfg.inputs[0].audioDomain == "/d");
+    CHECK(cfg.inputs[1].flow.empty() && cfg.inputs[1].label == "black");
+    CHECK(cfg.inputs[2].audioDomain == "/e");
+    auto const named = loadConfig({{"FLOWXER_ENGINE_INPUTS", R"([{"domain":"/d","video_flow":"v","audio_flow":"a","label":"Cam"}])"}});
+    CHECK(named.inputs[0].flow == "v" && named.inputs[0].audioFlow == "a");
+    CHECK_EQ(named.holdGrains, 0);
+    CHECK_EQ(cfg.outputs.size(), 2u);
+    CHECK(cfg.outputs[0].domain == "/Volumes/mxl/vmix1" && cfg.outputs[0].pgmVideo == "3924b34c-4532-57ab-8e21-cb87bccfa4e3");
+    CHECK(cfg.outputs[0].pgmAudio == "5ac3feb3-0d22-5835-8b07-fe175fc4d640" && cfg.outputs[0].pvwVideo.empty());
+    CHECK(cfg.outputs[1].domain == "/Volumes/mxl/out" && cfg.outputs[1].pgmVideo.empty());
+    CHECK_EQ(cfg.audioChannels, 2);
+    CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", R"([{"flow":"v1"}])"}}));
+    CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_OUTPUTS", R"([{"me":5}])"}}));
+    CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_TALLY_TSL", "mxl-tally:8910"}}));
+    CHECK(loadConfig({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_TALLY_TSL", "udp://mxl-tally:8910"}}).tallyTsl == "udp://mxl-tally:8910");
+}
+
+TEST(audio_crossfade)
+{
+    // Equal power: a² + b² = 1 all through the Mix.
+    for (int k = 0; k <= 10; ++k)
+    {
+        auto const g = crossfade(static_cast<float>(k) / 10.f);
+        CHECK(std::abs(g.a * g.a + g.b * g.b - 1.f) < 1e-5f);
+    }
+    CHECK(crossfade(0.f).a == 1.f && crossfade(0.f).b == 0.f);
+    CHECK(crossfade(1.f).a == 0.f && crossfade(1.f).b == 1.f);
+    // One grain of a 4-grain Mix ramps from 0.25 to 0.5; the next starts where it ended.
+    std::vector<float> a(960, 1.f);
+    std::vector<float> b(960, 0.f);
+    std::vector<float> out(960);
+    crossfadeBlock(a.data(), b.data(), out.data(), out.size(), 0.25f, 0.5f);
+    CHECK(std::abs(out.back() - crossfade(0.5f).a) < 1e-6f);
+    CHECK(out.front() < crossfade(0.25f).a && out.front() > crossfade(0.5f).a);
+    for (std::size_t s = 1; s < out.size(); ++s)
+    {
+        CHECK(out[s] <= out[s - 1]);
+    }
+    // 48 kHz samples on the video grid: 960 per grain at 50p, the same sample index as MXL.
+    auto const r = grainSamples(Rate{50, 1}, 1000);
+    CHECK_EQ(r.first, 960000ull);
+    CHECK_EQ(r.end - r.first, 960ull);
+    std::uint64_t total = 0;
+    for (std::uint64_t i = 0; i < 5; ++i)
+    {
+        auto const g = grainSamples(Rate{60000, 1001}, 1000 + i);
+        total += g.end - g.first;
+    }
+    CHECK_EQ(total, 4004ull);
+}
+
+TEST(tsl_packets)
+{
+    std::vector<TslDisplay> displays{{0, "Cam 1", kTslRed, kTslOff}, {1, "Cam 2", kTslOff, kTslGreen}};
+    auto const packets = tslPackets(2, displays);
+    CHECK_EQ(packets.size(), 1u);
+    auto const& p = packets[0];
+    auto const u16 = [&](std::size_t at) { return static_cast<unsigned>(static_cast<unsigned char>(p[at]) | (static_cast<unsigned char>(p[at + 1]) << 8)); };
+    // PBC counts everything after itself; VER 0, FLAGS 1 (UTF-16LE), SCREEN 2.
+    CHECK_EQ(u16(0), static_cast<unsigned>(p.size() - 2));
+    CHECK_EQ(static_cast<int>(p[2]), 0);
+    CHECK_EQ(static_cast<int>(p[3]), 1);
+    CHECK_EQ(u16(4), 2u);
+    // Display 0: index 0, LH red (bits 4-5), brightness 3 (bits 6-7), 10 bytes of UTF-16LE.
+    CHECK_EQ(u16(6), 0u);
+    CHECK_EQ(u16(8), (1u << 4) | (3u << 6));
+    CHECK_EQ(u16(10), 10u);
+    CHECK(p[12] == 'C' && p[13] == 0);
+    // Display 1 follows: RH green (bits 0-1).
+    CHECK_EQ(u16(22), 1u);
+    CHECK_EQ(u16(24), 2u | (3u << 6));
+    // More displays than fit in 2048 bytes go into further packets.
+    std::vector<TslDisplay> many(100, TslDisplay{0, std::string(20, 'x'), kTslOff, kTslOff});
+    auto const split = tslPackets(1, many);
+    // 100 displays of 46 bytes: 44 fit in one packet.
+    CHECK_EQ(split.size(), 3u);
+    for (auto const& packet : split)
+    {
+        CHECK(packet.size() <= 2048);
+    }
+    // TCP: DLE/STX, DLE doubled, DLE/ETX.
+    auto const wrapped = tslWrapTcp(std::string("\xfe\x01", 2));
+    CHECK(wrapped == std::string("\xfe\x02\xfe\xfe\x01\xfe\x03", 7));
+}
+
+TEST(tally_from_the_mixer)
+{
+    Mixer mixer(2, 3);
+    mixer.setProgram(1, Source{Source::Kind::Me, 2});
+    mixer.setPreview(1, Source{Source::Kind::Input, 3});
+    mixer.setProgram(2, Source{Source::Kind::Input, 2});
+    mixer.setPreview(2, Source{Source::Kind::Input, 1});
+    auto const screens = tallyDisplays(mixer, {"A", "B", "C"});
+    CHECK_EQ(screens.size(), 2u);
+    auto const& me1 = screens[0].second;
+    // Inputs 0..2 and the re-entry of ME 2 (index 1002).
+    CHECK_EQ(me1.size(), 4u);
+    CHECK(screens[0].first == 1 && me1[2].rh == kTslGreen && me1[3].index == 1002 && me1[3].lh == kTslRed);
+    CHECK(me1[0].lh == kTslOff && me1[1].lh == kTslOff);
+    auto const& me2 = screens[1].second;
+    CHECK_EQ(me2.size(), 3u);
+    CHECK(me2[1].lh == kTslRed && me2[0].rh == kTslGreen && me2[1].label == "B");
+    // While a Mix runs, both of its sources are red.
+    mixer.autoMix(2, 10);
+    mixer.frame(100);
+    auto const mixing = tallyDisplays(mixer, {"A", "B", "C"})[1].second;
+    CHECK(mixing[0].lh == kTslRed && mixing[1].lh == kTslRed);
 }

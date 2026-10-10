@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlowXer engine control</title>
+<style>
+  :root { color-scheme: dark; --bg: #111418; --panel: #1b2027; --line: #2a313b; --text: #e6e9ee; --muted: #8a94a3;
+          --pgm: #d73a3a; --pvw: #2e9e4f; --mix: #d9a400; --btn: #262d36; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 16px 24px; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  h1 { font-size: 18px; margin: 0; }
+  #health { color: var(--muted); }
+  #error { color: var(--pgm); min-height: 1.4em; }
+  .inputs { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; margin-bottom: 12px; }
+  figure { margin: 0; background: var(--panel); border-radius: 6px; overflow: hidden; position: relative; }
+  figcaption { padding: 2px 6px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  figure.on-pgm { outline: 3px solid var(--pgm); }
+  figure.on-pvw { outline: 3px solid var(--pvw); }
+  video { display: block; width: 100%; height: auto; background: #000; }
+  .me { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px;
+        display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px; }
+  .me h2 { font-size: 15px; margin: 0 0 6px; }
+  .monitors { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .bus { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-bottom: 6px; }
+  .bus .name { width: 34px; color: var(--muted); font-size: 12px; }
+  button { background: var(--btn); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+           font: inherit; font-size: 13px; cursor: pointer; min-width: 64px; }
+  button:hover { border-color: var(--muted); }
+  button.pgm { background: var(--pgm); border-color: var(--pgm); }
+  button.pvw { background: var(--pvw); border-color: var(--pvw); }
+  button.mix { background: var(--mix); border-color: var(--mix); color: #111; }
+  .take { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .take button { min-width: 72px; font-weight: 600; }
+  .take input { width: 64px; background: var(--btn); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: 5px; }
+  progress { width: 120px; }
+  @media (max-width: 900px) { .me { grid-template-columns: 1fr; } .inputs { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>FlowXer engine</h1>
+  <span id="health">connecting…</span>
+  <a href="mosaic" style="color: var(--muted)">mosaic test page</a>
+</header>
+<div id="error"></div>
+<div class="inputs" id="inputs"></div>
+<div id="mes"></div>
+<script>
+// Operator page: bus buttons, Cut and Auto per ME (POST /me/{m}/...), state from GET /status
+// twice a second, pictures from the one mosaic stream (WHEP) cropped per tile.
+const $ = (id) => document.getElementById(id);
+let map = null, stream = null, status = null;
+const figures = {};
+
+async function api(path, body) {
+  try {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const data = await res.json();
+    $('error').textContent = res.ok ? '' : `${path}: ${data.error || res.status}`;
+  } catch (err) {
+    $('error').textContent = String(err);
+  }
+  refresh();
+}
+
+function crop(tile) {
+  const fig = document.createElement('figure');
+  const video = document.createElement('video');
+  video.muted = true; video.autoplay = true; video.playsInline = true;
+  const right = map.width - tile.x - tile.w, bottom = map.height - tile.y - tile.h;
+  video.style.objectViewBox = `inset(${tile.y}px ${right}px ${bottom}px ${tile.x}px)`;
+  video.style.aspectRatio = `${tile.w} / ${tile.h}`;
+  if (stream) video.srcObject = stream;
+  const cap = document.createElement('figcaption');
+  cap.textContent = tile.label;
+  fig.append(video, cap);
+  figures[tile.id] = fig;
+  return fig;
+}
+
+async function connect() {
+  const base = map.whep_base || `${location.protocol}//${location.hostname}:${map.whep_port}`;
+  const pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.ontrack = (ev) => {
+    stream = ev.streams[0] || new MediaStream([ev.track]);
+    document.querySelectorAll('video').forEach((v) => { v.srcObject = stream; });
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') resolve(); });
+    setTimeout(resolve, 2000);
+  });
+  const res = await fetch(`${base}/${map.path}/whep`, { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp });
+  if (!res.ok) throw new Error(`WHEP ${res.status}`);
+  await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+}
+
+function sourceLabel(name) {
+  if (name.startsWith('in')) return status.inputs[parseInt(name.slice(2), 10) - 1]?.label || name;
+  return 'ME ' + name.slice(2);
+}
+
+function build() {
+  const tiles = Object.fromEntries(map.tiles.map((t) => [t.id, t]));
+  for (const input of status.inputs) {
+    const tile = tiles['in' + input.input];
+    if (tile) $('inputs').append(crop(tile));
+  }
+  for (const me of status.mes) {
+    const m = me.me;
+    const panel = document.createElement('section');
+    panel.className = 'me';
+    const monitors = document.createElement('div');
+    monitors.className = 'monitors';
+    for (const id of [`me${m}-pvw`, `me${m}-pgm`]) if (tiles[id]) monitors.append(crop(tiles[id]));
+    const controls = document.createElement('div');
+    const title = document.createElement('h2');
+    title.textContent = `ME ${m}`;
+    controls.append(title);
+    const sources = status.inputs.map((i) => 'in' + i.input);
+    for (let n = m + 1; n <= status.mes.length; n++) sources.push('me' + n);
+    for (const bus of ['program', 'preview']) {
+      const row = document.createElement('div');
+      row.className = 'bus';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = bus === 'program' ? 'PGM' : 'PVW';
+      row.append(name);
+      for (const source of sources) {
+        const b = document.createElement('button');
+        b.textContent = sourceLabel(source);
+        b.dataset.me = m; b.dataset.bus = bus; b.dataset.source = source;
+        b.onclick = () => api(`me/${m}/${bus}`, { source });
+        row.append(b);
+      }
+      controls.append(row);
+    }
+    const take = document.createElement('div');
+    take.className = 'take';
+    const cut = document.createElement('button');
+    cut.textContent = 'CUT';
+    cut.onclick = () => api(`me/${m}/cut`);
+    const auto = document.createElement('button');
+    auto.textContent = 'AUTO';
+    const frames = document.createElement('input');
+    frames.type = 'number'; frames.min = 1; frames.max = 1000; frames.value = 25; frames.title = 'Mix duration in grains';
+    auto.onclick = () => api(`me/${m}/auto`, { frames: parseInt(frames.value, 10) || 25 });
+    const progress = document.createElement('progress');
+    progress.id = `progress${m}`; progress.max = 1; progress.value = 0;
+    take.append(cut, auto, frames, document.createTextNode('grains'), progress);
+    controls.append(take);
+    panel.append(monitors, controls);
+    $('mes').append(panel);
+  }
+}
+
+function paint() {
+  const o = status.output;
+  $('health').textContent = `${o.fps.toFixed(2)} fps · skipped ${o.skipped} · late ${o.late} · lag ${o.lag_grains.max} grains · ` +
+    `GPU ${status.gpu_ms.total.avg.toFixed(1)} ms · CPU ${(status.cpu.process_percent / 100).toFixed(2)} cores`;
+  for (const fig of Object.values(figures)) fig.classList.remove('on-pgm', 'on-pvw');
+  for (const me of status.mes) {
+    document.querySelectorAll(`button[data-me="${me.me}"]`).forEach((b) => {
+      const onPgm = b.dataset.bus === 'program' && b.dataset.source === me.program;
+      const onPvw = b.dataset.bus === 'preview' && b.dataset.source === me.preview;
+      const mixing = me.mixing && b.dataset.bus === 'program' && b.dataset.source === me.preview;
+      b.className = onPgm ? 'pgm' : mixing ? 'mix' : onPvw ? 'pvw' : '';
+    });
+    const progress = $(`progress${me.me}`);
+    if (progress) progress.value = me.mixing && me.frames ? me.position / me.frames : 0;
+    if (me.me === 1) {
+      figures[me.program]?.classList.add('on-pgm');
+      if (me.preview !== me.program) figures[me.preview]?.classList.add('on-pvw');
+    }
+  }
+}
+
+async function refresh() {
+  try {
+    status = await (await fetch('status')).json();
+    paint();
+  } catch (err) {
+    $('health').textContent = 'no status: ' + err;
+  }
+}
+
+(async () => {
+  map = await (await fetch('mosaic/map')).json();
+  status = await (await fetch('status')).json();
+  build();
+  paint();
+  setInterval(refresh, 500);
+  try { await connect(); } catch (err) { $('error').textContent = 'preview: ' + err; }
+})();
+</script>
+</body>
+</html>

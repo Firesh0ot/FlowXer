@@ -15,12 +15,15 @@ option(FXENG_BUILD_TESTS "Build the unit tests (no GPU needed)" ON)
 find_package(Threads REQUIRED)
 find_package(nlohmann_json 3 REQUIRED)
 
-# Pure logic (no CUDA, no MXL): config, ME state, mosaic map, TAI arithmetic, v210 reference.
+# Pure logic (no CUDA, no MXL): config, ME state, mosaic map, TAI arithmetic, v210 reference,
+# audio crossfade, TSL tally.
 add_library(fxeng-core STATIC
+    src/core/audio.cpp
     src/core/config.cpp
     src/core/mixer.cpp
     src/core/mosaic_map.cpp
     src/core/tai.cpp
+    src/core/tsl.cpp
     src/core/v210.cpp
 )
 target_include_directories(fxeng-core PUBLIC src)
@@ -44,14 +47,22 @@ if(FXENG_BUILD_ENGINE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(AV REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil)
 
-    set(FXENG_PAGE ${CMAKE_CURRENT_BINARY_DIR}/generated/mosaic_page.hpp)
-    add_custom_command(
-        OUTPUT ${FXENG_PAGE}
-        COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/web/mosaic.html -DOUTPUT=${FXENG_PAGE} -DNAME=kMosaicPage
-                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
-        DEPENDS web/mosaic.html cmake/EmbedText.cmake
-        COMMENT "Embedding the mosaic test page"
-    )
+    # The web pages are compiled in: /mosaic (test page) and / (control page).
+    set(FXENG_PAGES "")
+    foreach(page mosaic control)
+        set(header ${CMAKE_CURRENT_BINARY_DIR}/generated/${page}_page.hpp)
+        string(SUBSTRING ${page} 0 1 first)
+        string(TOUPPER ${first} first)
+        string(SUBSTRING ${page} 1 -1 rest)
+        add_custom_command(
+            OUTPUT ${header}
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/web/${page}.html -DOUTPUT=${header} -DNAME=k${first}${rest}Page
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
+            DEPENDS web/${page}.html cmake/EmbedText.cmake
+            COMMENT "Embedding web/${page}.html"
+        )
+        list(APPEND FXENG_PAGES ${header})
+    endforeach()
 
     add_executable(flowxer-engine
         src/main.cpp
@@ -63,7 +74,7 @@ if(FXENG_BUILD_ENGINE)
         src/engine/http.cpp
         src/engine/mediamtx.cpp
         src/engine/stats.cpp
-        ${FXENG_PAGE}
+        ${FXENG_PAGES}
     )
     set_target_properties(flowxer-engine PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
     target_include_directories(flowxer-engine PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)

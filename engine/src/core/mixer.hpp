@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -39,6 +40,8 @@ struct MePlan
     Source a;
     Source b;
     float t = 0.f;
+    // t of the grain before (the audio crossfade ramps from tPrev to t within the grain).
+    float tPrev = 0.f;
     bool mixing = false;
     Source preview;
 };
@@ -87,6 +90,12 @@ public:
     std::vector<MePlan> frame(std::uint64_t index);
 
     [[nodiscard]] std::vector<MeView> view() const;
+    // Called (without the lock held) after every change of a bus or a Mix start/end. Set once
+    // before the render thread starts.
+    void onChange(std::function<void()> callback)
+    {
+        changed_ = std::move(callback);
+    }
     [[nodiscard]] int mes() const
     {
         return mes_;
@@ -113,7 +122,16 @@ private:
 
     int mes_;
     int inputs_;
+    void notify() const
+    {
+        if (changed_)
+        {
+            changed_();
+        }
+    }
+
     mutable std::mutex mu_;
     std::vector<Me> state_;
+    std::function<void()> changed_;
 };
 } // namespace fxeng

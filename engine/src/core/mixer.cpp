@@ -80,13 +80,16 @@ MixResult Mixer::setProgram(int me, Source source)
     {
         return MixResult::BadSource;
     }
-    std::lock_guard lock{mu_};
-    auto& state = state_[static_cast<std::size_t>(me - 1)];
-    if (state.mixing || state.pending)
     {
-        return MixResult::Busy;
+        std::lock_guard lock{mu_};
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        if (state.mixing || state.pending)
+        {
+            return MixResult::Busy;
+        }
+        state.program = source;
     }
-    state.program = source;
+    notify();
     return MixResult::Ok;
 }
 
@@ -100,13 +103,16 @@ MixResult Mixer::setPreview(int me, Source source)
     {
         return MixResult::BadSource;
     }
-    std::lock_guard lock{mu_};
-    auto& state = state_[static_cast<std::size_t>(me - 1)];
-    if (state.mixing || state.pending)
     {
-        return MixResult::Busy;
+        std::lock_guard lock{mu_};
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        if (state.mixing || state.pending)
+        {
+            return MixResult::Busy;
+        }
+        state.preview = source;
     }
-    state.preview = source;
+    notify();
     return MixResult::Ok;
 }
 
@@ -116,12 +122,15 @@ MixResult Mixer::cut(int me)
     {
         return MixResult::BadMe;
     }
-    std::lock_guard lock{mu_};
-    auto& state = state_[static_cast<std::size_t>(me - 1)];
-    std::swap(state.program, state.preview);
-    state.mixing = false;
-    state.pending = false;
-    state.position = 0;
+    {
+        std::lock_guard lock{mu_};
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        std::swap(state.program, state.preview);
+        state.mixing = false;
+        state.pending = false;
+        state.position = 0;
+    }
+    notify();
     return MixResult::Ok;
 }
 
@@ -135,22 +144,26 @@ MixResult Mixer::autoMix(int me, int frames)
     {
         return MixResult::BadFrames;
     }
-    std::lock_guard lock{mu_};
-    auto& state = state_[static_cast<std::size_t>(me - 1)];
-    if (state.mixing || state.pending)
     {
-        return MixResult::Busy;
+        std::lock_guard lock{mu_};
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        if (state.mixing || state.pending)
+        {
+            return MixResult::Busy;
+        }
+        state.frames = frames;
+        state.pending = true;
+        state.position = 0;
     }
-    state.frames = frames;
-    state.pending = true;
-    state.position = 0;
+    notify();
     return MixResult::Ok;
 }
 
 std::vector<MePlan> Mixer::frame(std::uint64_t index)
 {
     std::vector<MePlan> plans;
-    std::lock_guard lock{mu_};
+    bool ended = false;
+    std::unique_lock lock{mu_};
     for (int m = mes_; m >= 1; --m)
     {
         auto& state = state_[static_cast<std::size_t>(m - 1)];
@@ -171,6 +184,7 @@ std::vector<MePlan> Mixer::frame(std::uint64_t index)
             auto const step = static_cast<int>(std::min<std::uint64_t>(done, static_cast<std::uint64_t>(state.frames)));
             plan.mixing = true;
             plan.t = static_cast<float>(step) / static_cast<float>(state.frames);
+            plan.tPrev = static_cast<float>(step - 1) / static_cast<float>(state.frames);
             state.position = step;
             if (step >= state.frames)
             {
@@ -178,9 +192,15 @@ std::vector<MePlan> Mixer::frame(std::uint64_t index)
                 std::swap(state.program, state.preview);
                 state.mixing = false;
                 state.position = 0;
+                ended = true;
             }
         }
         plans.push_back(plan);
+    }
+    lock.unlock();
+    if (ended)
+    {
+        notify();
     }
     return plans;
 }

@@ -1,8 +1,10 @@
 #include "engine/engine.hpp"
 
+#include "core/audio.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
+#include "core/tsl.hpp"
 #include "engine/encoder.hpp"
 #include "engine/gpu.hpp"
 #include "engine/hostmem.hpp"
@@ -15,13 +17,17 @@
 #include <mxl/time.h>
 
 #include <cuda_runtime_api.h>
+#include <netdb.h>
 #include <nlohmann/json.hpp>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -30,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -205,18 +212,54 @@ struct Input
     std::atomic<std::uint64_t> lastGrainAt{0};
     Window upload;
     std::thread thread;
+    // PGM audio, read by fx-writer: state (under mu), blocks read, blocks missing (silence).
+    std::string audioState = "idle";
+    std::atomic<std::uint64_t> audioBlocks{0};
+    std::atomic<std::uint64_t> audioMissing{0};
+    std::atomic<std::uint64_t> audioReopens{0};
+
+    // No video flow: a black slot (keeps the input numbering, e.g. for the TSL tally).
+    [[nodiscard]] bool black() const
+    {
+        return cfg.flow.empty();
+    }
 };
 
+// One MXL output flow of an ME: PGM video, PVW video or PGM audio.
 struct Output
 {
     int me = 1;
     bool preview = false;
     std::string id;
     std::string label;
+    std::string domain;
+    mxlInstance instance = nullptr;
     mxlFlowWriter writer = nullptr;
+    // The flow existed and was opened (MXL create-or-open), not created.
+    bool existing = false;
     std::uint32_t grainCount = 0;
+    std::uint32_t channels = 0;
     std::atomic<std::uint64_t> committed{0};
     std::atomic<std::uint64_t> failed{0};
+};
+
+// The PGM audio state of fx-writer (only that thread touches it).
+struct AudioRun
+{
+    struct Reader
+    {
+        mxlInstance instance = nullptr;
+        mxlFlowReader reader = nullptr;
+        std::size_t channels = 0;
+        std::chrono::steady_clock::time_point retryAt{};
+    };
+    std::vector<Reader> readers;
+    std::map<std::string, mxlInstance> instances;
+    // Channel-major buffers of one grain: per input, per ME Program.
+    std::vector<std::vector<float>> in;
+    std::vector<std::vector<float>> me;
+    std::size_t channels = 2;
+    std::uint64_t last = 0;
 };
 
 // One output grain in flight: rendered by fx-render, downloaded and committed by fx-writer.
@@ -232,6 +275,8 @@ struct Slot
     std::vector<cudaEvent_t> mark;
     cudaEvent_t downloadStart = nullptr;
     std::vector<cudaEvent_t> downloaded;
+    // The ME plans of this grain (render order), for the audio.
+    std::vector<MePlan> plans;
     std::atomic<bool> busy{false};
 };
 
@@ -283,6 +328,21 @@ std::string videoFlowDefinition(std::string const& id, std::string const& label,
     return def.dump();
 }
 
+std::string audioFlowDefinition(std::string const& id, std::string const& label, std::string const& group, int channels)
+{
+    json def{{"id", id},
+        {"format", "urn:x-nmos:format:audio"},
+        {"label", label},
+        {"description", label},
+        {"tags", {{"urn:x-nmos:tag:grouphint/v1.0", {group}}}},
+        {"parents", json::array()},
+        {"media_type", "audio/float32"},
+        {"sample_rate", {{"numerator", kAudioRate}, {"denominator", 1}}},
+        {"channel_count", channels},
+        {"bit_depth", 32}};
+    return def.dump();
+}
+
 void nameThread(std::string const& name)
 {
     pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
@@ -302,8 +362,10 @@ struct Engine::Impl
     bool started = false;
 
     std::vector<std::unique_ptr<Input>> inputs;
+    // Video outputs: ME m PGM at 2(m-1), PVW at 2(m-1)+1. Audio outputs: ME m PGM at m-1.
     std::vector<std::unique_ptr<Output>> outputs;
-    mxlInstance outInstance = nullptr;
+    std::vector<std::unique_ptr<Output>> audioOutputs;
+    std::map<std::string, mxlInstance> outInstances;
     std::uint8_t* black = nullptr;
     std::vector<gpu::WorkBuffer> inWork;
     std::vector<gpu::WorkBuffer> pgmWork;
@@ -332,6 +394,12 @@ struct Engine::Impl
     std::condition_variable statsCv;
     std::thread renderThread;
     std::thread writerThread;
+    std::thread tallyThread;
+    std::mutex tallyMu;
+    std::condition_variable tallyCv;
+    bool tallyChanged = true;
+    std::atomic<std::uint64_t> tallyPackets{0};
+    std::atomic<std::uint64_t> tallyErrors{0};
     std::promise<void> writerWarm;
     std::thread encodeThread;
     std::thread statsThread;
@@ -357,6 +425,7 @@ struct Engine::Impl
     Window commitMs;
     Window lagGrains;
     Window encodeMs;
+    Window audioMs;
 
     mutable std::mutex snapMu;
     ThreadCpu::Result cpu;
@@ -481,42 +550,106 @@ struct Engine::Impl
         check(cudaStreamSynchronize(renderStream), "setup");
     }
 
-    void setupOutputs()
+    // The MXL instance of an output domain; creates the domain (and its domain_def.json) when
+    // it does not exist.
+    mxlInstance outputInstance(std::string const& domain, std::string const& domainId)
     {
-        std::filesystem::create_directories(cfg.outputDomain);
-        auto const defPath = std::filesystem::path(cfg.outputDomain) / "domain_def.json";
+        auto const it = outInstances.find(domain);
+        if (it != outInstances.end())
+        {
+            return it->second;
+        }
+        std::filesystem::create_directories(domain);
+        auto const defPath = std::filesystem::path(domain) / "domain_def.json";
         if (!std::filesystem::exists(defPath))
         {
             // BCP-007-03 requires id, label, description and tags.
             std::ofstream out(defPath);
-            out << json{{"id", nameUuid("domain:" + cfg.outputDomain)}, {"label", cfg.label}, {"description", "FlowXer engine outputs"}, {"tags", json::object()}}.dump()
+            out << json{{"id", domainId.empty() ? nameUuid("domain:" + domain) : domainId}, {"label", cfg.label}, {"description", "FlowXer engine outputs"},
+                       {"tags", json::object()}}
+                       .dump()
                 << "\n";
         }
-        outInstance = mxlCreateInstance(cfg.outputDomain.c_str(), nullptr);
-        if (outInstance == nullptr)
+        else if (!domainId.empty())
         {
-            throw std::runtime_error("cannot open the MXL output domain " + cfg.outputDomain);
+            std::ifstream in(defPath);
+            json const def = json::parse(in, nullptr, false);
+            if (def.is_discarded() || def.value("id", std::string{}) != domainId)
+            {
+                logWarn("domain_id_differs", {{"domain", domain}, {"configured", domainId}, {"file", def.is_discarded() ? "" : def.value("id", std::string{})}});
+            }
         }
-        mxlGarbageCollectFlows(outInstance);
+        mxlInstance const instance = mxlCreateInstance(domain.c_str(), nullptr);
+        if (instance == nullptr)
+        {
+            throw std::runtime_error("cannot open the MXL output domain " + domain);
+        }
+        // No garbage collection here: the flows a stopped mixer left in its domain are opened
+        // as they are (same inode), so their readers keep reading without re-opening.
+        outInstances[domain] = instance;
+        return instance;
+    }
+
+    // Creates the flow, or opens it when it exists (MXL create-or-open: same flow, same inode,
+    // so its readers keep reading). An existing flow must have the engine's format and no
+    // active writer.
+    std::unique_ptr<Output> openOutput(int me, char const* kind, std::string const& configured, OutputConfig const& oc, bool audio)
+    {
+        auto output = std::make_unique<Output>();
+        output->me = me;
+        output->preview = std::string(kind) == "PVW";
+        output->domain = oc.domain;
+        output->instance = outputInstance(oc.domain, oc.domainId);
+        std::string const name = "ME" + std::to_string(me) + " " + kind;
+        output->id = configured.empty() ? nameUuid(oc.domain + "/me" + std::to_string(me) + "/" + kind + (audio ? "/audio" : "")) : configured;
+        output->label = cfg.label + " " + name + (audio ? " Audio" : "");
+        auto const block = grainSamples(cfg.rate, 1);
+        auto const def = audio ? audioFlowDefinition(output->id, output->label, name + ":Audio", cfg.audioChannels)
+                               : videoFlowDefinition(output->id, output->label, name + ":Video", cfg.width, cfg.height, cfg.rate);
+        auto const options = audio ? "{\"maxCommitBatchSizeHint\":" + std::to_string(block.end - block.first) + "}" : std::string("{\"maxCommitBatchSizeHint\":1}");
+        // One writer at a time: a flow that another process still writes is not taken over.
+        bool active = false;
+        if (mxlIsFlowActive(output->instance, output->id.c_str(), &active) == MXL_STATUS_OK && active)
+        {
+            throw std::runtime_error("the MXL flow " + output->id + " in " + oc.domain + " has an active writer: stop the mixer that writes it first");
+        }
+        mxlFlowConfigInfo info{};
+        bool created = false;
+        if (mxlCreateFlowWriter(output->instance, def.c_str(), options.c_str(), &output->writer, &info, &created) != MXL_STATUS_OK)
+        {
+            throw std::runtime_error("cannot create or open the MXL flow " + output->id + " (" + output->label + ") in " + oc.domain);
+        }
+        output->existing = !created;
+        std::string why;
+        if (audio)
+        {
+            output->channels = info.continuous.channelCount;
+            if (info.common.format != MXL_DATA_FORMAT_AUDIO || info.common.grainRate.numerator != kAudioRate || info.common.grainRate.denominator != 1)
+            {
+                throw std::runtime_error("existing flow " + output->id + " is not 48 kHz audio");
+            }
+        }
+        else
+        {
+            output->grainCount = info.discrete.grainCount;
+            if (!created && !formatMatches(output->instance, output->id, why, false))
+            {
+                throw std::runtime_error("existing flow " + output->id + " is " + why + ", not v210 " + cfg.format);
+            }
+        }
+        logInfo(created ? "output_flow_created" : "output_flow_opened",
+            {{"me", me}, {"kind", std::string(kind) + (audio ? " audio" : " video")}, {"flow", output->id}, {"domain", oc.domain}, {"channels", output->channels}});
+        return output;
+    }
+
+    void setupOutputs()
+    {
         for (int m = 1; m <= cfg.mes; ++m)
         {
-            for (bool preview : {false, true})
-            {
-                auto output = std::make_unique<Output>();
-                output->me = m;
-                output->preview = preview;
-                std::string const kind = preview ? "PVW" : "PGM";
-                output->id = nameUuid(cfg.outputDomain + "/me" + std::to_string(m) + "/" + kind);
-                output->label = cfg.label + " ME" + std::to_string(m) + " " + kind;
-                auto const def = videoFlowDefinition(output->id, output->label, "ME" + std::to_string(m) + " " + kind + ":Video", cfg.width, cfg.height, cfg.rate);
-                mxlFlowConfigInfo info{};
-                if (mxlCreateFlowWriter(outInstance, def.c_str(), "{\"maxCommitBatchSizeHint\":1}", &output->writer, &info, nullptr) != MXL_STATUS_OK)
-                {
-                    throw std::runtime_error("cannot create the MXL writer for " + output->label);
-                }
-                output->grainCount = info.discrete.grainCount;
-                outputs.push_back(std::move(output));
-            }
+            auto const& oc = cfg.outputs[static_cast<std::size_t>(m - 1)];
+            outputs.push_back(openOutput(m, "PGM", oc.pgmVideo, oc, false));
+            outputs.push_back(openOutput(m, "PVW", oc.pvwVideo, oc, false));
+            audioOutputs.push_back(openOutput(m, "PGM", oc.pgmAudio, oc, true));
         }
     }
 
@@ -524,7 +657,7 @@ struct Engine::Impl
 
     // The flow carries cfg.width x cfg.height v210 (or v210a: its fill comes first) at the
     // engine's rate.
-    bool formatMatches(mxlInstance instance, std::string const& flowId, std::string& why) const
+    bool formatMatches(mxlInstance instance, std::string const& flowId, std::string& why, bool allowAlpha = true) const
     {
         std::size_t size = 0;
         mxlGetFlowDef(instance, flowId.c_str(), nullptr, &size);
@@ -547,7 +680,7 @@ struct Engine::Impl
         auto const rate = def.value("grain_rate", json::object());
         auto const num = rate.value("numerator", 0LL);
         auto const den = rate.value("denominator", 1LL);
-        if ((media != "video/v210" && media != "video/v210a") || width != cfg.width || height != cfg.height || num * cfg.rate.den != den * cfg.rate.num)
+        if ((media != "video/v210" && !(allowAlpha && media == "video/v210a")) || width != cfg.width || height != cfg.height || num * cfg.rate.den != den * cfg.rate.num)
         {
             why = media + " " + std::to_string(width) + "x" + std::to_string(height) + " " + std::to_string(num) + "/" + std::to_string(den);
             return false;
@@ -740,6 +873,10 @@ struct Engine::Impl
     // within the hold time, else nothing (black).
     std::shared_ptr<DevFrame> pick(Input& in, std::uint64_t j)
     {
+        if (in.black())
+        {
+            return nullptr;
+        }
         std::lock_guard lock{in.mu};
         if (in.recent.empty())
         {
@@ -754,7 +891,7 @@ struct Engine::Impl
                 {
                     return *it;
                 }
-                if ((*it)->index + static_cast<std::uint64_t>(cfg.holdGrains) < j)
+                if (cfg.holdGrains > 0 && (*it)->index + static_cast<std::uint64_t>(cfg.holdGrains) < j)
                 {
                     ++in.missing;
                     return nullptr;
@@ -891,6 +1028,7 @@ struct Engine::Impl
         }
         slot.index = index;
         slot.inputIndex = j;
+        slot.plans = plans;
     }
 
     void renderMain()
@@ -936,7 +1074,7 @@ struct Engine::Impl
 
     // ---- writer thread -------------------------------------------------------------------
 
-    void write(Slot& slot, HostRegistry& registry)
+    void write(Slot& slot, HostRegistry& registry, AudioRun& audio)
     {
         cudaStream_t const dl = downloadStream;
         cudaStreamWaitEvent(dl, slot.mark.back(), 0);
@@ -1013,7 +1151,221 @@ struct Engine::Impl
         }
         ++committed;
         slot.held.clear();
+        writeAudio(slot, audio);
         slot.busy.store(false);
+    }
+
+    // ---- PGM audio (fx-writer) -----------------------------------------------------------
+
+    void setAudioState(Input& in, char const* state)
+    {
+        std::lock_guard lock{in.mu};
+        in.audioState = state;
+    }
+
+    // The input's audio reader, opened when it has none (at most once a second).
+    bool openAudio(Input& in, AudioRun::Reader& r, AudioRun& audio)
+    {
+        if (r.reader != nullptr)
+        {
+            return true;
+        }
+        auto const now = std::chrono::steady_clock::now();
+        if (in.cfg.audioFlow.empty() || now < r.retryAt)
+        {
+            return false;
+        }
+        r.retryAt = now + std::chrono::seconds(1);
+        auto& instance = audio.instances[in.cfg.audioDomain];
+        if (instance == nullptr)
+        {
+            instance = mxlCreateInstance(in.cfg.audioDomain.c_str(), nullptr);
+        }
+        if (instance == nullptr)
+        {
+            setAudioState(in, "domain_not_found");
+            return false;
+        }
+        r.instance = instance;
+        if (mxlCreateFlowReader(instance, in.cfg.audioFlow.c_str(), nullptr, &r.reader) != MXL_STATUS_OK)
+        {
+            r.reader = nullptr;
+            setAudioState(in, "flow_not_found");
+            return false;
+        }
+        mxlFlowConfigInfo info{};
+        if (mxlFlowReaderGetConfigInfo(r.reader, &info) != MXL_STATUS_OK || info.common.format != MXL_DATA_FORMAT_AUDIO ||
+            info.common.grainRate.numerator != kAudioRate || info.common.grainRate.denominator != 1)
+        {
+            mxlReleaseFlowReader(instance, r.reader);
+            r.reader = nullptr;
+            setAudioState(in, "format_mismatch");
+            return false;
+        }
+        r.channels = info.continuous.channelCount;
+        setAudioState(in, "running");
+        logInfo("input_audio_open", {{"input", in.number}, {"flow", in.cfg.audioFlow}, {"channels", r.channels}});
+        return true;
+    }
+
+    // `count` samples of every channel ending at `end`, channel-major into dst (channels the
+    // flow does not have stay silent). False when they are not there (late, gone, re-created).
+    bool readAudio(Input& in, AudioRun::Reader& r, std::uint64_t end, std::size_t count, std::vector<float>& dst, std::size_t channels)
+    {
+        mxlWrappedMultiBufferSlice slice{};
+        // Never waits: the samples are L grains old; a stalled source gives silence, not a late
+        // video commit.
+        auto const status = mxlFlowReaderGetSamplesNonBlocking(r.reader, end, count, &slice);
+        if (status == MXL_ERR_FLOW_INVALID)
+        {
+            // The writer re-created the flow: open the new one.
+            mxlReleaseFlowReader(r.instance, r.reader);
+            r.reader = nullptr;
+            r.retryAt = {};
+            ++in.audioReopens;
+            return false;
+        }
+        if (status != MXL_STATUS_OK)
+        {
+            return false;
+        }
+        for (std::size_t c = 0; c < std::min(slice.count, channels); ++c)
+        {
+            std::size_t filled = 0;
+            for (auto const& fragment : slice.base.fragments)
+            {
+                if (fragment.pointer == nullptr)
+                {
+                    continue;
+                }
+                std::size_t const n = std::min(fragment.size / sizeof(float), count - filled);
+                std::memcpy(dst.data() + c * count + filled, static_cast<std::uint8_t const*>(fragment.pointer) + c * slice.stride, n * sizeof(float));
+                filled += n;
+            }
+        }
+        return true;
+    }
+
+    // PGM audio of output grain `index`: the audio of the PGM source, read L grains back on the
+    // same TAI grid as the video, crossfaded (equal power) while a Mix runs.
+    void audioGrain(std::uint64_t index, std::vector<MePlan> const& plans, AudioRun& audio)
+    {
+        auto const out = grainSamples(cfg.rate, index);
+        auto const src = grainSamples(cfg.rate, inputIndexFor(index, cfg.latency));
+        std::size_t const n = out.end - out.first;
+        std::uint64_t const delta = out.first - src.first;
+        std::size_t const ch = audio.channels;
+        std::vector<bool> needed(inputs.size(), false);
+        for (auto const& plan : plans)
+        {
+            for (auto const& source : {plan.a, plan.b})
+            {
+                if (source.kind == Source::Kind::Input && (source == plan.a || plan.mixing))
+                {
+                    needed[static_cast<std::size_t>(source.index - 1)] = true;
+                }
+            }
+        }
+        for (std::size_t k = 0; k < inputs.size(); ++k)
+        {
+            if (!needed[k])
+            {
+                continue;
+            }
+            auto& buffer = audio.in[k];
+            buffer.assign(ch * n, 0.f);
+            auto& in = *inputs[k];
+            auto& reader = audio.readers[k];
+            if (in.cfg.audioFlow.empty())
+            {
+                continue;
+            }
+            if (openAudio(in, reader, audio) && readAudio(in, reader, out.end - delta, n, buffer, ch))
+            {
+                ++in.audioBlocks;
+            }
+            else
+            {
+                ++in.audioMissing;
+            }
+        }
+        auto const sourceOf = [&](Source source) -> std::vector<float> const& {
+            return source.kind == Source::Kind::Input ? audio.in[static_cast<std::size_t>(source.index - 1)] : audio.me[static_cast<std::size_t>(source.index - 1)];
+        };
+        // Render order (ME n before ME m): a re-entered Program's audio is ready.
+        for (auto const& plan : plans)
+        {
+            auto& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
+            auto const& a = sourceOf(plan.a);
+            if (plan.mixing)
+            {
+                auto const& b = sourceOf(plan.b);
+                dst.resize(ch * n);
+                for (std::size_t c = 0; c < ch; ++c)
+                {
+                    crossfadeBlock(a.data() + c * n, b.data() + c * n, dst.data() + c * n, n, plan.tPrev, plan.t);
+                }
+            }
+            else
+            {
+                dst = a;
+            }
+            auto& output = *audioOutputs[static_cast<std::size_t>(plan.me - 1)];
+            mxlMutableWrappedMultiBufferSlice slice{};
+            if (mxlFlowWriterOpenSamples(output.writer, out.end, n, &slice) != MXL_STATUS_OK)
+            {
+                ++output.failed;
+                continue;
+            }
+            for (std::size_t c = 0; c < slice.count; ++c)
+            {
+                std::size_t filled = 0;
+                for (auto const& fragment : slice.base.fragments)
+                {
+                    if (fragment.pointer == nullptr)
+                    {
+                        continue;
+                    }
+                    std::size_t const m = std::min(fragment.size / sizeof(float), n - filled);
+                    auto* target = reinterpret_cast<float*>(static_cast<std::uint8_t*>(fragment.pointer) + c * slice.stride);
+                    if (c < ch)
+                    {
+                        std::memcpy(target, dst.data() + c * n + filled, m * sizeof(float));
+                    }
+                    else
+                    {
+                        std::fill(target, target + m, 0.f);
+                    }
+                    filled += m;
+                }
+            }
+            if (mxlFlowWriterCommitSamples(output.writer) == MXL_STATUS_OK)
+            {
+                ++output.committed;
+            }
+            else
+            {
+                ++output.failed;
+            }
+        }
+    }
+
+    // Audio for every grain since the last one written: a skipped video grain leaves no hole
+    // (a hole would replay old samples from the ring).
+    void writeAudio(Slot const& slot, AudioRun& audio)
+    {
+        auto const started = std::chrono::steady_clock::now();
+        std::uint64_t first = slot.index;
+        if (audio.last != 0 && slot.index > audio.last && slot.index - audio.last <= 25)
+        {
+            first = audio.last + 1;
+        }
+        for (std::uint64_t k = first; k <= slot.index; ++k)
+        {
+            audioGrain(k, slot.plans, audio);
+        }
+        audio.last = slot.index;
+        audioMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     }
 
     // Page-locks every grain of every writer before the first output grain: locking a grain
@@ -1047,6 +1399,15 @@ struct Engine::Impl
         logInfo("writer_grains_locked", {{"grains", registry.lockedCount()},
                                             {"ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()}});
         writerWarm.set_value();
+        AudioRun audio;
+        audio.readers.resize(inputs.size());
+        audio.in.resize(inputs.size());
+        audio.me.resize(audioOutputs.size());
+        audio.channels = 1;
+        for (auto const& output : audioOutputs)
+        {
+            audio.channels = std::max<std::size_t>(audio.channels, output->channels);
+        }
         while (true)
         {
             int k = 0;
@@ -1060,10 +1421,24 @@ struct Engine::Impl
                 k = writeQueue.front();
                 writeQueue.pop_front();
             }
-            write(slots[static_cast<std::size_t>(k)], registry);
+            write(slots[static_cast<std::size_t>(k)], registry, audio);
         }
         cudaStreamSynchronize(downloadStream);
         registry.release();
+        for (auto& reader : audio.readers)
+        {
+            if (reader.reader != nullptr)
+            {
+                mxlReleaseFlowReader(reader.instance, reader.reader);
+            }
+        }
+        for (auto& [domain, instance] : audio.instances)
+        {
+            if (instance != nullptr)
+            {
+                mxlDestroyInstance(instance);
+            }
+        }
     }
 
     // ---- encode and stats threads --------------------------------------------------------
@@ -1132,6 +1507,91 @@ struct Engine::Impl
         }
     }
 
+    // FLOWXER_TALLY_TSL: the raw tally of every ME on each change and once a second.
+    void tallyMain()
+    {
+        nameThread("fx-tally");
+        bool const tcp = cfg.tallyTsl.rfind("tcp://", 0) == 0;
+        std::string const target = cfg.tallyTsl.substr(6);
+        auto const colon = target.rfind(':');
+        std::string const host = target.substr(0, colon);
+        std::string const port = colon == std::string::npos ? "8910" : target.substr(colon + 1);
+        std::vector<std::string> labels;
+        for (auto const& input : inputs)
+        {
+            labels.push_back(input->cfg.label);
+        }
+        int fd = -1;
+        int failures = 0;
+        auto retryAt = std::chrono::steady_clock::now();
+        std::unique_lock lock{tallyMu};
+        while (run.load())
+        {
+            tallyCv.wait_for(lock, std::chrono::seconds(1), [&] { return tallyChanged || !run.load(); });
+            tallyChanged = false;
+            if (!run.load() || std::chrono::steady_clock::now() < retryAt)
+            {
+                continue;
+            }
+            lock.unlock();
+            bool ok = true;
+            if (fd < 0)
+            {
+                // Resolved at every connect: a Service that is not there yet is found later.
+                addrinfo hints{};
+                hints.ai_socktype = tcp ? SOCK_STREAM : SOCK_DGRAM;
+                addrinfo* found = nullptr;
+                ok = getaddrinfo(host.c_str(), port.c_str(), &hints, &found) == 0 && found != nullptr;
+                if (ok)
+                {
+                    fd = ::socket(found->ai_family, found->ai_socktype, found->ai_protocol);
+                    timeval timeout{1, 0};
+                    ok = fd >= 0 && setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0 && ::connect(fd, found->ai_addr, found->ai_addrlen) == 0;
+                }
+                if (found != nullptr)
+                {
+                    freeaddrinfo(found);
+                }
+            }
+            std::uint64_t sent = 0;
+            for (auto const& [screen, displays] : tallyDisplays(mixer, labels))
+            {
+                for (auto const& packet : tslPackets(screen, displays))
+                {
+                    auto const data = tcp ? tslWrapTcp(packet) : packet;
+                    // UDP: a listener that is not up yet (ICMP port unreachable) is not a failure.
+                    ok = ok && (::send(fd, data.data(), data.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(data.size()) || (!tcp && errno == ECONNREFUSED));
+                    sent += ok ? 1 : 0;
+                }
+            }
+            if (ok)
+            {
+                failures = 0;
+                tallyPackets += sent;
+            }
+            else
+            {
+                if (fd >= 0)
+                {
+                    ::close(fd);
+                    fd = -1;
+                }
+                ++tallyErrors;
+                int const backoff[] = {1, 2, 5, 10};
+                retryAt = std::chrono::steady_clock::now() + std::chrono::seconds(backoff[std::min(failures++, 3)]);
+                if (failures == 1)
+                {
+                    logWarn("tally_send_failed", {{"target", cfg.tallyTsl}});
+                }
+            }
+            lock.lock();
+        }
+        if (fd >= 0)
+        {
+            ::close(fd);
+        }
+    }
+
     // ---- start / stop --------------------------------------------------------------------
 
     void start()
@@ -1149,6 +1609,11 @@ struct Engine::Impl
         for (auto& input : inputs)
         {
             Input* in = input.get();
+            if (in->black())
+            {
+                in->state = "black";
+                continue;
+            }
             in->thread = std::thread([this, in] { inputMain(*in); });
         }
         // The render thread starts once the writer has page-locked its grains.
@@ -1160,6 +1625,17 @@ struct Engine::Impl
             encodeThread = std::thread([this] { encodeMain(); });
         }
         statsThread = std::thread([this] { statsMain(); });
+        if (!cfg.tallyTsl.empty())
+        {
+            mixer.onChange([this] {
+                {
+                    std::lock_guard lock{tallyMu};
+                    tallyChanged = true;
+                }
+                tallyCv.notify_one();
+            });
+            tallyThread = std::thread([this] { tallyMain(); });
+        }
         renderThread = std::thread([this] { renderMain(); });
         logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"mes", cfg.mes}, {"latency", cfg.latency}, {"work_format", cfg.workFormat},
                                       {"device_mb", allocated / 1048576}});
@@ -1176,8 +1652,12 @@ struct Engine::Impl
         writeCv.notify_all();
         encodeCv.notify_all();
         statsCv.notify_all();
+        {
+            std::lock_guard lock{tallyMu};
+        }
+        tallyCv.notify_all();
         // Render first (no new grains), then the writer drains its queue.
-        for (auto* thread : {&renderThread, &writerThread, &encodeThread, &statsThread})
+        for (auto* thread : {&renderThread, &writerThread, &encodeThread, &statsThread, &tallyThread})
         {
             if (thread->joinable())
             {
@@ -1196,19 +1676,24 @@ struct Engine::Impl
         {
             slot.held.clear();
         }
-        for (auto& output : outputs)
+        // The last writer's release deletes a flow (MXL): its readers see it again when the
+        // next writer (this engine or the mixer it replaced) creates it.
+        for (auto* list : {&outputs, &audioOutputs})
         {
-            if (output->writer != nullptr)
+            for (auto& output : *list)
             {
-                mxlReleaseFlowWriter(outInstance, output->writer);
-                output->writer = nullptr;
+                if (output->writer != nullptr)
+                {
+                    mxlReleaseFlowWriter(output->instance, output->writer);
+                    output->writer = nullptr;
+                }
             }
         }
-        if (outInstance != nullptr)
+        for (auto& [domain, instance] : outInstances)
         {
-            mxlDestroyInstance(outInstance);
-            outInstance = nullptr;
+            mxlDestroyInstance(instance);
         }
+        outInstances.clear();
         encoder.reset();
         if (mediamtx)
         {
@@ -1315,12 +1800,15 @@ struct Engine::Impl
         for (auto const& input : inputs)
         {
             std::string state;
+            std::string audioState;
             {
                 std::lock_guard lock{input->mu};
                 state = input->state;
+                audioState = input->cfg.audioFlow.empty() ? "none" : input->audioState;
             }
             auto const lastAt = input->lastGrainAt.load();
-            if (state == "running" && (lastAt == 0 || now > lastAt + periodNs(cfg.rate) * static_cast<std::uint64_t>(cfg.holdGrains)))
+            // No grain for a second: shown as no_signal (the picture holds, see holdGrains).
+            if (state == "running" && (lastAt == 0 || now > lastAt + 1'000'000'000ull))
             {
                 state = "no_signal";
             }
@@ -1338,7 +1826,14 @@ struct Engine::Impl
                 {"reopens", input->reopens.load()},
                 {"pool_exhausted", input->exhausted.load()},
                 {"unpinned_uploads", input->unpinned.load()},
-                {"upload_ms", input->upload.toJson()}});
+                {"upload_ms", input->upload.toJson()},
+                {"audio",
+                    {{"domain", input->cfg.audioDomain},
+                        {"flow", input->cfg.audioFlow},
+                        {"state", audioState},
+                        {"blocks", input->audioBlocks.load()},
+                        {"missing", input->audioMissing.load()},
+                        {"reopens", input->audioReopens.load()}}}});
         }
         out["inputs"] = list;
         json mes = json::array();
@@ -1346,14 +1841,22 @@ struct Engine::Impl
         {
             auto const& pgm = *outputs[static_cast<std::size_t>(2 * (view.me - 1))];
             auto const& pvw = *outputs[static_cast<std::size_t>(2 * (view.me - 1) + 1)];
+            auto const& aud = *audioOutputs[static_cast<std::size_t>(view.me - 1)];
+            auto const flow = [](Output const& o) {
+                return json{{"flow", o.id}, {"domain", o.domain}, {"label", o.label}, {"existing", o.existing}, {"committed", o.committed.load()},
+                    {"failed", o.failed.load()}};
+            };
+            json pgmAudio = flow(aud);
+            pgmAudio["channels"] = aud.channels;
             mes.push_back({{"me", view.me},
                 {"program", sourceName(view.program)},
                 {"preview", sourceName(view.preview)},
                 {"mixing", view.mixing},
                 {"frames", view.frames},
                 {"position", view.position},
-                {"pgm", {{"flow", pgm.id}, {"label", pgm.label}, {"committed", pgm.committed.load()}, {"failed", pgm.failed.load()}}},
-                {"pvw", {{"flow", pvw.id}, {"label", pvw.label}, {"committed", pvw.committed.load()}, {"failed", pvw.failed.load()}}}});
+                {"pgm", flow(pgm)},
+                {"pvw", flow(pvw)},
+                {"pgm_audio", pgmAudio}});
         }
         out["mes"] = mes;
         json mosaic = {{"enabled", cfg.mosaic}, {"fps", cfg.mosaicFps}, {"frames", mosaicFrames.load()}, {"dropped", mosaicDropped.load()}, {"encode_ms", encodeMs.toJson()}};
@@ -1375,6 +1878,8 @@ struct Engine::Impl
             {"own_mediamtx", mediamtx ? json{{"running", mediamtxRunning.load()}, {"restarts", mediamtx->restarts()}} : json(nullptr)},
             {"streams", streams}};
         out["mosaic"] = mosaic;
+        out["audio"] = {{"ms_per_grain", audioMs.toJson()}};
+        out["tally"] = {{"target", cfg.tallyTsl}, {"packets", tallyPackets.load()}, {"errors", tallyErrors.load()}};
         json threads = json::object();
         for (auto const& [name, percent] : cpuNow.threads)
         {

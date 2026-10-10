@@ -1,0 +1,38 @@
+{
+  "FLOWXER_ENGINE_LABEL": "vmix1",
+  "FLOWXER_ENGINE_FORMAT": "1080p50",
+  "FLOWXER_ENGINE_MES": 4,
+  "FLOWXER_ENGINE_LATENCY": 2,
+  "FLOWXER_ENGINE_GPU": 0,
+  "FLOWXER_ENGINE_HTTP_BIND": "0.0.0.0",
+  "FLOWXER_ENGINE_HTTP_PORT": 9630,
+  "FLOWXER_ENGINE_INPUTS": [
+    {"label": "Camera 1", "domain": "/Volumes/mxl/mirror-95c0b941-e735-5b18-bab5-f238d8618bf5",
+     "video_flow": "a72838ca-b99c-55be-868c-1f82896c3c80", "audio_flow": "c2044da5-2d6c-5bae-9a32-87b45f7a3abd"},
+    {"label": "Camera 2", "domain": "/Volumes/mxl/mirror-95c0b941-e735-5b18-bab5-f238d8618bf5",
+     "video_flow": "6f40beb6-2376-56a0-ad60-c2ea23422ed4", "audio_flow": "9da9282f-e7d5-5317-813a-5e2251ec0340"},
+    {"label": "Camera 3", "domain": "/Volumes/mxl/friday-night-show-browser1",
+     "video_flow": "9d5e0c8f-aa0d-54ce-b735-f3267c072e02", "audio_flow": "0627d724-a76f-559a-973a-329c2a96cfc4"},
+    {"label": "Camera 4"},
+    {"label": "Test 1"},
+    {"label": "Test 2"},
+    {"label": "Black"},
+    {"label": "Replay"}
+  ],
+  "FLOWXER_ENGINE_OUTPUT_DOMAIN": "/Volumes/mxl/friday-night-show-vmix1",
+  "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": "9528879f-c265-59e3-9823-bbba85ccb52d",
+  "FLOWXER_ENGINE_OUTPUTS": [
+    {"me": 1, "pgm_video": "42a6614e-1d0d-53fa-96f1-3afaa9f76540", "pgm_audio": "429c984c-9587-5f32-98ed-1f46ffd276a1",
+     "pvw_video": "ceec8004-aeba-487b-bb91-3ca7ec179f77"},
+    {"me": 2, "pgm_video": "d75d99a6-1e26-4167-a119-722df33d71f2", "pgm_audio": "7875f051-baad-4446-bc5c-886e474f6684",
+     "pvw_video": "464d038c-82ec-4130-97c4-0b9b682b33d4"},
+    {"me": 3, "pgm_video": "e2da3851-fbf0-4c9a-93b6-e587db2ebb03", "pgm_audio": "e8cfd83b-1560-425c-a460-8d352489c3c2",
+     "pvw_video": "2f2f7311-94e6-4226-91f0-5d60fa3a292d"},
+    {"me": 4, "pgm_video": "25cf3555-bab3-442b-9bab-ab06eac6f94f", "pgm_audio": "15f5b3c0-7082-4cf9-af66-ecd785959012",
+     "pvw_video": "13856d08-5c01-488b-9292-3c6fc3a77f12"}
+  ],
+  "PREVIEW_PUBLISH_URL": "rtsp://mxl-mediamtx.mxl-platform.svc.cluster.local:8554",
+  "PREVIEW_PATH_PREFIX": "friday-night-show/vmix1",
+  "PREVIEW_WHEP_URL": "https://whep.small.mxl.ipla.media.int",
+  "FLOWXER_TALLY_TSL": "udp://mxl-tally.mxl-platform.svc.cluster.local:8910"
+}
