@@ -5,6 +5,32 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: the engine replaces the GStreamer mixer (P2)
+
+FlowXer's media plane is its C++/CUDA engine (`engine/`), a child process of the
+control plane. One image, one code path; an NVIDIA GPU is required
+(`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`).
+
+- Every ME renders all the time: PGM video + audio and PVW video per ME, written
+  to MXL; `FLOWXER_RENDER_MES` (the first n MEs, default all panels),
+  `FLOWXER_PVW_OUTPUTS` (default true), `FLOWXER_LATENCY` (grains, default 4).
+- NMOS: senders `{ME} PGM Video`, `{ME} PGM Audio`, `{ME} PVW Video` per
+  rendering ME, each with its own flow (ME n no longer advertises ME 1's flow);
+  ME 1 PGM keeps its flow ids. Receiver `DSK 1 Key` (v210a). IS-05 opens and
+  closes the engine's readers at run time.
+- Sources in slot order (TSL INDEX): live inputs, clip players
+  (`FLOWXER_CLIP_PLAYERS`, replaces `FLOWXER_TEST_SOURCES`), Black. Test, file
+  and replay inputs become clip players (saved states and clients migrate).
+  Re-entry: an ME takes the Program of a higher ME (`me-<n>`, INDEX 1000 + n).
+- `GET /api/v1/engine` (timing, arrival lag per input, recommended latency),
+  `GET /api/v1/preview` (the mosaic stream and its tile map),
+  `POST /players/{id}/{action}`, `POST /keyers/{id}/auto`.
+- Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
+  `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
+  `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,
+  `/webrtc/whep/*`; the `/graphics` sample page. Stingers come back in P3: a
+  stinger take, an auto-stinger and an armed Wipe cut.
+
 ### Added
 
 - `FLOWXER_TALLY_TSL=udp://host:port` (or `tcp://`): the raw tally of every ME
