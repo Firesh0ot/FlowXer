@@ -139,6 +139,8 @@ class NmosNode:
         self.seed = self.settings.resolved_nmos_seed
         self.node_uuid = ids.node_id(self.seed)
         self.device_uuid = ids.device_id(self.seed)
+        # BCP-004-01: when the receivers' constraint sets last changed (structure or raster).
+        self.caps_version = nmos_version()
 
     def enabled(self) -> bool:
         return bool(self.settings.nmos_enable)
@@ -437,6 +439,7 @@ class NmosNode:
                 if role == "video":
                     caps: dict[str, Any] = {
                         "media_types": ["video/v210", "video/v210a"],
+                        "version": self.caps_version,
                         "constraint_sets": [
                             {
                                 "urn:x-nmos:cap:format:frame_width": {
@@ -451,6 +454,7 @@ class NmosNode:
                 else:
                     caps = {
                         "media_types": ["audio/float32"],
+                        "version": self.caps_version,
                         "constraint_sets": [
                             {
                                 "urn:x-nmos:cap:format:channel_count": {
@@ -505,6 +509,7 @@ class NmosNode:
                     "format": FORMAT_VIDEO,
                     "caps": {
                         "media_types": ["video/v210a"],
+                        "version": self.caps_version,
                         "constraint_sets": [
                             {
                                 "urn:x-nmos:cap:format:frame_width": {"enum": [self.settings.width]},
@@ -960,6 +965,7 @@ class NmosNode:
 
     def reconcile_inputs(self) -> None:
         """Create/remove receivers when live inputs or keyers appear or disappear."""
+        self.caps_version = nmos_version()
         with self.lock:
             owners = {owner for owner, _role in self._receiver_roles()}
             for item in self._live_inputs():

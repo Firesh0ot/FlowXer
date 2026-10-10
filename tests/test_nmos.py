@@ -251,6 +251,8 @@ def test_live_inputs_and_the_dsk_have_receivers_clip_players_and_black_none(tmp_
     assert key["id"] == ids.receiver_id(SEED, "dsk-1", "key")
     assert key["format"] == "urn:x-nmos:format:video"
     assert key["caps"]["media_types"] == ["video/v210a"]
+    # BCP-004-01: constraint sets need the caps version.
+    assert all(":" in item["caps"]["version"] for item in receivers)
 
 def test_creating_and_deleting_inputs_adds_receivers(tmp_path: Path) -> None:
     mixer = VisionMixer(_settings(tmp_path))
