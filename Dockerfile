@@ -75,6 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libavformat60 \
         libavutil58 \
         fonts-dejavu-core \
+        tini \
         curl \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -112,4 +113,5 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 9610 3252 3253 8989 8988 8289 8289/udp
 VOLUME ["/Volumes/mxl", "/storage", "/config"]
 USER 1000:1000
-ENTRYPOINT ["/entrypoint.sh"]
+# tini as PID 1 reaps what a crashed engine leaves (its MediaMTX), which flowxer cannot.
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
