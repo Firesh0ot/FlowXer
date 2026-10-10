@@ -49,6 +49,9 @@ jobs:
           cache-to: type=gha,scope=engine-proto,mode=max
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=proto-${{ steps.tags.outputs.short }}
+            org.opencontainers.image.title=flowxer-engine
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           tags: |
             ${{ steps.tags.outputs.image }}:proto-${{ steps.tags.outputs.short }}
             ${{ steps.tags.outputs.image }}:proto-latest
