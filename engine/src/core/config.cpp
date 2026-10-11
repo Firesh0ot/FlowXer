@@ -312,6 +312,7 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     }
     cfg.mes = getInt(values, "FLOWXER_ENGINE_MES", cfg.mes, 1, kMaxMes);
     cfg.keys = parseKeys(get(values, "FLOWXER_ENGINE_KEYS", ""), cfg.mes);
+    cfg.stingerPlayers = getInt(values, "FLOWXER_ENGINE_STINGER_PLAYERS", cfg.stingerPlayers, 0, kMaxStingerPlayers);
     cfg.latency = getInt(values, "FLOWXER_ENGINE_LATENCY", cfg.latency, 1, kMaxLatency);
     cfg.format = get(values, "FLOWXER_ENGINE_FORMAT", cfg.format);
     if (!parseFormat(cfg.format, cfg.width, cfg.height, cfg.rate))

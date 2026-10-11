@@ -75,6 +75,7 @@ constexpr int kMaxMes = 4;
 constexpr int kMaxSources = 23;
 // 4 MEs × (8 upstream keyers + 4 DSKs).
 constexpr int kMaxKeys = 48;
+constexpr int kMaxStingerPlayers = 4;
 constexpr int kMaxLatency = 10;
 
 struct Config
@@ -82,6 +83,8 @@ struct Config
     std::vector<InputConfig> inputs;
     std::vector<PlayerConfig> players;
     std::vector<KeyConfig> keys;
+    // Stinger players (a clip player with alpha and sound that plays the stingers over an ME).
+    int stingerPlayers = 0;
     // Rendering MEs (1-4); every one renders every grain.
     int mes = 1;
     int latency = 4;

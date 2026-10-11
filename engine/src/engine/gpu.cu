@@ -419,6 +419,35 @@ __global__ void from444Kernel(std::uint8_t const* y, std::uint8_t const* cb, std
     writeGroup(v210, rowBytes, row, group, w);
 }
 
+// One thread per word of a v210a key line: three 10-bit keys from the alpha luma (full range).
+__global__ void alphaKeyKernel(std::uint8_t const* luma, int pitch, bool deep, int width, int height, std::uint8_t* key, int keyRowBytes)
+{
+    int const word = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    if (row >= height || word * 4 >= keyRowBytes)
+    {
+        return;
+    }
+    std::uint32_t packed = 0;
+    for (int i = 0; i < 3; ++i)
+    {
+        int const x = word * 3 + i;
+        if (x >= width)
+        {
+            break;
+        }
+        unsigned k = 1023u;
+        if (luma != nullptr)
+        {
+            std::uint8_t const* line = luma + static_cast<std::size_t>(row) * static_cast<std::size_t>(pitch);
+            unsigned const v = deep ? reinterpret_cast<std::uint16_t const*>(line)[x] : line[x];
+            k = deep ? v >> 6 : (v << 2) | (v >> 6);
+        }
+        packed |= k << (10 * i);
+    }
+    reinterpret_cast<std::uint32_t*>(key + static_cast<std::size_t>(row) * static_cast<std::size_t>(keyRowBytes))[word] = packed;
+}
+
 struct ComposeArgs
 {
     // Y, Cb, Cr planes.
@@ -600,6 +629,12 @@ cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t con
     int height, std::uint8_t* v210, int rowBytes)
 {
     from444Kernel<<<groupGrid(rowBytes / 16, height), 128, 0, stream>>>(y, cb, cr, pitch, deep, width, height, v210, rowBytes);
+    return cudaGetLastError();
+}
+
+cudaError_t alphaToKey(cudaStream_t stream, std::uint8_t const* luma, int pitch, bool deep, int width, int height, std::uint8_t* key, int keyRowBytes)
+{
+    alphaKeyKernel<<<groupGrid(keyRowBytes / 4, height), 128, 0, stream>>>(luma, pitch, deep, width, height, key, keyRowBytes);
     return cudaGetLastError();
 }
 
@@ -1137,6 +1172,111 @@ bool selfTest(std::string& report)
             return false;
         }
         done += "compose (wipe + 2 linear + 1 luma key layers) exact; ";
+    }
+    // A stinger frame: its alpha (a decoder's 10-bit luma plane, P010) as the key plane after the
+    // fill pb, exact; then A with the stinger layer and a DSK above it (pa, key 512), against the
+    // CPU reference: exact. Without an alpha plane the key is full.
+    {
+        int const keyRow = keyPlaneRowBytes(w);
+        std::size_t const keyBytes = frameBytes + static_cast<std::size_t>(keyRow) * h;
+        std::size_t const pitch = static_cast<std::size_t>(w) * 2;
+        std::vector<std::uint16_t> luma(static_cast<std::size_t>(w) * h);
+        for (int y = 0; y < h; ++y)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                luma[static_cast<std::size_t>(y) * w + x] = static_cast<std::uint16_t>(((x * 7 + y * 3) % 1024) << 6);
+            }
+        }
+        std::vector<std::uint8_t> dsk(keyBytes, 0);
+        std::memcpy(dsk.data(), va.data(), frameBytes);
+        for (int y = 0; y < h; ++y)
+        {
+            auto* d = reinterpret_cast<std::uint32_t*>(dsk.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+            for (int x = 0; x < w; ++x)
+            {
+                d[x / 3] |= 512u << ((x % 3) * 10);
+            }
+        }
+        DeviceBytes dluma(luma.size() * 2);
+        DeviceBytes dsting(keyBytes);
+        DeviceBytes ddsk(keyBytes);
+        cudaMemcpy(dluma.get(), luma.data(), luma.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dsting.get(), vb.data(), frameBytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(ddsk.get(), dsk.data(), keyBytes, cudaMemcpyHostToDevice);
+        std::vector<std::uint8_t> sting(keyBytes);
+        alphaToKey(nullptr, nullptr, 0, false, w, h, dsting.get() + frameBytes, keyRow);
+        cudaError_t err = cudaDeviceSynchronize();
+        cudaMemcpy(sting.data(), dsting.get(), keyBytes, cudaMemcpyDeviceToHost);
+        bool full = err == cudaSuccess;
+        for (int x = 0; x < w && full; ++x)
+        {
+            full = keyAt(sting.data() + frameBytes + static_cast<std::size_t>(h - 1) * keyRow, x) == 1023u;
+        }
+        alphaToKey(nullptr, dluma.get(), static_cast<int>(pitch), true, w, h, dsting.get() + frameBytes, keyRow);
+        WorkBuffer wa;
+        WorkBuffer wo;
+        if (allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
+        {
+            report = "stinger: allocWork failed";
+            return false;
+        }
+        unpack(nullptr, da.get(), rowBytes, wa);
+        Compose job;
+        job.a = &wa;
+        job.layers[0].v210a = dsting.get();
+        job.layers[0].gain = 1.f;
+        job.layers[1].v210a = ddsk.get();
+        job.layers[1].gain = 1.f;
+        job.layerCount = 2;
+        compose(nullptr, job, rowBytes, keyRow, wo);
+        pack(nullptr, wo, dout.get(), rowBytes);
+        err = cudaDeviceSynchronize();
+        freeWork(wa);
+        freeWork(wo);
+        cudaMemcpy(sting.data(), dsting.get(), keyBytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+        int keyErrors = 0;
+        for (int y = 0; y < h; ++y)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                keyErrors += keyAt(sting.data() + frameBytes + static_cast<std::size_t>(y) * keyRow, x) != static_cast<unsigned>((x * 7 + y * 3) % 1024);
+            }
+        }
+        Planar422 got;
+        got.allocate(w, h);
+        unpackV210(back.data(), rowBytes, got);
+        Planar422 want = pa;
+        for (int l = 0; l < 2; ++l)
+        {
+            Planar422 const& fill = l == 0 ? pb : pa;
+            std::uint8_t const* keys = (l == 0 ? sting.data() : dsk.data()) + frameBytes;
+            for (int y = 0; y < h; ++y)
+            {
+                std::uint8_t const* line = keys + static_cast<std::size_t>(y) * keyRow;
+                for (int x = 0; x < w; ++x)
+                {
+                    std::size_t const i = static_cast<std::size_t>(y) * w + x;
+                    want.y[i] = mix10(want.y[i], fill.y[i], keyAlpha(keyAt(line, x), 1.f));
+                }
+                for (int x = 0; x < w / 2; ++x)
+                {
+                    std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x;
+                    float const a = 0.5f * (keyAlpha(keyAt(line, 2 * x), 1.f) + keyAlpha(keyAt(line, 2 * x + 1), 1.f));
+                    want.cb[c] = mix10(want.cb[c], fill.cb[c], a);
+                    want.cr[c] = mix10(want.cr[c], fill.cr[c], a);
+                }
+            }
+        }
+        int const diff = maxDiff(want, got);
+        if (err != cudaSuccess || !full || keyErrors != 0 || diff != 0)
+        {
+            report = "stinger: full key " + std::string(full ? "ok" : "wrong") + ", " + std::to_string(keyErrors) + " alpha samples off, compose max error " +
+                     std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+            return false;
+        }
+        done += "stinger alpha key and layer (under a DSK) exact; ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;

@@ -210,7 +210,7 @@ TEST(transition_types_and_wipes)
     CHECK(mixer.cut(1) == MixResult::Ok);
     p = mixer.frame(16).mes;
     CHECK(!p[1].mixing && !p[1].wiping && p[1].a == in(1) && p[1].preview == in(2));
-    // A take with a type: wipe, mix, cut; a stinger is a cut until stingers play.
+    // A take with a type: wipe, mix, cut; a stinger without a stinger player is a cut.
     CHECK(mixer.take(1, in(3), 2, std::nullopt, Transition::Wipe) == MixResult::Ok);
     p = mixer.frame(17).mes;
     CHECK(p[1].wiping && p[1].b == in(3));
@@ -223,7 +223,8 @@ TEST(transition_types_and_wipes)
     CHECK(!p[1].mixing && p[1].a == in(1));
     CHECK(mixer.take(1, in(2), 25, std::nullopt, Transition::Cut) == MixResult::Ok);
     CHECK(mixer.frame(21).mes[1].a == in(2) && !mixer.view()[0].mixing);
-    // A stinger as the next type: Auto is a cut (buses swapped at the next grain).
+    // A stinger as the next type: Auto has no stinger player, so it is a cut (buses swapped at the
+    // next grain); FlowXer takes a stinger with its player.
     next.type = Transition::Stinger;
     CHECK(mixer.setTransition(1, next) == MixResult::Ok);
     mixer.setPreview(1, in(3));
@@ -301,12 +302,89 @@ TEST(tbar_position)
     CHECK(mixer.cut(1) == MixResult::Ok);
     p = mixer.frame(117).mes;
     CHECK(!p[0].mixing && p[0].a == in(2) && p[0].preview == in(1));
-    // A stinger does not scrub: t > 0 starts it as an Auto (a cut for now).
+    // A stinger does not scrub: t > 0 starts it as an Auto (without a stinger player a cut).
     next.type = Transition::Stinger;
     CHECK(mixer.setTransition(1, next) == MixResult::Ok);
     CHECK(mixer.position(1, 0.2f) == MixResult::Ok);
     p = mixer.frame(118).mes;
     CHECK(!p[0].mixing && p[0].a == in(1));
+}
+
+TEST(stinger_cut_point_and_end)
+{
+    Mixer mixer(2, 4);
+    mixer.setProgram(1, in(1));
+    mixer.setPreview(1, in(2));
+    std::vector<bool> const ready{true};
+    std::vector<bool> const notReady{false};
+    // A 6-frame stinger on player 1, cut at frame 3, the buses swapping at its end.
+    CHECK(mixer.take(1, in(2), 0, in(1), Transition::Stinger, Sting{1, 6, 3}) == MixResult::Ok);
+    // Its first frame is not decoded yet: it waits (A, no overlay), counted; Auto is busy.
+    auto p = mixer.frame(100, notReady).mes[1];
+    CHECK(p.stinger == 0 && p.background() == in(1) && mixer.stingerWaits() == 1);
+    CHECK(mixer.view()[0].mixing && mixer.view()[0].stinger == 1);
+    CHECK(mixer.autoTransition(1) == MixResult::Busy);
+    // Ready at grain 101: frame f in grain 101 + f, the background B from grain 104 (the cut).
+    for (int f = 0; f < 6; ++f)
+    {
+        p = mixer.frame(101 + static_cast<std::uint64_t>(f), ready).mes[1];
+        CHECK(p.stinger == 1 && p.stingerFrame == f && !p.mixing && p.a == in(1) && p.b == in(2));
+        CHECK(p.background() == (f >= 3 ? in(2) : in(1)));
+        CHECK(p.tPrev == stingerFadeT(f - 1, 3, 6) && p.t == stingerFadeT(f, 3, 6));
+    }
+    // After the last frame the buses have swapped.
+    p = mixer.frame(107, ready).mes[1];
+    CHECK(p.stinger == 0 && p.a == in(2) && p.preview == in(1) && !mixer.view()[0].mixing);
+    // Skipped grains advance it: grain s + 4 shows frame 4, past the end it ends.
+    CHECK(mixer.take(1, in(3), 0, std::nullopt, Transition::Stinger, Sting{1, 6, 2}) == MixResult::Ok);
+    CHECK(mixer.frame(200, ready).mes[1].stingerFrame == 0);
+    p = mixer.frame(204, ready).mes[1];
+    CHECK(p.stingerFrame == 4 && p.cutDone && p.background() == in(3));
+    p = mixer.frame(210, ready).mes[1];
+    CHECK(p.stinger == 1 && p.stingerFrame == 5);
+    CHECK(mixer.frame(211, ready).mes[1].a == in(3) && !mixer.view()[0].mixing);
+    // A Cut during a stinger ends it as if it had run to its end; its overlay stops.
+    CHECK(mixer.take(1, in(1), 0, in(3), Transition::Stinger, Sting{1, 10, 5}) == MixResult::Ok);
+    mixer.frame(300, ready);
+    CHECK(mixer.cut(1) == MixResult::Ok);
+    p = mixer.frame(301, ready).mes[1];
+    CHECK(p.stinger == 0 && p.a == in(1) && p.preview == in(3));
+    // A player that never gets ready: a cut after kStingerWait grains.
+    auto const waits = mixer.stingerWaits();
+    CHECK(mixer.take(1, in(4), 0, std::nullopt, Transition::Stinger, Sting{1, 10, 5}) == MixResult::Ok);
+    for (std::uint64_t k = 0; k < static_cast<std::uint64_t>(Mixer::kStingerWait); ++k)
+    {
+        CHECK(mixer.frame(400 + k, notReady).mes[1].a == in(1));
+    }
+    CHECK(mixer.stingerWaits() == waits + static_cast<std::uint64_t>(Mixer::kStingerWait) && mixer.stingerCuts() == 0);
+    p = mixer.frame(400 + static_cast<std::uint64_t>(Mixer::kStingerWait), notReady).mes[1];
+    CHECK(p.stinger == 0 && p.a == in(4) && mixer.stingerCuts() == 1 && !mixer.view()[0].mixing);
+    // A cut point past the end is clamped to the length (B only after the swap).
+    CHECK(mixer.take(1, in(2), 0, std::nullopt, Transition::Stinger, Sting{1, 3, 9}) == MixResult::Ok);
+    CHECK(!mixer.frame(500, ready).mes[1].cutDone && !mixer.frame(502, ready).mes[1].cutDone);
+    CHECK(mixer.frame(503, ready).mes[1].a == in(2));
+}
+
+TEST(stinger_background_sound)
+{
+    // The equal-power crossfade of the background sound runs over the frames cut − 2 … cut + 1.
+    CHECK(stingerFadeT(-1, 10, 50) == 0.f && stingerFadeT(7, 10, 50) == 0.f);
+    CHECK(stingerFadeT(8, 10, 50) == 0.25f && stingerFadeT(9, 10, 50) == 0.5f);
+    CHECK(stingerFadeT(10, 10, 50) == 0.75f && stingerFadeT(11, 10, 50) == 1.f && stingerFadeT(30, 10, 50) == 1.f);
+    // A cut at frame 0 starts the fade with the stinger; the last frame always ends on B.
+    CHECK(stingerFadeT(0, 0, 50) == 0.75f && stingerFadeT(1, 0, 50) == 1.f);
+    CHECK(stingerFadeT(47, 49, 50) == 0.25f && stingerFadeT(48, 49, 50) == 0.5f && stingerFadeT(49, 49, 50) == 1.f);
+    // One grain at the cut ramps from 0.5 to 0.75 and ends where the next grain starts.
+    std::vector<float> a(960, 1.f);
+    std::vector<float> b(960, 0.f);
+    std::vector<float> out(960);
+    crossfadeBlock(a.data(), b.data(), out.data(), out.size(), stingerFadeT(9, 10, 50), stingerFadeT(10, 10, 50));
+    CHECK(std::abs(out.back() - crossfade(0.75f).a) < 1e-6f && out.front() < crossfade(0.5f).a);
+    // Outside the window the background is exactly A or B.
+    crossfadeBlock(a.data(), b.data(), out.data(), out.size(), 0.f, 0.f);
+    CHECK(out.front() == 1.f && out.back() == 1.f);
+    crossfadeBlock(a.data(), b.data(), out.data(), out.size(), 1.f, 1.f);
+    CHECK(out.front() == 0.f && out.back() == 0.f);
 }
 
 TEST(downstream_keyer_gain)
@@ -556,6 +634,10 @@ TEST(sources_players_and_keys)
     CHECK(configThrows({{"FLOWXER_ENGINE_KEYS", R"([{"flow":"k1"}])"}}));
     CHECK(configThrows({{"FLOWXER_ENGINE_KEYS", R"([{"me":2}])"}}));
     CHECK(configThrows({{"FLOWXER_ENGINE_PLAYERS", R"(["x"])"}}));
+    // Stinger players: none unless FlowXer asks for them, at most 4.
+    CHECK_EQ(cfg.stingerPlayers, 0);
+    CHECK_EQ(loadConfig({{"FLOWXER_ENGINE_STINGER_PLAYERS", "2"}}).stingerPlayers, 2);
+    CHECK(configThrows({{"FLOWXER_ENGINE_STINGER_PLAYERS", "5"}}));
 }
 
 TEST(preview_contract)

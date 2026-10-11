@@ -340,8 +340,10 @@ struct Slot
     std::vector<std::uint8_t*> out;
     // The input grains this output grain read; released after the downloads.
     std::vector<std::shared_ptr<DevFrame>> held;
-    // The clip player frames of this grain (their audio goes into the PGM audio).
+    // The clip player and stinger player frames of this grain (their audio goes into the PGM
+    // audio).
     std::vector<std::shared_ptr<PlayerFrame>> players;
+    std::vector<std::shared_ptr<PlayerFrame>> stingers;
     std::uint64_t index = 0;
     std::uint64_t inputIndex = 0;
     // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done.
@@ -450,6 +452,8 @@ struct Engine::Impl
     std::vector<int> keySlot;
     int keyPoolSize = 0;
     std::vector<std::unique_ptr<ClipPlayer>> players;
+    // Stinger players: clip players with v210a pictures (alpha) and sound.
+    std::vector<std::unique_ptr<ClipPlayer>> stingers;
     // Video outputs (PGM of every ME, PVW with pvwOutputs), audio outputs (ME m PGM at m-1).
     std::vector<std::unique_ptr<Output>> outputs;
     std::vector<std::unique_ptr<Output>> audioOutputs;
@@ -653,6 +657,21 @@ struct Engine::Impl
             setup.channels = static_cast<std::size_t>(cfg.audioChannels);
             players.push_back(std::make_unique<ClipPlayer>(setup));
             allocated += players.back()->deviceBytes();
+        }
+        for (int s = 1; s <= cfg.stingerPlayers; ++s)
+        {
+            PlayerSetup setup;
+            setup.number = s;
+            setup.label = "Stinger " + std::to_string(s);
+            setup.width = cfg.width;
+            setup.height = cfg.height;
+            setup.rate = cfg.rate;
+            setup.gpu = cfg.gpu;
+            setup.frameBytes = frameBytes;
+            setup.keyRowBytes = keyRowBytes;
+            setup.channels = static_cast<std::size_t>(cfg.audioChannels);
+            stingers.push_back(std::make_unique<ClipPlayer>(setup));
+            allocated += stingers.back()->deviceBytes();
         }
         auto addWork = [&](std::vector<gpu::WorkBuffer>& list, std::size_t count) {
             list.resize(count);
@@ -1298,7 +1317,12 @@ struct Engine::Impl
     // Queues all GPU work of output grain `index` on the render stream (returns at once).
     void render(std::uint64_t index, Slot& slot)
     {
-        auto const plan = mixer.frame(index);
+        std::vector<bool> stingerReady(stingers.size());
+        for (std::size_t k = 0; k < stingers.size(); ++k)
+        {
+            stingerReady[k] = stingers[k]->ready();
+        }
+        auto const plan = mixer.frame(index, stingerReady);
         auto const& plans = plan.mes;
         std::uint64_t const j = inputIndexFor(index, cfg.latency);
         std::size_t const nIn = inputs.size();
@@ -1326,14 +1350,20 @@ struct Engine::Impl
                 onAir[static_cast<std::size_t>(key.settings.source.index - 1)] = true;
             }
         }
+        // A stinger player is on air while a stinger of it runs.
+        std::vector<bool> stingOnAir(stingers.size(), false);
         for (auto const& p : plans)
         {
             for (auto const& source : {p.a, p.b})
             {
-                if (source.kind == Source::Kind::Player && (source == p.a || p.mixing))
+                if (source.kind == Source::Kind::Player && (source == p.background() || p.mixing))
                 {
                     onAir[static_cast<std::size_t>(source.index - 1)] = true;
                 }
+            }
+            if (p.stinger > 0)
+            {
+                stingOnAir[static_cast<std::size_t>(p.stinger - 1)] = true;
             }
         }
         for (std::size_t k = 0; k < players.size(); ++k)
@@ -1345,6 +1375,11 @@ struct Engine::Impl
                 ready[nIn + k] = playerFrames[k]->ready;
             }
         }
+        std::vector<std::shared_ptr<PlayerFrame>> stingFrames(stingers.size());
+        for (std::size_t k = 0; k < stingers.size(); ++k)
+        {
+            stingFrames[k] = stingers[k]->frameFor(index, stingOnAir[k]);
+        }
         std::vector<bool> needed(nSrc, false);
         auto const need = [&](Source source) {
             int const s = sourceSlot(source);
@@ -1355,7 +1390,7 @@ struct Engine::Impl
         };
         for (auto const& p : plans)
         {
-            need(p.a);
+            need(p.background());
             if (p.mixing)
             {
                 need(p.b);
@@ -1419,10 +1454,11 @@ struct Engine::Impl
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
-            // Program in one pass: the background (A, a Mix or a Wipe to B), the upstream keyers,
-            // the DSKs, Fade to Black. Keys have no preview (Preview shows only its source).
+            // Program in one pass: the background (A, a Mix or a Wipe to B, or a stinger's A or B),
+            // the upstream keyers, the stinger, the DSKs, Fade to Black. Keys have no preview
+            // (Preview shows only its source).
             gpu::Compose job;
-            job.a = &workOf(p.a);
+            job.a = &workOf(p.background());
             job.b = p.mixing ? &workOf(p.b) : nullptr;
             job.t = p.mixing ? p.t : 0.f;
             job.wiping = p.wiping;
@@ -1430,8 +1466,23 @@ struct Engine::Impl
             {
                 job.wipe = makeWipe(p.wipe, p.t, cfg.width, cfg.height);
             }
-            for (bool const upstream : {true, false})
+            for (int stage = 0; stage < 3; ++stage)
             {
+                if (stage == 1)
+                {
+                    // The stinger: over the upstream keys, under the DSKs.
+                    auto const& frame = p.stinger > 0 ? stingFrames[static_cast<std::size_t>(p.stinger - 1)] : nullptr;
+                    if (frame && frame->v210 != nullptr && job.layerCount < gpu::kMaxLayers)
+                    {
+                        cudaStreamWaitEvent(st, frame->ready, 0);
+                        gpu::KeyLayer layer;
+                        layer.v210a = frame->v210;
+                        layer.gain = 1.f;
+                        job.layers[job.layerCount++] = layer;
+                    }
+                    continue;
+                }
+                bool const upstream = stage == 0;
                 for (auto const& key : plan.keys)
                 {
                     if (key.me != p.me || key.upstream != upstream || key.gain <= 0.f || job.layerCount >= gpu::kMaxLayers)
@@ -1497,6 +1548,7 @@ struct Engine::Impl
             }
         }
         slot.players = std::move(playerFrames);
+        slot.stingers = std::move(stingFrames);
         slot.index = index;
         slot.inputIndex = j;
         slot.plans = plans;
@@ -1625,6 +1677,7 @@ struct Engine::Impl
         slot.held.clear();
         writeAudio(slot, audio);
         slot.players.clear();
+        slot.stingers.clear();
         slot.busy.store(false);
     }
 
@@ -1771,7 +1824,7 @@ struct Engine::Impl
 
     // PGM audio of output grain `index`: the audio of the PGM source, read L grains back on the
     // same TAI grid as the video (a clip player's own audio of the grain), crossfaded (equal
-    // power) while a Mix runs.
+    // power) while a Mix runs and around a stinger's cut point; a stinger's sound is added.
     void audioGrain(std::uint64_t index, Slot const& slot, AudioRun& audio)
     {
         auto const& plans = slot.plans;
@@ -1789,7 +1842,7 @@ struct Engine::Impl
             for (auto const& source : {plan.a, plan.b})
             {
                 int const s = sourceSlot(source);
-                if (s >= 0 && (source == plan.a || plan.mixing))
+                if (s >= 0 && (source == plan.a || plan.mixing || plan.stinger > 0))
                 {
                     needed[static_cast<std::size_t>(s)] = true;
                 }
@@ -1837,13 +1890,14 @@ struct Engine::Impl
             return s >= 0 ? &audio.in[static_cast<std::size_t>(s)] : nullptr;
         };
         std::vector<float> const silence(ch * n, 0.f);
+        std::vector<float> sting;
         // Render order (ME n before ME m): a re-entered Program's audio is ready.
         for (auto const& plan : plans)
         {
             auto& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
             auto const* a = sourceOf(plan.a);
             a = a != nullptr && a->size() == ch * n ? a : &silence;
-            if (plan.mixing)
+            if (plan.mixing || plan.stinger > 0)
             {
                 auto const* b = sourceOf(plan.b);
                 b = b != nullptr && b->size() == ch * n ? b : &silence;
@@ -1856,6 +1910,16 @@ struct Engine::Impl
             else
             {
                 dst = *a;
+            }
+            auto const& stingFrame =
+                plan.stinger > 0 && static_cast<std::size_t>(plan.stinger) <= slot.stingers.size() ? slot.stingers[static_cast<std::size_t>(plan.stinger - 1)] : nullptr;
+            if (stingFrame && stingFrame->index == index && stingFrame->samples > 0)
+            {
+                copyPlayerAudio(*stingFrame, sting, n, ch);
+                for (std::size_t s = 0; s < dst.size(); ++s)
+                {
+                    dst[s] += sting[s];
+                }
             }
             // Fade to Black takes the sound with it, ramping within the grain.
             if (plan.ftb > 0.f || plan.ftbPrev > 0.f)
@@ -2104,9 +2168,12 @@ struct Engine::Impl
                 in->thread = std::thread([this, in] { inputMain(*in); });
             }
         }
-        for (auto& player : players)
+        for (auto* list : {&players, &stingers})
         {
-            player->start();
+            for (auto& player : *list)
+            {
+                player->start();
+            }
         }
         // The render thread starts once the writer has page-locked its grains.
         auto warm = writerWarm.get_future();
@@ -2118,7 +2185,8 @@ struct Engine::Impl
         }
         statsThread = std::thread([this] { statsMain(); });
         renderThread = std::thread([this] { renderMain(); });
-        logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"players", players.size()}, {"keys", keys.size()}, {"mes", cfg.mes},
+        logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"players", players.size()}, {"stinger_players", stingers.size()},
+                                      {"keys", keys.size()}, {"mes", cfg.mes},
                                       {"latency", cfg.latency}, {"pvw_outputs", cfg.pvwOutputs}, {"work_format", cfg.workFormat},
                                       {"device_mb", allocated / 1048576}});
     }
@@ -2158,10 +2226,14 @@ struct Engine::Impl
         {
             slot.held.clear();
             slot.players.clear();
+            slot.stingers.clear();
         }
-        for (auto& player : players)
+        for (auto* list : {&players, &stingers})
         {
-            player->stop();
+            for (auto& player : *list)
+            {
+                player->stop();
+            }
         }
         // The last writer's release deletes a flow (MXL): its readers see it again when the
         // next writer (this engine or the mixer it replaced) creates it.
@@ -2224,6 +2296,7 @@ struct Engine::Impl
         inputs.clear();
         keys.clear();
         players.clear();
+        stingers.clear();
         cudaStreamDestroy(renderStream);
         cudaStreamDestroy(downloadStream);
         logInfo("engine_stopped", {{"rendered", rendered.load()}, {"committed", committed.load()}, {"skipped", skipped.load()}});
@@ -2307,6 +2380,7 @@ struct Engine::Impl
             {"mes", cfg.mes},
             {"inputs", inputs.size()},
             {"players", players.size()},
+            {"stinger_players", stingers.size()},
             {"keys", keys.size()},
             {"pvw_outputs", cfg.pvwOutputs},
             {"work_format", cfg.workFormat},
@@ -2400,6 +2474,12 @@ struct Engine::Impl
             playerList.push_back(json::parse(player->statusJson()));
         }
         out["players"] = playerList;
+        json stingerList = json::array();
+        for (auto const& player : stingers)
+        {
+            stingerList.push_back(json::parse(player->statusJson()));
+        }
+        out["stingers"] = {{"players", stingerList}, {"waits", mixer.stingerWaits()}, {"cuts", mixer.stingerCuts()}};
         json mes = json::array();
         auto const flow = [](Output const& o) {
             return json{{"flow", o.id}, {"domain", o.domain}, {"label", o.label}, {"existing", o.existing}, {"committed", o.committed.load()},
@@ -2427,6 +2507,7 @@ struct Engine::Impl
                 {"ftb", round3(mixer.ftbGain(view.me))},
                 {"manual", view.manual},
                 {"t", round3(view.t)},
+                {"stinger", view.stinger},
                 {"next_transition", transitionName(view.next.type)},
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},
@@ -2525,6 +2606,24 @@ std::string Engine::playerCommand(int k, PlayerCommand const& command)
         return "no clip player " + std::to_string(k);
     }
     return impl_->players[static_cast<std::size_t>(k - 1)]->command(command);
+}
+
+std::string Engine::stingerCommand(int k, PlayerCommand const& command)
+{
+    if (k < 1 || k > static_cast<int>(impl_->stingers.size()))
+    {
+        return "no stinger player " + std::to_string(k);
+    }
+    return impl_->stingers[static_cast<std::size_t>(k - 1)]->command(command);
+}
+
+long long Engine::stingerFrames(int k) const
+{
+    if (k < 1 || k > static_cast<int>(impl_->stingers.size()))
+    {
+        return -1;
+    }
+    return impl_->stingers[static_cast<std::size_t>(k - 1)]->frames();
 }
 
 std::string Engine::statusJson() const

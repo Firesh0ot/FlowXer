@@ -85,6 +85,7 @@ json meView(Engine& engine, int me)
         {
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
                 {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
+                {"stinger", view.stinger},
                 {"transition", transitionJson(view.next)}};
         }
     }
@@ -200,7 +201,23 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "take needs a source (in<n>, cp<n>, black, me<n>) and integer frames");
         }
-        return mixResult(engine, mixer.take(me, *s, *n, preview, *type), me, "ME");
+        // A stinger: its player's loaded stinger and cut frame (a player without one cuts).
+        Sting sting;
+        if (*type == Transition::Stinger && body.contains("stinger"))
+        {
+            if (!body["stinger"].is_number_integer() || (body.contains("cut") && !body["cut"].is_number_integer()))
+            {
+                return error(400, "stinger (the player) and cut must be integers");
+            }
+            sting.player = body["stinger"].get<int>();
+            sting.cut = body.value("cut", 0);
+            sting.frames = static_cast<int>(engine.stingerFrames(sting.player));
+            if (sting.frames < 0)
+            {
+                return error(404, "no stinger player " + std::to_string(sting.player));
+            }
+        }
+        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting), me, "ME");
     }
     if (action == "cut")
     {
@@ -350,6 +367,26 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     if (int const k = pathNumber(request.path, "/player/", rest); k > 0)
     {
         return playerCommand(engine, k, rest, body);
+    }
+    if (int const k = pathNumber(request.path, "/stinger/", rest); k > 0 && rest == "load")
+    {
+        // A stinger onto stinger player k (path "" unloads): cued on its first frame, played by
+        // a take with type stinger.
+        PlayerCommand command;
+        command.action = PlayerCommand::Action::Load;
+        command.kind = "stinger";
+        command.path = text(body, "path");
+        command.alpha = text(body, "alpha");
+        command.audio = text(body, "audio");
+        command.channels = body.contains("channels") && body["channels"].is_number_integer() ? body["channels"].get<int>() : 0;
+        command.frames = body.contains("frames") && body["frames"].is_number_integer() ? body["frames"].get<long long>() : 0;
+        command.playOnCut = true;
+        auto const failed = engine.stingerCommand(k, command);
+        if (!failed.empty())
+        {
+            return error(failed.rfind("no stinger player", 0) == 0 ? 404 : 409, failed);
+        }
+        return reply(200, json{{"stinger", k}, {"frames", engine.stingerFrames(k)}});
     }
     if (int const k = pathNumber(request.path, "/keyer/", rest); k > 0)
     {

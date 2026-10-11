@@ -1,5 +1,7 @@
 #include "core/mixer.hpp"
 
+#include "core/audio.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -155,6 +157,8 @@ void Mixer::finishMix(Me& state)
     state.from = 0.f;
     state.after.reset();
     state.position = 0;
+    state.sting = Sting{};
+    state.waiting = false;
 }
 
 MixResult Mixer::setProgram(int me, Source source)
@@ -177,6 +181,8 @@ MixResult Mixer::setProgram(int me, Source source)
         state.from = 0.f;
         state.after.reset();
         state.position = 0;
+        state.sting = Sting{};
+        state.waiting = false;
         state.program = source;
     }
     notify();
@@ -227,7 +233,7 @@ MixResult Mixer::setTransition(int me, TransitionSettings const& settings)
     return MixResult::Ok;
 }
 
-MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview, Transition type)
+MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview, Transition type, Sting sting)
 {
     if (!validMe(me))
     {
@@ -245,7 +251,16 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
         std::lock_guard lock{mu_};
         auto& state = state_[static_cast<std::size_t>(me - 1)];
         finishMix(state);
-        if (frames == 0 || type == Transition::Cut || type == Transition::Stinger)
+        if (type == Transition::Stinger && sting.player > 0 && sting.frames > 0)
+        {
+            state.target = target;
+            state.after = preview;
+            state.frames = sting.frames;
+            state.sting = sting;
+            state.sting.cut = std::clamp(sting.cut, 0, sting.frames);
+            state.pending = true;
+        }
+        else if (frames == 0 || type == Transition::Cut || type == Transition::Stinger)
         {
             state.program = target;
             if (preview)
@@ -515,7 +530,7 @@ MixResult Mixer::keyAuto(int key, int frames)
     return MixResult::Ok;
 }
 
-FramePlan Mixer::frame(std::uint64_t index)
+FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerReady)
 {
     FramePlan out;
     bool ended = false;
@@ -523,7 +538,32 @@ FramePlan Mixer::frame(std::uint64_t index)
     for (int m = mes_; m >= 1; --m)
     {
         auto& state = state_[static_cast<std::size_t>(m - 1)];
-        if (state.pending)
+        if (state.pending && state.sting.player > 0)
+        {
+            // A stinger waits for its first frame (counted), at most kStingerWait grains; then
+            // it is a cut.
+            auto const p = static_cast<std::size_t>(state.sting.player - 1);
+            if (!state.waiting)
+            {
+                state.waiting = true;
+                state.start = index;
+            }
+            if (p < stingerReady.size() && stingerReady[p])
+            {
+                state.waiting = false;
+            }
+            else if (index - state.start < static_cast<std::uint64_t>(kStingerWait))
+            {
+                ++stingerWaits_;
+            }
+            else
+            {
+                ++stingerCuts_;
+                finishMix(state);
+                ended = true;
+            }
+        }
+        if (state.pending && !state.waiting)
         {
             state.pending = false;
             state.mixing = true;
@@ -555,6 +595,24 @@ FramePlan Mixer::frame(std::uint64_t index)
                 state.manual = false;
                 state.wiping = false;
                 state.after.reset();
+                ended = true;
+            }
+        }
+        else if (state.mixing && state.sting.player > 0)
+        {
+            // A stinger: its frame f in grain start + f, the background b from the cut point, the
+            // buses swapped after its last frame.
+            int const f = static_cast<int>(std::min<std::uint64_t>(index >= state.start ? index - state.start : 0,
+                static_cast<std::uint64_t>(state.frames - 1)));
+            plan.stinger = state.sting.player;
+            plan.stingerFrame = f;
+            plan.cutDone = f >= state.sting.cut;
+            plan.tPrev = stingerFadeT(f - 1, state.sting.cut, state.frames);
+            plan.t = stingerFadeT(f, state.sting.cut, state.frames);
+            state.position = f + 1;
+            if (f >= state.frames - 1)
+            {
+                finishMix(state);
                 ended = true;
             }
         }
@@ -614,10 +672,23 @@ std::vector<MeView> Mixer::view() const
         view.position = state.position;
         view.manual = state.manual;
         view.t = state.manual ? state.t : 0.f;
+        view.stinger = view.mixing ? state.sting.player : 0;
         view.next = state.next;
         views.push_back(view);
     }
     return views;
+}
+
+std::uint64_t Mixer::stingerWaits() const
+{
+    std::lock_guard lock{mu_};
+    return stingerWaits_;
+}
+
+std::uint64_t Mixer::stingerCuts() const
+{
+    std::lock_guard lock{mu_};
+    return stingerCuts_;
 }
 
 std::vector<KeyView> Mixer::keyView() const

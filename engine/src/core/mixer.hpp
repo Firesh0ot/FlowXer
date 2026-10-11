@@ -1,4 +1,4 @@
-// ME state: Program/Preview buses, Cut, Mix and Wipe, re-entry, the keyers (upstream and
+// ME state: Program/Preview buses, Cut, Mix, Wipe and Stinger, re-entry, the keyers (upstream and
 // downstream), Fade to Black. No GPU, no MXL: the control thread changes it, the render thread
 // takes one plan per output grain.
 #pragma once
@@ -41,7 +41,7 @@ struct Source
 std::optional<Source> parseSource(std::string const& text);
 std::string sourceName(Source source);
 
-// An ME's transition type. A stinger is a cut until stingers play (P3 M3).
+// An ME's transition type.
 enum class Transition
 {
     Cut,
@@ -63,6 +63,15 @@ struct TransitionSettings
     WipeSettings wipe;
 };
 
+// A stinger of a take: stinger player `player` (1-based) with its loaded stinger's frames and cut
+// frame (the background switches there).
+struct Sting
+{
+    int player = 0;
+    int frames = 0;
+    int cut = 0;
+};
+
 // What one ME renders for one output grain.
 struct MePlan
 {
@@ -76,11 +85,23 @@ struct MePlan
     bool mixing = false;
     bool wiping = false;
     WipeSettings wipe;
+    // A stinger from a to b: stinger player `stinger` (0: none) shows its frame `stingerFrame`
+    // over the upstream keys; the background is b from the cut point (`cutDone`). The background
+    // sound crossfades from a to b by tPrev..t (4 grains around the cut point).
+    int stinger = 0;
+    int stingerFrame = 0;
+    bool cutDone = false;
     Source preview;
     // Fade to Black over the ME's whole output (after the DSKs): its gain now and at the grain
     // before (the audio ramps between them).
     float ftb = 0.f;
     float ftbPrev = 0.f;
+
+    // The background picture (a, or b after a stinger's cut point; a Mix or Wipe adds b).
+    [[nodiscard]] Source background() const
+    {
+        return stinger > 0 && cutDone ? b : a;
+    }
 };
 
 // A keyer's settings: a linear key from its key input (v210a fill + key), or a luma key of a
@@ -137,6 +158,8 @@ struct MeView
     // A T-bar (position-driven) transition, held at t.
     bool manual = false;
     float t = 0.f;
+    // The stinger player of a running (or waiting) stinger, else 0.
+    int stinger = 0;
     TransitionSettings next;
 };
 
@@ -182,10 +205,11 @@ public:
     MixResult setPreview(int me, Source source);
     // The ME's next transition (type, rate, wipe). A running transition keeps its own.
     MixResult setTransition(int me, TransitionSettings const& settings);
-    // Program goes to `target`: at the next grain (a cut, a stinger, or frames 0), or by a Mix or
-    // the ME's Wipe over `frames` grains. Preview becomes `preview` when it is given (at the end
-    // of the transition). A take during a transition ends that one first (buses as at its end).
-    MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix);
+    // Program goes to `target`: at the next grain (a cut, or frames 0), by a Mix or the ME's Wipe
+    // over `frames` grains, or by the stinger `sting` (a stinger without one is a cut). Preview
+    // becomes `preview` when it is given (at the end of the transition). A take during a
+    // transition ends that one first (buses as at its end).
+    MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix, Sting sting = {});
     // Program and Preview swap at the next grain; a running transition ends there.
     MixResult cut(int me);
     // The ME's next transition from Program to Preview over `frames` grains (its rate when not
@@ -210,8 +234,11 @@ public:
 
     // Render thread: the plans of output grain `index`. A Mix starts at the first grain after the
     // command and its progress follows the grain index, so skipped grains do not stretch it. A
-    // Mix ends (buses swapped) after its last grain.
-    FramePlan frame(std::uint64_t index);
+    // Mix ends (buses swapped) after its last grain. A stinger starts at the first grain its
+    // player is ready for (`stingerReady[p - 1]`: its first frame decoded), at the latest after
+    // kStingerWait grains (then it is a cut); started at grain s it shows its frame f in grain
+    // s + f, switches the background at s + cut and ends after its last frame.
+    FramePlan frame(std::uint64_t index, std::vector<bool> const& stingerReady = {});
 
     [[nodiscard]] std::vector<MeView> view() const;
     [[nodiscard]] std::vector<KeyView> keyView() const;
@@ -225,8 +252,12 @@ public:
     {
         return mes_;
     }
+    // Grains stingers waited for their first frame, and stingers that became cuts after waiting.
+    [[nodiscard]] std::uint64_t stingerWaits() const;
+    [[nodiscard]] std::uint64_t stingerCuts() const;
 
     static constexpr int kMaxFrames = 1000;
+    static constexpr int kStingerWait = 50;
 
 private:
     struct Me
@@ -249,6 +280,9 @@ private:
         bool manual = false;
         float t = 0.f;
         float tLast = 0.f;
+        // A stinger (player 0: none); `waiting` while its player is not ready (since `start`).
+        Sting sting;
+        bool waiting = false;
         TransitionSettings next;
     };
     // A keyer's (with its place and settings) or an FTB's fade.
@@ -294,6 +328,8 @@ private:
     std::vector<Fade> keys_;
     // One Fade to Black per ME.
     std::vector<Fade> ftbs_;
+    std::uint64_t stingerWaits_ = 0;
+    std::uint64_t stingerCuts_ = 0;
     std::function<void()> changed_;
 };
 } // namespace fxeng

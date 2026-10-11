@@ -50,6 +50,11 @@ cudaError_t fillBlack(cudaStream_t stream, std::uint8_t* v210, int rowBytes, int
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes);
 
+// A stinger's alpha (the luma plane of a decoder picture, `pitch` bytes per line: 8-bit, or with
+// `deep` 16-bit samples holding 10 bits in their high bits) as a v210a key plane, full range
+// (8 bits widen to 10); without a plane a full key (1023).
+cudaError_t alphaToKey(cudaStream_t stream, std::uint8_t const* luma, int pitch, bool deep, int width, int height, std::uint8_t* key, int keyRowBytes);
+
 // A key layer: a linear key from a v210a fill + key (device; the key plane follows the fill,
 // `keyRowBytes` per line), α = key/1023 · gain (straight fill); or, with `luma` set, a luma key of
 // a work picture (yuv16 only), α = lumaAlpha(Y, clip, soft, invert, gain), the fill the picture

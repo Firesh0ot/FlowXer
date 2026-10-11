@@ -24,6 +24,11 @@ CrossfadeGains crossfade(float t);
 // sample) to t1 (at the last), so each grain continues where the previous one ended.
 void crossfadeBlock(float const* a, float const* b, float* out, std::size_t samples, float t0, float t1);
 
+// A stinger's background sound: an equal-power crossfade over the 4 grains around its cut point
+// (stinger frames cut − 2 … cut + 1). The t at the end of frame f (0 … frames − 1); frame f ramps
+// from the t at the end of frame f − 1, frame 0 from 0. The last frame ends at 1.
+float stingerFadeT(int f, int cut, int frames);
+
 // The 48 kHz sample range of output grain `index`: [first, end). It matches the grain's TAI
 // span; MXL continuous flows index samples on the same TAI clock.
 struct SampleRange
