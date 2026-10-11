@@ -107,6 +107,9 @@ ENV FLOWXER_MXL_ROOT=/Volumes/mxl
 ENV FLOWXER_STORAGE_ROOT=/storage
 ENV FLOWXER_MXL_REVISION=$MXL_REF
 ENV PYTHONUNBUFFERED=1
+# numpy's OpenBLAS starts a spinning thread per host core when it is first used (a clip's sound
+# crossfade): a burst that got the container throttled under a CPU limit, the engine with it.
+ENV OPENBLAS_NUM_THREADS=1
 
 # 9610 API, 3252/3253 NMOS; the engine's own MediaMTX (without PREVIEW_PUBLISH_URL): 8989 WHEP,
 # 8988 HLS, 8289/udp+tcp ICE. The engine's control port (9630) is on localhost only.
