@@ -121,6 +121,17 @@ export function SettingsModal({
             onChange={(e) => set("dsks_per_me", Number(e.target.value))}
           />
         </label>
+        <label>
+          Stinger players
+          <input
+            type="number"
+            min={0}
+            max={4}
+            value={form.stinger_players}
+            disabled={Boolean(pinned.stinger_players)}
+            onChange={(e) => set("stinger_players", Number(e.target.value))}
+          />
+        </label>
         {error ? <p className="error">{error}</p> : null}
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>

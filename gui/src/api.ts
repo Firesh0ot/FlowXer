@@ -98,6 +98,7 @@ export interface LibraryItem {
   ready: boolean;
   playback: string;
   has_alpha: boolean;
+  has_sound: boolean;
   cut_frame?: number | null;
   cut_ms?: number | null;
   frame_count: number;
@@ -138,6 +139,7 @@ export interface WorkspaceConfig {
   stinger_count: number;
   keyers_per_me: number;
   dsks_per_me: number;
+  stinger_players: number;
   source_tile_aspect?: "16:9" | "9:16";
 }
 
