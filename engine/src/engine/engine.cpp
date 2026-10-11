@@ -1306,18 +1306,27 @@ struct Engine::Impl
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
-            gpu::mix(st, workOf(p.a), p.mixing ? &workOf(p.b) : nullptr, p.mixing ? p.t : 0.f, pgmWork[me]);
-            gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
-            // Downstream keyers over the ME's Program only: keys have no preview (Preview shows
-            // only its source).
+            // Program in one pass: the background (A, a Mix or a Wipe to B), then the downstream
+            // keyers. Keys have no preview (Preview shows only its source).
+            gpu::Compose job;
+            job.a = &workOf(p.a);
+            job.b = p.mixing ? &workOf(p.b) : nullptr;
+            job.t = p.mixing ? p.t : 0.f;
+            job.wiping = p.wiping;
+            if (p.wiping)
+            {
+                job.wipe = makeWipe(p.wipe, p.t, cfg.width, cfg.height);
+            }
             for (auto const& dsk : plan.dsks)
             {
                 auto const& frame = dsk.me == p.me && dsk.gain > 0.f ? keyFrames[static_cast<std::size_t>(dsk.key - 1)] : nullptr;
-                if (frame)
+                if (frame && job.layerCount < gpu::kMaxLayers)
                 {
-                    gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pgmWork[me]);
+                    job.layers[job.layerCount++] = gpu::KeyLayer{frame->data, dsk.gain};
                 }
             }
+            gpu::compose(st, job, rowBytes, keyRowBytes, pgmWork[me]);
+            gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
             cudaEventRecord(*mark++, st);
         }
         for (std::size_t me = 0; me < pgmWork.size(); ++me)
@@ -2233,6 +2242,8 @@ struct Engine::Impl
                 {"program", sourceName(view.program)},
                 {"preview", sourceName(view.preview)},
                 {"mixing", view.mixing},
+                {"wiping", view.wiping},
+                {"next_transition", transitionName(view.next.type)},
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},
                 {"position", view.position},

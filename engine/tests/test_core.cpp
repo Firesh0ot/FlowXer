@@ -7,6 +7,7 @@
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
 #include "core/v210.hpp"
+#include "core/wipe.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -161,3 +162,142 @@ TEST(ycbcr_rgb_round_trip)
     CHECK_EQ(static_cast<int>(to8(1023)), 255);
 }
 
+
+// ---- wipes ------------------------------------------------------------------------------
+
+namespace
+{
+float patternAt(int code, int x, int y, bool reverse = false, int w = 1920, int h = 1080)
+{
+    WipeSettings set;
+    set.pattern = code;
+    set.reverse = reverse;
+    return wipePattern(makeWipe(set, 0.5f, w, h), x, y);
+}
+} // namespace
+
+TEST(wipe_codes_at_known_points)
+{
+    int const w = 1920;
+    int const h = 1080;
+    // Bars: left edge first, right edge last; top first, bottom last.
+    CHECK(patternAt(1, 0, 500) < 0.001f && patternAt(1, w - 1, 500) > 0.999f);
+    CHECK(patternAt(2, 900, 0) < 0.001f && patternAt(2, 900, h - 1) > 0.999f);
+    // Corner boxes start in their corner, centre boxes and irises in the centre.
+    CHECK(patternAt(3, 0, 0) < 0.001f && patternAt(5, w - 1, h - 1) < 0.001f && patternAt(4, w - 1, 0) < 0.001f && patternAt(6, 0, h - 1) < 0.001f);
+    CHECK(patternAt(3, w - 1, h - 1) > 0.999f);
+    for (int code : {101, 102, 119})
+    {
+        CHECK(patternAt(code, w / 2, h / 2) < 0.002f);
+        CHECK(patternAt(code, 0, 0) > 0.99f);
+    }
+    // Edge boxes start at the middle of their edge.
+    CHECK(patternAt(23, w / 2, 0) < 0.002f && patternAt(24, w - 1, h / 2) < 0.002f && patternAt(25, w / 2, h - 1) < 0.002f &&
+          patternAt(26, 0, h / 2) < 0.002f);
+    // Barn doors open from the centre line; diagonals from their corner.
+    CHECK(patternAt(21, w / 2, 0) < 0.002f && patternAt(21, 0, 0) > 0.99f);
+    CHECK(patternAt(22, 0, h / 2) < 0.002f && patternAt(22, 0, 0) > 0.99f);
+    CHECK(patternAt(41, 0, 0) < 0.001f && patternAt(41, w - 1, h - 1) > 0.999f);
+    CHECK(patternAt(42, w - 1, 0) < 0.001f && patternAt(42, 0, h - 1) > 0.999f);
+    CHECK(patternAt(45, 0, h - 1) < 0.002f && patternAt(46, 0, 0) < 0.002f && patternAt(46, w - 1, 0) > 0.99f);
+    // The circle is round in pixels: the same s 400 pixels right of and below the centre.
+    CHECK(std::abs(patternAt(119, w / 2 + 400, h / 2) - patternAt(119, w / 2, h / 2 + 400)) < 0.001f);
+    // Clock: clockwise from 12, 3, 6, 9 o'clock.
+    CHECK(patternAt(201, w / 2 + 2, 0) < 0.01f);
+    CHECK(std::abs(patternAt(201, w - 1, h / 2) - 0.25f) < 0.001f);
+    CHECK(std::abs(patternAt(201, w / 2, h - 1) - 0.5f) < 0.001f);
+    CHECK(std::abs(patternAt(201, 0, h / 2) - 0.75f) < 0.001f);
+    CHECK(patternAt(202, w - 1, h / 2 + 1) < 0.01f && patternAt(203, w / 2 - 1, h - 1) < 0.01f && patternAt(204, 0, h / 2 - 1) < 0.01f);
+    // Reverse runs every pattern backwards.
+    for (int code : kWipeCodes)
+    {
+        for (auto [x, y] : {std::pair{17, 33}, std::pair{960, 540}, std::pair{1800, 1000}})
+        {
+            CHECK(patternAt(code, x, y, true) == 1.f - patternAt(code, x, y));
+        }
+    }
+    CHECK(wipeCodeValid(119) && !wipeCodeValid(7) && !wipeCodeValid(0));
+    CHECK_EQ(sizeof(kWipeCodes) / sizeof(kWipeCodes[0]), 23u);
+}
+
+TEST(wipe_end_points_are_exact)
+{
+    // t = 0 is A and t = 1 is B everywhere, for every code, softness, border and direction.
+    int const w = 96;
+    int const h = 54;
+    Planar422 a;
+    Planar422 b;
+    a.allocate(w, h);
+    b.allocate(w, h);
+    fillRandom(a, 3);
+    fillRandom(b, 4);
+    Planar422 out;
+    int errors = 0;
+    for (int code : kWipeCodes)
+    {
+        for (float soft : {0.f, 0.08f, 1.f})
+        {
+            for (float border : {0.f, 0.03f, 1.f})
+            {
+                for (bool reverse : {false, true})
+                {
+                    WipeSettings set;
+                    set.pattern = code;
+                    set.reverse = reverse;
+                    set.soft = soft;
+                    set.border = border;
+                    wipeFrame(a, b, makeWipe(set, 0.f, w, h), out);
+                    errors += !(out.y == a.y && out.cb == a.cb && out.cr == a.cr);
+                    wipeFrame(a, b, makeWipe(set, 1.f, w, h), out);
+                    errors += !(out.y == b.y && out.cb == b.cb && out.cr == b.cr);
+                }
+            }
+        }
+    }
+    CHECK_EQ(errors, 0);
+}
+
+TEST(wipe_soft_edge_and_border)
+{
+    // A horizontal bar on a 1000-pixel line at t = 0.5: A = 100, B = 900.
+    int const w = 1000;
+    int const h = 2;
+    Planar422 a;
+    Planar422 b;
+    a.allocate(w, h);
+    b.allocate(w, h);
+    std::fill(a.y.begin(), a.y.end(), static_cast<std::uint16_t>(100));
+    std::fill(b.y.begin(), b.y.end(), static_cast<std::uint16_t>(900));
+    std::fill(a.cb.begin(), a.cb.end(), static_cast<std::uint16_t>(512));
+    std::fill(b.cb.begin(), b.cb.end(), static_cast<std::uint16_t>(512));
+    a.cr = a.cb;
+    b.cr = b.cb;
+    WipeSettings set;
+    Planar422 out;
+    // Hard: B left of the front (F = 0.5), A right of it.
+    wipeFrame(a, b, makeWipe(set, 0.5f, w, h), out);
+    CHECK(out.y[0] == 900 && out.y[499] == 900 && out.y[500] == 100 && out.y[999] == 100);
+    // Soft 0.1: F = 0.55, a linear ramp from B to A over 100 pixels (s 0.45 .. 0.55).
+    set.soft = 0.1f;
+    wipeFrame(a, b, makeWipe(set, 0.5f, w, h), out);
+    CHECK(out.y[440] == 900 && out.y[560] == 100);
+    CHECK(std::abs(static_cast<int>(out.y[500]) - 500) <= 5);
+    for (int x = 441; x < 560; ++x)
+    {
+        CHECK(out.y[static_cast<std::size_t>(x)] <= out.y[static_cast<std::size_t>(x - 1)]);
+    }
+    // Hard with a border of 0.1 in grey 600: F = 0.55; B up to s = 0.45, the border to 0.55.
+    set.soft = 0.f;
+    set.border = 0.1f;
+    set.borderY = 600;
+    wipeFrame(a, b, makeWipe(set, 0.5f, w, h), out);
+    CHECK(out.y[440] == 900 && out.y[460] == 600 && out.y[540] == 600 && out.y[560] == 100);
+    // Chroma takes the mean of its pair's masks: the pair across the hard edge at x = 499/500.
+    set.border = 0.f;
+    std::fill(b.cb.begin(), b.cb.end(), static_cast<std::uint16_t>(712));
+    WipeSettings odd;
+    wipeFrame(a, b, makeWipe(odd, 0.501f, w, h), out);
+    CHECK_EQ(out.y[500], 900);
+    CHECK_EQ(out.y[501], 100);
+    CHECK_EQ(out.cb[250], 612);
+}

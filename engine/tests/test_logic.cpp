@@ -96,9 +96,9 @@ TEST(mix_follows_the_grain_index)
     Mixer mixer(1, 8);
     CHECK(mixer.setProgram(1, in(1)) == MixResult::Ok);
     CHECK(mixer.setPreview(1, in(2)) == MixResult::Ok);
-    CHECK(mixer.autoMix(1, 0) == MixResult::BadFrames);
-    CHECK(mixer.autoMix(1, 4) == MixResult::Ok);
-    CHECK(mixer.autoMix(1, 4) == MixResult::Busy);
+    CHECK(mixer.autoTransition(1, 0) == MixResult::BadFrames);
+    CHECK(mixer.autoTransition(1, 4) == MixResult::Ok);
+    CHECK(mixer.autoTransition(1, 4) == MixResult::Busy);
     auto p = mixer.frame(100).mes;
     CHECK(p[0].mixing);
     CHECK(p[0].t == 0.25f);
@@ -123,7 +123,7 @@ TEST(cut_swaps_and_ends_a_mix)
     auto p = mixer.frame(1).mes;
     CHECK(p[0].a == in(2));
     CHECK(p[0].preview == in(1));
-    CHECK(mixer.autoMix(1, 50) == MixResult::Ok);
+    CHECK(mixer.autoTransition(1, 50) == MixResult::Ok);
     mixer.frame(2);
     CHECK(mixer.view()[0].mixing);
     CHECK(mixer.cut(1) == MixResult::Ok);
@@ -173,6 +173,76 @@ TEST(take_with_explicit_preview)
     CHECK(p[0].a == in(1) && p[0].preview == in(3));
     CHECK(mixer.take(1, in(9), 0, std::nullopt) == MixResult::BadSource);
     CHECK(mixer.take(1, in(1), 1001, std::nullopt) == MixResult::BadFrames);
+}
+
+TEST(transition_types_and_wipes)
+{
+    Mixer mixer(2, 4);
+    mixer.setProgram(1, in(1));
+    mixer.setPreview(1, in(2));
+    // The ME's next transition: a circle wipe at 4 grains.
+    TransitionSettings next;
+    next.type = Transition::Wipe;
+    next.frames = 4;
+    next.wipe.pattern = 119;
+    next.wipe.soft = 0.05f;
+    CHECK(mixer.setTransition(1, next) == MixResult::Ok);
+    CHECK(mixer.view()[0].next.type == Transition::Wipe && mixer.view()[0].next.wipe.pattern == 119);
+    // Auto runs it over its rate, then the buses swap.
+    CHECK(mixer.autoTransition(1) == MixResult::Ok);
+    CHECK(mixer.autoTransition(1) == MixResult::Busy);
+    // A change of the next transition does not touch the running one.
+    next.wipe.pattern = 1;
+    CHECK(mixer.setTransition(1, next) == MixResult::Ok);
+    auto p = mixer.frame(10).mes;
+    CHECK(p[1].me == 1 && p[1].mixing && p[1].wiping && p[1].wipe.pattern == 119 && p[1].t == 0.25f);
+    CHECK(!p[0].mixing && !p[0].wiping);
+    CHECK(mixer.view()[0].wiping && mixer.view()[0].frames == 4);
+    p = mixer.frame(13).mes;
+    CHECK(p[1].wiping && p[1].t == 1.f && p[1].b == in(2));
+    p = mixer.frame(14).mes;
+    CHECK(!p[1].mixing && !p[1].wiping && p[1].a == in(2) && p[1].preview == in(1));
+    // An explicit rate overrides the ME's; the next wipe is the bar.
+    CHECK(mixer.autoTransition(1, 2) == MixResult::Ok);
+    p = mixer.frame(15).mes;
+    CHECK(p[1].wiping && p[1].wipe.pattern == 1 && p[1].t == 0.5f);
+    // A Cut during a wipe ends it as if it had run to its end (the target stays on Program).
+    CHECK(mixer.cut(1) == MixResult::Ok);
+    p = mixer.frame(16).mes;
+    CHECK(!p[1].mixing && !p[1].wiping && p[1].a == in(1) && p[1].preview == in(2));
+    // A take with a type: wipe, mix, cut; a stinger is a cut until stingers play.
+    CHECK(mixer.take(1, in(3), 2, std::nullopt, Transition::Wipe) == MixResult::Ok);
+    p = mixer.frame(17).mes;
+    CHECK(p[1].wiping && p[1].b == in(3));
+    mixer.frame(18);
+    CHECK(mixer.take(1, in(4), 2, std::nullopt, Transition::Mix) == MixResult::Ok);
+    p = mixer.frame(19).mes;
+    CHECK(p[1].mixing && !p[1].wiping && p[1].a == in(3) && p[1].b == in(4));
+    CHECK(mixer.take(1, in(1), 25, std::nullopt, Transition::Stinger) == MixResult::Ok);
+    p = mixer.frame(20).mes;
+    CHECK(!p[1].mixing && p[1].a == in(1));
+    CHECK(mixer.take(1, in(2), 25, std::nullopt, Transition::Cut) == MixResult::Ok);
+    CHECK(mixer.frame(21).mes[1].a == in(2) && !mixer.view()[0].mixing);
+    // A stinger as the next type: Auto is a cut (buses swapped at the next grain).
+    next.type = Transition::Stinger;
+    CHECK(mixer.setTransition(1, next) == MixResult::Ok);
+    mixer.setPreview(1, in(3));
+    CHECK(mixer.autoTransition(1) == MixResult::Ok);
+    p = mixer.frame(22).mes;
+    CHECK(!p[1].mixing && p[1].a == in(3) && p[1].preview == in(2));
+    // Checks.
+    next.wipe.pattern = 7;
+    CHECK(mixer.setTransition(1, next) == MixResult::BadPattern);
+    next.wipe.pattern = 1;
+    next.wipe.soft = 1.5f;
+    CHECK(mixer.setTransition(1, next) == MixResult::BadPattern);
+    next.wipe.soft = 0.f;
+    next.frames = 0;
+    CHECK(mixer.setTransition(1, next) == MixResult::BadFrames);
+    next.frames = 25;
+    CHECK(mixer.setTransition(3, next) == MixResult::BadMe);
+    CHECK(parseTransition("wipe") == Transition::Wipe && !parseTransition("Wipe").has_value());
+    CHECK(transitionName(Transition::Stinger) == "stinger");
 }
 
 TEST(downstream_keyer_gain)

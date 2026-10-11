@@ -53,6 +53,34 @@ std::string sourceName(Source source)
     return "black";
 }
 
+std::optional<Transition> parseTransition(std::string const& text)
+{
+    for (auto type : {Transition::Cut, Transition::Mix, Transition::Wipe, Transition::Stinger})
+    {
+        if (text == transitionName(type))
+        {
+            return type;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string transitionName(Transition type)
+{
+    switch (type)
+    {
+    case Transition::Cut:
+        return "cut";
+    case Transition::Mix:
+        return "mix";
+    case Transition::Wipe:
+        return "wipe";
+    case Transition::Stinger:
+        break;
+    }
+    return "stinger";
+}
+
 Mixer::Mixer(int mes, int inputs, int players, std::vector<int> dskMes)
     : mes_(std::max(1, mes))
     , inputs_(std::max(0, inputs))
@@ -120,6 +148,7 @@ void Mixer::finishMix(Me& state)
     }
     state.pending = false;
     state.mixing = false;
+    state.wiping = false;
     state.after.reset();
     state.position = 0;
 }
@@ -139,6 +168,7 @@ MixResult Mixer::setProgram(int me, Source source)
         auto& state = state_[static_cast<std::size_t>(me - 1)];
         state.pending = false;
         state.mixing = false;
+        state.wiping = false;
         state.after.reset();
         state.position = 0;
         state.program = source;
@@ -168,7 +198,30 @@ MixResult Mixer::setPreview(int me, Source source)
     return MixResult::Ok;
 }
 
-MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview)
+MixResult Mixer::setTransition(int me, TransitionSettings const& settings)
+{
+    if (!validMe(me))
+    {
+        return MixResult::BadMe;
+    }
+    if (settings.frames < 1 || settings.frames > kMaxFrames)
+    {
+        return MixResult::BadFrames;
+    }
+    if (!wipeCodeValid(settings.wipe.pattern) || !(settings.wipe.soft >= 0.f && settings.wipe.soft <= 1.f) ||
+        !(settings.wipe.border >= 0.f && settings.wipe.border <= 1.f))
+    {
+        return MixResult::BadPattern;
+    }
+    {
+        std::lock_guard lock{mu_};
+        state_[static_cast<std::size_t>(me - 1)].next = settings;
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview, Transition type)
 {
     if (!validMe(me))
     {
@@ -186,7 +239,7 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
         std::lock_guard lock{mu_};
         auto& state = state_[static_cast<std::size_t>(me - 1)];
         finishMix(state);
-        if (frames == 0)
+        if (frames == 0 || type == Transition::Cut || type == Transition::Stinger)
         {
             state.program = target;
             if (preview)
@@ -200,6 +253,8 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
             state.after = preview;
             state.frames = frames;
             state.pending = true;
+            state.wiping = type == Transition::Wipe;
+            state.wipe = state.next.wipe;
         }
     }
     notify();
@@ -223,18 +278,19 @@ MixResult Mixer::cut(int me)
     return take(me, preview, 0, program);
 }
 
-MixResult Mixer::autoMix(int me, int frames)
+MixResult Mixer::autoTransition(int me, std::optional<int> frames)
 {
     if (!validMe(me))
     {
         return MixResult::BadMe;
     }
-    if (frames < 1 || frames > kMaxFrames)
+    if (frames && (*frames < 1 || *frames > kMaxFrames))
     {
         return MixResult::BadFrames;
     }
     Source program;
     Source preview;
+    TransitionSettings next;
     {
         std::lock_guard lock{mu_};
         auto const& state = state_[static_cast<std::size_t>(me - 1)];
@@ -244,8 +300,9 @@ MixResult Mixer::autoMix(int me, int frames)
         }
         program = state.program;
         preview = state.preview;
+        next = state.next;
     }
-    return take(me, preview, frames, program);
+    return take(me, preview, frames.value_or(next.frames), program, next.type);
 }
 
 MixResult Mixer::dskSet(int key, bool on)
@@ -310,6 +367,8 @@ FramePlan Mixer::frame(std::uint64_t index)
         plan.a = state.program;
         plan.b = state.mixing ? state.target : state.preview;
         plan.preview = state.preview;
+        plan.wiping = state.mixing && state.wiping;
+        plan.wipe = state.wipe;
         if (state.mixing)
         {
             auto const done = index >= state.start ? index - state.start + 1 : 1;
@@ -370,9 +429,11 @@ std::vector<MeView> Mixer::view() const
         view.program = state.program;
         view.preview = state.preview;
         view.mixing = state.mixing || state.pending;
+        view.wiping = view.mixing && state.wiping;
         view.target = view.mixing ? state.target : state.program;
         view.frames = view.mixing ? state.frames : 0;
         view.position = state.position;
+        view.next = state.next;
         views.push_back(view);
     }
     return views;

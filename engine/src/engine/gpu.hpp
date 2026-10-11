@@ -3,6 +3,8 @@
 // same author).
 #pragma once
 
+#include "core/wipe.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
@@ -48,9 +50,30 @@ cudaError_t fillBlack(cudaStream_t stream, std::uint8_t* v210, int rowBytes, int
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes);
 
-// Keys a v210a fill + key (device; the key plane follows the fill, `keyRowBytes` per line) over
-// a work picture: out = fill·α + out·(1 − α), α = key/1023 · gain (straight fill).
-cudaError_t keyV210a(cudaStream_t stream, std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, WorkBuffer& io);
+// A key layer: a v210a fill + key (device; the key plane follows the fill, `keyRowBytes` per
+// line) keyed at `gain`: out = fill·α + out·(1 − α), α = key/1023 · gain (straight fill).
+struct KeyLayer
+{
+    std::uint8_t const* v210a = nullptr;
+    float gain = 0.f;
+};
+constexpr int kMaxLayers = 14;
+
+// One ME's Program in one pass (docs/engine-p3.md §2): the background (A; the dissolve of A to B
+// at t; or the wipe of A to B), then the key layers in order, written once. In yuv16 one fused
+// kernel; in rgba16f separate passes.
+struct Compose
+{
+    WorkBuffer const* a = nullptr;
+    // A transition to b runs when it is set.
+    WorkBuffer const* b = nullptr;
+    float t = 0.f;
+    bool wiping = false;
+    Wipe wipe;
+    KeyLayer layers[kMaxLayers];
+    int layerCount = 0;
+};
+cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int keyRowBytes, WorkBuffer& out);
 
 struct MosaicSource
 {
@@ -71,7 +94,7 @@ constexpr int kMaxMosaicTiles = 16;
 cudaError_t mosaic(cudaStream_t stream, MosaicSource const* tiles, int count, std::uint8_t* luma, int lumaPitch, std::uint8_t* chroma, int chromaPitch);
 
 // Kernel checks against the CPU reference on the current device: v210 round trip (yuv16
-// exact, rgba16f within 2 codes), dissolve (exact), mosaic. `report` says what was checked
-// or what failed.
+// exact, rgba16f within 2 codes), dissolve (exact), every wipe code (bit-exact), the fused compose
+// with key layers (exact), mosaic. `report` says what was checked or what failed.
 bool selfTest(std::string& report);
 } // namespace fxeng::gpu

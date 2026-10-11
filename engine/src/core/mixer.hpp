@@ -1,6 +1,8 @@
-// ME state: Program/Preview buses, Cut and Mix, re-entry, the downstream keyers. No GPU, no MXL:
-// the control thread changes it, the render thread takes one plan per output grain.
+// ME state: Program/Preview buses, Cut, Mix and Wipe, re-entry, the downstream keyers. No GPU, no
+// MXL: the control thread changes it, the render thread takes one plan per output grain.
 #pragma once
+
+#include "core/wipe.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -38,17 +40,41 @@ struct Source
 std::optional<Source> parseSource(std::string const& text);
 std::string sourceName(Source source);
 
+// An ME's transition type. A stinger is a cut until stingers play (P3 M3).
+enum class Transition
+{
+    Cut,
+    Mix,
+    Wipe,
+    Stinger
+};
+
+// "cut", "mix", "wipe", "stinger"; nothing for anything else.
+std::optional<Transition> parseTransition(std::string const& text);
+std::string transitionName(Transition type);
+
+// The ME's next transition: what Auto runs, and the wipe a take with type wipe uses.
+struct TransitionSettings
+{
+    Transition type = Transition::Mix;
+    // The rate in grains.
+    int frames = 25;
+    WipeSettings wipe;
+};
+
 // What one ME renders for one output grain.
 struct MePlan
 {
     int me = 1;
-    // Program: a, dissolving to b by t while `mixing`.
+    // Program: a, going to b by t while `mixing` (a Mix, or a Wipe when `wiping`).
     Source a;
     Source b;
     float t = 0.f;
     // t of the grain before (the audio crossfade ramps from tPrev to t within the grain).
     float tPrev = 0.f;
     bool mixing = false;
+    bool wiping = false;
+    WipeSettings wipe;
     Source preview;
 };
 
@@ -72,12 +98,15 @@ struct MeView
     int me = 1;
     Source program;
     Source preview;
+    // A transition runs (Mix or Wipe).
     bool mixing = false;
-    // The source a running Mix goes to.
+    bool wiping = false;
+    // The source a running transition goes to.
     Source target;
     int frames = 0;
-    // Grains of the running Mix already rendered (0 while it waits for its first grain).
+    // Grains of the running transition already rendered (0 while it waits for its first grain).
     int position = 0;
+    TransitionSettings next;
 };
 
 struct DskView
@@ -96,6 +125,7 @@ enum class MixResult
     BadMe,
     BadSource,
     BadFrames,
+    BadPattern,
     Busy
 };
 
@@ -111,18 +141,21 @@ public:
     // ME count .. 1.
     [[nodiscard]] std::vector<int> renderOrder() const;
 
-    // Immediate: ends a running Mix on that ME.
+    // Immediate: ends a running transition on that ME.
     MixResult setProgram(int me, Source source);
-    // Immediate; a running Mix keeps going (and no longer changes Preview at its end).
+    // Immediate; a running transition keeps going (and no longer changes Preview at its end).
     MixResult setPreview(int me, Source source);
-    // Program goes to `target`: at the next grain (frames 0) or by a dissolve over `frames`
-    // grains. Preview becomes `preview` when it is given (at the end of the Mix). A take during a
-    // Mix ends that Mix first (buses as at its end).
-    MixResult take(int me, Source target, int frames, std::optional<Source> preview);
-    // Program and Preview swap at the next grain; a running Mix ends there.
+    // The ME's next transition (type, rate, wipe). A running transition keeps its own.
+    MixResult setTransition(int me, TransitionSettings const& settings);
+    // Program goes to `target`: at the next grain (a cut, a stinger, or frames 0), or by a Mix or
+    // the ME's Wipe over `frames` grains. Preview becomes `preview` when it is given (at the end
+    // of the transition). A take during a transition ends that one first (buses as at its end).
+    MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix);
+    // Program and Preview swap at the next grain; a running transition ends there.
     MixResult cut(int me);
-    // Dissolve Program to Preview over `frames` grains, then swap the buses.
-    MixResult autoMix(int me, int frames);
+    // The ME's next transition from Program to Preview over `frames` grains (its rate when not
+    // given), then the buses swap.
+    MixResult autoTransition(int me, std::optional<int> frames = std::nullopt);
 
     // Downstream keyer k (1-based): on or off at the next grain, or a fade to the other state over
     // `frames` grains (an auto during an auto turns back from where it is).
@@ -159,8 +192,12 @@ private:
         int frames = 0;
         bool pending = false;
         bool mixing = false;
+        // The running transition is a wipe, with these settings (taken when it starts).
+        bool wiping = false;
+        WipeSettings wipe;
         std::uint64_t start = 0;
         int position = 0;
+        TransitionSettings next;
     };
     struct Dsk
     {
@@ -179,7 +216,7 @@ private:
     {
         return me >= 1 && me <= mes_;
     }
-    // Ends a pending or running Mix as if it had run to its end. Lock held.
+    // Ends a pending or running transition as if it had run to its end. Lock held.
     static void finishMix(Me& state);
     void notify() const
     {

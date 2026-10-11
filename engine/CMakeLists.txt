@@ -16,7 +16,7 @@ find_package(Threads REQUIRED)
 find_package(nlohmann_json 3 REQUIRED)
 
 # Pure logic (no CUDA, no MXL): config, ME state, mosaic map, TAI arithmetic, v210 reference,
-# audio crossfade.
+# audio crossfade, wipe reference.
 add_library(fxeng-core STATIC
     src/core/audio.cpp
     src/core/config.cpp
@@ -25,10 +25,13 @@ add_library(fxeng-core STATIC
     src/core/playout.cpp
     src/core/tai.cpp
     src/core/v210.cpp
+    src/core/wipe.cpp
 )
 target_include_directories(fxeng-core PUBLIC src)
 target_link_libraries(fxeng-core PUBLIC Threads::Threads nlohmann_json::nlohmann_json)
 target_compile_options(fxeng-core PRIVATE -Wall -Wextra)
+# No FMA contraction anywhere: the CPU wipe reference and the kernels agree bit for bit.
+target_compile_options(fxeng-core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
 
 if(FXENG_BUILD_TESTS)
     enable_testing()
@@ -61,7 +64,7 @@ if(FXENG_BUILD_ENGINE)
     )
     set_target_properties(flowxer-engine PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Static)
     target_compile_definitions(flowxer-engine PRIVATE FXENG_VERSION="${PROJECT_VERSION}")
-    target_compile_options(flowxer-engine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
+    target_compile_options(flowxer-engine PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra> $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false -Xcompiler=-ffp-contract=off>)
     # libcuda and libnvidia-ml come from the NVIDIA container toolkit at run time (NVML is dlopened).
     target_link_libraries(flowxer-engine PRIVATE fxeng-core mxl::mxl CUDA::cudart_static PkgConfig::AV ${CMAKE_DL_LIBS})
     install(TARGETS flowxer-engine RUNTIME DESTINATION bin)
