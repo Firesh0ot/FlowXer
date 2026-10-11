@@ -323,5 +323,5 @@ TEST(wipe_vectors_for_the_gui)
         float const s = patternAt(v[0].get<int>(), v[1].get<int>(), v[2].get<int>(), false, w, h);
         worst = std::max(worst, std::abs(s - v[3].get<float>()));
     }
-    CHECK(worst < 1e-5f);
+    CHECK(worst < 1e-6f);
 }
