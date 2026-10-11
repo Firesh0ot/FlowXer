@@ -143,6 +143,12 @@ def test_the_engine_starts_gets_the_state_and_the_commands(engine_mixer, setting
     # Frames come from the engine's status.
     assert _wait(lambda: mixer.frames_rendered > 0)
     assert mixer.status().engine["state"] == "running"
+    # Per FlowXer input: arrival lag, missing and late grains.
+    from flowxer.api.metrics import render_prometheus
+
+    text = render_prometheus(mixer)
+    assert 'flowxer_input_late_total{input="cam-1"} 0' in text
+    assert 'flowxer_input_arrival_ms{input="cam-1",essence="video",stat="max"}' in text
 
 
 def test_an_is05_route_reaches_the_engine(engine_mixer, settings) -> None:

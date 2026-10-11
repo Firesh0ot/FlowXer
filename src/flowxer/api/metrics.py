@@ -177,6 +177,10 @@ def _input_lines(mixer) -> list[str]:
         "# HELP flowxer_input_missing_total Output grains without the input's grain (video) or samples (audio), start-up windows not counted",
         "# TYPE flowxer_input_missing_total counter",
     ]
+    late = [
+        "# HELP flowxer_input_late_total Grains of the input that came too late for their output grain (its last grain was shown again)",
+        "# TYPE flowxer_input_late_total counter",
+    ]
     for input_id, entry in sorted(runtime.items()):
         for essence, key in (("video", "arrival_ms"), ("audio", "audio_lag_ms")):
             value = entry.get(key)
@@ -187,7 +191,9 @@ def _input_lines(mixer) -> list[str]:
         if "missing" in entry:
             missing.append(_line("flowxer_input_missing_total", int(entry.get("missing") or 0), {"input": input_id, "essence": "video"}))
             missing.append(_line("flowxer_input_missing_total", int(entry.get("audio_missing") or 0), {"input": input_id, "essence": "audio"}))
-    return lines + missing
+        if "late" in entry and "missing" in entry:
+            late.append(_line("flowxer_input_late_total", int(entry.get("late") or 0), {"input": input_id}))
+    return lines + missing + late
 
 
 def _busy_seconds(mixer) -> float:
