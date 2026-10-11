@@ -23,6 +23,8 @@ from flowxer.api.schemas import (
     MixerState,
     MixerStatus,
     OutputFlows,
+    PanelTransition,
+    PanelTransitionUpdate,
     ProgramBus,
     StingerInfo,
     StingerSlot,
@@ -138,7 +140,7 @@ class VisionMixer:
         self._stall_logged = False
         # Operations that need the control plane; /livez fails when one is stuck.
         self.watchdog = ControlPlaneWatchdog()
-        self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
+        self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "wipe": 0, "stinger": 0}
         self._lock = threading.RLock()
         # (input id, essence) -> MXL domain id of a route whose domain is missing; routed once it
         # appears.
@@ -1158,6 +1160,24 @@ class VisionMixer:
         m = self._panel_number(panel)
         self._engine_call("POST", f"/me/{m}/program", {"source": self._engine_source(panel.program_input_id)}, client=client)
         self._engine_call("POST", f"/me/{m}/preview", {"source": self._engine_source(panel.preview_input_id)}, client=client)
+        self._push_transition(panel, client)
+
+    def _push_transition(self, panel: MixerPanel, client: EngineClient | None = None) -> None:
+        """The ME's next transition (its wipe is what a take with type wipe uses)."""
+        if not self._rendered(panel):
+            return
+        transition = panel.transition
+        wipe = transition.wipe
+        body = {
+            "type": transition.type.value,
+            "frames": transition.rate_frames,
+            "pattern": wipe.pattern,
+            "reverse": wipe.reverse,
+            "soft": wipe.soft,
+            "border": wipe.border,
+            "border_color": wipe.border_color,
+        }
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/transition", body, client=client)
 
     # ── mixer lifecycle ──────────────────────────────────────────────────────
 
@@ -1405,8 +1425,10 @@ class VisionMixer:
         stinger_id: str | None = None,
         panel_id: str = "me-1",
         duration_ms: int = 0,
+        frames: int | None = None,
     ) -> MixerStatus:
-        """Direct source → Program (source-tile right-click). A stinger is a cut in this version."""
+        """Direct source → Program (source-tile right-click). A wipe uses the ME's wipe settings
+        (and its rate without a duration). A stinger is a cut in this version."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest(program_input_id=input_id, preview_input_id=input_id))
         panel = self.get_panel(panel_id)
@@ -1414,7 +1436,9 @@ class VisionMixer:
         if transition == TransitionType.stinger:
             self._note_stinger_cut()
             transition = TransitionType.cut
-        self._put_on_program(panel, input_id, transition, flip_flop=False, duration_ms=duration_ms)
+        if transition == TransitionType.wipe and not frames and not duration_ms:
+            frames = panel.transition.rate_frames
+        self._put_on_program(panel, input_id, transition, flip_flop=False, duration_ms=duration_ms, frames=frames or 0)
         return self.status()
 
     def cut(self, panel_id: str = "me-1") -> MixerStatus:
@@ -1444,6 +1468,34 @@ class VisionMixer:
         else:
             target = black
         self._put_on_program(panel, target, TransitionType.mix, flip_flop=False, duration_ms=duration_ms)
+        return self.status()
+
+    def update_transition(self, panel_id: str, payload: PanelTransitionUpdate) -> PanelTransition:
+        """Change the ME's next transition (type, rate, wipe settings, stinger slot)."""
+        panel = self.get_panel(panel_id)
+        data = panel.transition.model_dump()
+        update = payload.model_dump(exclude_unset=True)
+        data["wipe"].update(update.pop("wipe", None) or {})
+        data.update(update)
+        if data.get("stinger_slot_id") is not None:
+            self.get_stinger_slot(data["stinger_slot_id"])
+        try:
+            panel.transition = PanelTransition(**data)
+        except ValidationError as exc:
+            raise MixerError(f"invalid transition: {exc.errors()[0]['msg']}") from exc
+        self._push_transition(panel)
+        return panel.transition
+
+    def auto(self, panel_id: str = "me-1", frames: int | None = None) -> MixerStatus:
+        """The ME's next transition from Preview to Program over its rate (or `frames`), then the
+        buses swap. A stinger is a cut in this version."""
+        panel = self._ensure_running_panel(panel_id)
+        incoming = self._preview_id(panel)
+        transition = panel.transition.type
+        if transition == TransitionType.stinger:
+            self._note_stinger_cut()
+            transition = TransitionType.cut
+        self._put_on_program(panel, incoming, transition, flip_flop=True, frames=frames or panel.transition.rate_frames)
         return self.status()
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
@@ -1476,7 +1528,10 @@ class VisionMixer:
         *,
         flip_flop: bool,
         duration_ms: int = 0,
+        frames: int = 0,
     ) -> None:
+        """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
+        default); `flip_flop` puts the old Program on Preview."""
         outgoing = panel.program_input_id
         panel.program_input_id = source_id
         panel.last_transition = transition.value
@@ -1486,12 +1541,12 @@ class VisionMixer:
         swapped = flip_flop and outgoing and outgoing != source_id
         if swapped:
             panel.preview_input_id = outgoing
-        frames = 0
-        if transition == TransitionType.mix:
-            ms = duration_ms or DEFAULT_MIX_MS
-            frames = _frames(ms, self.settings.fps)
-            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + ms / 1000)
+        if transition in (TransitionType.mix, TransitionType.wipe):
+            frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
+            # Tally: both sources are on air (LH) for the whole mix or wipe.
+            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + frames / self.settings.fps)
         else:
+            frames = 0
             self._mixes.pop(panel.id, None)
         if self.panels and panel.id == self.panels[0].id:
             self.program_input_id = source_id
@@ -1502,9 +1557,17 @@ class VisionMixer:
             self.program_bus = ProgramBus.live
         if self._rendered(panel):
             body: dict[str, Any] = {"source": self._engine_source(source_id), "frames": frames}
+            if transition == TransitionType.wipe:
+                # Without a type the engine mixes (frames > 0) or cuts.
+                body["type"] = transition.value
             if swapped:
                 body["preview"] = self._engine_source(outgoing)
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/take", body)
+        wipe = panel.transition.wipe
+        if transition == TransitionType.wipe and wipe.alternate:
+            # Flip-flop: the next wipe runs back (this one keeps the direction it started with).
+            wipe.reverse = not wipe.reverse
+            self._push_transition(panel)
         self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:

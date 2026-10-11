@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from flowxer.api.schemas import (
+    AutoRequest,
     ConsoleState,
     ConvertJobOut,
     DomainInfo,
@@ -21,7 +22,9 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
+    PanelTransition,
     PanelTransitionRequest,
+    PanelTransitionUpdate,
     PlayerCueRequest,
     PreviewRequest,
     ResourceInfo,
@@ -342,14 +345,19 @@ def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     "/mixer/take",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Take a logical input (or me-<n>, re-entry) to Program: cut or mix (a stinger is a cut in this version)",
+    summary="Take a logical input (or me-<n>, re-entry) to Program: cut, mix or wipe (a stinger is a cut in this version)",
 )
 def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
         body = mixer.take(
-            payload.input_id, payload.transition, payload.stinger_id, payload.panel_id, payload.duration_ms
+            payload.input_id,
+            payload.transition,
+            payload.stinger_id,
+            payload.panel_id,
+            payload.duration_ms,
+            payload.frames,
         )
     except MixerError as exc:
         raise _http(exc)
@@ -387,6 +395,38 @@ def mixer_cut(
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="cut", mixer=body)
+
+
+@router.post(
+    "/mixer/auto",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Run the ME's next transition (mix or wipe; a stinger is a cut in this version) from Preview to Program",
+)
+def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    payload = payload or AutoRequest()
+    try:
+        body = mixer.auto(payload.panel_id, payload.frames)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="auto", mixer=body)
+
+
+@router.patch(
+    "/panels/{panel_id}/transition",
+    response_model=PanelTransition,
+    tags=["mixer"],
+    summary="The ME's next transition: type (mix, wipe, stinger), rate in frames, wipe pattern and edge, stinger slot",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_panel_transition(
+    panel_id: str, payload: PanelTransitionUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> PanelTransition:
+    try:
+        return mixer.update_transition(panel_id, payload)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise _http(exc, code)
 
 
 @router.post(

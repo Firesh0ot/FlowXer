@@ -38,7 +38,64 @@ class ProgramBus(str, Enum):
 class TransitionType(str, Enum):
     cut = "cut"
     mix = "mix"
+    wipe = "wipe"
     stinger = "stinger"
+
+
+# SMPTE ST 258 wipe codes (docs/engine-p3.md §4): bars 1, 2; corner boxes 3-6; barn doors 21, 22;
+# edge boxes 23-26; diagonals 41, 42; diagonal barn doors 45, 46; box 101; diamond 102; circle 119;
+# clock 201-204.
+WIPE_CODES = (1, 2, 3, 4, 5, 6, 21, 22, 23, 24, 25, 26, 41, 42, 45, 46, 101, 102, 119, 201, 202, 203, 204)
+
+
+class WipeSettings(BaseModel):
+    pattern: int = Field(default=1, description="SMPTE wipe code: " + ", ".join(map(str, WIPE_CODES)))
+    reverse: bool = Field(default=False, description="Run the pattern backwards")
+    alternate: bool = Field(
+        default=False, description="Flip-flop: reverse toggles after each wipe, so the next one goes back"
+    )
+    soft: float = Field(default=0.0, ge=0.0, le=1.0, description="Soft edge, a fraction of the pattern's travel")
+    border: float = Field(default=0.0, ge=0.0, le=1.0, description="Border width, a fraction of the pattern's travel")
+    border_color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+
+    @field_validator("pattern")
+    @classmethod
+    def _known_code(cls, value: int) -> int:
+        if value not in WIPE_CODES:
+            raise ValueError(f"pattern must be one of {', '.join(map(str, WIPE_CODES))}")
+        return value
+
+
+class WipeSettingsUpdate(BaseModel):
+    pattern: int | None = None
+    reverse: bool | None = None
+    alternate: bool | None = None
+    soft: float | None = None
+    border: float | None = None
+    border_color: str | None = None
+
+
+class PanelTransition(BaseModel):
+    """An ME's next transition: what Auto runs."""
+
+    type: TransitionType = Field(default=TransitionType.mix, description="mix, wipe or stinger (a cut until stingers play)")
+    rate_frames: int = Field(default=25, ge=1, le=1000, description="Duration of Auto in frames")
+    wipe: WipeSettings = Field(default_factory=WipeSettings)
+    stinger_slot_id: str | None = Field(default=None, description="The stinger slot of type stinger")
+
+    @field_validator("type")
+    @classmethod
+    def _not_cut(cls, value: TransitionType) -> TransitionType:
+        if value == TransitionType.cut:
+            raise ValueError("type must be mix, wipe or stinger")
+        return value
+
+
+class PanelTransitionUpdate(BaseModel):
+    type: TransitionType | None = None
+    rate_frames: int | None = None
+    wipe: WipeSettingsUpdate | None = None
+    stinger_slot_id: str | None = None
 
 
 class StingerPhase(str, Enum):
@@ -194,6 +251,12 @@ class TakeRequest(BaseModel):
     )
     transition: TransitionType = TransitionType.cut
     duration_ms: int = Field(default=0, ge=0, le=10000)
+    frames: int | None = Field(
+        default=None,
+        ge=0,
+        le=1000,
+        description="Duration in frames (instead of duration_ms); a wipe without either takes the ME's rate",
+    )
     stinger_id: str | None = None
     panel_id: str = Field(default="me-1", description="Mixer panel (ME) to cut to program")
 
@@ -217,6 +280,11 @@ class PanelTransitionRequest(BaseModel):
         default=None,
         description="For Wipe: true arms, false disarms. Omit to toggle.",
     )
+
+
+class AutoRequest(BaseModel):
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME)")
+    frames: int | None = Field(default=None, ge=1, le=1000, description="Duration in frames (default: the ME's rate)")
 
 
 class PlayerCueRequest(BaseModel):
@@ -369,6 +437,7 @@ class MixerPanel(BaseModel):
     preview_input_id: str | None = None
     wipe_armed: bool = False
     last_transition: str = "cut"
+    transition: PanelTransition = Field(default_factory=PanelTransition)
 
 
 class DownstreamKeyer(BaseModel):
