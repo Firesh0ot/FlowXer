@@ -25,12 +25,13 @@ from flowxer.library.ffmpeg import (
     build_clip_video_command,
     build_still_command,
     build_still_filter,
-    build_stinger_mezz_command,
+    build_stinger_alpha_command,
     build_thumb_command,
     build_video_filter,
     conversion_threads,
     conversion_timeout,
     has_alpha_pix_fmt,
+    is_rgb_pix_fmt,
     parse_frame_rate,
 )
 from flowxer.library.models import (
@@ -42,7 +43,6 @@ from flowxer.library.models import (
     LibraryItem,
     LibraryKind,
 )
-from flowxer.library.ram import decide_ram_playback
 from flowxer.library.sequence import safe_extract_tga_zip, validate_sequence
 from flowxer.library.store import LibraryStore
 
@@ -220,9 +220,15 @@ class ConversionQueue:
                 log.exception("job listener failed")
 
     def ready_on_disk(self, item: LibraryItem, format_id: str) -> bool:
-        """Ready, and its files are there (a clip: its mezzanine and its sound)."""
+        """Ready, and its files are there (a clip: its mezzanine and its sound; a stinger: its
+        colour, its alpha and its sound when it has them)."""
         if not item.is_ready(format_id) or not self.store.mezz_path(item.id, format_id, item.kind).is_file():
             return False
+        conv = item.conversion_for(format_id)
+        if item.kind == LibraryKind.stinger:
+            return (not conv.has_alpha or self.store.alpha_path(item.id, format_id).is_file()) and (
+                not conv.audio or self.store.audio_path(item.id, format_id).is_file()
+            )
         return item.kind != LibraryKind.clip or self.store.audio_path(item.id, format_id).is_file()
 
     def _settle_item(self, job: ConvertJob, error: str) -> None:
@@ -499,8 +505,9 @@ class ConversionQueue:
         )
 
     def _remove_prores_mezzanine(self, item: LibraryItem, format_id: str) -> None:
-        """A clip converted before the engine had a ProRes mezzanine (mezz-<format>.mov). It is
-        derived, never the original, and the new mezzanine replaces it."""
+        """A clip converted before the engine, or a stinger converted before P3, had a ProRes
+        mezzanine (mezz-<format>.mov). It is derived, never the original, and the new mezzanine
+        replaces it."""
         old = self.store.item_dir(item.id) / f"mezz-{format_id}.mov"
         if old.is_file() and item.original.get("path") != old.name:
             old.unlink(missing_ok=True)
@@ -536,7 +543,8 @@ class ConversionQueue:
         return ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=still.name, playback="ram")
 
     def _unpack_zip(self, item: LibraryItem, job: ConvertJob) -> None:
-        """Unpack an uploaded TGA ZIP into sequence/ (done here, not in the upload request)."""
+        """Unpack an uploaded sequence ZIP (frames and a WAV) into sequence/ (done here, not in the
+        upload request)."""
         directory = self.store.item_dir(item.id)
         archive = self._original_path(item)
         stage = directory / f"zip-stage-{job.id}"
@@ -570,6 +578,10 @@ class ConversionQueue:
     def _convert_stinger(
         self, item: LibraryItem, fmt: VideoFormat, job: ConvertJob, cancel: threading.Event
     ) -> ConversionInfo:
+        """A stinger as the engine plays it (docs/engine-p3.md §6): its colour as the clip
+        mezzanine (HEVC 4:4:4 10-bit), its alpha as the luma of a lossless HEVC 4:2:0 10-bit stream
+        (none for an opaque stinger) and its sound as a clip's (none when it is silent). The
+        original stays."""
         if not self.ffmpeg.which():
             return ConversionInfo(status=ConversionStatus.failed, error="ffmpeg not available")
         if item.original.get("source_kind") == "zip":
@@ -577,13 +589,20 @@ class ConversionQueue:
         original = self._original_path(item)
         directory = self.store.item_dir(item.id)
         mezz = self.store.mezz_path(item.id, fmt.id, LibraryKind.stinger)
-        mezz_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.mov"
+        alpha_file = self.store.alpha_path(item.id, fmt.id)
+        audio_file = self.store.audio_path(item.id, fmt.id)
+        colour_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.mkv"
+        alpha_tmp = directory / f"mezz-{fmt.id}-alpha.{job.id}.tmp.mkv"
+        audio_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.f32"
         thumb = self.store.thumb_path(item.id)
         thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
         src_kind = item.original.get("source_kind") or ("sequence" if original.is_dir() else "video")
         old_fps = float(item.original.get("fps") or item.options.sequence_fps or (fmt.frame_rate_num / fmt.frame_rate_den))
         seq_fps = float(item.options.sequence_fps or (fmt.frame_rate_num / fmt.frame_rate_den))
-        has_alpha = bool(item.original.get("has_alpha", True))
+        # The sound: a sequence's WAV or the video's audio (its first stream).
+        sound: Path | None = None
+        sound_channels = 0
+        sound_layout = ""
         input_args: list[str]
 
         if src_kind == "sequence" or original.is_dir():
@@ -592,6 +611,7 @@ class ConversionQueue:
                 errors = "; ".join(i.message for i in info.issues if i.level == "error")
                 return ConversionInfo(status=ConversionStatus.failed, error=errors or "invalid sequence")
             has_alpha = info.has_alpha
+            rgb = True
             input_args = [
                 "-framerate",
                 str(seq_fps),
@@ -601,6 +621,10 @@ class ConversionQueue:
                 str(info.files[0].parent / info.pattern),
             ]
             duration = info.frame_count / seq_fps
+            if info.sound is not None:
+                astream = next((s for s in self.ffmpeg.probe(info.sound).streams if s.codec_type == "audio"), None)
+                if astream is not None:
+                    sound, sound_channels, sound_layout = info.sound, int(astream.channels), astream.channel_layout
             item.original.update(
                 {
                     "source_kind": "sequence",
@@ -611,52 +635,73 @@ class ConversionQueue:
                     "pattern": info.pattern,
                     "start_number": info.start_number,
                     "fps": seq_fps,
+                    "audio_channels": sound_channels,
                 }
             )
         else:
             probe = self.ffmpeg.probe(original)
             vstream = next((s for s in probe.streams if s.codec_type == "video"), None)
             astream = next((s for s in probe.streams if s.codec_type == "audio"), None)
+            pix_fmt = vstream.pix_fmt if vstream else ""
+            # VP9 keeps its alpha in a side stream that only libvpx decodes.
+            vp9_alpha = bool(vstream and vstream.codec_name == "vp9" and str(vstream.tags.get("alpha_mode") or "") == "1")
+            has_alpha = has_alpha_pix_fmt(pix_fmt) or vp9_alpha
+            rgb = is_rgb_pix_fmt(pix_fmt)
             if vstream:
-                has_alpha = has_alpha_pix_fmt(vstream.pix_fmt) or has_alpha
                 old_fps = parse_frame_rate(vstream.r_frame_rate or vstream.avg_frame_rate, old_fps)
-            input_args = ["-i", str(original)]
+            input_args = [*(["-c:v", "libvpx-vp9"] if vp9_alpha else []), "-i", str(original)]
             duration = probe.duration
+            if astream is not None:
+                sound, sound_channels, sound_layout = original, int(astream.channels), astream.channel_layout
             item.original.update(
                 {
                     "source_kind": "video",
                     "has_alpha": has_alpha,
                     "fps": old_fps,
-                    "audio_channels": int(astream.channels) if astream else 0,
+                    "audio_channels": sound_channels,
                 }
             )
 
-        vf = build_video_filter(
-            width=fmt.width,
-            height=fmt.height,
-            fps_num=fmt.frame_rate_num,
-            fps_den=fmt.frame_rate_den,
-            fit=item.options.fit.value,
-            fps_mode=item.options.fps_mode.value,
-            src_interlaced=False,
-            color_space=str(item.original.get("color_space") or ""),
-            dst_pix_fmt="yuva444p10le",
-        )
+        def video_filter(dst_pix_fmt: str) -> str:
+            return build_video_filter(
+                width=fmt.width,
+                height=fmt.height,
+                fps_num=fmt.frame_rate_num,
+                fps_den=fmt.frame_rate_den,
+                fit=item.options.fit.value,
+                fps_mode=item.options.fps_mode.value,
+                src_interlaced=False,
+                color_space=str(item.original.get("color_space") or ""),
+                dst_pix_fmt=dst_pix_fmt,
+                rgb=rgb,
+                # Bars around a stinger that does not fill the raster are transparent.
+                pad="black@0",
+            )
+
+        keyint = max(1, round(fmt.frame_rate_num / fmt.frame_rate_den))
+        nvenc = self.ffmpeg.has_nvenc()
+        use_ch = 1 if item.options.map_channels == 1 else 2
         timeout = conversion_timeout(duration, motion=item.options.fps_mode.value == "motion")
         try:
-            job.progress = 0.3
+            job.progress = 0.2
             self._emit(job)
             result = self._run(
                 item,
-                build_stinger_mezz_command(input_args=input_args, mezz=mezz_tmp, vf=vf, threads=self.threads),
+                build_clip_video_command(
+                    original=None,
+                    input_args=input_args,
+                    video_tmp=colour_tmp,
+                    vf=video_filter("yuv422p10le"),
+                    keyint=keyint,
+                    threads=self.threads,
+                    nvenc=nvenc,
+                ),
                 timeout,
                 cancel,
             )
             if result.code != 0:
                 return ConversionInfo(status=ConversionStatus.failed, error="stinger transcode failed")
-            self._run(item, build_thumb_command(mezz=mezz_tmp, thumb=thumb_tmp), 120.0, cancel)
-
-            probed = self.ffmpeg.probe(mezz_tmp)
+            probed = self.ffmpeg.probe(colour_tmp)
             frames = 0
             for stream in probed.streams:
                 if stream.codec_type == "video" and stream.nb_frames.isdigit():
@@ -665,33 +710,73 @@ class ConversionQueue:
             if frames <= 0 and probed.duration > 0:
                 frames = int(round(probed.duration * (fmt.frame_rate_num / fmt.frame_rate_den)))
             if frames <= 0:
-                frames = int(item.original.get("frame_count") or 0)
-            if frames <= 0:
                 return ConversionInfo(status=ConversionStatus.failed, error="stinger mezzanine has no frames")
-            self._publish(mezz_tmp, mezz)
+            if has_alpha:
+                job.progress = 0.5
+                self._emit(job)
+                result = self._run(
+                    item,
+                    build_stinger_alpha_command(
+                        input_args=input_args,
+                        alpha_tmp=alpha_tmp,
+                        vf=video_filter("yuva444p10le"),
+                        width=fmt.width,
+                        height=fmt.height,
+                        fps=f"{fmt.frame_rate_num}/{fmt.frame_rate_den}",
+                        keyint=keyint,
+                        threads=self.threads,
+                        nvenc=nvenc,
+                    ),
+                    timeout,
+                    cancel,
+                )
+                if result.code != 0:
+                    return ConversionInfo(status=ConversionStatus.failed, error="stinger alpha transcode failed")
+            need = samples_until_grain(frames, fmt.frame_rate_num, fmt.frame_rate_den, 48000)
+            if sound is not None:
+                job.progress = 0.75
+                self._emit(job)
+                audio = self._run(
+                    item,
+                    build_clip_audio_command(
+                        original=sound,
+                        audio_tmp=audio_tmp,
+                        af="aresample=48000",
+                        src_channels=sound_channels,
+                        dst_channels=use_ch,
+                        samples=need,
+                        src_layout=sound_layout,
+                    ),
+                    timeout,
+                    cancel,
+                )
+                if audio.code != 0:
+                    log.warning("sound of stinger %s cannot be read, the stinger is silent", item.id)
+                    sound = None
+            self._run(item, build_thumb_command(mezz=colour_tmp, thumb=thumb_tmp), 120.0, cancel)
+            self._publish(colour_tmp, mezz)
+            for tmp, final, used in ((alpha_tmp, alpha_file, has_alpha), (audio_tmp, audio_file, sound is not None)):
+                if used:
+                    self._publish(tmp, final)
+                else:
+                    final.unlink(missing_ok=True)
             self._publish(thumb_tmp, thumb)
+            self._remove_prores_mezzanine(item, fmt.id)
         finally:
-            for tmp in (mezz_tmp, thumb_tmp):
+            for tmp in (colour_tmp, alpha_tmp, audio_tmp, thumb_tmp):
                 tmp.unlink(missing_ok=True)
 
         new_fps = fmt.frame_rate_num / fmt.frame_rate_den
-        decision = decide_ram_playback(
-            frames=frames,
-            fps=new_fps,
-            width=fmt.width,
-            height=fmt.height,
-            has_alpha=True,
-            ram_clip_max_s=self.ram_clip_max_s,
-            ram_budget_bytes=self.ram_budget_bytes,
-        )
         # The cut frame is set in _run_job from the item as it is when the job ends.
         return ConversionInfo(
             status=ConversionStatus.ready,
             frames=frames,
-            audio_samples=0,
-            audio_channels=0,
+            audio_samples=need if sound is not None else 0,
+            audio_channels=use_ch if sound is not None else 0,
             mezz=mezz.name,
+            audio=audio_file.name if sound is not None else None,
             has_alpha=has_alpha,
             duration_s=frames / new_fps,
-            playback="ram" if decision.use_ram else "decode_ahead",
+            # The engine decodes ahead on the GPU (a stinger player).
+            playback="decode_ahead",
         )

@@ -722,6 +722,8 @@ class LibraryItemOut(BaseModel):
     ready: bool = False
     playback: str = "unknown"
     has_alpha: bool = False
+    # A clip or stinger with sound (a stinger's sound goes into PGM).
+    has_sound: bool = False
     cut_frame: int | None = None
     cut_ms: int | None = None
     frame_count: int = 0

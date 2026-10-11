@@ -1006,6 +1006,7 @@ class VisionMixer:
             ready=item.is_ready(fmt),
             playback=conv.playback,
             has_alpha=item.has_alpha or conv.has_alpha,
+            has_sound=bool(conv.audio),
             cut_frame=item.cut_frame if item.cut_frame is not None else conv.cut_frame,
             cut_ms=item.cut_ms if item.cut_ms is not None else conv.cut_ms,
             frame_count=conv.frames or int(item.original.get("frame_count") or 0),

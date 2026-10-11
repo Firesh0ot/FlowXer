@@ -24,7 +24,7 @@ from flowxer.library.uploads import UploadBusy, UploadError, UploadNoSpace, Uplo
 
 router = APIRouter(tags=["library"])
 
-# Frames of one TGA folder upload.
+# Files of one sequence folder upload (frames and a WAV).
 MAX_SEQUENCE_FILES = 10_000
 
 
@@ -269,7 +269,7 @@ def upload_complete(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> 
     "/uploads/sequence",
     response_model=LibraryItemOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload a TGA folder (multipart: name, sequence_fps, cut_frame, fit, files) as a stinger",
+    summary="Upload a sequence folder (multipart: name, sequence_fps, cut_frame, fit, files: TGA or PNG frames and a WAV) as a stinger",
 )
 async def upload_sequence(request: Request, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
     library = mixer.library
@@ -282,10 +282,10 @@ async def upload_sequence(request: Request, mixer: VisionMixer = Depends(get_mix
             stage,
             max_bytes=library.uploads.upload_limit_bytes,
             max_files=MAX_SEQUENCE_FILES,
-            keep=lambda name: name.lower().endswith(".tga"),
+            keep=lambda name: name.lower().endswith((".tga", ".png", ".wav")),
         )
         if not files:
-            raise UploadError("no .tga files in the upload")
+            raise UploadError("no .tga or .png files in the upload")
         fit = fields.get("fit", "fit")
         options = ConvertOptions(
             fit=FitMode(fit) if fit in FitMode._value2member_map_ else FitMode.fit,
