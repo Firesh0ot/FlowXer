@@ -284,6 +284,33 @@ FLOWXER_PROGRAM_AUTOSTART=true
 
 `/readyz` is 200 only when the MXL root is readable, the output domain is writable and, with a registry configured, the node is registered (heartbeat within 12 s). `/livez` is 503 when the control plane is stuck: an IS-05 activation or a Program start or stop has not finished for 60 s (Kubernetes then restarts the pod); `flowxer_control_plane_busy_seconds` is the age of the oldest running one.
 
+### Metrics
+
+`GET /metrics` (and `/api/v1/metrics`, not behind the API token) is Prometheus text. For dashboards:
+
+| What | Metrics |
+|---|---|
+| On air, Program | `flowxer_on_air`, `flowxer_program_stalled`, `flowxer_frames_rendered_total`, `flowxer_frames_dropped_total` (grains skipped to stay on the TAI grid), `flowxer_transitions_total{type}`, `flowxer_program_input`, `flowxer_preview_input` |
+| Engine output | `flowxer_engine_up`, `flowxer_engine_restarts_total`, `flowxer_engine_output_fps`, `flowxer_engine_output_grains_rendered_total`, `_committed_total`, `_skipped_total`, `_late_total`, `flowxer_engine_output_write_failed_total`, `flowxer_engine_output_lag_grains{stat}`, `flowxer_engine_output_commit_ms{stat}` |
+| Latency | `flowxer_latency_grains`, `flowxer_recommended_latency_grains` (covers the latest arrival seen) |
+| Inputs (FlowXer ids) | `flowxer_input_arrival_ms{input,essence,stat}`, `flowxer_input_late_total{input}`, `flowxer_input_missing_total{input,essence}`, `flowxer_input_state{input,essence,state}` |
+| Inputs (engine names `in<n>`, `key<n>`) | `flowxer_engine_input_running`, `_grains_total`, `_late_total`, `_missing_total`, `_resyncs_total`, `_reopens_total`, `flowxer_engine_input_audio_blocks_total`, `_audio_missing_total`, `_audio_waits_total` |
+| GPU time | `flowxer_engine_gpu_stage_ms{stage,stat}` with `stage` = `upload_per_input`, `unpack`, `me` (and `me="<n>"`, per ME), `pack`, `mosaic`, `render`, `download`, `total`; `flowxer_engine_gpu_utilization_percent`, `flowxer_engine_gpu_device_used_mb`, `flowxer_engine_gpu_engine_allocated_mb` |
+| Clip players | `flowxer_engine_player_playing{player}`, `flowxer_engine_player_frames_decoded_total`, `flowxer_engine_player_frames_late_total`, `flowxer_engine_player_decode_ms{stat}` |
+| Preview mosaic | `flowxer_engine_mosaic_frames_total`, `_dropped_total`, `flowxer_engine_mosaic_encode_ms`, `flowxer_engine_mosaic_connected` (publishing), `flowxer_engine_mosaic_bytes_total`, `flowxer_engine_gpu_encoder_sessions`, `flowxer_engine_gpu_encoder_percent`; own MediaMTX: `flowxer_engine_preview_mediamtx_running`, `_restarts_total` |
+| Library | `flowxer_library_jobs{state=queued\|running}`, `flowxer_library_conversions_total{result}`, `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc` |
+| Control plane | `flowxer_control_plane_busy_seconds`, `flowxer_nmos_registry_up`, `flowxer_nmos_activations_total{result}`, `flowxer_tally_export_*`, `flowxer_engine_cpu_percent{thread}`, `flowxer_process_cpu_percent`, `flowxer_process_memory_bytes` |
+
+### Upgrading from FlowXer 14
+
+The P2 image replaces 14.x in place with the same `/config` (the saved state), the same NMOS seed and the same output domain. Lab, from 14.21.46 with 4 live inputs routed over IS-05, 2 test sources, 2 MEs and a multiviewer reading ME 1 PGM: ME 1 PGM keeps its flow ids, the IS-05 activations of the live inputs are restored, their tally INDEX stays 0..N−1 and Black keeps its number; the multiviewer had no signal while the images were swapped and played again 3.2 s after the new one started.
+
+- **Environment:** `FLOWXER_TEST_SOURCES` is no longer read: set `FLOWXER_CLIP_PLAYERS` instead (the designer's `testSources` becomes `clipPlayers`). Set a GPU (`nvidia.com/gpu`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`) and drop `FLOWXER_GPU`, `FLOWXER_GST_MODE`, `FLOWXER_MONITOR_FPS` and `FLOWXER_WEBRTC_*`. `WIDGET_FRAME_ANCESTORS` goes to the gui container.
+- **What an operator loses:** test sources become clip players at the same TSL INDEX, empty (black) until a clip or the colour bars are put on them; the Replay input (the last INDEX) is gone, its role is a clip player's; the HTML overlay is gone, so DSK 1 stays on but keys nothing until a v210a key (e.g. mxl-browser-source in `v210a` mode) is routed to its receiver `DSK 1 Key`; stingers and Wipe are cuts until P3; the per-source WebRTC and JPEG previews are replaced by the mosaic; clips of the library are converted again (NVENC, about 35 s per minute of clip) and black until then.
+- **New on the tally:** an ME's re-entry source, INDEX 1000 + n.
+- **Known in 14.21.46:** started with its live inputs unrouted (autostart, or a start before the first IS-05 activation) its MXL sources crash the process (exit 139, a general protection fault in libstdc++ in an `mxlsrc` thread). With the routes in the saved state it starts. P2 has no such path.
+- **Rollback** (not tested): 14.x does not know clip players and ignores a state that P2 saved (it starts from its environment and defaults). Keep the 14.x state (`GET /api/v1/config/export`, or a copy of `/config`) before the upgrade to roll back with it.
+
 ### Route a camera to input 1, take it to Program, route Program out
 
 Live inputs have NMOS receivers; an IS-05 activation opens the engine's reader for that flow, a deactivation closes it. Replace the UUIDs with values from `GET http://<host>:3252/x-nmos/node/v1.3/receivers` and `…/senders`.

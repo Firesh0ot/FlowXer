@@ -35,10 +35,12 @@ control plane. One image, one code path; an NVIDIA GPU is required
   PVW; on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
   `rate_ms`; `POST /keyers/{id}/auto` without a duration uses it).
 - GUI: every picture of the console (sources, each ME's Preview and Program) is
-  a crop of the engine's one preview mosaic: one WHEP session per page that
-  reconnects by itself, each picture a box of its tile's aspect ratio with the
-  stream's video scaled and moved inside it (CSS transform; every browser, no
-  `object-view-box`), and reconnects by itself. Clip players get their library
+  a crop of the engine's one preview mosaic: one WHEP session per page, each
+  picture a box of its tile's aspect ratio with the stream's video scaled and
+  moved inside it (CSS transform; every browser, no `object-view-box`). The
+  session connects again by itself, at once when no video came for a second:
+  about 2.4 s after a MediaMTX restart (the engine checks its built-in
+  MediaMTX every 200 ms and its publisher retries within 0.5 s). Clip players get their library
   clip or still in the tile's header, the position and remaining time over the
   picture and a transport bar (cue, play, pause, stop, loop, play on cut; a
   still is a frame memory); DSK 1 gets Auto and its rate; the clip library
@@ -65,6 +67,17 @@ control plane. One image, one code path; an NVIDIA GPU is required
   numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`): a conversion
   that filled the limit got the container throttled and the engine skipped
   grains.
+- Metrics for the engine, the inputs (arrival lag, late and missing grains
+  per FlowXer input), GPU time per stage and per ME, the clip players
+  (`flowxer_engine_player_frames_decoded_total`, `_decode_ms`), the mosaic and
+  its MediaMTX (`flowxer_engine_preview_mediamtx_running`, `_restarts_total`)
+  and the library (`flowxer_library_jobs`, `flowxer_library_conversions_total`,
+  `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc`); the list
+  is in the README (Metrics).
+- Upgrade from 14.x with the same `/config`: ME 1 PGM keeps its flow ids, the
+  live inputs keep their IS-05 activations and tally INDEX; test sources become
+  empty clip players, the Replay input goes, DSK 1 needs a v210a key (README,
+  Upgrading from FlowXer 14).
 - Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
   `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
   `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,
