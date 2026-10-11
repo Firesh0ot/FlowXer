@@ -88,6 +88,9 @@ class ConversionQueue:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._started = False
+        # For /metrics: finished conversions by result, and how long the last one took.
+        self.finished: dict[str, int] = {}
+        self.last_seconds = 0.0
 
     def start(self) -> None:
         with self._lock:
@@ -276,6 +279,10 @@ class ConversionQueue:
                         log.exception("cannot record the end of job %s", job.id)
             with self._lock:
                 self._running.pop(job.id, None)
+                if not self._stop.is_set():
+                    self.finished[job.state.value] = self.finished.get(job.state.value, 0) + 1
+                    if job.started_at and job.finished_at:
+                        self.last_seconds = job.finished_at - job.started_at
             self._emit(job)
 
     def _run_job(self, job: ConvertJob, cancel: threading.Event) -> None:

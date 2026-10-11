@@ -2411,6 +2411,8 @@ std::string Engine::metricsText() const
         std::string const l = "player=\"" + std::to_string(player["player"].get<int>()) + "\"";
         metric("player_playing", player["state"] == "playing" ? 1.0 : 0.0, l);
         metric("player_frames_late_total", player.value("late", 0.0), l);
+        metric("player_frames_decoded_total", player.value("decoded", 0.0), l);
+        metric("player_decode_ms", player.value("decode_ms", 0.0), l + ",stat=\"avg\"");
     }
     auto const& mosaic = s["mosaic"];
     metric("mosaic_frames_total", mosaic["frames"].get<double>());
@@ -2420,6 +2422,13 @@ std::string Engine::metricsText() const
     {
         metric("mosaic_connected", mosaic["encoder"]["connected"].get<bool>() ? 1.0 : 0.0);
         metric("mosaic_bytes_total", mosaic["encoder"]["bytes"].get<double>());
+    }
+    // The built-in MediaMTX (own mode): running and how often it was started again.
+    auto const& own = s["preview"]["own_mediamtx"];
+    if (own.is_object())
+    {
+        metric("preview_mediamtx_running", own["running"].get<bool>() ? 1.0 : 0.0);
+        metric("preview_mediamtx_restarts_total", own["restarts"].get<double>());
     }
     metric("cpu_percent", s["cpu"]["process_percent"].get<double>(), "thread=\"process\"");
     for (auto const& [thread, value] : s["cpu"]["threads_percent"].items())

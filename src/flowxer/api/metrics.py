@@ -157,6 +157,7 @@ def render_prometheus(mixer) -> str:
                         {"input": item.id, "essence": role, "state": candidate},
                     )
                 )
+    lines += _library_lines(getattr(getattr(mixer, "library", None), "queue", None))
     text = "\n".join(lines) + "\n"
     # The engine's own metrics (flowxer_engine_*: GPU time per stage, inputs by engine name).
     if engine is not None:
@@ -193,6 +194,39 @@ def _busy_seconds(mixer) -> float:
     watchdog = getattr(mixer, "watchdog", None)
     oldest = watchdog.oldest() if watchdog is not None else None
     return oldest[1] if oldest else 0.0
+
+
+def _library_lines(queue) -> list[str]:
+    """The media library's conversions: jobs waiting and running, finished ones by result, the
+    last one's duration, and whether NVENC encodes the clip mezzanines (once it was tried)."""
+    if queue is None:
+        return []
+    jobs = queue.list_jobs()
+    lines = [
+        "# HELP flowxer_library_jobs Conversion jobs queued or running",
+        "# TYPE flowxer_library_jobs gauge",
+    ]
+    for state in ("queued", "running"):
+        lines.append(_line("flowxer_library_jobs", sum(1 for j in jobs if j.state.value == state), {"state": state}))
+    lines += [
+        "# HELP flowxer_library_conversions_total Finished conversions by result",
+        "# TYPE flowxer_library_conversions_total counter",
+    ]
+    for result in ("done", "failed", "cancelled"):
+        lines.append(_line("flowxer_library_conversions_total", queue.finished.get(result, 0), {"result": result}))
+    lines += [
+        "# HELP flowxer_library_last_conversion_seconds How long the last finished conversion took",
+        "# TYPE flowxer_library_last_conversion_seconds gauge",
+        _line("flowxer_library_last_conversion_seconds", round(queue.last_seconds, 3)),
+    ]
+    nvenc = getattr(queue.ffmpeg, "_nvenc", None)
+    if nvenc is not None:
+        lines += [
+            "# HELP flowxer_library_nvenc 1 when NVENC encodes the clip mezzanines, 0 when x265 does",
+            "# TYPE flowxer_library_nvenc gauge",
+            _line("flowxer_library_nvenc", 1 if nvenc else 0),
+        ]
+    return lines
 
 
 def live_payload(mixer) -> tuple[int, dict[str, Any]]:
