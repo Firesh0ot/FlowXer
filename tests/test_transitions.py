@@ -153,3 +153,44 @@ def test_a_bad_transition_is_refused(mixer: VisionMixer) -> None:
     else:
         raise AssertionError("pattern 999 was accepted")
     assert mixer.panels[0].transition.wipe.pattern == 1
+
+
+def test_the_t_bar(client: TestClient, mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    calls = _record_engine(mixer)
+    _wipe(mixer, pattern=119, alternate=True)
+    # Off 0: the ME's wipe starts and is held; both sources are on air until it ends.
+    assert client.post("/api/v1/mixer/position", json={"position": 0.3}).status_code == 200
+    assert calls[-1] == ("POST", "/me/1/position", {"t": 0.3})
+    assert mixer.program_input_id == "cam-1" and lit(mixer)[0] == {"cam-1", "cam-2"}
+    assert lit(mixer, now=time.monotonic() + 60)[0] == {"cam-1", "cam-2"}
+    mixer.set_position("me-1", 0.7)
+    # 1 completes it: the buses swap, flip-flop reverses the next wipe.
+    mixer.set_position("me-1", 1.0)
+    assert ("POST", "/me/1/position", {"t": 1.0}) in calls
+    assert not any(path == "/me/1/take" for _method, path, _body in calls)
+    assert mixer.program_input_id == "cam-2" and mixer.preview_input_id == "cam-1"
+    assert mixer.panels[0].transition.wipe.reverse and mixer.last_transition == "wipe"
+    assert lit(mixer, now=time.monotonic() + 0.1) == ({"cam-2"}, {"cam-1"})
+    # Back to 0 ends it without the swap.
+    mixer.set_position("me-1", 0.4)
+    mixer.set_position("me-1", 0.0)
+    assert calls[-1] == ("POST", "/me/1/position", {"t": 0.0})
+    assert mixer.program_input_id == "cam-2" and lit(mixer) == ({"cam-2"}, {"cam-1"})
+    # Auto from a held position: the engine runs the rest (0.5 of 30 frames).
+    mixer.set_position("me-1", 0.5)
+    mixer.auto("me-1")
+    assert calls[-1][1] == "/me/1/transition" and calls[-2] == ("POST", "/me/1/auto", {"frames": 30})
+    assert mixer.program_input_id == "cam-1" and mixer.preview_input_id == "cam-2"
+    assert lit(mixer)[0] == {"cam-1", "cam-2"} and lit(mixer, now=time.monotonic() + 0.35)[0] == {"cam-1"}
+    # A Cut at a held position completes it (the engine ends it as if it had run to its end).
+    mixer.set_position("me-1", 0.5)
+    mixer.cut("me-1")
+    assert calls[-1] == ("POST", "/me/1/take", {"source": "in2", "frames": 0})
+    assert mixer.program_input_id == "cam-2" and mixer.preview_input_id == "cam-1"
+    # A stinger does not scrub: off 0 it runs as an Auto (a cut in this version).
+    mixer.update_transition("me-1", PanelTransitionUpdate(type=TransitionType.stinger))
+    mixer.set_position("me-1", 0.2)
+    assert calls[-1] == ("POST", "/me/1/take", {"source": "in1", "frames": 0, "preview": "in2"})
+    assert client.post("/api/v1/mixer/position", json={"position": 1.2}).status_code == 422
+    mixer.stop()

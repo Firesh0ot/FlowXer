@@ -152,8 +152,11 @@ class VisionMixer:
         self.tally = TallyService()
         # FLOWXER_TALLY_TSL, started at the end of __init__.
         self.tally_export: TallyExport | None = None
-        # Panel id -> (outgoing, incoming, monotonic end) of its last mix, for the raw tally.
-        self._mixes: dict[str, tuple[str | None, str, float]] = {}
+        # Panel id -> (outgoing, incoming, monotonic end or None while a T-bar holds it) of its last
+        # mix or wipe, for the raw tally.
+        self._mixes: dict[str, tuple[str | None, str, float | None]] = {}
+        # Panel id -> (position, outgoing, incoming) of a transition the T-bar holds.
+        self._positions: dict[str, tuple[float, str | None, str]] = {}
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -1145,6 +1148,10 @@ class VisionMixer:
     def _on_engine_ready(self, client: EngineClient) -> None:
         """Every (re)start of the engine: push routes, clip players, keyers and buses."""
         with self.nmos.lock:
+            # A new engine holds no T-bar transition: Program stays where it was.
+            for panel_id in self._positions:
+                self._mixes.pop(panel_id, None)
+            self._positions.clear()
             for item in self.list_inputs():
                 if item.kind == InputKind.mxl_live:
                     self._push_route(item, client)
@@ -1490,12 +1497,53 @@ class VisionMixer:
         """The ME's next transition from Preview to Program over its rate (or `frames`), then the
         buses swap. A stinger is a cut in this version."""
         panel = self._ensure_running_panel(panel_id)
+        held = self._positions.pop(panel.id, None)
+        if held is not None:
+            # From the held T-bar position: the engine runs the rest at the rate.
+            position, _outgoing, incoming = held
+            rate = frames or panel.transition.rate_frames
+            if self._rendered(panel):
+                self._engine_call("POST", f"/me/{self._panel_number(panel)}/auto", {"frames": rate})
+            rest = max(1, round(rate * (1 - position)))
+            swap = panel.preview_input_id == incoming
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=rest, send=False)
+            return self.status()
         incoming = self._preview_id(panel)
         transition = panel.transition.type
         if transition == TransitionType.stinger:
             self._note_stinger_cut()
             transition = TransitionType.cut
         self._put_on_program(panel, incoming, transition, flip_flop=True, frames=frames or panel.transition.rate_frames)
+        return self.status()
+
+    def set_position(self, panel_id: str = "me-1", position: float = 0.0) -> MixerStatus:
+        """The T-bar (0..1): moving off 0 starts the ME's next transition from Preview to Program
+        and holds it there; 1 completes it (the buses swap); 0 ends it without the swap. Auto
+        runs the rest. A stinger does not scrub: moving off 0 runs it as an Auto."""
+        panel = self._ensure_running_panel(panel_id)
+        held = self._positions.get(panel.id)
+        if held is None:
+            if position <= 0:
+                return self.status()
+            if panel.transition.type == TransitionType.stinger:
+                return self.auto(panel.id)
+            held = (position, panel.program_input_id, self._preview_id(panel))
+            # Tally: both sources are on air while the T-bar holds the transition.
+            self._mixes[panel.id] = (held[1], held[2], None)
+        if self._rendered(panel):
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/position", {"t": position})
+        _position, outgoing, incoming = held
+        if position >= 1:
+            del self._positions[panel.id]
+            swap = panel.preview_input_id == incoming
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
+        elif position <= 0:
+            self._positions.pop(panel.id, None)
+            self._mixes.pop(panel.id, None)
+            self._publish_tally()
+        else:
+            self._positions[panel.id] = (position, outgoing, incoming)
+            self._publish_tally()
         return self.status()
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
@@ -1529,9 +1577,17 @@ class VisionMixer:
         flip_flop: bool,
         duration_ms: int = 0,
         frames: int = 0,
+        send: bool = True,
     ) -> None:
         """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
-        default); `flip_flop` puts the old Program on Preview."""
+        default); `flip_flop` puts the old Program on Preview. `send=False`: the engine does it
+        already (the T-bar)."""
+        held = self._positions.pop(panel.id, None)
+        if held is not None:
+            # A held T-bar transition ends first, as if it had run to its end (as in the engine).
+            _position, _outgoing, incoming = held
+            swap = panel.preview_input_id == incoming
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
         outgoing = panel.program_input_id
         panel.program_input_id = source_id
         panel.last_transition = transition.value
@@ -1555,7 +1611,7 @@ class VisionMixer:
             if source_id in self.inputs and self.inputs[source_id].kind == InputKind.mxl_live:
                 self.last_live_input_id = source_id
             self.program_bus = ProgramBus.live
-        if self._rendered(panel):
+        if send and self._rendered(panel):
             body: dict[str, Any] = {"source": self._engine_source(source_id), "frames": frames}
             if transition == TransitionType.wipe:
                 # Without a type the engine mixes (frames > 0) or cuts.

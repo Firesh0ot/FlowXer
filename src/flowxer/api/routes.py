@@ -26,6 +26,7 @@ from flowxer.api.schemas import (
     PanelTransitionRequest,
     PanelTransitionUpdate,
     PlayerCueRequest,
+    PositionRequest,
     PreviewRequest,
     ResourceInfo,
     StingerInfo,
@@ -411,6 +412,20 @@ def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="auto", mixer=body)
+
+
+@router.post(
+    "/mixer/position",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it without the swap",
+)
+def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    try:
+        body = mixer.set_position(payload.panel_id, payload.position)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="position", mixer=body)
 
 
 @router.patch(

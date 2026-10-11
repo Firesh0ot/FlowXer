@@ -287,6 +287,13 @@ class AutoRequest(BaseModel):
     frames: int | None = Field(default=None, ge=1, le=1000, description="Duration in frames (default: the ME's rate)")
 
 
+class PositionRequest(BaseModel):
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME)")
+    position: float = Field(
+        ..., ge=0.0, le=1.0, description="T-bar: off 0 starts the ME's transition, 1 completes it, 0 ends it without the swap"
+    )
+
+
 class PlayerCueRequest(BaseModel):
     frame: int = Field(default=0, ge=0, description="Frame of the clip to show (0 = the first)")
 
