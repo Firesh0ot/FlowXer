@@ -118,15 +118,23 @@ of the library item for the current format) and drives the transport.
   16-bit). NVDEC: one 1080p50 player at 40–60 Mbit/s takes about 4 % of the A16 GPU's
   decoders, 6 % of a CPU core.
 
-### Downstream keyer (DSK)
+### Keyers
 
-`FLOWXER_ENGINE_KEYS` gives each key input (a v210a flow: the v210 fill followed by a 10-bit
-key plane, e.g. mxl-browser-source in `v210a` mode) its DSK on one ME (FlowXer: `DSK 1 Key` on
-ME 1). It keys linearly over the ME's Program only: keys have no preview, Preview shows only its
-source. out = fill · α + background · (1 − α) with α = key / 1023 · gain, per sample (chroma: the
-mean α of its pixel pair), straight fill. The key is read at grain *i − L* like an input; an
-unrouted key input keys nothing. `POST /dsk/<k>` `{"on": bool}` cuts it, `/dsk/<k>/auto`
-`{"frames": n}` fades the gain over n grains.
+`FLOWXER_ENGINE_KEYS` lists the keyers (`{"label", "me", "stage": "upstream"|"downstream",
+"domain", "flow"}`; FlowXer: per rendering ME its upstream keyers, then its DSKs). They key over
+the ME's Program only (keys have no preview, Preview shows only its source), as layers of the
+fused compose: the background, the upstream keyers, the DSKs, Fade to Black.
+- **Linear:** the keyer's key input, a v210a flow (the v210 fill followed by a 10-bit key plane,
+  e.g. mxl-browser-source in `v210a` mode). out = fill · α + background · (1 − α) with
+  α = key / 1023 · gain, per sample (chroma: the mean α of its pixel pair), straight fill. The key
+  is read at grain *i − L* like an input; an unrouted key input keys nothing.
+- **Luma:** a self key of a source the ME may take (an input, a clip player, `me<n>` with n > m):
+  α = clamp(((Y − 64) / 876 − clip) / soft) (hard with no softness), inverted, times the gain;
+  the fill is the source. A clip player keyed on air counts as on air.
+- **Key flows:** keyers routed to the same flow share one reader and upload; a flow's frames
+  are allocated when it is first routed (stream-ordered), not at start.
+- `POST /keyer/<k>` `{"on": bool}` cuts it, `/keyer/<k>/auto` `{"frames": n}` fades the gain over
+  n grains, `/keyer/<k>/settings` sets the mode and its values.
 
 ### Working format
 
@@ -253,9 +261,10 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /me/{m}/ftb`, `/me/{m}/ftb/auto` | `{"on": true}`, `{"frames": 30}` | Fade to Black of the ME's whole output (a black layer after the DSKs; the PGM audio fades with it); the buses stay |
 | `POST /me/{m}/position` | `{"t": 0.4}` (0–1) | the T-bar: t > 0 starts the ME's next transition and holds it at t (audio ramps to it within a grain); 1 completes it after that grain, 0 ends it without the swap; a stinger runs as an Auto; 409 during an Auto |
 | `PUT /input/{k}` | `{"video": {"domain", "flow"}, "audio": {"domain", "flow"}}` | opens (or, without a flow, closes) the input's readers |
-| `PUT /key/{k}` | `{"domain", "flow"}` | the same for a key input (v210a) |
-| `POST /dsk/{k}` | `{"on": true}` | the DSK on or off at the next grain |
-| `POST /dsk/{k}/auto` | `{"frames": 25}` | fades the DSK on (or off when it is on) |
+| `PUT /key/{k}` | `{"domain", "flow"}` | routes keyer k's key input (v210a); a flow another keyer reads is shared |
+| `POST /keyer/{k}` | `{"on": true}` | the keyer on or off at the next grain |
+| `POST /keyer/{k}/auto` | `{"frames": 25}` | fades the keyer on (or off when it is on) |
+| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma", "source", "clip", "soft", "gain", "invert"}` | the key; a luma source must be one the keyer's ME may take |
 | `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |

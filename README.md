@@ -49,7 +49,7 @@ flowchart LR
 - **Sources** in slot order: live inputs (an MXL video + audio pair, routed over IS-05), clip players, Black.
 - **Clip players** play clips from the media library (decoded on the GPU) and stills (frame memory): loop, play on cut, cue, play, pause, stop. The colour bars ship as a library still.
 - **Transitions:** Cut, and per ME the next transition for Auto: Mix or Wipe (23 SMPTE wipe codes with soft edge, border width and colour, reverse and flip-flop), at the ME's rate in frames; a T-bar; Fade to Black of the ME's whole output (the DSKs and the sound too; the buses and the tally stay). **Audio follows video** with an equal-power crossfade along the transition. Stingers play from P3 M3: until then a stinger is a cut.
-- **DSK 1** on ME 1 keys a v210a fill + key flow (e.g. mxl-browser-source in `v210a` key mode) over ME 1 Program: on, off, auto. Keys have no preview: Preview shows only its source.
+- **Keyers** on every rendering ME: upstream keyers (`FLOWXER_KEYERS_PER_ME`, 0–8, default 2) under the transition and DSKs (`FLOWXER_DSKS_PER_ME`, 0–4, default 1) over it, each linear (its own v210a fill + key input, e.g. mxl-browser-source in `v210a` key mode or a chroma-key function) or luma (a self key of a source the ME may take): on, off, auto. Keyers routed to the same flow share one reader. Keys have no preview: Preview shows only its source.
 - **Preview mosaic:** the engine encodes every source and every ME's Program and Preview once (NVENC); the console crops its pictures out of that one WebRTC stream. No audio preview.
 - **NMOS** IS-04/IS-05 node (BCP-007-03), **tally** over TSL UMD 5.0 (to receivers, and the raw tally for the platform's tally calculator), Prometheus metrics.
 - Runs in **Docker** (`vision-mixer` + `gui`) or on Kubernetes with the MXL domains mounted.
@@ -74,7 +74,7 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 
 - **Pictures:** every source tile and the Preview and Program monitors are crops of the engine's one preview mosaic: the page opens **one WHEP session** (`GET /api/v1/preview` gives the stream and the tile map) and reconnects by itself when it drops. Each picture is a box of its tile's aspect ratio with `overflow: hidden`, holding a `<video>` on that one stream that a CSS `transform: scale(…) translate(…)` stretches and moves so only the tile shows. That works in every browser (no `object-view-box`). Black has no tile; off-air the monitors say why there is no picture.
 - **Clip players** pick the library clip or still they play in their tile's header (an empty player is black), show the position and remaining time over the picture, and have the transport under it: ⏮ cue the first frame, ▶ play, ⏸ pause, ■ stop (back to the first frame), **LOOP**, **AUTO** (play on cut: start when taken to Program). A still shows **FRAME MEM**.
-- **DSK** (per keyer): ON/OFF cuts it, **AUTO** fades it over its rate (in frames; kept with the keyer), `· NO KEY` when its key input has no signal.
+- **Keyers** of the active ME (its upstream keyers, then its DSKs): ON/OFF cuts it, **AUTO** fades it over its rate (in frames; kept with the keyer), `· NO KEY` when a linear key's input has no signal; ⚙ sets the key: linear, or luma of a source with clip, soft and invert, and the gain.
 - **File** takes the mixer on-air or off-air and opens the **clip and still library** and the stinger library.
 - **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots and keyers. What the production sets through the environment is greyed out.
 - The gear on a **source** (`PATCH /inputs/{id}`): name, kind (`mxl_live`, `clip_player`, `black`), flows of a live input, the clip or still of a clip player with loop and play on cut, and the auto-stinger.
@@ -119,8 +119,8 @@ If `FLOWXER_API_TOKEN` is set, calls to **9610** need `Authorization: Bearer …
 | Source left click (PVW) / right click (PGM) | `POST /mixer/preview`, `POST /mixer/take` |
 | Source ⚙, clip player item, loop, play on cut | `PATCH /inputs/{id}` (`library_item_id`, `loop`, `play_on_cut`, `stinger_slot_id`) |
 | Clip player transport | `POST /players/{id}/cue` (`{"frame": n}`), `/play`, `/pause`, `/stop` |
-| DSK ON/OFF, rate | `PATCH /keyers/{id}` (`enabled`, `rate_ms`) |
-| DSK AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
+| Keyers | `GET /keyers`; `PATCH /keyers/{id}` (`enabled`, `rate_ms`, `mode`: `linear`/`luma`, `source_id`, `clip`, `soft`, `gain`, `invert`); ids `me-<n>-key-<k>`, `dsk-<k>` (ME 1), `me-<n>-dsk-<k>` |
+| Keyer AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
 | Transition type, rate, wipe pattern and edge | `PATCH /panels/{id}/transition` (`type`, `rate_frames`, `wipe`: `pattern`, `reverse`, `alternate`, `soft`, `border`, `border_color`; `stinger_slot_id`); `GET /console` `panels[].transition` |
 | T-bar lever | `POST /mixer/position` (`panel_id`, `position` 0–1): off 0 starts the ME's transition and holds it, 1 completes it, 0 ends it without the swap; AUTO runs the rest; a stinger runs as an Auto |
 | CUT / AUTO / FTB | `POST /mixer/cut`, `/mixer/auto` (`panel_id`, `frames`), `/mixer/fade-to-black`. Kept for API clients: `/mixer/fade` (a mix), `/mixer/wipe` (arms Wipe), `/mixer/take` (`transition`: `cut`, `mix`, `wipe`, `stinger`; `frames` or `duration_ms`) |
@@ -258,13 +258,14 @@ The platform's production designer sets the mixer's structure through the enviro
 | `FLOWXER_FORMAT` | `format_id`, raster and rate | `1080p50` |
 | `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_CLIP_PLAYERS` | The input list: `logical_source_count` and each input's id, kind and label | `4`; `["Cam 1","Cam 2","Cam 3","Cam 4"]` or `Cam 1,Cam 2,Cam 3,Cam 4`; `2` |
 | `FLOWXER_PANELS` | `mixer_panel_count` (MEs, 1–4) | `2` |
+| `FLOWXER_KEYERS_PER_ME`, `FLOWXER_DSKS_PER_ME` | `keyers_per_me` (0–8, default 2) and `dsks_per_me` (0–4, default 1) of every rendering ME; set, the keyer labels are fixed | `2`, `1` |
 
 With the input list set, the inputs are in this order (the slot order, the TSL INDEX): `cam-1`..`cam-N` (`mxl_live`, labelled from `FLOWXER_INPUT_LABELS`, the rest `Camera n`), `clip-1`..`clip-C` (clip players, `Clip n`), then `black` (Black). Live inputs and clip players together are at most 23 (24 sources with Black). More labels than live inputs, a duplicate or empty label, or an unknown format stop the process with exit code 78. `FLOWXER_CLIP_PLAYERS` replaces `FLOWXER_TEST_SOURCES`, which is no longer read; saved states and API clients with test, file or replay inputs get clip players.
 
 - **Kept from the saved state:** receiver connections (IS-05), and per input the essences, group hint, library item, loop, play on cut and auto-stinger when its id and kind stay the same; keyers, stingers, tally and the other workspace fields. Routes of an input the environment removed are dropped; Program or Preview on it starts empty.
 - **API and GUI:** what the environment sets cannot be changed (409, the message names the variable): `PUT /workspace` with another `format_id`, `logical_source_count` or `mixer_panel_count`; `POST` and `DELETE /inputs`; `PATCH /inputs/{id}` with another `label` or `kind`. The current values pass, so a client may send whole documents. `GET /console` lists these fields in `pinned`; the GUI greys them out.
 - **Export and import:** an imported document gets the environment's structure, as at a start; everything else in it is imported.
-- **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input and `DSK 1 Key` (v210a) for the keyer; per rendering ME the senders `ME <n> PGM Video`, `ME <n> PGM Audio` and `ME <n> PVW Video`, each with its own flow. ME 1 PGM keeps FlowXer's flow ids across versions.
+- **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input, and one v210a receiver per keyer of each rendering ME: `ME <n> Key <k>` (upstream), `DSK <k> Key` (ME 1, P2's id kept), `ME <n> DSK <k> Key`; per rendering ME the senders `ME <n> PGM Video`, `ME <n> PGM Audio` and `ME <n> PVW Video`, each with its own flow. ME 1 PGM keeps FlowXer's flow ids across versions.
 - `FLOWXER_PROGRAM_AUTOSTART=true` starts Program once the state is restored: ME 1 Program on the first live input (else the first input), Preview on the next one. A start that fails is logged and shown in `GET /mixer`, and tried again after 2, 5, 10, then every 30 s until Program runs or an operator starts or stops it. An input routed to an MXL domain that does not exist yet (a fabrics mirror after a node reboot) is black and silent and reads its flow once the domain appears.
 
 ```bash
@@ -441,7 +442,7 @@ For the platform's tally calculator, which works out from this raw tally what is
 | TEXT | Source label, UTF-16LE (FLAGS bit 0) |
 
 - **INDEX:** at start the sources are numbered from 0 in slot order: with the production structure from the environment `cam-1`..`cam-N`, `clip-1`..`clip-C`, `black`. An input added later (`POST /inputs`, only without that structure) gets the next number. A number stays with its input while the process runs; after a restart the numbering starts again from the slots.
-- **Lights nothing:** the downstream keyer (its key input is no source of the ME).
+- **Keys** light LH only (keys have no preview): a luma key's source while the key is on air; each linear keyer's key input as INDEX `2000 + 100·n + k` (upstream keyer k of ME n) or `3000 + 100·n + k` (DSK k of ME n; ME 1 DSK 1 = 3101), TEXT its receiver label, red while the keyer is on air. Fade to Black lights nothing new.
 - **When:** each update holds every source of every ME, the ones that are off included. It goes out on each change (also when a mix starts and ends) and every second. While Program is stopped every lamp is off; the last update at shutdown says so.
 - **Transport:** a packet holds at most 2048 bytes; a larger update is split. Over TCP each packet is wrapped in DLE/STX … DLE/ETX with DLE stuffing. The host name is resolved when the export connects and again after a failure. After a failure the export tries again after 1, 2, 5, then every 10 s and logs at most once a minute. A thread of its own takes the state and sends.
 - **Metrics** (`/metrics`, only while the export is set): `flowxer_tally_export_packets_total`, `flowxer_tally_export_send_errors_total` and `flowxer_tally_export_last_success_timestamp_seconds`.
