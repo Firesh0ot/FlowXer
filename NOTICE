@@ -31,8 +31,10 @@ MIT
   Copyright (c) 2026 Adrian Hilber (MIT). FlowXer reimplements the
   ideas; no C++ sources were copied.
 
-LGPL-2.1+
-  FFmpeg / libav via the Ubuntu ffmpeg packages (mixer image)
+LGPL-2.1+ / GPL-2.0+
+  FFmpeg / libav via the Ubuntu ffmpeg packages (mixer image). Ubuntu builds them with
+  GPL parts such as libx264 and libx265; the media library runs those through the
+  separate ffmpeg program (the x265 fallback of the clip conversion).
 
 NVIDIA CUDA EULA
   The CUDA runtime, linked statically into the media engine

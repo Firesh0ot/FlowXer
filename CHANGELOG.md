@@ -32,7 +32,21 @@ control plane. One image, one code path; an NVIDIA GPU is required
   stop. An empty player is black. The colour bars ship as a library still.
 - DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
   (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM and
-  PVW; on, off, auto.
+  PVW; on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
+  `rate_ms`; `POST /keyers/{id}/auto` without a duration uses it).
+- GUI: every picture of the console (sources, each ME's Preview and Program) is
+  a crop of the engine's one preview mosaic: one WHEP session per page that
+  reconnects by itself, each picture a box of its tile's aspect ratio with the
+  stream's video scaled and moved inside it (CSS transform; every browser, no
+  `object-view-box`). Clip players get a bar (library clip or still, cue, play,
+  pause, stop, loop, play on cut, position and remaining time; a still is a
+  frame memory), DSK 1 gets Auto and its rate, the clip library holds stills.
+  The per-source WebRTC and JPEG previews are gone.
+- Operator-screen widget `bus` (Program and Preview rows with Cut and Auto of
+  one ME), served by flowxer-gui: `GET /widgets` (from `GET /api/v1/widgets`)
+  and `GET /widget/bus?me=<n>[&theme=dark|light|transparent]`, framed only by
+  the origins in `WIDGET_FRAME_ANCESTORS` (gui container, default `'self'`),
+  with `widget-ready` and `widget-size` messages.
 - Library: a clip's mezzanine is HEVC 4:4:4 10-bit (a key frame every second,
   no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32 sound file,
   instead of ProRes 422 HQ. NVENC encodes it with constant QP 8 (about 90
