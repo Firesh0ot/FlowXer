@@ -38,9 +38,11 @@ control plane. One image, one code path; an NVIDIA GPU is required
   a crop of the engine's one preview mosaic: one WHEP session per page that
   reconnects by itself, each picture a box of its tile's aspect ratio with the
   stream's video scaled and moved inside it (CSS transform; every browser, no
-  `object-view-box`). Clip players get a bar (library clip or still, cue, play,
-  pause, stop, loop, play on cut, position and remaining time; a still is a
-  frame memory), DSK 1 gets Auto and its rate, the clip library holds stills.
+  `object-view-box`), and reconnects by itself. Clip players get their library
+  clip or still in the tile's header, the position and remaining time over the
+  picture and a transport bar (cue, play, pause, stop, loop, play on cut; a
+  still is a frame memory); DSK 1 gets Auto and its rate; the clip library
+  holds stills.
   The per-source WebRTC and JPEG previews are gone.
 - Operator-screen widget `bus` (Program and Preview rows with Cut and Auto of
   one ME), served by flowxer-gui: `GET /widgets` (from `GET /api/v1/widgets`)

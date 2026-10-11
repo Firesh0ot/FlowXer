@@ -66,13 +66,13 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 │                                                                  │
 │  [Cam 1 ⚙] [Cam 2 ⚙] [Clip 1 ⚙] …   source tiles (16:9 or 9:16)  │
 │   left of picture = PVW · right = PGM          Cut     Fade      │
-│   clip players: item ⏮ ▶ ⏸ ■ LOOP AUTO 00:03.12 −00:06.37       │
+│   clip players: [item ▾] · 00:03.12 −00:06.37 · ⏮ ▶ ⏸ ■ LOOP AUTO │
 │                                                Fade to Black Wipe │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 - **Pictures:** every source tile and the Preview and Program monitors are crops of the engine's one preview mosaic: the page opens **one WHEP session** (`GET /api/v1/preview` gives the stream and the tile map) and reconnects by itself when it drops. Each picture is a box of its tile's aspect ratio with `overflow: hidden`, holding a `<video>` on that one stream that a CSS `transform: scale(…) translate(…)` stretches and moves so only the tile shows. That works in every browser (no `object-view-box`). Black has no tile; off-air the monitors say why there is no picture.
-- **Clip players** have a bar under their picture: the library clip or still they play (an empty player is black), ⏮ cue the first frame, ▶ play, ⏸ pause, ■ stop (back to the first frame), **LOOP**, **AUTO** (play on cut: start when taken to Program), and the position and remaining time. A still shows **FRAME MEM**.
+- **Clip players** pick the library clip or still they play in their tile's header (an empty player is black), show the position and remaining time over the picture, and have the transport under it: ⏮ cue the first frame, ▶ play, ⏸ pause, ■ stop (back to the first frame), **LOOP**, **AUTO** (play on cut: start when taken to Program). A still shows **FRAME MEM**.
 - **DSK** (per keyer): ON/OFF cuts it, **AUTO** fades it over its rate (in frames; kept with the keyer), `· NO KEY` when its key input has no signal.
 - **File** takes the mixer on-air or off-air and opens the **clip and still library** and the stinger library.
 - **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots and keyers. What the production sets through the environment is greyed out.

@@ -183,24 +183,29 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   color: transparent; cursor: pointer; font-size: 11px; letter-spacing: 0.12em;
 }
 .hit:hover { color: #fff; background: #ffffff14; }
-/* A clip player's controls under its picture. */
+/* A clip player: its library item in the header, the position over the picture, the transport
+   in one row under it. */
+.source-tile header .player-select {
+  min-width: 0; max-width: 100%; background: #0b1220; color: var(--text);
+  border: 1px solid var(--line); padding: 1px 2px; font: inherit; font-size: 11px;
+}
+.player-position {
+  position: absolute; right: 4px; bottom: 4px; pointer-events: none;
+  padding: 1px 5px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  background: #000b; color: var(--text); border-radius: 3px;
+}
+.player-position em { font-style: normal; color: var(--muted); }
+.player-position.frame-memory { color: #e0b025; letter-spacing: 0.08em; }
 .player-bar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px;
-  padding: 4px 6px; font-size: 11px; border-top: 1px solid var(--line); min-width: 0;
+  display: flex; align-items: center; gap: 2px; padding: 3px 4px;
+  font-size: 10px; border-top: 1px solid var(--line); min-width: 0; overflow: hidden;
 }
-.player-bar select {
-  flex: 1 1 110px; min-width: 0; background: #0b1220; color: var(--text);
-  border: 1px solid var(--line); padding: 2px 4px; font: inherit;
-}
-.player-bar .transport { display: flex; gap: 2px; }
 .player-bar button {
-  background: #151b26; color: var(--text); border: 1px solid var(--line); border-radius: 3px;
-  padding: 2px 6px; font: inherit; line-height: 1.2; cursor: pointer;
+  flex: 0 1 auto; min-width: 0; background: #151b26; color: var(--text); border: 1px solid var(--line);
+  border-radius: 3px; padding: 1px 5px; font: inherit; line-height: 1.3; cursor: pointer;
 }
-.player-bar button.on { outline: 2px solid var(--accent); }
-.player-bar .position { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.player-bar .position em { font-style: normal; color: var(--muted); }
-.player-bar .frame-memory { color: #e0b025; letter-spacing: 0.08em; }
+.player-bar button:nth-child(5) { margin-left: auto; }
+.player-bar button.on { outline: 2px solid var(--accent); outline-offset: -2px; }
 /* A downstream keyer: on/off, Auto and its rate. */
 .dsk-control { display: flex; align-items: stretch; }
 .aux-row .dsk-control button { border-radius: 0; }
