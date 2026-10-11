@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { LibraryModal } from "./components/LibraryModal";
 import { Monitor } from "./components/Monitor";
+import { DskControl } from "./components/DskControl";
+import { previewSession } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
@@ -9,6 +11,12 @@ import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { StatusChip } from "./components/StatusChip";
 import { TallySettingsModal } from "./components/TallySettingsModal";
 import { TransitionBank } from "./components/TransitionBank";
+
+/** Frames per second of a frame rate such as "50/1" or "60000/1001". */
+function framesPerSecond(rate: string | undefined): number {
+  const [num, den] = (rate ?? "50/1").split("/").map(Number);
+  return num > 0 ? num / (den > 0 ? den : 1) : 50;
+}
 
 /** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
 function sourceStripColumns(count: number, aspect: string = "16:9"): number {
@@ -33,6 +41,7 @@ export default function App() {
   const refresh = async () => {
     try {
       const next = await api.console();
+      previewSession.setMap(next.preview);
       setSnapshot(next);
       setError(null);
       setActivePanel((current) =>
@@ -65,7 +74,8 @@ export default function App() {
   }
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
-  const webrtc = snapshot.webrtc?.enabled ?? false;
+  const fps = framesPerSecond(snapshot.formats.find((item) => item.id === snapshot.workspace.format_id)?.frame_rate);
+  const playable = (snapshot.library ?? []).filter((item) => item.ready && (item.kind === "clip" || item.kind === "still"));
 
   return (
     <div className="console">
@@ -96,7 +106,7 @@ export default function App() {
                           setMenu(null);
                         }}
                       >
-                        Clip library…
+                        Clip and still library…
                       </button>
                       <button
                         onClick={() => {
@@ -168,32 +178,22 @@ export default function App() {
         <div className="monitors">
           <div className="bus-column">
             <h2>Preview</h2>
-            <Monitor
-              streamId={`panel:${panel.id}:pvw`}
-              webrtc={webrtc}
-              label={panel.preview_input_id ?? "NO SRC"}
-              tally="pvw"
-            />
+            <Monitor tileId={`panel:${panel.id}:pvw`} label={panel.preview_input_id ?? "NO SRC"} tally="pvw" />
           </div>
           <div className="bus-column">
             <h2>Program</h2>
-            <Monitor
-              streamId={`panel:${panel.id}:pgm`}
-              webrtc={webrtc}
-              label={panel.program_input_id ?? "NO SRC"}
-              tally="pgm"
-            />
+            <Monitor tileId={`panel:${panel.id}:pgm`} label={panel.program_input_id ?? "NO SRC"} tally="pgm" />
           </div>
         </div>
         <div className="aux-row">
           {snapshot.keyers.map((keyer) => (
-            <button
+            <DskControl
               key={keyer.id}
-              className={keyer.enabled ? "on" : ""}
-              onClick={() => void api.patchKeyer(keyer.id, { enabled: !keyer.enabled }).then(refresh)}
-            >
-              {keyer.label} {keyer.enabled ? "ON" : "OFF"}
-            </button>
+              keyer={keyer}
+              keyState={snapshot.sources?.[keyer.id]?.state}
+              fps={fps}
+              onCommand={(fn) => void command(fn)}
+            />
           ))}
           {snapshot.stinger_slots.map((slot) => (
             <div key={slot.id} className="stinger-chip">
@@ -202,7 +202,7 @@ export default function App() {
                 onClick={() => {
                   const target = panel.preview_input_id;
                   if (!target) return;
-                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "replay"
+                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "clip_player"
                     ? "to_replay"
                     : "to_live";
                   void command(() =>
@@ -239,10 +239,13 @@ export default function App() {
               key={input.id}
               input={input}
               panel={panel}
-              webrtc={webrtc}
+              runtime={snapshot.sources?.[input.id]}
+              library={playable}
+              fps={fps}
               onPreview={() => void command(() => api.preview(input.id, panel.id))}
               onProgram={() => void command(() => api.take(input.id, panel.id))}
               onSettings={() => setSourceEdit(input)}
+              onPlayer={(fn) => void command(fn)}
             />
           ))}
         </div>
@@ -280,8 +283,7 @@ export default function App() {
       {sourceEdit ? (
         <SourceSettingsModal
           input={sourceEdit}
-          clips={snapshot.clips}
-          libraryClips={(snapshot.library ?? []).filter((item) => item.kind === "clip")}
+          libraryItems={playable}
           stingerSlots={snapshot.stinger_slots}
           pinnedBy={snapshot.pinned?.logical_source_count}
           onClose={() => setSourceEdit(null)}

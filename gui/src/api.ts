@@ -1,4 +1,6 @@
-export type InputKind = "mxl_live" | "file" | "replay" | "test" | "black";
+import type { PreviewMap } from "./preview";
+
+export type InputKind = "mxl_live" | "clip_player" | "black";
 
 export interface LogicalInput {
   id: string;
@@ -7,6 +9,9 @@ export interface LogicalInput {
   slot: number;
   file_path?: string | null;
   library_item_id?: string | null;
+  /** Clip players: loop, and play when taken to Program. */
+  loop?: boolean;
+  play_on_cut?: boolean;
   group_hint?: string | null;
   stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;
@@ -26,9 +31,19 @@ export interface DownstreamKeyer {
   id: string;
   label: string;
   enabled: boolean;
-  url: string;
-  title: string;
-  subtitle: string;
+  /** Duration of its Auto. */
+  rate_ms: number;
+}
+
+/** What the engine reports for an input (GET /console `sources`); clip players add the transport. */
+export interface SourceRuntime {
+  state?: string;
+  kind?: "clip" | "still" | "";
+  frame?: number;
+  frames?: number;
+  loop?: boolean;
+  play_on_cut?: boolean;
+  error?: string;
 }
 
 export interface StingerSlot {
@@ -46,7 +61,7 @@ export interface StingerSlot {
 
 export interface LibraryItem {
   id: string;
-  kind: "clip" | "stinger";
+  kind: "clip" | "still" | "stinger";
   name: string;
   tags: string[];
   status: string;
@@ -187,7 +202,10 @@ export interface ConsoleState {
   stinger_slots: StingerSlot[];
   mixer: MixerStatus;
   resources: ResourceInfo;
-  webrtc?: { enabled: boolean; protocol: string };
+  /** The preview mosaic and its tile map. */
+  preview: PreviewMap;
+  /** Per input id what the engine reports (clip players: their transport). */
+  sources?: Record<string, SourceRuntime>;
   clips: { name: string; path: string; library_item_id?: string | null; ready?: boolean }[];
   stingers: StingerInfo[];
   library?: LibraryItem[];
@@ -263,6 +281,17 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload),
     }).then((r) => parse<LogicalInput>(r)),
+  keyerAuto: (id: string) =>
+    fetch(`/api/v1/keyers/${id}/auto`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) =>
+      parse<DownstreamKeyer>(r),
+    ),
+  /** Clip player transport: cue (a frame, 0 = the first), play, pause, stop. */
+  player: (inputId: string, action: "cue" | "play" | "pause" | "stop", frame = 0) =>
+    fetch(`/api/v1/players/${inputId}/${action}`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(action === "cue" ? { frame } : {}),
+    }).then((r) => parse<LogicalInput>(r)),
   patchKeyer: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/keyers/${id}`, {
       method: "PATCH",
@@ -301,7 +330,7 @@ export const api = {
     }).then((r) => parse<TallyConfig>(r)),
   tallyRefresh: () =>
     fetch("/api/v1/tally/refresh", { method: "POST" }).then((r) => parse<TallyConfig>(r)),
-  library: (kind?: "clip" | "stinger", q = "") => {
+  library: (kind?: "clip" | "still" | "stinger", q = "") => {
     const params = new URLSearchParams();
     if (kind) params.set("kind", kind);
     if (q) params.set("q", q);
@@ -325,7 +354,7 @@ export const api = {
   uploadInit: (payload: {
     name: string;
     size: number;
-    kind: "clip" | "stinger";
+    kind: "clip" | "still" | "stinger";
     mode: "video" | "image_sequence" | "zip";
     options?: Record<string, unknown>;
   }) =>
@@ -361,7 +390,7 @@ export const api = {
 
 export async function uploadFileChunked(
   file: File,
-  kind: "clip" | "stinger",
+  kind: "clip" | "still" | "stinger",
   mode: "video" | "zip",
   options: Record<string, unknown> = {},
   onProgress?: (ratio: number) => void,

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -29,6 +30,17 @@ export default defineConfig({
       "/redoc": mixerProxy(),
       "/graphics": mixerProxy(),
       "/openapi.json": mixerProxy(),
+      // nginx serves the widget list at /widgets (dev: the page is /widget.html?me=1).
+      "/widgets": { ...mixerProxy(), rewrite: () => "/api/v1/widgets" },
+    },
+  },
+  build: {
+    rollupOptions: {
+      // The console, and the bus widget nginx serves at /widget/bus.
+      input: {
+        main: fileURLToPath(new URL("index.html", import.meta.url)),
+        widget: fileURLToPath(new URL("widget.html", import.meta.url)),
+      },
     },
   },
   preview: {

@@ -224,7 +224,9 @@ class PlayerCueRequest(BaseModel):
 
 
 class KeyerAutoRequest(BaseModel):
-    duration_ms: int = Field(default=500, ge=1, le=10000, description="Fade on or off over this time")
+    duration_ms: int | None = Field(
+        default=None, ge=1, le=10000, description="Fade on or off over this time (default: the keyer's rate)"
+    )
 
 
 class StingerPlayRequest(BaseModel):
@@ -376,6 +378,7 @@ class DownstreamKeyer(BaseModel):
     id: str
     label: str
     enabled: bool = Field(default=False, description="On air")
+    rate_ms: int = Field(default=500, ge=1, le=10000, description="Duration of its Auto (fade on or off)")
 
 
 class StingerSlot(BaseModel):
@@ -439,6 +442,7 @@ class WorkspaceUpdate(BaseModel):
 class KeyerUpdate(BaseModel):
     enabled: bool | None = Field(default=None, description="On or off at the next frame")
     label: str | None = None
+    rate_ms: int | None = Field(default=None, ge=1, le=10000, description="Duration of its Auto")
 
 
 class StingerSlotUpdate(BaseModel):

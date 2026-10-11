@@ -36,6 +36,7 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
+from flowxer import __version__
 from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.domain.mxl_domain import load_domain_info, scan_domains
 from flowxer.engine.formats import VIDEO_FORMATS
@@ -161,6 +162,30 @@ def engine_status(mixer: VisionMixer = Depends(get_mixer)) -> dict:
 )
 def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
     return preview_info(mixer)
+
+
+@router.get(
+    "/widgets",
+    tags=["gui"],
+    summary="The operator-screen widgets flowxer-gui serves at /widget/<id>, with their parameters",
+    description=(
+        "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
+        "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
+        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows "
+        "and Cut/Auto of one ME."
+    ),
+)
+def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
+    me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
+    return [
+        {
+            "id": "bus",
+            "title": "FlowXer bus",
+            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 150},
+            "version": __version__,
+        }
+    ]
 
 
 @router.get(

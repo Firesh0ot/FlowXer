@@ -154,6 +154,11 @@ def test_one_downstream_keyer(mixer: VisionMixer) -> None:
     mixer.keyer_auto("dsk-1", duration_ms=500)
     assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 25})
     assert mixer.keyers[0].enabled is False
+    # Auto without a duration takes the keyer's rate.
+    mixer.update_keyer("dsk-1", rate_ms=1000)
+    mixer.keyer_auto("dsk-1")
+    assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 50})
+    assert mixer.keyers[0].rate_ms == 1000 and mixer.keyers[0].enabled is True
 
 
 def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:

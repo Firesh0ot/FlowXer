@@ -68,6 +68,7 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
         "/api/v1/players/{input_id}/{action}",
         "/api/v1/keyers/{keyer_id}/auto",
         "/api/v1/preview",
+        "/api/v1/widgets",
         "/api/v1/engine",
         "/api/v1/stinger-slots/{slot_id}",
         "/api/v1/mixer/cut",
@@ -101,6 +102,22 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
     assert "TallyReceiver" in components
     assert spec["info"]["title"] == "FlowXer Vision Mixer"
     assert spec["openapi"].startswith("3.")
+
+
+def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
+    widgets = client.get("/api/v1/widgets").json()
+    assert [w["id"] for w in widgets] == ["bus"]
+    bus = widgets[0]
+    assert bus["params"]["required"] == ["me"]
+    assert bus["params"]["properties"]["me"]["maximum"] == len(mixer.panels)
+    assert bus["min_size"] == {"w": 480, "h": 150}
+
+
+def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer) -> None:
+    keyer = client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 800}).json()
+    assert keyer["rate_ms"] == 800
+    assert client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 0}).status_code == 422
+    assert mixer.keyers[0].rate_ms == 800
 
 
 def test_health_and_config(client: TestClient) -> None:

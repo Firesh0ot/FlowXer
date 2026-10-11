@@ -8,6 +8,9 @@ import {
 
 type UploadMode = "video" | "zip" | "folder";
 
+/** Pictures upload as stills (a clip player holds one as a frame memory). */
+const STILL_FILE = /\.(png|jpe?g|tiff?|bmp|webp|dpx|exr)$/i;
+
 export function LibraryModal({
   kind,
   onClose,
@@ -29,7 +32,9 @@ export function LibraryModal({
   const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
-    const [nextItems, nextJobs] = await Promise.all([api.library(kind, query), api.jobs()]);
+    // The clip library holds the stills too.
+    const [listed, nextJobs] = await Promise.all([api.library(kind === "clip" ? undefined : kind, query), api.jobs()]);
+    const nextItems = kind === "clip" ? listed.filter((item) => item.kind !== "stinger") : listed;
     setItems(nextItems);
     setJobs(nextJobs.filter((job) => nextItems.some((item) => item.id === job.item_id)));
   };
@@ -67,7 +72,7 @@ export function LibraryModal({
           const uploadMode = kind === "stinger" && mode === "zip" ? "zip" : "video";
           await uploadFileChunked(
             file,
-            kind,
+            kind === "clip" && STILL_FILE.test(file.name) ? "still" : kind,
             uploadMode,
             {
               fit,
@@ -97,7 +102,7 @@ export function LibraryModal({
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => void onDrop(event)}
       >
-        <h2>{kind === "clip" ? "Clip library" : "Stinger library"}</h2>
+        <h2>{kind === "clip" ? "Clip and still library" : "Stinger library"}</h2>
         <p className="hint">
           Upload converts in the background to an intra-frame mezzanine. Items show as converting
           until ready; the mixer is never blocked.
@@ -151,7 +156,15 @@ export function LibraryModal({
               type="file"
               multiple={mode === "folder"}
               {...(mode === "folder" ? ({ webkitdirectory: "", directory: "" } as Record<string, string>) : {})}
-              accept={mode === "zip" ? ".zip" : mode === "folder" ? ".tga" : "video/*,.mov,.mxf,.mkv,.ts"}
+              accept={
+                mode === "zip"
+                  ? ".zip"
+                  : mode === "folder"
+                    ? ".tga"
+                    : kind === "clip"
+                      ? "video/*,image/*,.mov,.mxf,.mkv,.ts,.dpx,.exr"
+                      : "video/*,.mov,.mxf,.mkv,.ts"
+              }
               disabled={busy}
               onChange={(e) => {
                 const list = e.target.files ? Array.from(e.target.files) : [];
@@ -197,6 +210,7 @@ export function LibraryModal({
               <div>
                 <strong>{item.name}</strong>
                 <p>
+                  {item.kind === "still" ? "still · " : ""}
                   {item.ready ? "ready" : item.status}
                   {item.playback !== "unknown" ? ` · ${item.playback}` : ""}
                   {item.frame_count ? ` · ${item.frame_count}f` : ""}

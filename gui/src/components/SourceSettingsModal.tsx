@@ -1,12 +1,11 @@
 import { useState } from "react";
 import type { LibraryItem, LogicalInput, StingerSlot } from "../api";
 
-const KINDS = ["test", "black", "mxl_live", "file", "replay"] as const;
+const KINDS = ["mxl_live", "clip_player", "black"] as const;
 
 export function SourceSettingsModal({
   input,
-  clips,
-  libraryClips,
+  libraryItems,
   stingerSlots,
   pinnedBy,
   onClose,
@@ -14,8 +13,8 @@ export function SourceSettingsModal({
   onOpenLibrary,
 }: {
   input: LogicalInput;
-  clips: { name: string; library_item_id?: string | null; ready?: boolean }[];
-  libraryClips: LibraryItem[];
+  /** Ready clips and stills of the library. */
+  libraryItems: LibraryItem[];
   stingerSlots: StingerSlot[];
   /** Variables that set the inputs' ids, kinds and labels, when the environment does. */
   pinnedBy?: string;
@@ -29,12 +28,11 @@ export function SourceSettingsModal({
   const [videoFlow, setVideoFlow] = useState(input.video?.flow_id ?? "");
   const [audioFlow, setAudioFlow] = useState(input.audio?.flow_id ?? "");
   const [libraryItemId, setLibraryItemId] = useState(input.library_item_id ?? "");
-  const [filePath, setFilePath] = useState(input.file_path ?? "");
+  const [loop, setLoop] = useState(Boolean(input.loop));
+  const [playOnCut, setPlayOnCut] = useState(Boolean(input.play_on_cut));
   const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
 
-  const readyClips = libraryClips.filter((item) => item.ready);
-  const legacyClips = clips.filter((clip) => !clip.library_item_id);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -81,45 +79,29 @@ export function SourceSettingsModal({
             </label>
           </>
         ) : null}
-        {kind === "file" || kind === "replay" ? (
+        {kind === "clip_player" ? (
           <>
             <label>
-              Library clip
-              <select
-                value={libraryItemId}
-                onChange={(e) => {
-                  setLibraryItemId(e.target.value);
-                  if (e.target.value) setFilePath("");
-                }}
-              >
-                <option value="">Select library clip</option>
-                {readyClips.map((item) => (
+              Clip or still
+              <select value={libraryItemId} onChange={(e) => setLibraryItemId(e.target.value)}>
+                <option value="">Empty (black)</option>
+                {libraryItems.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {item.name}
-                    {item.playback !== "unknown" ? ` (${item.playback})` : ""}
+                    {item.name} ({item.kind === "still" ? "still" : `${item.duration_s.toFixed(1)} s`})
                   </option>
                 ))}
               </select>
             </label>
-            <label>
-              Legacy file path
-              <select
-                value={filePath}
-                onChange={(e) => {
-                  setFilePath(e.target.value);
-                  if (e.target.value) setLibraryItemId("");
-                }}
-              >
-                <option value="">None</option>
-                {legacyClips.map((clip) => (
-                  <option key={clip.name} value={clip.name}>
-                    {clip.name}
-                  </option>
-                ))}
-              </select>
+            <label className="check">
+              <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} />
+              Loop
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={playOnCut} onChange={(e) => setPlayOnCut(e.target.checked)} />
+              Play on cut (start when taken to Program)
             </label>
             <button type="button" className="ghost" onClick={onOpenLibrary}>
-              Open clip library…
+              Open clip and still library…
             </button>
           </>
         ) : null}
@@ -163,14 +145,10 @@ export function SourceSettingsModal({
                     payload.audio = audioFlow ? { flow_id: audioFlow } : null;
                   }
                 }
-                if (kind === "file" || kind === "replay") {
-                  if (libraryItemId) {
-                    payload.library_item_id = libraryItemId;
-                    payload.file_path = null;
-                  } else if (filePath) {
-                    payload.file_path = filePath;
-                    payload.library_item_id = null;
-                  }
+                if (kind === "clip_player") {
+                  payload.library_item_id = libraryItemId || null;
+                  payload.loop = loop;
+                  payload.play_on_cut = playOnCut;
                 }
                 await onSave(payload);
                 onClose();

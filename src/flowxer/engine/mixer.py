@@ -459,8 +459,12 @@ class VisionMixer:
     def _keyer_number(self, keyer: DownstreamKeyer) -> int:
         return self.keyers.index(keyer) + 1
 
-    def update_keyer(self, keyer_id: str, *, enabled: bool | None = None, label: str | None = None) -> DownstreamKeyer:
+    def update_keyer(
+        self, keyer_id: str, *, enabled: bool | None = None, label: str | None = None, rate_ms: int | None = None
+    ) -> DownstreamKeyer:
         keyer = self.get_keyer(keyer_id)
+        if rate_ms is not None:
+            keyer.rate_ms = rate_ms
         if label is not None and label != keyer.label:
             keyer.label = label
             # The key receiver is "<label> Key".
@@ -470,11 +474,12 @@ class VisionMixer:
             self._engine_call("PUT", f"/dsk/{self._keyer_number(keyer)}", {"on": enabled})
         return keyer
 
-    def keyer_auto(self, keyer_id: str, duration_ms: int = 500) -> DownstreamKeyer:
-        """Fade the keyer on (or off when it is on) over duration_ms."""
+    def keyer_auto(self, keyer_id: str, duration_ms: int | None = None) -> DownstreamKeyer:
+        """Fade the keyer on (or off when it is on) over duration_ms (default: its rate)."""
         keyer = self.get_keyer(keyer_id)
         keyer.enabled = not keyer.enabled
-        self._engine_call("POST", f"/dsk/{self._keyer_number(keyer)}/auto", {"frames": _frames(duration_ms, self.settings.fps)})
+        frames = _frames(duration_ms or keyer.rate_ms, self.settings.fps)
+        self._engine_call("POST", f"/dsk/{self._keyer_number(keyer)}/auto", {"frames": frames})
         return keyer
 
     def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
