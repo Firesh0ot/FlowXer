@@ -51,11 +51,18 @@ waits in MXL, condition variables): no busy loops.
 - Sources: the live inputs `in1`..`inN`, the clip players `cp1`..`cpC`, `black` and
   `me2`..`me4`. ME *m* may take the Program of ME *n* only when *n > m* (re-entry, 0 frames,
   no loops possible).
-- Program renders every grain into its own bus buffer (a copy, or the dissolve during a Mix);
-  Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
+- Program renders every grain into its own bus buffer in one fused compose pass: the background
+  (a copy, the dissolve during a Mix, or the wipe during a Wipe), then the key layers (the DSKs),
+  written once. Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
   `<label> ME<m> PVW`).
-- Cut swaps Program and Preview at the next grain. Auto (Mix) dissolves over N grains, then
-  swaps. Its progress follows the grain index, so skipped grains do not stretch it.
+- Cut swaps Program and Preview at the next grain. Auto runs the ME's next transition (Mix or
+  Wipe; a stinger is a cut until stingers play) over N grains, then swaps. Its progress follows
+  the grain index, so skipped grains do not stretch it.
+- Wipes (`core/wipe.hpp`): the SMPTE codes 1, 2, 3–6, 21–26, 41, 42, 45, 46, 101, 102, 119 and
+  201–204 map each pixel to s in [0, 1]; the front F = t · (1 + soft + border) gives the mask,
+  with the soft edge split around the border; reverse is 1 − s; t = 0 is all A and t = 1 all B.
+  The kernel and the CPU reference are one code path, built without FMA contraction
+  (`-fmad=false`, `-ffp-contract=off`): they agree bit for bit.
 - An input without a video flow is a black slot. It keeps the numbering (the TSL tally and the
   operator's habits), e.g. a camera that is not connected.
 
@@ -238,9 +245,10 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 |---|---|---|
 | `POST /me/{m}/preview` | `{"source": "in3"}` | the ME; 400 for a source the ME may not take, 409 during a Mix |
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
-| `POST /me/{m}/take` | `{"source", "frames", "preview"}` | Program to the source, cut (0 frames) or mixed, with an optional new Preview |
+| `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb"}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code |
+| `POST /me/{m}/take` | `{"source", "frames", "preview", "type"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, `stinger`), mixed (`mix`, the default) or wiped with the ME's wipe (`wipe`) |
 | `POST /me/{m}/cut` | – | the ME |
-| `POST /me/{m}/auto` | `{"frames": 25}` (1–1000) | the ME; 409 while a Mix runs |
+| `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition; 409 while one runs |
 | `PUT /input/{k}` | `{"video": {"domain", "flow"}, "audio": {"domain", "flow"}}` | opens (or, without a flow, closes) the input's readers |
 | `PUT /key/{k}` | `{"domain", "flow"}` | the same for a key input (v210a) |
 | `POST /dsk/{k}` | `{"on": true}` | the DSK on or off at the next grain |
@@ -330,7 +338,9 @@ grain), a Preview change during a Mix refused, the buses swapped after the Mix; 
 ME 2 → ME 1 gives the same picture in the same output grain; ME 2 may not take `me1` or
 `me2`. Output grain *i* equals the source's grain *i − 2* byte for byte (yuv16).
 GPU self-test: yuv16 round trip and dissolve exact, rgba16f round trip exact on the test
-picture, dissolve within 1 code.
+picture, dissolve within 1 code. P3 adds every wipe code (5 positions, 4 soft/border settings, both
+directions: 920 cases) bit for bit against the CPU reference, and the fused compose (a wipe and two
+key layers) exact.
 
 ### Against the success criteria
 
