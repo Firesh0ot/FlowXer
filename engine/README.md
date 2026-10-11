@@ -9,7 +9,8 @@ Since P2 it is FlowXer's media path: the Python control plane (`src/flowxer/engi
 starts it as a child process with a configuration file, restarts it with backoff, and drives
 it over its control API on 127.0.0.1 (NMOS, IS-05 routes, tally, the library and the GUI stay
 in Python). The P1 design is [DESIGN.md](DESIGN.md); the P1 sections below (drop-in,
-measurements) are kept as its record.
+measurements) are kept as its record. P3 (transitions, wipes, keyers, stingers) is designed in
+[docs/engine-p3.md](../docs/engine-p3.md).
 
 ## How it works
 
