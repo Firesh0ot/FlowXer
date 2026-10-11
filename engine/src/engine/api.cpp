@@ -84,7 +84,8 @@ json meView(Engine& engine, int me)
         if (view.me == me)
         {
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
-                {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"transition", transitionJson(view.next)}};
+                {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
+                {"transition", transitionJson(view.next)}};
         }
     }
     return json::object();
@@ -104,6 +105,8 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "frames must be 1.." + std::to_string(Mixer::kMaxFrames));
     case MixResult::BadPattern:
         return error(400, "pattern must be a wipe code of P3, soft and border 0..1");
+    case MixResult::BadPosition:
+        return error(400, "t must be 0..1");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -209,6 +212,14 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         }
         auto const n = body.contains("frames") ? std::optional<int>(body["frames"].get<int>()) : std::nullopt;
         return mixResult(engine, mixer.autoTransition(me, n), me, "ME");
+    }
+    if (action == "position")
+    {
+        if (!body.contains("t") || !body["t"].is_number())
+        {
+            return error(400, "t must be a number 0..1");
+        }
+        return mixResult(engine, mixer.position(me, body["t"].get<float>()), me, "ME");
     }
     return error(404, "unknown action " + action);
 }

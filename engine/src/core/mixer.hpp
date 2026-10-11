@@ -106,6 +106,9 @@ struct MeView
     int frames = 0;
     // Grains of the running transition already rendered (0 while it waits for its first grain).
     int position = 0;
+    // A T-bar (position-driven) transition, held at t.
+    bool manual = false;
+    float t = 0.f;
     TransitionSettings next;
 };
 
@@ -126,6 +129,7 @@ enum class MixResult
     BadSource,
     BadFrames,
     BadPattern,
+    BadPosition,
     Busy
 };
 
@@ -154,8 +158,12 @@ public:
     // Program and Preview swap at the next grain; a running transition ends there.
     MixResult cut(int me);
     // The ME's next transition from Program to Preview over `frames` grains (its rate when not
-    // given), then the buses swap.
+    // given), then the buses swap. From a held T-bar position it runs the rest at that rate.
     MixResult autoTransition(int me, std::optional<int> frames = std::nullopt);
+    // The T-bar: t > 0 starts the ME's next transition (Program to Preview) and holds it at t;
+    // t = 1 completes it (the buses swap after that grain); t = 0 ends it without the swap. A
+    // stinger does not scrub: t > 0 starts it as an Auto. Busy while an Auto runs.
+    MixResult position(int me, float t);
 
     // Downstream keyer k (1-based): on or off at the next grain, or a fade to the other state over
     // `frames` grains (an auto during an auto turns back from where it is).
@@ -197,6 +205,12 @@ private:
         WipeSettings wipe;
         std::uint64_t start = 0;
         int position = 0;
+        // An Auto runs from t = from (0, or a held T-bar position) to 1.
+        float from = 0.f;
+        // A T-bar transition: held at t; tLast is the t of the grain before (the audio ramp).
+        bool manual = false;
+        float t = 0.f;
+        float tLast = 0.f;
         TransitionSettings next;
     };
     struct Dsk

@@ -149,6 +149,8 @@ void Mixer::finishMix(Me& state)
     state.pending = false;
     state.mixing = false;
     state.wiping = false;
+    state.manual = false;
+    state.from = 0.f;
     state.after.reset();
     state.position = 0;
 }
@@ -169,6 +171,8 @@ MixResult Mixer::setProgram(int me, Source source)
         state.pending = false;
         state.mixing = false;
         state.wiping = false;
+        state.manual = false;
+        state.from = 0.f;
         state.after.reset();
         state.position = 0;
         state.program = source;
@@ -291,18 +295,86 @@ MixResult Mixer::autoTransition(int me, std::optional<int> frames)
     Source program;
     Source preview;
     TransitionSettings next;
+    bool resumed = false;
     {
         std::lock_guard lock{mu_};
-        auto const& state = state_[static_cast<std::size_t>(me - 1)];
-        if (state.mixing || state.pending)
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        if (state.manual)
+        {
+            // From the held T-bar position: the rest at the rate, from the next grain.
+            int const rate = frames.value_or(state.next.frames);
+            state.frames = std::max(1, static_cast<int>(std::lround(static_cast<float>(rate) * (1.f - state.t))));
+            state.from = state.t;
+            state.manual = false;
+            state.mixing = false;
+            state.pending = true;
+            state.position = 0;
+            resumed = true;
+        }
+        else if (state.mixing || state.pending)
         {
             return MixResult::Busy;
         }
-        program = state.program;
-        preview = state.preview;
-        next = state.next;
+        else
+        {
+            program = state.program;
+            preview = state.preview;
+            next = state.next;
+        }
+    }
+    if (resumed)
+    {
+        notify();
+        return MixResult::Ok;
     }
     return take(me, preview, frames.value_or(next.frames), program, next.type);
+}
+
+MixResult Mixer::position(int me, float t)
+{
+    if (!validMe(me))
+    {
+        return MixResult::BadMe;
+    }
+    if (!(t >= 0.f && t <= 1.f))
+    {
+        return MixResult::BadPosition;
+    }
+    bool sting = false;
+    {
+        std::lock_guard lock{mu_};
+        auto& state = state_[static_cast<std::size_t>(me - 1)];
+        if (state.pending || (state.mixing && !state.manual))
+        {
+            return MixResult::Busy;
+        }
+        if (!state.mixing)
+        {
+            if (t <= 0.f)
+            {
+                return MixResult::Ok;
+            }
+            sting = state.next.type == Transition::Stinger || state.next.type == Transition::Cut;
+            if (!sting)
+            {
+                state.target = state.preview;
+                state.after = state.program;
+                state.frames = state.next.frames;
+                state.wiping = state.next.type == Transition::Wipe;
+                state.wipe = state.next.wipe;
+                state.mixing = true;
+                state.manual = true;
+                state.tLast = 0.f;
+            }
+        }
+        state.t = t;
+    }
+    if (sting)
+    {
+        return autoTransition(me);
+    }
+    notify();
+    return MixResult::Ok;
 }
 
 MixResult Mixer::dskSet(int key, bool on)
@@ -369,13 +441,38 @@ FramePlan Mixer::frame(std::uint64_t index)
         plan.preview = state.preview;
         plan.wiping = state.mixing && state.wiping;
         plan.wipe = state.wipe;
-        if (state.mixing)
+        if (state.mixing && state.manual)
         {
+            // The T-bar: held at t; the grain at t = 1 shows the target in full, then the buses
+            // swap; at t = 0 the transition ends without the swap.
+            plan.mixing = true;
+            plan.t = state.t;
+            plan.tPrev = state.tLast;
+            state.tLast = state.t;
+            if (state.t >= 1.f)
+            {
+                finishMix(state);
+                ended = true;
+            }
+            else if (state.t <= 0.f)
+            {
+                state.mixing = false;
+                state.manual = false;
+                state.wiping = false;
+                state.after.reset();
+                ended = true;
+            }
+        }
+        else if (state.mixing)
+        {
+            // An Auto from `from` (0, or a held T-bar position) to 1; its progress follows the
+            // grain index.
             auto const done = index >= state.start ? index - state.start + 1 : 1;
             auto const step = static_cast<int>(std::min<std::uint64_t>(done, static_cast<std::uint64_t>(state.frames)));
+            float const span = 1.f - state.from;
             plan.mixing = true;
-            plan.t = static_cast<float>(step) / static_cast<float>(state.frames);
-            plan.tPrev = static_cast<float>(step - 1) / static_cast<float>(state.frames);
+            plan.t = step >= state.frames ? 1.f : state.from + span * (static_cast<float>(step) / static_cast<float>(state.frames));
+            plan.tPrev = state.from + span * (static_cast<float>(step - 1) / static_cast<float>(state.frames));
             state.position = step;
             if (step >= state.frames)
             {
@@ -433,6 +530,8 @@ std::vector<MeView> Mixer::view() const
         view.target = view.mixing ? state.target : state.program;
         view.frames = view.mixing ? state.frames : 0;
         view.position = state.position;
+        view.manual = state.manual;
+        view.t = state.manual ? state.t : 0.f;
         view.next = state.next;
         views.push_back(view);
     }

@@ -2243,6 +2243,8 @@ struct Engine::Impl
                 {"preview", sourceName(view.preview)},
                 {"mixing", view.mixing},
                 {"wiping", view.wiping},
+                {"manual", view.manual},
+                {"t", round3(view.t)},
                 {"next_transition", transitionName(view.next.type)},
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},

@@ -245,6 +245,70 @@ TEST(transition_types_and_wipes)
     CHECK(transitionName(Transition::Stinger) == "stinger");
 }
 
+TEST(tbar_position)
+{
+    Mixer mixer(1, 4);
+    mixer.setProgram(1, in(1));
+    mixer.setPreview(1, in(2));
+    TransitionSettings next;
+    next.type = Transition::Wipe;
+    next.frames = 10;
+    next.wipe.pattern = 101;
+    CHECK(mixer.setTransition(1, next) == MixResult::Ok);
+    // t = 0 without a transition: nothing.
+    CHECK(mixer.position(1, 0.f) == MixResult::Ok);
+    CHECK(!mixer.view()[0].mixing);
+    CHECK(mixer.position(1, 1.5f) == MixResult::BadPosition);
+    // t > 0 starts the ME's transition and holds it; skipped grains do not move it.
+    CHECK(mixer.position(1, 0.3f) == MixResult::Ok);
+    CHECK(mixer.view()[0].manual && mixer.view()[0].t == 0.3f);
+    auto p = mixer.frame(100).mes;
+    CHECK(p[0].mixing && p[0].wiping && p[0].t == 0.3f && p[0].tPrev == 0.f && p[0].a == in(1) && p[0].b == in(2));
+    p = mixer.frame(101).mes;
+    CHECK(p[0].t == 0.3f && p[0].tPrev == 0.3f);
+    CHECK(mixer.position(1, 0.6f) == MixResult::Ok);
+    p = mixer.frame(105).mes;
+    CHECK(p[0].t == 0.6f && p[0].tPrev == 0.3f);
+    // An Auto from the held position runs the rest (0.4 of 10 grains) from the next grain.
+    CHECK(mixer.autoTransition(1) == MixResult::Ok);
+    CHECK(mixer.position(1, 0.5f) == MixResult::Busy);
+    p = mixer.frame(106).mes;
+    CHECK(p[0].wiping && std::abs(p[0].t - 0.7f) < 1e-6f && p[0].tPrev == 0.6f);
+    mixer.frame(107);
+    mixer.frame(108);
+    p = mixer.frame(109).mes;
+    CHECK(p[0].t == 1.f);
+    p = mixer.frame(110).mes;
+    CHECK(!p[0].mixing && p[0].a == in(2) && p[0].preview == in(1));
+    // t = 1 completes it after that grain.
+    CHECK(mixer.position(1, 0.5f) == MixResult::Ok);
+    mixer.frame(111);
+    CHECK(mixer.position(1, 1.f) == MixResult::Ok);
+    p = mixer.frame(112).mes;
+    CHECK(p[0].mixing && p[0].t == 1.f && p[0].tPrev == 0.5f);
+    p = mixer.frame(113).mes;
+    CHECK(!p[0].mixing && p[0].a == in(1) && p[0].preview == in(2));
+    // Back to t = 0 ends it without the swap.
+    CHECK(mixer.position(1, 0.4f) == MixResult::Ok);
+    mixer.frame(114);
+    CHECK(mixer.position(1, 0.f) == MixResult::Ok);
+    p = mixer.frame(115).mes;
+    CHECK(p[0].mixing && p[0].t == 0.f && p[0].tPrev == 0.4f);
+    p = mixer.frame(116).mes;
+    CHECK(!p[0].mixing && p[0].a == in(1) && p[0].preview == in(2));
+    // A Cut at a held position completes the transition.
+    CHECK(mixer.position(1, 0.5f) == MixResult::Ok);
+    CHECK(mixer.cut(1) == MixResult::Ok);
+    p = mixer.frame(117).mes;
+    CHECK(!p[0].mixing && p[0].a == in(2) && p[0].preview == in(1));
+    // A stinger does not scrub: t > 0 starts it as an Auto (a cut for now).
+    next.type = Transition::Stinger;
+    CHECK(mixer.setTransition(1, next) == MixResult::Ok);
+    CHECK(mixer.position(1, 0.2f) == MixResult::Ok);
+    p = mixer.frame(118).mes;
+    CHECK(!p[0].mixing && p[0].a == in(1));
+}
+
 TEST(downstream_keyer_gain)
 {
     Mixer mixer(2, 2, 0, {1});
