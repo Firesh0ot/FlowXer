@@ -1308,15 +1308,14 @@ struct Engine::Impl
             auto const me = static_cast<std::size_t>(p.me - 1);
             gpu::mix(st, workOf(p.a), p.mixing ? &workOf(p.b) : nullptr, p.mixing ? p.t : 0.f, pgmWork[me]);
             gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
-            // Downstream keyers over the ME's Program and Preview (Preview shows what Program
-            // will look like after the next transition).
+            // Downstream keyers over the ME's Program only: keys have no preview (Preview shows
+            // only its source).
             for (auto const& dsk : plan.dsks)
             {
                 auto const& frame = dsk.me == p.me && dsk.gain > 0.f ? keyFrames[static_cast<std::size_t>(dsk.key - 1)] : nullptr;
                 if (frame)
                 {
                     gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pgmWork[me]);
-                    gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pvwWork[me]);
                 }
             }
             cudaEventRecord(*mark++, st);

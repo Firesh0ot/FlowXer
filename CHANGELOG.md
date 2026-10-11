@@ -31,8 +31,8 @@ control plane. One image, one code path; an NVIDIA GPU is required
   Program) on the input (`PATCH /inputs/{id}`); transport cue, play, pause,
   stop. An empty player is black. The colour bars ship as a library still.
 - DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
-  (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM and
-  PVW; on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
+  (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM
+  only (keys have no preview: PVW shows only its source); on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
   `rate_ms`; `POST /keyers/{id}/auto` without a duration uses it).
 - GUI: every picture of the console (sources, each ME's Preview and Program) is
   a crop of the engine's one preview mosaic: one WHEP session per page, each

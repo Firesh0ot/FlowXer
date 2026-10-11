@@ -48,7 +48,7 @@ struct KeyConfig
 {
     std::string label;
     Route route;
-    // The ME whose Program (and Preview) the DSK keys (P2: ME 1).
+    // The ME whose Program the DSK keys (P2: ME 1); keys have no preview.
     int me = 1;
 };
 

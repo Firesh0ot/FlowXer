@@ -26,7 +26,7 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   Program from the same grain), packs all outputs to v210 and, every second grain, draws the
   mosaic. All of this is queued on one CUDA stream; the thread does not wait for the GPU.
   When it is late it skips to the current grain and counts the skip; it never slides.
-  The downstream keyer keys over its ME's Program and Preview there.
+  The downstream keyer keys over its ME's Program there (keys have no preview).
 - **Clip player threads** (`fx-cp1` …), one per clip player: decode the loaded clip ahead
   (NVDEC) or upload the still once; see [Clip players](#clip-players).
 - **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
@@ -114,8 +114,8 @@ of the library item for the current format) and drives the transport.
 
 `FLOWXER_ENGINE_KEYS` gives each key input (a v210a flow: the v210 fill followed by a 10-bit
 key plane, e.g. mxl-browser-source in `v210a` mode) its DSK on one ME (FlowXer: `DSK 1 Key` on
-ME 1). It keys linearly over the ME's Program and Preview (Preview shows what Program will look
-like): out = fill · α + background · (1 − α) with α = key / 1023 · gain, per sample (chroma: the
+ME 1). It keys linearly over the ME's Program only: keys have no preview, Preview shows only its
+source. out = fill · α + background · (1 − α) with α = key / 1023 · gain, per sample (chroma: the
 mean α of its pixel pair), straight fill. The key is read at grain *i − L* like an input; an
 unrouted key input keys nothing. `POST /dsk/<k>` `{"on": bool}` cuts it, `/dsk/<k>/auto`
 `{"frames": n}` fades the gain over n grains.
@@ -607,6 +607,15 @@ Same `/config`, NMOS seed and output domain: ME 1 PGM keeps its flow ids, the li
 IS-05 activations are restored, their tally INDEX and Black's are unchanged; a multiviewer 1.4.1
 reading ME 1 PGM played again 3.2 s after the new image started. The top-level README
 (Upgrading from FlowXer 14) lists what an operator loses.
+
+### DSK 1 keys Program only
+
+Keys have no preview (user decision, 2026-10-11): DSK 1 keys ME 1 PGM; PVW, and the mosaic's PVW
+tile with it, shows only its source (FlowXer 14 showed the overlay on PVW too). `fxp2-functional.py`
+with an image of this change (`fxp2:m4c`): 66 of 66 checks, among them PGM over Black =
+mix10(black, fill, key) with a maximum error of 0 codes while PVW is the camera bit for bit, and
+an Auto on and off fading PGM only, PVW the camera in every sample. The soak below ran before
+this change (DSK over PGM and PVW).
 
 ### 2 h soak (`fxp2-soak.py`)
 

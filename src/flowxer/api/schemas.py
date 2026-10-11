@@ -373,7 +373,7 @@ class MixerPanel(BaseModel):
 
 class DownstreamKeyer(BaseModel):
     """A downstream keyer on ME 1: keys its key input (a v210a fill + key MXL flow, NMOS
-    receiver "<label> Key") over ME 1 Program and Preview."""
+    receiver "<label> Key") over ME 1 Program only (keys have no preview)."""
 
     id: str
     label: str
