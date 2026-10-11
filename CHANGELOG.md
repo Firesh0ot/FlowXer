@@ -73,7 +73,9 @@ control plane. One image, one code path; an NVIDIA GPU is required
   its MediaMTX (`flowxer_engine_preview_mediamtx_running`, `_restarts_total`)
   and the library (`flowxer_library_jobs`, `flowxer_library_conversions_total`,
   `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc`); the list
-  is in the README (Metrics).
+  is in the README (Metrics). `flowxer_webrtc_peers` is gone; the Grafana
+  dashboard shows the engine's fps, skipped and late grains and GPU time
+  instead.
 - Upgrade from 14.x with the same `/config`: ME 1 PGM keeps its flow ids, the
   live inputs keep their IS-05 activations and tally INDEX; test sources become
   empty clip players, the Replay input goes, DSK 1 needs a v210a key (README,
