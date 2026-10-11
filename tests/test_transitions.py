@@ -1,11 +1,13 @@
-"""P3 M1: the transition type per ME (mix, wipe, stinger), Auto, takes with a type, flip-flop,
-the engine commands and the tally of wipes (docs/engine-p3.md §3, §4)."""
+"""P3: the transition type per ME (mix, wipe, stinger), Auto, takes with a type, flip-flop, the
+T-bar, the engine commands and the tally of wipes (M1, docs/engine-p3.md §3, §4); the keyers per ME
+from the environment and the P2 state (M2, §5)."""
 
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
-from flowxer.api.schemas import MixerStartRequest, PanelTransitionUpdate, TransitionType, WipeSettingsUpdate
+from flowxer.api.schemas import MixerStartRequest, PanelTransitionUpdate, TransitionType, WipeSettingsUpdate, WorkspaceUpdate
 from flowxer.engine.mixer import MixerError, VisionMixer
 from test_tally_export import lit
 
@@ -194,3 +196,37 @@ def test_the_t_bar(client: TestClient, mixer: VisionMixer) -> None:
     assert calls[-1] == ("POST", "/me/1/take", {"source": "in1", "frames": 0, "preview": "in2"})
     assert client.post("/api/v1/mixer/position", json={"position": 1.2}).status_code == 422
     mixer.stop()
+
+
+def test_a_p2_state_keeps_dsk_1(settings) -> None:
+    # P2 saved one DSK on ME 1 (downstream_keyer_count, a keyer without ME or stage).
+    mixer = VisionMixer(settings)
+    state = mixer.export_state()
+    state["workspace"].pop("keyers_per_me")
+    state["workspace"].pop("dsks_per_me")
+    state["workspace"]["downstream_keyer_count"] = 1
+    state["keyers"] = [{"id": "dsk-1", "label": "Graphics", "enabled": True, "rate_ms": 800}]
+    again = VisionMixer(settings)
+    again._apply_state(state, checked=False)
+    assert again.workspace.dsks_per_me == 1 and again.workspace.keyers_per_me == 2
+    dsk = again.get_keyer("dsk-1")
+    assert (dsk.panel_id, dsk.stage.value, dsk.label, dsk.enabled, dsk.rate_ms) == ("me-1", "downstream", "Graphics", True, 800)
+    assert [keyer.id for keyer in again.keyers] == ["me-1-key-1", "me-1-key-2", "dsk-1"]
+
+
+def test_keyer_counts_from_the_environment(settings) -> None:
+    settings.panels = 2
+    settings.keyers_per_me = 1
+    settings.dsks_per_me = 2
+    mixer = VisionMixer(settings)
+    assert [keyer.id for keyer in mixer.keyers] == ["me-1-key-1", "dsk-1", "dsk-2", "me-2-key-1", "me-2-dsk-1", "me-2-dsk-2"]
+    assert [keyer.receiver_label for keyer in mixer.keyers] == [
+        "ME 1 Key 1", "DSK 1 Key", "DSK 2 Key", "ME 2 Key 1", "ME 2 DSK 1 Key", "ME 2 DSK 2 Key",
+    ]
+    # Pinned: the counts and the labels.
+    with pytest.raises(MixerError, match="FLOWXER_KEYERS_PER_ME"):
+        mixer.apply_workspace(WorkspaceUpdate(keyers_per_me=3))
+    with pytest.raises(MixerError, match="labels are fixed"):
+        mixer.update_keyer("dsk-1", label="Graphics")
+    config = mixer._engine_config("test")["FLOWXER_ENGINE_KEYS"]
+    assert config[4] == {"label": "ME 2 DSK 1 Key", "me": 2, "stage": "downstream"}
