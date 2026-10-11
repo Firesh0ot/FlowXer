@@ -6,6 +6,7 @@
 #include "core/mixer.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
+#include "core/playout.hpp"
 #include "core/tai.hpp"
 
 #include <cmath>
@@ -434,4 +435,90 @@ TEST(audio_crossfade)
         total += g.end - g.first;
     }
     CHECK_EQ(total, 4004ull);
+}
+
+// ---- clip player transport -------------------------------------------------------------
+
+TEST(playout_cue_play_pause_stop)
+{
+    Playout p;
+    CHECK(p.advance(1, false).frame == -1);
+    p.load(4, false, false);
+    CHECK(p.state() == Playout::State::Cued);
+    auto s = p.advance(10, false);
+    CHECK(s.frame == 0 && !s.playing);
+    p.play();
+    CHECK(p.advance(11, false).frame == 0);
+    s = p.advance(12, false);
+    CHECK(s.frame == 1 && s.playing);
+    p.pause();
+    // Paused: the last frame shown holds.
+    CHECK(p.advance(13, false).frame == 1 && !p.advance(14, false).playing);
+    p.play();
+    CHECK(p.advance(15, false).frame == 2);
+    s = p.advance(16, false);
+    CHECK(s.frame == 3 && s.seq == 3 && s.generation == p.cursor().generation);
+    // The end without loop: the last frame holds, the state is ended.
+    s = p.advance(17, false);
+    CHECK(s.frame == 3 && !s.playing && p.state() == Playout::State::Ended);
+    // Play from the end starts over.
+    auto const before = p.cursor().generation;
+    p.play();
+    CHECK(p.cursor().generation > before && p.cursor().start == 0);
+    CHECK(p.advance(18, false).frame == 0);
+    p.cue(2);
+    s = p.advance(19, false);
+    CHECK(p.state() == Playout::State::Cued && s.frame == 2 && s.seq == 0 && p.cursor().start == 2);
+    p.play();
+    s = p.advance(20, false);
+    CHECK(s.frame == 2 && s.seq == 0);
+    s = p.advance(21, false);
+    CHECK(s.frame == 3 && s.seq == 1 && p.cursor().start == 2);
+    p.cue(99);
+    CHECK(p.advance(22, false).frame == 3);
+    p.stop();
+    CHECK(p.state() == Playout::State::Cued && p.advance(23, false).frame == 0);
+    p.unload();
+    CHECK(p.advance(24, false).frame == -1 && p.cursor().empty);
+}
+
+TEST(playout_loop_skips_and_play_on_cut)
+{
+    Playout p;
+    p.load(3, true, true);
+    // Not on air: holds the first frame.
+    CHECK(p.advance(100, false).frame == 0);
+    // Taken to Program: plays from the cued frame.
+    auto s = p.advance(101, true);
+    CHECK(s.frame == 0 && s.playing && p.state() == Playout::State::Playing);
+    CHECK(p.advance(102, true).frame == 1);
+    CHECK(p.advance(103, true).frame == 2);
+    // Loop: on to the first frame without a break.
+    s = p.advance(104, true);
+    CHECK(s.frame == 0 && s.playing);
+    // Two grains skipped by the render thread: the clip stays on time (0 -> 3 = frame 0 again).
+    s = p.advance(107, true);
+    CHECK(s.frame == 0 && s.seq == 6);
+    // Still on air: no new start; pause and going on air again resumes.
+    p.pause();
+    CHECK(p.advance(108, false).frame == 0);
+    CHECK(p.advance(109, true).playing);
+    // Without play on cut, going on air does not start it.
+    Playout q;
+    q.load(5, false, false);
+    CHECK(!q.advance(1, true).playing && q.state() == Playout::State::Cued);
+    // A still (1 frame) plays and holds its only frame.
+    Playout still;
+    still.load(1, false, false);
+    still.play();
+    CHECK(still.advance(1, false).frame == 0 && still.advance(2, false).frame == 0);
+    CHECK(still.state() == Playout::State::Ended);
+    // Without loop a skip past the end ends the clip on its last frame.
+    Playout r;
+    r.load(3, false, false);
+    r.play();
+    r.advance(1, false);
+    s = r.advance(9, false);
+    CHECK(s.frame == 2 && s.seq == 2 && !s.playing && r.state() == Playout::State::Ended);
+    CHECK(std::string(stateName(Playout::State::Paused)) == "paused");
 }

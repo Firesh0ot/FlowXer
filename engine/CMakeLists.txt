@@ -22,6 +22,7 @@ add_library(fxeng-core STATIC
     src/core/config.cpp
     src/core/mixer.cpp
     src/core/mosaic_map.cpp
+    src/core/playout.cpp
     src/core/tai.cpp
     src/core/v210.cpp
 )
