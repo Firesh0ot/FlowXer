@@ -41,4 +41,5 @@ def receiver_name(input_id: str, role: str) -> str:
 
 
 def sender_name(panel_id: str, role: str) -> str:
-    return f"{panel_id}-pgm-{role}"
+    """`{panel_id}-pgm-video|audio` or `{panel_id}-pvw-video` (role video, audio, pvw-video)."""
+    return f"{panel_id}-{role}" if role.startswith("pvw-") else f"{panel_id}-pgm-{role}"

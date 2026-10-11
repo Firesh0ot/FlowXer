@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
@@ -12,6 +12,7 @@ from flowxer.api.schemas import (
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
+    KeyerAutoRequest,
     KeyerUpdate,
     LogicalInput,
     LogicalInputCreate,
@@ -20,12 +21,9 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
-    OverlayStatus,
-    OverlayUpdate,
     PanelTransitionRequest,
+    PlayerCueRequest,
     PreviewRequest,
-    ReplayLoadRequest,
-    ReplayTransitionRequest,
     ResourceInfo,
     StingerInfo,
     StingerPlayRequest,
@@ -38,15 +36,14 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
+from flowxer import __version__
 from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.domain.mxl_domain import load_domain_info, scan_domains
-from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
-from flowxer.engine.preview import UnknownStream, render_jpeg, resolve_stream
+from flowxer.engine.preview import preview_info
 from flowxer.engine.resources import collect_resources
 from flowxer.engine.tally import TALLY_PRESETS
-from flowxer.engine.webrtc import create_whep_answer, webrtc_available
 from flowxer.settings import Settings, get_settings
 
 router = APIRouter()
@@ -70,7 +67,6 @@ def health(
     mixer: VisionMixer = Depends(get_mixer),
     settings: Settings = Depends(get_settings),
 ) -> HealthResponse:
-    caps = probe_backend()
     return HealthResponse(
         status="ok",
         service="flowxer-vision-mixer",
@@ -78,9 +74,8 @@ def health(
         mxl_domain=str(settings.output_domain),
         mxl_root=str(settings.mxl_root),
         mxl_output_domain_id=settings.resolved_output_domain_id,
-        gstreamer=bool(caps["gstreamer"]),
-        mxl_plugins=bool(caps["mxl_plugins"]),
-        simulate=mixer.backend == "simulate" or settings.simulate,
+        simulate=settings.simulate,
+        engine=mixer.engine.state if mixer.engine is not None else ("simulate" if mixer.backend == "simulate" else "stopped"),
         mxl_revision=settings.resolved_mxl_revision,
     )
 
@@ -129,8 +124,68 @@ def config(settings: Settings = Depends(get_settings)) -> dict:
         "storage_root": str(settings.storage_root),
         "group_hint": settings.group_hint,
         "default_stinger": settings.default_stinger,
-        "overlay_url": settings.overlay_url,
+        "latency_grains": settings.latency,
+        "render_mes": settings.render_mes,
+        "pvw_outputs": settings.pvw_outputs,
     }
+
+
+@router.get(
+    "/engine",
+    tags=["system"],
+    summary="The media engine's status: timing per stage, per input arrival lag, clip players, outputs",
+    description=(
+        "The engine's own status (refreshed once a second while Program is on air). "
+        "`engine.recommended_latency_grains` is the latency that covers the latest input arrival "
+        "seen since each input was routed; compare it with FLOWXER_LATENCY."
+    ),
+)
+def engine_status(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    status_body = mixer.engine_status()
+    return {
+        "process": mixer.engine.summary() if mixer.engine is not None else {"state": mixer.backend},
+        "status": status_body,
+    }
+
+
+@router.get(
+    "/preview",
+    tags=["gui"],
+    summary="The preview mosaic stream (WebRTC WHEP / HLS) and where each picture is in it",
+    description=(
+        "One stream holds every picture of the console: the sources, and each rendering ME's "
+        "Program and Preview. `tiles` gives each picture's rectangle in the stream with its "
+        "id (`source:<input id>` or `panel:<panel id>:pgm|pvw`). With a shared MediaMTX "
+        "(PREVIEW_WHEP_URL) `whep_url` is absolute; with the built-in one the player uses "
+        "`whep_port` on the page's host."
+    ),
+)
+def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return preview_info(mixer)
+
+
+@router.get(
+    "/widgets",
+    tags=["gui"],
+    summary="The operator-screen widgets flowxer-gui serves at /widget/<id>, with their parameters",
+    description=(
+        "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
+        "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
+        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows "
+        "and Cut/Auto of one ME."
+    ),
+)
+def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
+    me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
+    return [
+        {
+            "id": "bus",
+            "title": "FlowXer bus",
+            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 150},
+            "version": __version__,
+        }
+    ]
 
 
 @router.get(
@@ -214,7 +269,7 @@ def get_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Logical
     "/inputs/{input_id}",
     response_model=LogicalInput,
     tags=["inputs"],
-    summary="Update label, kind, essences, clip path, or auto-stinger on a logical input",
+    summary="Update label, kind, essences, the clip player's media, loop and play-on-cut, or auto-stinger",
 )
 def patch_input(
     input_id: str, payload: LogicalInputUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -251,7 +306,7 @@ def delete_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> None
     "/mixer",
     response_model=MixerStatus,
     tags=["mixer"],
-    summary="Program, preview, overlay, stinger and output flow status",
+    summary="Program, preview, every ME's output flows and the media engine's state",
 )
 def mixer_status(mixer: VisionMixer = Depends(get_mixer)) -> MixerStatus:
     return mixer.status()
@@ -261,7 +316,7 @@ def mixer_status(mixer: VisionMixer = Depends(get_mixer)) -> MixerStatus:
     "/mixer/start",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Start the GStreamer vision mixer and publish PGM v210 + float32 flows",
+    summary="Take the mixer on air: start the media engine, which writes every rendering ME's PGM (v210 + float32) and PVW flows",
 )
 def mixer_start(
     payload: MixerStartRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -277,7 +332,7 @@ def mixer_start(
     "/mixer/stop",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Stop the GStreamer pipeline and take the mixer off-air",
+    summary="Take the mixer off-air: stop the media engine",
 )
 def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     return MixerCommandResponse(status="stopped", mixer=mixer.stop())
@@ -287,7 +342,7 @@ def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     "/mixer/take",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Take a logical input to program (cut, mix or stinger)",
+    summary="Take a logical input (or me-<n>, re-entry) to Program: cut or mix (a stinger is a cut in this version)",
 )
 def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
@@ -321,7 +376,7 @@ def mixer_preview(
     "/mixer/cut",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Cut Preview to Program. Auto-stinger on the Preview source, or an armed Wipe, plays a stinger instead.",
+    summary="Cut Preview to Program (auto-stingers and Wipe come back in P3)",
 )
 def mixer_cut(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -372,7 +427,7 @@ def mixer_fade_to_black(
     "/mixer/wipe",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Arm Wipe so the next Cut plays the default stinger (toggle if armed is omitted)",
+    summary="Arm Wipe (toggle if armed is omitted); wipes come in P3, the next Cut is a cut",
 )
 def mixer_wipe(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -386,41 +441,10 @@ def mixer_wipe(
 
 
 @router.get(
-    "/overlay",
-    response_model=OverlayStatus,
-    tags=["overlay"],
-    summary="HTML5 graphics keyer status",
-)
-def overlay_status(mixer: VisionMixer = Depends(get_mixer)) -> OverlayStatus:
-    return mixer.status().overlay
-
-
-@router.post(
-    "/overlay",
-    response_model=MixerCommandResponse,
-    tags=["overlay"],
-    summary="Enable/disable the HTML5 overlay or change its URL and ident text",
-)
-def overlay_update(
-    payload: OverlayUpdate, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.set_overlay(
-            enabled=payload.enabled,
-            url=payload.url,
-            title=payload.title,
-            subtitle=payload.subtitle,
-        )
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="overlay", mixer=body)
-
-
-@router.get(
     "/storage/clips",
     response_model=list[StorageClip],
     tags=["storage"],
-    summary="List playable video files in mixer storage",
+    summary="List the library clips and stills a clip player can play",
 )
 def storage_clips(mixer: VisionMixer = Depends(get_mixer)) -> list[StorageClip]:
     return [StorageClip(**item) for item in mixer.list_clips()]
@@ -437,59 +461,10 @@ def storage_stingers(mixer: VisionMixer = Depends(get_mixer)) -> list[StingerInf
 
 
 @router.post(
-    "/replay/load",
-    response_model=LogicalInput,
-    tags=["replay"],
-    summary="Load a stored clip onto the replay logical input",
-)
-def replay_load(
-    payload: ReplayLoadRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> LogicalInput:
-    try:
-        if payload.library_item_id:
-            return mixer.load_library_clip(payload.input_id, payload.library_item_id)
-        return mixer.load_clip(payload.input_id, payload.file_path or "")
-    except MixerError as exc:
-        raise _http(exc, status.HTTP_404_NOT_FOUND if "not found" in str(exc) else status.HTTP_409_CONFLICT)
-
-
-@router.post(
-    "/replay/take",
-    response_model=MixerCommandResponse,
-    tags=["replay"],
-    summary="Stinger from live program into replay",
-)
-def replay_take(
-    payload: ReplayTransitionRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.take_replay(payload.stinger_id, payload.input_id)
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="to_replay", mixer=body)
-
-
-@router.post(
-    "/replay/return",
-    response_model=MixerCommandResponse,
-    tags=["replay"],
-    summary="Stinger from replay back to the previous live input",
-)
-def replay_return(
-    payload: ReplayTransitionRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.return_live(payload.stinger_id, payload.input_id)
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="to_live", mixer=body)
-
-
-@router.post(
     "/stinger/play",
     response_model=MixerCommandResponse,
     tags=["stinger"],
-    summary="Play a TGA or video stinger and cut Program at the cut frame; flip_flop swaps Preview/Program",
+    summary="Stinger take (a cut in this version; stingers come back in P3); flip_flop swaps Preview/Program",
 )
 def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)
@@ -508,22 +483,35 @@ def stinger_play(
 
 
 @router.post(
-    "/stinger/tick",
-    response_model=MixerCommandResponse,
-    tags=["stinger"],
-    summary="Advance the stinger by N frames (used by tests and the simulate backend)",
+    "/players/{input_id}/{action}",
+    response_model=LogicalInput,
+    tags=["inputs"],
+    summary="Clip player transport: cue, play, pause, stop",
+    description=(
+        "`cue` shows a frame and holds (body `{\"frame\": n}`, default the first); `play` plays "
+        "from there; `pause` holds the current frame; `stop` goes back to the first frame and "
+        "holds. Loop and play-on-cut are set on the input (`PATCH /inputs/{id}`)."
+    ),
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
 )
-def stinger_tick(
-    frames: int = 1, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    return MixerCommandResponse(status="tick", mixer=mixer.advance_stinger(frames))
+def player_command(
+    input_id: str,
+    action: str,
+    payload: PlayerCueRequest | None = None,
+    mixer: VisionMixer = Depends(get_mixer),
+) -> LogicalInput:
+    try:
+        return mixer.player_command(input_id, action, (payload or PlayerCueRequest()).frame)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise _http(exc, code)
 
 
 @router.get(
     "/console",
     response_model=ConsoleState,
     tags=["gui"],
-    summary="One-shot operator console snapshot (workspace, buses, resources, WebRTC)",
+    summary="One-shot operator console snapshot (workspace, buses, resources, preview mosaic, per-source state)",
 )
 def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
     mixer_status = mixer.status()
@@ -545,7 +533,8 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
         resources=ResourceInfo.model_validate(collect_resources(mixer)),
-        webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
+        preview=preview_info(mixer),
+        sources=mixer.source_runtime(),
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
         library=[mixer.library_item_out(item) for item in mixer.library.list_items()],
@@ -660,8 +649,8 @@ def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
 @router.patch(
     "/keyers/{keyer_id}",
     response_model=DownstreamKeyer,
-    tags=["overlay"],
-    summary="Configure a downstream keyer (HTML5 graphics)",
+    tags=["keyers"],
+    summary="Downstream keyer on or off (at the next frame), or its label",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -677,6 +666,21 @@ def patch_keyer(
         raise _http(exc, code)
 
 
+@router.post(
+    "/keyers/{keyer_id}/auto",
+    response_model=DownstreamKeyer,
+    tags=["keyers"],
+    summary="Fade the downstream keyer on (or off when it is on)",
+)
+def keyer_auto(
+    keyer_id: str, payload: KeyerAutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> DownstreamKeyer:
+    try:
+        return mixer.keyer_auto(keyer_id, (payload or KeyerAutoRequest()).duration_ms)
+    except MixerError as exc:
+        raise _http(exc, status.HTTP_404_NOT_FOUND)
+
+
 @router.patch(
     "/stinger-slots/{slot_id}",
     response_model=StingerSlot,
@@ -690,48 +694,3 @@ def patch_stinger_slot(
         return mixer.configure_stinger_slot(slot_id, payload)
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND)
-
-
-@router.get(
-    "/preview/jpeg/{stream_id:path}",
-    tags=["gui"],
-    summary="JPEG snapshot of a source or ME bus (WebRTC fallback)",
-    description=(
-        "`stream_id` is `source:<input id>` or `panel:<panel id>:pgm|pvw`; any other name is 404."
-    ),
-    responses={404: {"model": ErrorBody}},
-)
-def preview_jpeg(stream_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Response:
-    try:
-        resolve_stream(mixer, stream_id)
-    except UnknownStream as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    payload = render_jpeg(mixer, stream_id)
-    return Response(content=payload, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-
-@router.post(
-    "/webrtc/whep/{stream_id:path}",
-    tags=["gui"],
-    summary="WHEP: browser sends SDP offer, mixer answers with a WebRTC video preview",
-)
-async def webrtc_whep(
-    stream_id: str, request: Request, mixer: VisionMixer = Depends(get_mixer)
-) -> Response:
-    if not webrtc_available():
-        raise HTTPException(
-            status_code=501,
-            detail="WebRTC preview requires aiortc. JPEG fallback is at /api/v1/preview/jpeg/{stream_id}",
-        )
-    offer = (await request.body()).decode("utf-8")
-    if not offer.strip():
-        raise HTTPException(status_code=400, detail="SDP offer required")
-    try:
-        answer = await create_whep_answer(mixer, stream_id, offer)
-    except RuntimeError as exc:
-        if "too many WebRTC" in str(exc):
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
-    return Response(content=answer, media_type="application/sdp")

@@ -12,7 +12,8 @@ ENV NGINX_ENVSUBST_FILTER=FLOWXER_
 COPY gui/nginx.main.conf /etc/nginx/nginx.conf
 COPY gui/nginx.conf /etc/nginx/templates/default.conf.template
 COPY gui/docker-entrypoint.d/40-flowxer-token.sh /docker-entrypoint.d/40-flowxer-token.sh
-RUN chmod +x /docker-entrypoint.d/40-flowxer-token.sh \
+COPY gui/docker-entrypoint.d/50-flowxer-widgets.sh /docker-entrypoint.d/50-flowxer-widgets.sh
+RUN chmod +x /docker-entrypoint.d/40-flowxer-token.sh /docker-entrypoint.d/50-flowxer-widgets.sh \
     && : > /etc/nginx/conf.d/flowxer-auth.inc \
     && rm -f /etc/nginx/conf.d/default.conf \
     && mkdir -p /tmp/nginx-client-body /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uwsgi /tmp/nginx-scgi /etc/nginx/templates \

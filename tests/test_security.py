@@ -19,18 +19,19 @@ def test_apache_license_and_notice_are_complete() -> None:
     assert "Copyright 2026 FlowXer contributors" in license_text
     notice = (ROOT / "NOTICE").read_text(encoding="utf-8")
     assert "Apache-2.0" in notice
-    assert "GStreamer" in notice
     assert "FFmpeg" in notice
-    assert "gstcefsrc" in notice
+    assert "MediaMTX" in notice
+    assert "GStreamer" not in notice and "gstcefsrc" not in notice
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "mxl-builder" in dockerfile
-    assert "cef-builder" in dockerfile
+    # The media engine is built in the same image (CUDA multi-stage).
+    assert "AS engine-build" in dockerfile
+    assert "flowxer-engine" in dockerfile
     assert "ARG MXL_REF=218ddaa" in dockerfile
     assert "USER 1000:1000" in dockerfile
     assert "io.dmf.mxl.revision" in dockerfile
     assert "FLOWXER_MXL_ROOT=/Volumes/mxl" in dockerfile
-    assert "docker/build-mxl.sh" in dockerfile
-    assert "docker/build-cef.sh" in dockerfile
+    assert "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility" in dockerfile
+    assert "gstreamer" not in dockerfile.lower() and "cef" not in dockerfile.lower()
     assert "pre-built" not in dockerfile
     assert "cp /app/configs/domain_def.json /mxl-domain/domain_def.json" not in dockerfile
     entrypoint = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
@@ -66,7 +67,7 @@ def test_api_token_protects_control_plane(settings: Settings, mixer: VisionMixer
     locked = settings.model_copy(update={"api_token": "staging-token-1"})
     client = TestClient(create_app(locked, mixer))
     assert client.get("/api/v1/health").status_code == 200
-    assert client.get("/graphics/lower-third.html").status_code == 200
+    assert client.get("/static/panel.js").status_code == 200
     assert client.get("/docs").status_code == 401
     assert client.get("/openapi.json").status_code == 401
     denied = client.post("/api/v1/mixer/start", json={"program_input_id": "cam-1"})
@@ -85,18 +86,14 @@ def test_api_token_protects_control_plane(settings: Settings, mixer: VisionMixer
     assert started.status_code == 200
 
 
-def test_clip_paths_cannot_escape_storage(mixer: VisionMixer) -> None:
-    with pytest.raises(MixerError, match="storage"):
-        mixer._resolve_clip("/etc/passwd")
-    with pytest.raises(MixerError, match="storage"):
-        mixer._resolve_clip("../../etc/passwd")
+def test_library_ids_cannot_escape_the_library(mixer: VisionMixer) -> None:
+    with pytest.raises(MixerError, match="unknown library"):
+        mixer._check_player_media("../../etc/passwd")
 
-
-def test_replay_load_rejects_traversal(client: TestClient) -> None:
-    response = client.post("/api/v1/replay/load", json={"file_path": "../secret.mp4"})
-    assert response.status_code == 409
-    assert "storage" in response.json()["detail"]
-
+def test_player_media_is_a_library_item(client: TestClient) -> None:
+    response = client.patch("/api/v1/inputs/clip-1", json={"library_item_id": "../secret"})
+    assert response.status_code in {404, 409}
+    assert "library" in response.json()["detail"]
 
 def test_stinger_id_and_media_stay_in_storage(mixer: VisionMixer) -> None:
     with pytest.raises(MixerError, match="invalid stinger"):
@@ -108,17 +105,10 @@ def test_stinger_id_and_media_stay_in_storage(mixer: VisionMixer) -> None:
         )
 
 
-def test_overlay_rejects_file_and_metadata_urls(client: TestClient) -> None:
-    file_url = client.post("/api/v1/overlay", json={"url": "file:///etc/passwd"})
-    assert file_url.status_code == 409
-    meta = client.post("/api/v1/overlay", json={"url": "http://169.254.169.254/latest/meta-data"})
-    assert meta.status_code == 409
-    ok = client.post(
-        "/api/v1/overlay",
-        json={"url": "http://127.0.0.1:9610/graphics/lower-third.html"},
-    )
-    assert ok.status_code == 200
-
+def test_the_html_overlay_is_gone(client: TestClient) -> None:
+    # The DSK keys a v210a input (e.g. mxl-browser-source); the mixer renders no URLs any more.
+    assert client.post("/api/v1/overlay", json={"url": "file:///etc/passwd"}).status_code in {404, 405}
+    assert client.patch("/api/v1/keyers/dsk-1", json={"url": "file:///etc/passwd"}).json().get("url") is None
 
 def test_tally_rejects_cloud_metadata_but_allows_lan(mixer: VisionMixer) -> None:
     with pytest.raises(MixerError, match="not allowed"):

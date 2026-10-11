@@ -38,9 +38,11 @@ from flowxer.library.ffmpeg import (
     FFmpeg,
     RunResult,
     build_clip_audio_command,
-    build_clip_mux_command,
     build_clip_video_command,
+    build_still_command,
+    build_still_filter,
     build_video_filter,
+    conversion_threads,
     default_runner,
 )
 from flowxer.library.models import ConversionInfo, ConversionStatus, LibraryItem, LibraryKind
@@ -61,9 +63,15 @@ def _ready_item(mixer: VisionMixer, item_id: str, kind: LibraryKind, name: str, 
     fmt = mixer.workspace.format_id
     item = LibraryItem(id=item_id, kind=kind, name=name, original={"path": "original.mov", "source_kind": "video"})
     if ready:
-        item.conversions[fmt] = ConversionInfo(status=ConversionStatus.ready, frames=20, mezz=f"mezz-{fmt}.mov")
+        mezz = store.mezz_path(item_id, fmt, kind)
+        item.conversions[fmt] = ConversionInfo(
+            status=ConversionStatus.ready, frames=20, audio_channels=2, mezz=mezz.name,
+            audio=store.audio_path(item_id, fmt).name if kind == LibraryKind.clip else None,
+        )
         store.item_dir(item_id).mkdir(parents=True, exist_ok=True)
-        store.mezz_path(item_id, fmt).write_bytes(b"x")
+        mezz.write_bytes(b"x")
+        if kind == LibraryKind.clip:
+            store.audio_path(item_id, fmt).write_bytes(b"\0" * 8)
     else:
         item.conversions[fmt] = ConversionInfo(status=ConversionStatus.converting, frames=20)
     store.save(item)
@@ -105,17 +113,156 @@ def test_build_video_filter_fill_motion():
 
 
 def test_clip_commands(tmp_path: Path):
-    video = build_clip_video_command(original=tmp_path / "in.mov", video_tmp=tmp_path / "v.mov", vf="fps=50/1")
+    """The clip mezzanine is HEVC 4:4:4 10-bit (NVDEC has no 4:2:2), never 4:2:0: the 4:2:2
+    picture widened by repeating each chroma sample; no B-frames, a key frame per second. NVENC
+    with constant QP (decoding and scaling get the thread budget), else x265 with CRF (x265 gets
+    the budget, decoding and scaling one thread each)."""
+    common = dict(original=tmp_path / "in.mov", video_tmp=tmp_path / "v.mkv", vf="fps=50/1", keyint=50, threads=4)
+    video = build_clip_video_command(**common, nvenc=True)
     assert video[0] == "ffmpeg"
-    assert "prores_ks" in video
-    assert video[video.index("-profile:v") + 1] == "3"
+    assert video[video.index("-c:v") + 1] == "hevc_nvenc"
+    assert video[video.index("-profile:v") + 1] == "rext"
+    assert video[video.index("-rc") + 1] == "constqp" and video[video.index("-qp") + 1] == "8"
+    assert video[video.index("-bf") + 1] == "0" and video[video.index("-g") + 1] == "50"
+    assert video[video.index("-vf") + 1] == "fps=50/1,scale=flags=neighbor,format=yuv444p16le"
+    before_input = video[: video.index("-i")]
+    # The last -threads/-filter_threads before the input win: half the budget each.
+    assert before_input[len(before_input) - 1 - before_input[::-1].index("-threads") + 1] == "2"
+    assert before_input[len(before_input) - 1 - before_input[::-1].index("-filter_threads") + 1] == "2"
     assert video[video.index("-protocol_whitelist") + 1] == "file"
-    mux = build_clip_mux_command(
-        video_tmp=tmp_path / "v.mov", audio_tmp=tmp_path / "a.f32le", audio_channels=4, mezz=tmp_path / "m.mov"
+    assert video[-3:] == ["-f", "matroska", str(tmp_path / "v.mkv")]
+
+    video = build_clip_video_command(**common, nvenc=False)
+    assert video[video.index("-threads") + 1] == "1" and video.index("-threads") < video.index("-i")
+    assert video[video.index("-filter_threads") + 1] == "1"
+    assert video.count("-threads") == 1 and video.count("-filter_threads") == 1
+    assert video[video.index("-c:v") + 1] == "libx265"
+    assert video[video.index("-profile:v") + 1] == "main444-10"
+    assert video[video.index("-vf") + 1] == "fps=50/1,scale=flags=neighbor,format=yuv444p10le"
+    params = video[video.index("-x265-params") + 1]
+    assert "keyint=50:min-keyint=50:bframes=0" in params and "crf=8" in params and "pools=4" in params
+    assert video[-3:] == ["-f", "matroska", str(tmp_path / "v.mkv")]
+
+
+def test_nvenc_is_probed_once_and_x265_is_the_fallback(caplog):
+    calls = []
+
+    def runner(cmd, timeout=None, cancel=None):
+        calls.append(cmd)
+        return RunResult(code=1, stderr="[hevc_nvenc] Cannot load libnvidia-encode.so.1")
+
+    ff = FFmpeg(runner=runner)
+    with caplog.at_level("WARNING"):
+        assert ff.has_nvenc() is False
+        assert ff.has_nvenc() is False
+    assert len(calls) == 1 and "hevc_nvenc" in calls[0]
+    assert [r.getMessage() for r in caplog.records if "NVENC" in r.getMessage()] == [
+        "NVENC cannot be opened ([hevc_nvenc] Cannot load libnvidia-encode.so.1): clip mezzanines are encoded with x265"
+    ]
+    assert FFmpeg(runner=lambda cmd, timeout=None, cancel=None: RunResult(code=0)).has_nvenc() is True
+
+
+def test_conversion_threads_leave_the_engine_two_cores(tmp_path: Path):
+    """A conversion must not fill the container's CPU limit: the whole container would be
+    throttled, the engine with it."""
+    assert conversion_threads(cgroup=tmp_path) == 8  # no cgroup file: no limit
+    (tmp_path / "cpu.max").write_text("max 100000")
+    assert conversion_threads(cgroup=tmp_path) == 8
+    (tmp_path / "cpu.max").write_text("600000 100000")
+    assert conversion_threads(cgroup=tmp_path) == 4
+    assert conversion_threads(2, cgroup=tmp_path) == 2
+    (tmp_path / "cpu.max").write_text("250000 100000")
+    assert conversion_threads(cgroup=tmp_path) == 1
+
+
+def test_still_command_and_filter(tmp_path: Path):
+    vf = build_still_filter(width=1920, height=1080, fit="fit")
+    assert vf.startswith("scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080")
+    # An RGB image or a full-range JPEG becomes limited-range BT.709.
+    assert vf.endswith("scale=out_color_matrix=bt709:out_range=tv,format=yuv422p10le")
+    cmd = build_still_command(original=tmp_path / "in.png", still_tmp=tmp_path / "s.v210", vf=vf)
+    assert cmd[cmd.index("-frames:v") + 1] == "1"
+    assert cmd[cmd.index("-c:v") + 1] == "v210"
+    assert cmd[-3:] == ["-f", "rawvideo", str(tmp_path / "s.v210")]
+    assert cmd[cmd.index("-protocol_whitelist") + 1] == "file"
+
+
+def test_player_media_of_a_clip_and_a_still(mixer):
+    """The engine loads a clip's mezzanine with its sound file, channels and frames; a still's
+    v210 picture."""
+    fmt = mixer.workspace.format_id
+    store = mixer.library.store
+    _ready_item(mixer, "clipaaa00001", LibraryKind.clip, "clip.mov")
+    _ready_item(mixer, "stilaaa00001", LibraryKind.still, "bars.png")
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="clipaaa00001", loop=True))
+    media = mixer._player_media(mixer.get_input("clip-1"))
+    assert media == {
+        "path": str(store.mezz_path("clipaaa00001", fmt, LibraryKind.clip)),
+        "kind": "clip",
+        "audio": str(store.audio_path("clipaaa00001", fmt)),
+        "channels": 2,
+        "frames": 20,
+        "loop": True,
+        "play_on_cut": False,
+    }
+    assert media["path"].endswith(f"mezz-{fmt}.mkv") and media["audio"].endswith(f"mezz-{fmt}.f32")
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="stilaaa00001"))
+    media = mixer._player_media(mixer.get_input("clip-1"))
+    assert media["kind"] == "still" and media["path"].endswith(f"still-{fmt}.v210") and "audio" not in media
+
+
+def test_a_clip_without_its_new_mezzanine_is_converted_again(settings: Settings, monkeypatch):
+    """A clip converted before the engine (a ProRes mezz-<format>.mov) or whose files were deleted
+    is converted again from its original at the next start; the original is kept."""
+    mixer = VisionMixer(settings)
+    _wait_legacy(mixer)
+    fmt = mixer.workspace.format_id
+    store = mixer.library.store
+    item = LibraryItem(id="oldaaa000001", kind=LibraryKind.clip, name="old.mov", original={"path": "original.mov", "source_kind": "video"})
+    item.conversions[fmt] = ConversionInfo(status=ConversionStatus.ready, frames=20, mezz=f"mezz-{fmt}.mov")
+    store.item_dir(item.id).mkdir(parents=True)
+    (store.item_dir(item.id) / "original.mov").write_bytes(b"original")
+    (store.item_dir(item.id) / f"mezz-{fmt}.mov").write_bytes(b"prores")
+    store.save(item)
+    assert mixer.library.mezzanine_path(item.id) is None  # the engine cannot play ProRes
+    mixer.library.stop()
+    queued = []
+    monkeypatch.setattr(
+        service_module.ConversionQueue, "enqueue",
+        lambda self, item_id, format_id, options=None, *, low_priority=False: queued.append((item_id, format_id, low_priority)),
     )
-    # Big-endian: GStreamer's qtdemux reads MOV float PCM as F32BE (little-endian plays silent).
-    assert mux[mux.index("-c:a") + 1] == "pcm_f32be"
-    assert mux[mux.index("-ac") + 1] == "4"
+    again = VisionMixer(settings)
+    assert ("oldaaa000001", fmt, True) in queued
+    assert (store.item_dir(item.id) / "original.mov").read_bytes() == b"original"
+    again.library.stop()
+
+
+def test_colour_bars_are_seeded_once(settings: Settings):
+    mixer = VisionMixer(settings)
+    bars = [i for i in mixer.library.list_items(kind=LibraryKind.still) if i.name == "Colour bars"]
+    assert len(bars) == 1 and bars[0].tags == ["bars"]
+    original = mixer.library.store.item_dir(bars[0].id) / bars[0].original["path"]
+    assert original.read_bytes() == service_module.COLOUR_BARS.read_bytes()
+    mixer.library.delete(bars[0].id)
+    mixer.library.stop()
+    again = VisionMixer(settings)  # deleted by the user: not seeded again
+    assert not [i for i in again.library.list_items(kind=LibraryKind.still) if i.name == "Colour bars"]
+    again.library.stop()
+
+
+def test_import_dir_image_becomes_a_still(mixer, tmp_path: Path):
+    _wait_legacy(mixer)
+    library = mixer.library
+    import_dir = tmp_path / "import"
+    import_dir.mkdir()
+    (import_dir / "logo.png").write_bytes(b"png")
+    before = set(library.store.list_ids())
+    seen: dict = {}
+    library._scan_import_dir(import_dir, seen)
+    library._scan_import_dir(import_dir, seen)
+    new = set(library.store.list_ids()) - before
+    assert len(new) == 1
+    assert library.get(new.pop()).kind == LibraryKind.still
 
 
 def test_clip_audio_is_conformed_by_ffmpeg(tmp_path: Path):
@@ -151,17 +298,6 @@ def test_clip_audio_is_conformed_by_ffmpeg(tmp_path: Path):
     )
     assert "anullsrc=r=48000:cl=mono" in silence
     assert silence[silence.index("-af") + 1] == "pan=2c|c0=c0,apad=whole_len=960,atrim=end_sample=960"
-
-
-def test_file_input_video_branch_links_decodebin_to_videoconvert():
-    """decodebin must be followed by an element that only takes video, or gst-launch may
-    link the sound pad there and stop the input (a bare queue did that)."""
-    from flowxer.api.schemas import LogicalInput
-    from flowxer.engine.pipeline import _video_source_bin
-
-    settings = Settings(simulate=True)
-    clip = LogicalInput(id="replay", label="Replay", kind=InputKind.replay, slot=0, file_path="/x/mezz.mov")
-    assert "! decodebin name=vdec_replay ! videoconvert " in _video_source_bin(clip, settings, "d", {})
 
 
 def test_samples_until_grain_5994_cadence():
@@ -322,7 +458,7 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
     fmt = mixer.workspace.format_id
     _ready_item(mixer, "clipaaa00001", LibraryKind.clip, "clip one.mov")
     _ready_item(mixer, "stingaaa0001", LibraryKind.stinger, "My Sting.zip")
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id="clipaaa00001"))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="clipaaa00001"))
     slot_id = mixer.stinger_slots[0].id
     slot = mixer.configure_stinger_slot(slot_id, StingerSlotUpdate(library_item_id="stingaaa0001", cut_frame=5))
     assert slot.stinger_id == "stingaaa0001"  # the item id, never its display name
@@ -347,19 +483,19 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
     mixer.library.stop()
 
     saved = json.loads((settings.state_dir / "state.json").read_text(encoding="utf-8"))
-    replay = next(item for item in saved["inputs"] if item["id"] == "replay")
-    assert replay["library_item_id"] == "clipaaa00001" and "file_path" not in replay
+    player = next(item for item in saved["inputs"] if item["id"] == "clip-1")
+    assert player["library_item_id"] == "clipaaa00001" and "file_path" not in player
     assert "media_path" not in saved["stinger_slots"][0]
 
     again = VisionMixer(settings)
-    mezz = again.library.store.mezz_path("clipaaa00001", fmt)
-    assert again.get_input("replay").library_item_id == "clipaaa00001"
-    assert again.get_input("replay").file_path == str(mezz)
+    mezz = again.library.store.mezz_path("clipaaa00001", fmt, LibraryKind.clip)
+    assert again.get_input("clip-1").library_item_id == "clipaaa00001"
+    assert again._player_media(again.get_input("clip-1"))["path"] == str(mezz)
     restored = again.get_stinger_slot(slot_id)
     assert restored.library_item_id == "stingaaa0001"
     assert restored.stinger_id == "stingaaa0001"
     assert restored.ready and restored.cut_frame == 5
-    assert restored.media_path == str(again.library.store.mezz_path("stingaaa0001", fmt))
+    assert restored.media_path == str(again.library.store.mezz_path("stingaaa0001", fmt, LibraryKind.stinger))
     assert again.get_input("cam-1").kind == InputKind.mxl_live
     assert again.nmos.active(rid, "receivers")["transport_params"][0]["mxl_flow_id"] == VIDEO_FLOW
     # In use again after the restart: neither item can be deleted.
@@ -369,11 +505,11 @@ def test_library_bindings_survive_restart_and_config_import(settings: Settings) 
 
     client = TestClient(_app(settings, again))
     exported = client.get("/api/v1/config/export").json()
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": None})
-    assert again.get_input("replay").file_path == "_unassigned"
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": None})
+    assert again._player_media(again.get_input("clip-1"))["path"] == ""
     response = client.post("/api/v1/config/import", json=exported)
     assert response.status_code == 200, response.text
-    assert again.get_input("replay").file_path == str(mezz)
+    assert again._player_media(again.get_input("clip-1"))["path"] == str(mezz)
     assert again.get_stinger_slot(slot_id).ready
     again.library.stop()
 
@@ -402,10 +538,10 @@ def test_label_patch_on_library_slot_keeps_the_item(client, mixer):
 
 def test_library_delete_in_use_409(client, mixer):
     _ready_item(mixer, "busyaaa00001", LibraryKind.clip, "busy.mov")
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id="busyaaa00001"))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id="busyaaa00001"))
     response = client.delete("/api/v1/library/busyaaa00001")
     assert response.status_code == 409
-    mixer.update_input("replay", LogicalInputUpdate(library_item_id=None))
+    mixer.update_input("clip-1", LogicalInputUpdate(library_item_id=None))
     assert client.delete("/api/v1/library/busyaaa00001").status_code == 204
     assert client.get("/api/v1/library/busyaaa00001").status_code == 404
 
@@ -419,27 +555,26 @@ def test_invalid_library_ids_are_404(client):
 # ── finding 2: a stinger that is not ready cuts without recursion ────────────
 
 
-def test_not_ready_auto_stinger_hard_cuts(client, mixer):
+def test_auto_stinger_sources_cut(client, mixer):
+    # Stingers come back in P3: a source with an auto-stinger is taken with a cut.
     _ready_item(mixer, "clipaaa00001", LibraryKind.clip, "clip.mov")
     _ready_item(mixer, "stingbbb0002", LibraryKind.stinger, "pending", ready=False)
     slot_id = mixer.stinger_slots[0].id
     response = client.patch(f"/api/v1/stinger-slots/{slot_id}", json={"library_item_id": "stingbbb0002"})
     assert response.json()["ready"] is False
-    for input_id in ("replay", "cam-1"):
+    for input_id in ("clip-1", "cam-1"):
         assert client.patch(f"/api/v1/inputs/{input_id}", json={"stinger_slot_id": slot_id}).status_code == 200
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": "clipaaa00001"})
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": "clipaaa00001"})
 
-    response = client.post("/api/v1/mixer/take", json={"input_id": "replay", "transition": "cut"})
+    response = client.post("/api/v1/mixer/take", json={"input_id": "clip-1", "transition": "cut"})
     assert response.status_code == 200, response.text
-    assert mixer.program_input_id == "replay"
-    assert mixer.stinger_player is None
+    assert mixer.program_input_id == "clip-1"
 
     assert client.post("/api/v1/mixer/preview", json={"input_id": "cam-1"}).status_code == 200
     response = client.post("/api/v1/mixer/cut", json={})
     assert response.status_code == 200, response.text
     assert mixer.program_input_id == "cam-1"
-    assert mixer.preview_input_id == "replay"  # flip-flop like a plain cut
-
+    assert mixer.preview_input_id == "clip-1"  # flip-flop like a plain cut
 
 def test_stinger_not_ready_hard_cut(client, mixer):
     _ready_item(mixer, "pendaaa00001", LibraryKind.stinger, "pending-sting", ready=False)
@@ -460,15 +595,17 @@ def test_stinger_not_ready_hard_cut(client, mixer):
 
 def test_conversion_end_refreshes_inputs_and_slots(client, mixer):
     _ready_item(mixer, "clipccc00003", LibraryKind.clip, "late.mov", ready=False)
-    client.patch("/api/v1/inputs/replay", json={"library_item_id": "clipccc00003"})
-    assert mixer.get_input("replay").file_path == "_unassigned"
+    client.patch("/api/v1/inputs/clip-1", json={"library_item_id": "clipccc00003"})
+    assert mixer._player_media(mixer.get_input("clip-1"))["path"] == ""
     _ready_item(mixer, "clipccc00003", LibraryKind.clip, "late.mov")
+    calls = []
+    mixer.engine = type("Engine", (), {"ready": True})()
+    mixer._engine_call = lambda method, path, body, client=None: calls.append((method, path, body))
     mixer._on_library_job(type("Job", (), {"state": "done", "format_id": mixer.workspace.format_id})())
-    assert mixer.get_input("replay").file_path.endswith("mezz-1080p50.mov")
-
-
-# ── finding 4: GUI proxy and TGA folder uploads ──────────────────────────────
-
+    mixer.engine = None
+    # The engine loads the clip as soon as it is converted.
+    assert calls[-1][1] == "/player/1/load"
+    assert calls[-1][2]["path"] == mixer._player_media(mixer.get_input("clip-1"))["path"] != ""
 
 def test_gui_proxy_passes_upload_chunks():
     conf = (Path(__file__).parents[1] / "gui" / "nginx.conf").read_text(encoding="utf-8")
@@ -744,8 +881,42 @@ def test_upload_and_convert_clip_with_ffmpeg(client, mixer, tmp_path: Path):
         time.sleep(0.5)
     assert item["status"] == "ready", item
     assert item["ready"] is True
-    stored = mixer.library.get(item_id).conversion_for(mixer.workspace.format_id)
+    fmt = mixer.workspace.format_id
+    stored = mixer.library.get(item_id).conversion_for(fmt)
     assert stored.audio_samples == samples_until_grain(stored.frames, 50, 1)
+    # The mezzanine: HEVC 4:4:4 10-bit; the sound: raw float32 of exactly the clip's frames.
+    store = mixer.library.store
+    probe = FFmpeg().probe(store.mezz_path(item_id, fmt, LibraryKind.clip))
+    video = next(s for s in probe.streams if s.codec_type == "video")
+    assert (video.codec_name, video.pix_fmt) == ("hevc", "yuv444p10le")
+    assert store.audio_path(item_id, fmt).stat().st_size == stored.audio_samples * stored.audio_channels * 4
+    assert (store.item_dir(item_id) / "original.mp4").read_bytes() == data
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_upload_and_convert_still_with_ffmpeg(client, mixer, tmp_path: Path):
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 18), (255, 0, 0)).save(buffer, format="PNG")
+    data = buffer.getvalue()
+    init = client.post("/api/v1/uploads", json={"name": "red.png", "size": len(data), "kind": "still", "mode": "video"})
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["id"]
+    assert client.put(f"/api/v1/uploads/{upload_id}/chunks/0", content=data).status_code == 200
+    item_id = client.post(f"/api/v1/uploads/{upload_id}/complete").json()["id"]
+    for _ in range(60):
+        item = client.get(f"/api/v1/library/{item_id}").json()
+        if item["status"] in {"ready", "failed"}:
+            break
+        time.sleep(0.5)
+    assert item["status"] == "ready", item
+    fmt = mixer.workspace.format_id
+    still = mixer.library.store.mezz_path(item_id, fmt, LibraryKind.still)
+    width, height = mixer.settings.width, mixer.settings.height
+    raw = still.read_bytes()
+    assert len(raw) == (width + 47) // 48 * 128 * height
+    # Red in limited-range BT.709 10-bit: Y 250, Cb 409, Cr 960 (first v210 word: Cb, Y, Cr).
+    word = int.from_bytes(raw[:4], "little")
+    assert abs((word >> 10 & 1023) - 250) <= 2 and abs((word & 1023) - 409) <= 2 and abs((word >> 20 & 1023) - 960) <= 2
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")

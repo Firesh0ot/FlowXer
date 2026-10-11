@@ -1,5 +1,3 @@
-import time
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -14,9 +12,11 @@ def test_default_console_has_sources_panel_and_dsk(mixer: VisionMixer) -> None:
     assert mixer.panels[0].id == "me-1"
     assert mixer.keyers[0].id == "dsk-1"
     assert mixer.stinger_slots[0].role == "shared"
-    assert mixer.get_input("cam-1").kind.value == "test"
+    # Live inputs, a clip player, Black (no test sources or replay input any more).
+    assert [item.kind.value for item in mixer.list_inputs()] == ["mxl_live"] * 6 + ["clip_player", "black"]
+    assert mixer.get_input("cam-1").kind.value == "mxl_live"
+    assert mixer.get_input("clip-1").kind.value == "clip_player"
     assert mixer.get_input("black").kind.value == "black"
-    assert mixer.get_input("replay").kind.value == "replay"
 
 
 def test_workspace_settings_resize_console(mixer: VisionMixer) -> None:
@@ -27,15 +27,18 @@ def test_workspace_settings_resize_console(mixer: VisionMixer) -> None:
             mixer_panel_count=2,
             stinger_mode="separate",
             stinger_count=1,
-            downstream_keyer_count=2,
+            downstream_keyer_count=0,
         )
     )
     assert mixer.settings.width == 1280
     assert mixer.settings.height == 720
     assert len(mixer.list_inputs()) == 4
+    assert [item.kind.value for item in mixer.list_inputs()] == ["mxl_live", "mxl_live", "clip_player", "black"]
     assert len(mixer.panels) == 2
     assert [slot.role for slot in mixer.stinger_slots] == ["in", "out"]
-    assert len(mixer.keyers) == 2
+    assert mixer.keyers == []
+    with pytest.raises(MixerError, match="at most 1"):
+        mixer.apply_workspace(WorkspaceUpdate(downstream_keyer_count=2))
 
 
 def test_source_tile_aspect_while_running(mixer: VisionMixer) -> None:
@@ -58,20 +61,16 @@ def test_left_preview_right_program_on_panel(mixer: VisionMixer) -> None:
     assert mixer.panels[0].program_input_id == "black"
 
 
-def test_console_and_jpeg_and_resources_api(client: TestClient) -> None:
+def test_console_and_resources_api(client: TestClient) -> None:
     console = client.get("/api/v1/console").json()
     assert console["workspace"]["format_id"] == "1080p50"
     assert console["workspace"]["source_tile_aspect"] == "16:9"
     assert console["nmos"]["enabled"] is False
     assert len(console["formats"]) >= 4
     assert console["resources"]["cpu_count"] >= 1
-    jpeg = client.get("/api/v1/preview/jpeg/source:cam-1")
-    assert jpeg.status_code == 200
-    assert jpeg.headers["content-type"] == "image/jpeg"
-    assert jpeg.content[:2] == b"\xff\xd8"
-    pgm = client.get("/api/v1/preview/jpeg/panel:me-1:pgm")
-    assert pgm.status_code == 200
-
+    assert console["preview"]["available"] is False
+    assert console["sources"] == {}
+    assert client.get("/api/v1/resources").status_code == 200
 
 def test_keyer_and_stinger_slot_api(client: TestClient) -> None:
     updated = client.patch(
@@ -125,19 +124,16 @@ def test_stinger_slot_cut_time_and_video(mixer: VisionMixer) -> None:
     assert "sting.webm" in bound.media_path
 
 
-def test_cut_uses_configured_cut_time(mixer: VisionMixer) -> None:
-    from flowxer.api.schemas import MixerStartRequest, StingerSlotUpdate
-
-    mixer.configure_stinger_slot("shared-1", StingerSlotUpdate(cut_ms=40))
+def test_an_armed_wipe_does_not_change_the_cut(mixer: VisionMixer) -> None:
+    # Wipes and stingers come in P3: the next Cut is a cut and disarms the Wipe.
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
     mixer.set_wipe()
+    assert mixer.panels[0].wipe_armed is True
     mixer.cut()
-    assert mixer.stinger_player is not None
-    # 40ms at 50 fps is frame 2; play_stinger already advanced 1 frame.
-    mixer.advance_stinger(1)
-    assert mixer.program_input_id == "cam-2"
-
+    assert mixer.program_input_id == "cam-2" and mixer.preview_input_id == "cam-1"
+    assert mixer.panels[0].wipe_armed is False
+    assert mixer.last_transition == "cut"
 
 def test_cut_flip_flops_preview_and_program(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
@@ -168,38 +164,21 @@ def test_fade_to_black_and_restore(mixer: VisionMixer) -> None:
     assert mixer.program_input_id == "cam-2"
 
 
-def test_wipe_arms_stinger_for_next_cut(mixer: VisionMixer) -> None:
+def test_wipe_stays_armed_over_a_take(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
     mixer.set_wipe()
-    assert mixer.panels[0].wipe_armed is True
     mixer.take("cam-3")
     assert mixer.program_input_id == "cam-3"
     assert mixer.panels[0].wipe_armed is True
-    mixer.cut()
-    assert mixer.stinger_player is not None
-    assert mixer.panels[0].wipe_armed is False
-    assert mixer.program_input_id == "cam-3"
-    stinger = mixer.get_stinger("replay-wipe")
-    remaining = stinger.cut_frame - mixer.stinger_player.frame
-    mixer.advance_stinger(remaining)
-    assert mixer.program_input_id == "cam-2"
-    assert mixer.preview_input_id == "cam-3"
 
-
-def test_wipe_cut_auto_ticks_stinger(mixer: VisionMixer) -> None:
-    mixer.settings.stinger_auto_tick = True
+def test_set_wipe_toggles(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
-    mixer.set_preview("cam-2")
     mixer.set_wipe()
-    mixer.cut()
-    deadline = time.time() + 2
-    while mixer.stinger_player is not None and time.time() < deadline:
-        time.sleep(0.02)
-    assert mixer.stinger_player is None
-    assert mixer.program_input_id == "cam-2"
-    assert mixer.preview_input_id == "cam-1"
-
+    mixer.set_wipe()
+    assert mixer.panels[0].wipe_armed is False
+    mixer.set_wipe(armed=True)
+    assert mixer.panels[0].wipe_armed is True
 
 def test_transition_bank_api(client: TestClient) -> None:
     client.post("/api/v1/mixer/start", json={"program_input_id": "cam-1"})
@@ -219,68 +198,37 @@ def test_transition_bank_api(client: TestClient) -> None:
 
 
 def test_stinger_play_flip_flops_preview_to_program(mixer: VisionMixer) -> None:
+    # A stinger is a cut in this version (stingers come in P3).
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
     mixer.play_stinger("replay-wipe", "cam-2", direction="to_live", flip_flop=True, panel_id="me-1")
-    assert mixer.stinger_player is not None
-    stinger = mixer.get_stinger("replay-wipe")
-    remaining = stinger.cut_frame - mixer.stinger_player.frame
-    mixer.advance_stinger(max(remaining, 0))
     assert mixer.program_input_id == "cam-2"
     assert mixer.preview_input_id == "cam-1"
+    assert mixer.status().stinger["phase"] == "idle"
 
-
-def test_stinger_on_another_me_leaves_me_1_and_its_stinger_alone(mixer: VisionMixer) -> None:
-    # Only ME 1 renders: a Wipe or stinger take on ME 2 switches ME 2 at once, without media.
+def test_every_me_switches_on_its_own(mixer: VisionMixer) -> None:
     mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
-    mixer.set_wipe()
-    mixer.cut()
-    player = mixer.stinger_player
-    assert player is not None
     mixer.set_preview("cam-4", panel_id="me-2")
     mixer.take("cam-3", panel_id="me-2")
-    mixer.set_wipe(panel_id="me-2")
     mixer.cut(panel_id="me-2")
     me_2 = mixer.get_panel("me-2")
     assert (me_2.program_input_id, me_2.preview_input_id) == ("cam-4", "cam-3")
-    assert me_2.wipe_armed is False
-    assert me_2.last_transition == "stinger"
     mixer.take("cam-1", TransitionType.stinger, panel_id="me-2")
     assert mixer.get_panel("me-2").program_input_id == "cam-1"
-    assert mixer.stinger_player is player and not player.done
-    assert mixer.program_input_id == "cam-1"
-    mixer.advance_stinger(player.info.frame_count)
-    assert mixer.stinger_player is None
-    assert mixer.program_input_id == mixer.panels[0].program_input_id == "cam-2"
-    assert mixer.get_panel("me-2").program_input_id == "cam-1"
+    # ME 1 is untouched.
+    assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
 
-
-def test_source_auto_stinger_on_take_and_cut(mixer: VisionMixer) -> None:
+def test_source_auto_stinger_is_a_cut(mixer: VisionMixer) -> None:
     from flowxer.api.schemas import LogicalInputUpdate
 
     mixer.update_input("cam-2", LogicalInputUpdate(stinger_slot_id="shared-1"))
+    assert mixer.get_input("cam-2").stinger_slot_id == "shared-1"
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.take("cam-2")
-    assert mixer.stinger_player is not None
-    assert mixer.stinger_player.target_input_id == "cam-2"
-    remaining = mixer.stinger_player.info.frame_count - mixer.stinger_player.frame + 1
-    mixer.advance_stinger(max(remaining, 1))
-    assert mixer.stinger_player is None
     assert mixer.program_input_id == "cam-2"
-
     mixer.set_preview("cam-3")
     mixer.cut()
-    assert mixer.stinger_player is None
     assert mixer.program_input_id == "cam-3"
     assert mixer.preview_input_id == "cam-2"
-
-    mixer.set_preview("cam-2")
-    mixer.cut()
-    assert mixer.stinger_player is not None
-    assert mixer.stinger_player.target_input_id == "cam-2"
-    stinger = mixer.get_stinger("replay-wipe")
-    mixer.advance_stinger(max(stinger.cut_frame - mixer.stinger_player.frame, 0))
-    assert mixer.program_input_id == "cam-2"
-    assert mixer.preview_input_id == "cam-3"

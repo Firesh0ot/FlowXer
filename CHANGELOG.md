@@ -5,6 +5,87 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: the engine replaces the GStreamer mixer (P2)
+
+FlowXer's media plane is its C++/CUDA engine (`engine/`), a child process of the
+control plane. One image, one code path; an NVIDIA GPU is required
+(`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`).
+
+- Every ME renders all the time: PGM video + audio and PVW video per ME, written
+  to MXL; `FLOWXER_RENDER_MES` (the first n MEs, default all panels),
+  `FLOWXER_PVW_OUTPUTS` (default true), `FLOWXER_LATENCY` (grains, default 4).
+- NMOS: senders `{ME} PGM Video`, `{ME} PGM Audio`, `{ME} PVW Video` per
+  rendering ME, each with its own flow (ME n no longer advertises ME 1's flow);
+  ME 1 PGM keeps its flow ids. Receiver `DSK 1 Key` (v210a). IS-05 opens and
+  closes the engine's readers at run time.
+- Sources in slot order (TSL INDEX): live inputs, clip players
+  (`FLOWXER_CLIP_PLAYERS`, replaces `FLOWXER_TEST_SOURCES`), Black. Test, file
+  and replay inputs become clip players (saved states and clients migrate).
+  Re-entry: an ME takes the Program of a higher ME (`me-<n>`, INDEX 1000 + n).
+- `GET /api/v1/engine` (timing, arrival lag per input, recommended latency),
+  `GET /api/v1/preview` (the mosaic stream and its tile map),
+  `POST /players/{id}/{action}`, `POST /keyers/{id}/auto`.
+- Clip players: a library clip plays from its mezzanine, decoded on the GPU
+  (NVDEC), with its sound in audio-follows-video; a still is uploaded once and
+  held (frame memory). Loop and play on cut (it starts when the player goes to
+  Program) on the input (`PATCH /inputs/{id}`); transport cue, play, pause,
+  stop. An empty player is black. The colour bars ship as a library still.
+- DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
+  (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM
+  only (keys have no preview: PVW shows only its source); on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
+  `rate_ms`; `POST /keyers/{id}/auto` without a duration uses it).
+- GUI: every picture of the console (sources, each ME's Preview and Program) is
+  a crop of the engine's one preview mosaic: one WHEP session per page, each
+  picture a box of its tile's aspect ratio with the stream's video scaled and
+  moved inside it (CSS transform; every browser, no `object-view-box`). The
+  session connects again by itself, at once when no video came for a second:
+  about 2.4 s after a MediaMTX restart (the engine checks its built-in
+  MediaMTX every 200 ms and its publisher retries within 0.5 s). Clip players get their library
+  clip or still in the tile's header, the position and remaining time over the
+  picture and a transport bar (cue, play, pause, stop, loop, play on cut; a
+  still is a frame memory); DSK 1 gets Auto and its rate; the clip library
+  holds stills.
+  The per-source WebRTC and JPEG previews are gone.
+- Operator-screen widget `bus` (Program and Preview rows with Cut and Auto of
+  one ME), served by flowxer-gui: `GET /widgets` (from `GET /api/v1/widgets`)
+  and `GET /widget/bus?me=<n>[&theme=dark|light|transparent]`, framed only by
+  the origins in `WIDGET_FRAME_ANCESTORS` (gui container, default `'self'`),
+  with `widget-ready` and `widget-size` messages.
+- Library: a clip's mezzanine is HEVC 4:4:4 10-bit (a key frame every second,
+  no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32 sound file,
+  instead of ProRes 422 HQ. NVENC encodes it with constant QP 8 (about 90
+  frames/s on air: a minute of clip in about 35 s); without NVENC x265 with
+  CRF 8 (7–10 frames/s), logged once. The 4:2:2 picture goes in with each
+  chroma sample repeated, so the engine gets the 4:2:2 picture back. At least
+  56 dB PSNR, about 200–400 MB per minute at 1080p50 (x265: 150–320 MB), up
+  to 2.4 GB with heavy grain (x265: 1.5 GB). Stills
+  (uploads, and pictures in the import dir) become one v210 picture. A clip
+  converted before is converted again at the next start (the original stays,
+  the ProRes mezzanine goes). A conversion uses the container's CPU limit less
+  two cores (8 threads without a limit): for decoding and scaling with NVENC,
+  for x265's workers otherwise (decoding and scaling then on one thread), and
+  numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`): a conversion
+  that filled the limit got the container throttled and the engine skipped
+  grains.
+- Metrics for the engine, the inputs (arrival lag, late and missing grains
+  per FlowXer input), GPU time per stage and per ME, the clip players
+  (`flowxer_engine_player_frames_decoded_total`, `_decode_ms`), the mosaic and
+  its MediaMTX (`flowxer_engine_preview_mediamtx_running`, `_restarts_total`)
+  and the library (`flowxer_library_jobs`, `flowxer_library_conversions_total`,
+  `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc`); the list
+  is in the README (Metrics). `flowxer_webrtc_peers` is gone; the Grafana
+  dashboard shows the engine's fps, skipped and late grains and GPU time
+  instead.
+- Upgrade from 14.x with the same `/config`: ME 1 PGM keeps its flow ids, the
+  live inputs keep their IS-05 activations and tally INDEX; test sources become
+  empty clip players, the Replay input goes, DSK 1 needs a v210a key (README,
+  Upgrading from FlowXer 14).
+- Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
+  `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
+  `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,
+  `/webrtc/whep/*`; the `/graphics` sample page. Stingers come back in P3: a
+  stinger take, an auto-stinger and an armed Wipe cut.
+
 ### Added
 
 - `FLOWXER_TALLY_TSL=udp://host:port` (or `tcp://`): the raw tally of every ME

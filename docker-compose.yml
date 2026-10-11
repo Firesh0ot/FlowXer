@@ -18,6 +18,11 @@ services:
       # Loopback only: do not publish the mixer API on a public interface.
       # The operator GUI on 9620 proxies /api (and injects FLOWXER_API_TOKEN).
       - "127.0.0.1:9610:9610"
+      # The preview mosaic (the engine's own MediaMTX): WHEP, HLS, ICE.
+      - "8989:8989"
+      - "8988:8988"
+      - "8289:8289"
+      - "8289:8289/udp"
     environment:
       FLOWXER_MXL_DOMAIN: /mxl-domain
       FLOWXER_STORAGE_ROOT: /storage
@@ -32,9 +37,8 @@ services:
       FLOWXER_HEIGHT: "1080"
       FLOWXER_FRAME_RATE_NUM: "50"
       FLOWXER_FRAME_RATE_DEN: "1"
-      FLOWXER_GST_MODE: auto
       FLOWXER_HOST: "0.0.0.0"
-      FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
       FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:-}
       FLOWXER_CORS_ORIGINS: ${FLOWXER_CORS_ORIGINS:-*}
     volumes:
@@ -45,6 +49,14 @@ services:
         source: ./storage
         target: /storage
     shm_size: "2gb"
+    # The media engine needs an NVIDIA GPU (NVIDIA container toolkit).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, video, utility]
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

@@ -27,6 +27,16 @@ FORMAT_VIDEO = "urn:x-nmos:format:video"
 FORMAT_AUDIO = "urn:x-nmos:format:audio"
 GROUPHINT = "urn:x-nmos:tag:grouphint/v1.0"
 NULL_ACTIVATION = {"mode": None, "requested_time": None, "activation_time": None}
+# The senders of a rendering ME: IS-04 role (part of the resource ids), format, label after the
+# panel label, group hint after the panel id. PGM keeps the roles "video" and "audio" of the
+# senders before PVW existed, so their ids do not change.
+OUTPUT_KINDS = (
+    ("video", "urn:x-nmos:format:video", "PGM Video", "PgmVideo"),
+    ("audio", "urn:x-nmos:format:audio", "PGM Audio", "PgmAudio"),
+    ("pvw-video", "urn:x-nmos:format:video", "PVW Video", "PvwVideo"),
+)
+# The receiver role of a keyer's key input (v210a fill + key).
+KEY_ROLE = "key"
 STAGED_PATCH_FIELDS = {
     "sender_id",
     "receiver_id",
@@ -129,6 +139,8 @@ class NmosNode:
         self.seed = self.settings.resolved_nmos_seed
         self.node_uuid = ids.node_id(self.seed)
         self.device_uuid = ids.device_id(self.seed)
+        # BCP-004-01: when the receivers' constraint sets last changed (structure or raster).
+        self.caps_version = nmos_version()
 
     def enabled(self) -> bool:
         return bool(self.settings.nmos_enable)
@@ -142,25 +154,22 @@ class NmosNode:
     def status(self) -> dict[str, Any]:
         with self.lock:
             receivers = []
-            for item in self.mixer.list_inputs():
-                if item.kind != InputKind.mxl_live:
-                    continue
-                for role in ("video", "audio"):
-                    rid = ids.receiver_id(self.seed, item.id, role)
-                    active = self._active.get(rid, self._empty_receiver_active())
-                    params = (active.get("transport_params") or [{}])[0]
-                    receivers.append(
-                        {
-                            "input_id": item.id,
-                            "role": role,
-                            "receiver_id": rid,
-                            "state": self.input_state(item.id, role),
-                            "master_enable": bool(active.get("master_enable")),
-                            "sender_id": active.get("sender_id"),
-                            "mxl_domain_id": params.get("mxl_domain_id"),
-                            "mxl_flow_id": params.get("mxl_flow_id"),
-                        }
-                    )
+            for owner, role in self._receiver_roles():
+                rid = ids.receiver_id(self.seed, owner, role)
+                active = self._active.get(rid, self._empty_receiver_active())
+                params = (active.get("transport_params") or [{}])[0]
+                receivers.append(
+                    {
+                        "input_id": owner,
+                        "role": role,
+                        "receiver_id": rid,
+                        "state": self.input_state(owner, role),
+                        "master_enable": bool(active.get("master_enable")),
+                        "sender_id": active.get("sender_id"),
+                        "mxl_domain_id": params.get("mxl_domain_id"),
+                        "mxl_flow_id": params.get("mxl_flow_id"),
+                    }
+                )
             return {
                 "enabled": self.enabled(),
                 "registry_url": self.settings.resolved_registry_url,
@@ -320,12 +329,38 @@ class NmosNode:
     def _live_inputs(self):
         return [item for item in self.mixer.list_inputs() if item.kind == InputKind.mxl_live]
 
-    def _sender_ids(self) -> set[str]:
-        out = set()
-        for panel in self.mixer.panels or []:
-            out.add(ids.sender_id(self.seed, panel.id, "video"))
-            out.add(ids.sender_id(self.seed, panel.id, "audio"))
+    def _keyers(self):
+        return list(getattr(self.mixer, "keyers", []) or [])
+
+    def _receiver_roles(self) -> list[tuple[str, str]]:
+        """(owner id, role) of every receiver: video and audio of each live input, the key
+        input of each downstream keyer."""
+        roles = [(item.id, role) for item in self._live_inputs() for role in ("video", "audio")]
+        roles += [(keyer.id, KEY_ROLE) for keyer in self._keyers()]
+        return roles
+
+    def _outputs(self) -> list[tuple[Any, str, str, str, str, str | None]]:
+        """(panel, role, format, label suffix, group hint suffix, MXL flow id) of every sender:
+        PGM video, PGM audio and (with FLOWXER_PVW_OUTPUTS) PVW video of each rendering ME. The
+        MXL flow id is None while Program is off-air."""
+        out = []
+        for panel in self.mixer.rendered_panels():
+            flows = self.mixer.me_outputs.get(panel.id)
+            for role, fmt, suffix, tag in OUTPUT_KINDS:
+                if role == "pvw-video" and not self.settings.pvw_outputs:
+                    continue
+                mxl = None
+                if flows is not None:
+                    mxl = {
+                        "video": flows.pgm_video_flow_id,
+                        "audio": flows.pgm_audio_flow_id,
+                        "pvw-video": flows.pvw_video_flow_id,
+                    }[role]
+                out.append((panel, role, fmt, suffix, tag, mxl))
         return out
+
+    def _sender_ids(self) -> set[str]:
+        return {ids.sender_id(self.seed, panel.id, role) for panel, role, *_ in self._outputs()}
 
     def _tags(self) -> dict[str, list[str]]:
         """NMOS_TAGS on the node and the device (e.g. the platform's production and function)."""
@@ -404,6 +439,7 @@ class NmosNode:
                 if role == "video":
                     caps: dict[str, Any] = {
                         "media_types": ["video/v210", "video/v210a"],
+                        "version": self.caps_version,
                         "constraint_sets": [
                             {
                                 "urn:x-nmos:cap:format:frame_width": {
@@ -418,6 +454,7 @@ class NmosNode:
                 else:
                     caps = {
                         "media_types": ["audio/float32"],
+                        "version": self.caps_version,
                         "constraint_sets": [
                             {
                                 "urn:x-nmos:cap:format:channel_count": {
@@ -452,40 +489,65 @@ class NmosNode:
                         "caps": caps,
                     }
                 )
+        for keyer in self._keyers():
+            rid = ids.receiver_id(self.seed, keyer.id, KEY_ROLE)
+            active = self._active.get(rid, self._empty_receiver_active())
+            out.append(
+                {
+                    "id": rid,
+                    "version": nmos_version(),
+                    "label": f"{keyer.label} Key",
+                    "description": f"{keyer.label} key input (v210a fill and key)",
+                    "tags": {GROUPHINT: [f"{keyer.id}:Key"]},
+                    "device_id": self.device_uuid,
+                    "transport": TRANSPORT_MXL,
+                    "interface_bindings": [],
+                    "subscription": {
+                        "sender_id": active.get("sender_id"),
+                        "active": bool(active.get("master_enable")),
+                    },
+                    "format": FORMAT_VIDEO,
+                    "caps": {
+                        "media_types": ["video/v210a"],
+                        "version": self.caps_version,
+                        "constraint_sets": [
+                            {
+                                "urn:x-nmos:cap:format:frame_width": {"enum": [self.settings.width]},
+                                "urn:x-nmos:cap:format:frame_height": {"enum": [self.settings.height]},
+                            }
+                        ],
+                    },
+                }
+            )
         return out
 
     def senders(self) -> list[dict[str, Any]]:
         out = []
-        outputs = self.mixer.outputs
         domain_id = self.settings.resolved_output_domain_id
-        for panel in self.mixer.panels or []:
-            for role, fmt, mxl_flow in (
-                ("video", FORMAT_VIDEO, outputs.video_flow_id if outputs else None),
-                ("audio", FORMAT_AUDIO, outputs.audio_flow_id if outputs else None),
-            ):
-                sid = ids.sender_id(self.seed, panel.id, role)
-                out.append(
-                    {
-                        "id": sid,
-                        "version": nmos_version(),
-                        "label": f"{panel.label} PGM {role.title()}",
-                        "description": f"{panel.label} program {role}",
-                        "tags": {GROUPHINT: [f"{panel.id}:Pgm{role.title()}"]},
-                        "device_id": self.device_uuid,
-                        "manifest_href": None,
-                        "transport": TRANSPORT_MXL,
-                        "interface_bindings": [],
-                        "subscription": {
-                            "receiver_id": None,
-                            "active": bool(outputs),
-                        },
-                        "flow_id": ids.flow_id(self.seed, panel.id, role),
-                    }
-                )
-                self._active.setdefault(
-                    sid,
-                    self._empty_sender_active(domain_id, str(mxl_flow) if mxl_flow else None),
-                )
+        for panel, role, _fmt, suffix, tag, mxl_flow in self._outputs():
+            sid = ids.sender_id(self.seed, panel.id, role)
+            out.append(
+                {
+                    "id": sid,
+                    "version": nmos_version(),
+                    "label": f"{panel.label} {suffix}",
+                    "description": f"{panel.label} {suffix.lower()}",
+                    "tags": {GROUPHINT: [f"{panel.id}:{tag}"]},
+                    "device_id": self.device_uuid,
+                    "manifest_href": None,
+                    "transport": TRANSPORT_MXL,
+                    "interface_bindings": [],
+                    "subscription": {
+                        "receiver_id": None,
+                        "active": mxl_flow is not None,
+                    },
+                    "flow_id": ids.flow_id(self.seed, panel.id, role),
+                }
+            )
+            self._active.setdefault(
+                sid,
+                self._empty_sender_active(domain_id, str(mxl_flow) if mxl_flow else None),
+            )
         return out
 
     def sources(self) -> list[dict[str, Any]]:
@@ -505,89 +567,74 @@ class NmosNode:
                 {"label": f"Channel {index + 1}", "symbol": f"NSC{index + 1:03d}"}
                 for index in range(count)
             ]
-        for panel in self.mixer.panels or []:
-            video = {
-                "id": ids.source_id(self.seed, panel.id, "video"),
+        for panel, role, fmt, suffix, tag, _mxl in self._outputs():
+            source = {
+                "id": ids.source_id(self.seed, panel.id, role),
                 "version": nmos_version(),
-                "label": f"{panel.label} PGM Video source",
+                "label": f"{panel.label} {suffix} source",
                 "description": "",
-                "tags": {GROUPHINT: [f"{panel.id}:PgmVideo"]},
+                "tags": {GROUPHINT: [f"{panel.id}:{tag}"]},
                 "device_id": self.device_uuid,
                 "parents": [],
                 "clock_name": "clk0",
                 "caps": {},
-                "format": FORMAT_VIDEO,
+                "format": fmt,
                 "grain_rate": dict(grain),
             }
-            audio = {
-                "id": ids.source_id(self.seed, panel.id, "audio"),
-                "version": nmos_version(),
-                "label": f"{panel.label} PGM Audio source",
-                "description": "",
-                "tags": {GROUPHINT: [f"{panel.id}:PgmAudio"]},
-                "device_id": self.device_uuid,
-                "parents": [],
-                "clock_name": "clk0",
-                "caps": {},
-                "format": FORMAT_AUDIO,
-                "grain_rate": dict(grain),
-                "channels": channels,
-            }
-            out.extend([video, audio])
+            if fmt == FORMAT_AUDIO:
+                source["channels"] = channels
+            out.append(source)
         return out
 
     def flows(self) -> list[dict[str, Any]]:
         out = []
-        outputs = self.mixer.outputs
         grain = {
             "numerator": self.settings.frame_rate_num,
             "denominator": self.settings.frame_rate_den,
         }
         width = self.settings.width
         height = self.settings.height
-        for panel in self.mixer.panels or []:
-            video = {
-                "id": ids.flow_id(self.seed, panel.id, "video"),
+        for panel, role, fmt, suffix, tag, mxl_flow in self._outputs():
+            flow: dict[str, Any] = {
+                "id": ids.flow_id(self.seed, panel.id, role),
                 "version": nmos_version(),
-                "label": f"{panel.label} PGM Video",
+                "label": f"{panel.label} {suffix}",
                 "description": "",
-                "tags": {GROUPHINT: [f"{panel.id}:PgmVideo"]},
-                "source_id": ids.source_id(self.seed, panel.id, "video"),
+                "tags": {GROUPHINT: [f"{panel.id}:{tag}"]},
+                "source_id": ids.source_id(self.seed, panel.id, role),
                 "device_id": self.device_uuid,
                 "parents": [],
-                "format": FORMAT_VIDEO,
-                "media_type": self.settings.video_media_type,
+                "format": fmt,
                 "grain_rate": dict(grain),
-                "frame_width": width,
-                "frame_height": height,
-                "colorspace": "BT709",
-                "interlace_mode": "progressive",
-                "transfer_characteristic": "SDR",
-                "components": [
-                    {"name": "Y", "width": width, "height": height, "bit_depth": 10},
-                    {"name": "Cb", "width": width // 2, "height": height, "bit_depth": 10},
-                    {"name": "Cr", "width": width // 2, "height": height, "bit_depth": 10},
-                ],
             }
-            audio = {
-                "id": ids.flow_id(self.seed, panel.id, "audio"),
-                "version": nmos_version(),
-                "label": f"{panel.label} PGM Audio",
-                "description": "",
-                "tags": {GROUPHINT: [f"{panel.id}:PgmAudio"]},
-                "source_id": ids.source_id(self.seed, panel.id, "audio"),
-                "device_id": self.device_uuid,
-                "parents": [],
-                "format": FORMAT_AUDIO,
-                "media_type": self.settings.audio_media_type,
-                "grain_rate": dict(grain),
-                "sample_rate": {"numerator": self.settings.audio_rate, "denominator": 1},
-                "bit_depth": 32,
-            }
-            if outputs:
-                video["tags"]["urn:x-nmos:tag:mxl_flow_id"] = [outputs.video_flow_id]
-                audio["tags"]["urn:x-nmos:tag:mxl_flow_id"] = [outputs.audio_flow_id]
-            out.extend([video, audio])
+            if fmt == FORMAT_VIDEO:
+                flow.update(
+                    {
+                        "media_type": self.settings.video_media_type,
+                        "frame_width": width,
+                        "frame_height": height,
+                        "colorspace": "BT709",
+                        "interlace_mode": "progressive",
+                        "transfer_characteristic": "SDR",
+                        "components": [
+                            {"name": "Y", "width": width, "height": height, "bit_depth": 10},
+                            {"name": "Cb", "width": width // 2, "height": height, "bit_depth": 10},
+                            {"name": "Cr", "width": width // 2, "height": height, "bit_depth": 10},
+                        ],
+                    }
+                )
+            else:
+                flow.update(
+                    {
+                        "media_type": self.settings.audio_media_type,
+                        "sample_rate": {"numerator": self.settings.audio_rate, "denominator": 1},
+                        "bit_depth": 32,
+                    }
+                )
+            if mxl_flow:
+                # Every sender carries its own ME's flow.
+                flow["tags"]["urn:x-nmos:tag:mxl_flow_id"] = [mxl_flow]
+            out.append(flow)
         return out
 
     def list_ids(self, collection: str) -> list[str]:
@@ -621,10 +668,9 @@ class NmosNode:
         return None
 
     def _lookup_receiver(self, receiver_id: str) -> tuple[str, str] | None:
-        for item in self._live_inputs():
-            for role in ("video", "audio"):
-                if ids.receiver_id(self.seed, item.id, role) == receiver_id:
-                    return item.id, role
+        for owner, role in self._receiver_roles():
+            if ids.receiver_id(self.seed, owner, role) == receiver_id:
+                return owner, role
         return None
 
     def constraints(self, resource_id: str, side: str) -> dict[str, Any]:
@@ -660,14 +706,9 @@ class NmosNode:
         return self._empty_sender_active(domain_id, self._sender_mxl_flow(resource_id))
 
     def _sender_mxl_flow(self, resource_id: str) -> str | None:
-        outputs = self.mixer.outputs
-        if not outputs:
-            return None
-        for panel in self.mixer.panels or []:
-            if ids.sender_id(self.seed, panel.id, "video") == resource_id:
-                return outputs.video_flow_id
-            if ids.sender_id(self.seed, panel.id, "audio") == resource_id:
-                return outputs.audio_flow_id
+        for panel, role, _fmt, _suffix, _tag, mxl_flow in self._outputs():
+            if ids.sender_id(self.seed, panel.id, role) == resource_id:
+                return mxl_flow
         return None
 
     def _busy(self, operation: str):
@@ -861,6 +902,14 @@ class NmosNode:
             states[role] = "not_routed"
         else:
             states[role] = flow_presence(self.settings.mxl_root, str(domain_id), str(flow_id))
+        if role == KEY_ROLE:
+            self.mixer.apply_key_route(
+                input_id,
+                domain_id=str(domain_id) if domain_id else None,
+                flow_id=str(flow_id) if flow_id else None,
+                enabled=enabled,
+            )
+            return
         self.mixer.apply_nmos_receiver(
             input_id,
             role,
@@ -915,18 +964,17 @@ class NmosNode:
         self.mark_changed()
 
     def reconcile_inputs(self) -> None:
-        """Create/remove receivers when live inputs appear or disappear."""
+        """Create/remove receivers when live inputs or keyers appear or disappear."""
+        self.caps_version = nmos_version()
         with self.lock:
-            live_ids = {item.id for item in self._live_inputs()}
+            owners = {owner for owner, _role in self._receiver_roles()}
             for item in self._live_inputs():
                 self.sync_from_rest(item.id)
             for input_id in list(self._input_states):
-                if input_id not in live_ids:
+                if input_id not in owners:
                     self._drop_input_receivers(input_id)
             valid_receivers = {
-                ids.receiver_id(self.seed, item.id, role)
-                for item in self._live_inputs()
-                for role in ("video", "audio")
+                ids.receiver_id(self.seed, owner, role) for owner, role in self._receiver_roles()
             }
             senders = self._sender_ids()
             for rid in list(self._active):
@@ -937,7 +985,7 @@ class NmosNode:
 
     def _drop_input_receivers(self, input_id: str) -> None:
         self._input_states.pop(input_id, None)
-        for role in ("video", "audio"):
+        for role in ("video", "audio", KEY_ROLE):
             rid = ids.receiver_id(self.seed, input_id, role)
             self._active.pop(rid, None)
             self._staged.pop(rid, None)
@@ -946,32 +994,29 @@ class NmosNode:
         """Receiver connections by input and role (no seed-derived ids), for the saved state."""
         routes = []
         with self.lock:
-            for item in self._live_inputs():
-                for role in ("video", "audio"):
-                    active = self._active.get(ids.receiver_id(self.seed, item.id, role))
-                    if not active:
-                        continue
-                    params = (active.get("transport_params") or [{}])[0]
-                    routes.append(
-                        {
-                            "input_id": item.id,
-                            "role": role,
-                            "sender_id": active.get("sender_id"),
-                            "master_enable": bool(active.get("master_enable")),
-                            "mxl_domain_id": params.get("mxl_domain_id"),
-                            "mxl_flow_id": params.get("mxl_flow_id"),
-                        }
-                    )
+            for owner, role in self._receiver_roles():
+                active = self._active.get(ids.receiver_id(self.seed, owner, role))
+                if not active:
+                    continue
+                params = (active.get("transport_params") or [{}])[0]
+                routes.append(
+                    {
+                        "input_id": owner,
+                        "role": role,
+                        "sender_id": active.get("sender_id"),
+                        "master_enable": bool(active.get("master_enable")),
+                        "mxl_domain_id": params.get("mxl_domain_id"),
+                        "mxl_flow_id": params.get("mxl_flow_id"),
+                    }
+                )
         return routes
 
     def import_routes(self, routes: list[dict[str, Any]]) -> None:
         """Activate saved receiver connections again, so they survive a restart."""
         with self.lock:
-            live = {item.id for item in self._live_inputs()}
+            valid = set(self._receiver_roles())
             for route in routes:
-                if not isinstance(route, dict) or route.get("role") not in {"video", "audio"}:
-                    continue
-                if route.get("input_id") not in live:
+                if not isinstance(route, dict) or (route.get("input_id"), route.get("role")) not in valid:
                     continue
                 rid = ids.receiver_id(self.seed, route["input_id"], route["role"])
                 active = self._empty_receiver_active()
@@ -1003,40 +1048,33 @@ class NmosNode:
         gets its state refreshed: applying it again would restart a live mxlsrc.
         """
         with self.lock:
-            for item in self._live_inputs():
-                for role in ("video", "audio"):
-                    state = self.input_state(item.id, role)
-                    if state not in {"waiting", "no_signal", "running"}:
-                        continue
-                    rid = ids.receiver_id(self.seed, item.id, role)
-                    active = self._active.get(rid)
-                    if not active:
-                        continue
-                    params = (active.get("transport_params") or [{}])[0]
-                    domain_id = params.get("mxl_domain_id") or self.settings.resolved_output_domain_id
-                    presence = flow_presence(
-                        self.settings.mxl_root, str(domain_id), str(params.get("mxl_flow_id"))
-                    )
-                    if state != "waiting" or presence == "waiting":
-                        self._input_states.setdefault(item.id, {})[role] = presence
-                        continue
-                    try:
-                        self._apply_receiver(rid, active)
-                    except NmosActivationError:
-                        log.debug("refresh waiting failed for %s", rid, exc_info=True)
+            for owner, role in self._receiver_roles():
+                state = self.input_state(owner, role)
+                if state not in {"waiting", "no_signal", "running"}:
+                    continue
+                rid = ids.receiver_id(self.seed, owner, role)
+                active = self._active.get(rid)
+                if not active:
+                    continue
+                params = (active.get("transport_params") or [{}])[0]
+                domain_id = params.get("mxl_domain_id") or self.settings.resolved_output_domain_id
+                presence = flow_presence(
+                    self.settings.mxl_root, str(domain_id), str(params.get("mxl_flow_id"))
+                )
+                if state != "waiting" or presence == "waiting":
+                    self._input_states.setdefault(owner, {})[role] = presence
+                    continue
+                try:
+                    self._apply_receiver(rid, active)
+                except NmosActivationError:
+                    log.debug("refresh waiting failed for %s", rid, exc_info=True)
 
     def sync_senders_from_outputs(self) -> None:
-        outputs = self.mixer.outputs
-        if outputs is None:
-            return
+        """The senders carry their ME's MXL flows (Program started or stopped, raster changed)."""
         domain_id = self.settings.resolved_output_domain_id
         with self.lock:
-            for panel in self.mixer.panels or []:
-                for role, flow in (
-                    ("video", outputs.video_flow_id),
-                    ("audio", outputs.audio_flow_id),
-                ):
-                    sid = ids.sender_id(self.seed, panel.id, role)
-                    self._active[sid] = self._empty_sender_active(domain_id, flow)
-                    self._staged[sid] = dict(self._active[sid])
+            for panel, role, _fmt, _suffix, _tag, mxl_flow in self._outputs():
+                sid = ids.sender_id(self.seed, panel.id, role)
+                self._active[sid] = self._empty_sender_active(domain_id, mxl_flow)
+                self._staged[sid] = dict(self._active[sid])
         self.mark_changed()

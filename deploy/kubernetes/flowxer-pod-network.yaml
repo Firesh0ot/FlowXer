@@ -5,8 +5,9 @@
 # The mixer listens on 0.0.0.0:9610 inside the pod (the API token guards it;
 # /livez, /readyz and /metrics are open) and the GUI on 9620 proxies /api to it.
 # The node announces the pod IP (NMOS_HOST_ADDRESS from the downward API).
-# WebRTC previews need the pod IP to be routable from the browser; the GUI
-# falls back to JPEG otherwise.
+# The media engine needs an NVIDIA GPU (nvidia runtime class, one GPU slot). The GUI plays
+# the preview mosaic from the platform's shared MediaMTX (the preview contract:
+# PREVIEW_PUBLISH_URL, PREVIEW_PATH_PREFIX, PREVIEW_WHEP_URL, PREVIEW_HLS_URL).
 ---
 apiVersion: v1
 kind: Namespace
@@ -44,6 +45,10 @@ data:
   NMOS_DNS_SD: "false"
   NMOS_PORT: "3252"
   SHUTDOWN_TIMEOUT_S: "10"
+  PREVIEW_PUBLISH_URL: "rtsp://mxl-mediamtx.mxl-platform.svc:8554"
+  PREVIEW_PATH_PREFIX: "demo/flowxer-1"
+  PREVIEW_WHEP_URL: "https://whep.example"
+  PREVIEW_HLS_URL: "https://hls.example"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -66,6 +71,7 @@ spec:
     spec:
       # Longer than SHUTDOWN_TIMEOUT_S: stop media, deregister, remove the domain.
       terminationGracePeriodSeconds: 20
+      runtimeClassName: nvidia
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -91,10 +97,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            - name: FLOWXER_WEBRTC_PUBLIC_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,video,utility
+          resources:
+            limits:
+              nvidia.com/gpu: 1
           ports:
             - name: mixer
               containerPort: 9610

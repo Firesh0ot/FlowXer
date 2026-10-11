@@ -2,20 +2,9 @@
 set -euo pipefail
 
 mkdir -p "${FLOWXER_STORAGE_ROOT:-/storage}/clips" \
-         "${FLOWXER_STORAGE_ROOT:-/storage}/stingers" \
-         "${FLOWXER_STORAGE_ROOT:-/storage}/graphics"
-
-if [[ -d /opt/mxl/lib || -d /opt/gstcef ]]; then
-  ldconfig || true
-fi
-
-# cefsrc needs a display. Start a private Xvfb when the host did not provide one.
-if [[ -z "${DISPLAY:-}" ]] && command -v Xvfb >/dev/null 2>&1; then
-  export DISPLAY="${FLOWXER_DISPLAY:-:99}"
-  Xvfb "${DISPLAY}" -screen 0 1920x1080x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
-fi
-mkdir -p "${GST_CEF_CACHE_LOCATION:-/tmp/cef-cache}"
+         "${FLOWXER_STORAGE_ROOT:-/storage}/stingers"
 
 # flowxer binds FLOWXER_HOST:FLOWXER_PORT and NMOS_PORT itself: exit 75 when a port is
-# taken, 78 on invalid settings, 143 after SIGTERM.
+# taken, 78 on invalid settings, 143 after SIGTERM. It starts the media engine
+# (flowxer-engine) as its child when Program goes on air.
 exec flowxer

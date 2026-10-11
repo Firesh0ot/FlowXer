@@ -51,6 +51,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          # The engine stages (CUDA toolkit, vcpkg, MXL) change rarely.
+          cache-from: type=gha,scope=mixer
           build-args: |
             FLOWXER_VERSION=${{ steps.version.outputs.version }}
             VCS_REF=${{ github.sha }}

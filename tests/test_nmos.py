@@ -41,15 +41,12 @@ def _settings(tmp_path: Path) -> Settings:
         storage_root=tmp_path / "storage",
         state_dir=tmp_path / "config",
         simulate=True,
-        gst_mode="simulate",
         width=64,
         height=36,
         frame_rate_num=50,
         frame_rate_den=1,
         stinger_frame_count=8,
-        overlay_url="http://127.0.0.1:9610/graphics/lower-third.html",
         group_hint="FlowXerTest",
-        stinger_auto_tick=False,
     )
 
 
@@ -237,21 +234,30 @@ def test_malformed_params_are_rejected(tmp_path: Path) -> None:
     assert auto.status_code == 400
 
 
-def test_test_black_file_have_no_receivers(tmp_path: Path) -> None:
+def _receiver_ids(client) -> set[str]:
+    return {item["id"] for item in client.get("/x-nmos/node/v1.3/receivers").json()}
+
+
+def test_live_inputs_and_the_dsk_have_receivers_clip_players_and_black_none(tmp_path: Path) -> None:
     mixer = VisionMixer(_settings(tmp_path))
     client = TestClient(create_nmos_app(mixer.nmos))
     receivers = client.get("/x-nmos/node/v1.3/receivers").json()
-    assert receivers == []
-    mixer.update_input("cam-1", LogicalInputUpdate(kind=InputKind.mxl_live, group_hint="cam-1"))
-    receivers = client.get("/x-nmos/node/v1.3/receivers").json()
-    assert len(receivers) == 2
+    live = [item for item in mixer.list_inputs() if item.kind == InputKind.mxl_live]
+    assert len(receivers) == 2 * len(live) + 1
     labels = {item["label"] for item in receivers}
-    assert "Camera 1 Video" in labels
-    assert "Camera 1 Audio" in labels
-
+    assert {"Camera 1 Video", "Camera 1 Audio", "DSK 1 Key"} <= labels
+    assert not any(label.startswith(("Clip", "Black")) for label in labels)
+    key = next(item for item in receivers if item["label"] == "DSK 1 Key")
+    assert key["id"] == ids.receiver_id(SEED, "dsk-1", "key")
+    assert key["format"] == "urn:x-nmos:format:video"
+    assert key["caps"]["media_types"] == ["video/v210a"]
+    # BCP-004-01: constraint sets need the caps version.
+    assert all(":" in item["caps"]["version"] for item in receivers)
 
 def test_creating_and_deleting_inputs_adds_receivers(tmp_path: Path) -> None:
     mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    before = _receiver_ids(client)
     mixer.register_input(
         LogicalInputCreate(
             id="ext-1",
@@ -260,23 +266,22 @@ def test_creating_and_deleting_inputs_adds_receivers(tmp_path: Path) -> None:
             group_hint="ext-1",
         )
     )
-    client = TestClient(create_nmos_app(mixer.nmos))
-    assert len(client.get("/x-nmos/node/v1.3/receivers").json()) == 2
+    assert _receiver_ids(client) - before == {ids.receiver_id(SEED, "ext-1", "video"), ids.receiver_id(SEED, "ext-1", "audio")}
     mixer.delete_input("ext-1")
-    assert client.get("/x-nmos/node/v1.3/receivers").json() == []
-
+    assert _receiver_ids(client) == before
 
 def test_workspace_count_does_not_leave_stale_receivers(tmp_path: Path) -> None:
     mixer = _live_mixer(tmp_path)
     mixer.apply_workspace(WorkspaceUpdate(logical_source_count=4))
-    # cam-1 is still mxl_live among the remaining four.
+    # cam-1, cam-2, clip-1 and Black remain; the DSK keeps its key receiver.
     client = TestClient(create_nmos_app(mixer.nmos))
-    receivers = client.get("/x-nmos/node/v1.3/receivers").json()
-    assert {item["id"] for item in receivers} == {
+    assert _receiver_ids(client) == {
         ids.receiver_id(SEED, "cam-1", "video"),
         ids.receiver_id(SEED, "cam-1", "audio"),
+        ids.receiver_id(SEED, "cam-2", "video"),
+        ids.receiver_id(SEED, "cam-2", "audio"),
+        ids.receiver_id(SEED, "dsk-1", "key"),
     }
-
 
 def test_on_air_activation_keeps_program_running(tmp_path: Path) -> None:
     mixer = _live_mixer(tmp_path)
@@ -480,3 +485,68 @@ def test_scheduled_relative_activation(tmp_path: Path) -> None:
     assert active["activation"]["requested_time"] == "0:50000000"
     staged = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/staged").json()
     assert staged["activation"] == {"mode": None, "requested_time": None, "activation_time": None}
+
+
+def test_every_rendering_me_has_pgm_and_pvw_senders_with_its_own_flows(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.panels = 3
+    settings.render_mes = 2
+    mixer = VisionMixer(settings)
+    client = TestClient(create_nmos_app(mixer.nmos))
+    senders = client.get("/x-nmos/node/v1.3/senders").json()
+    assert sorted(item["label"] for item in senders) == [
+        "ME 1 PGM Audio", "ME 1 PGM Video", "ME 1 PVW Video",
+        "ME 2 PGM Audio", "ME 2 PGM Video", "ME 2 PVW Video",
+    ]
+    # PGM keeps its ids from before PVW existed.
+    assert ids.sender_id(SEED, "me-1", "video") in {item["id"] for item in senders}
+    assert ids.sender_id(SEED, "me-1", "pvw-video") in {item["id"] for item in senders}
+    status = mixer.start()
+    flows = {item["label"]: item for item in client.get("/x-nmos/node/v1.3/flows").json()}
+    me_2 = status.me_outputs[1]
+    assert flows["ME 2 PGM Video"]["tags"]["urn:x-nmos:tag:mxl_flow_id"] == [me_2.pgm_video_flow_id]
+    assert flows["ME 2 PVW Video"]["tags"]["urn:x-nmos:tag:mxl_flow_id"] == [me_2.pvw_video_flow_id]
+    assert flows["ME 1 PGM Video"]["tags"]["urn:x-nmos:tag:mxl_flow_id"] == [status.outputs.video_flow_id]
+    for label, flow_id in (("ME 2 PGM Audio", me_2.pgm_audio_flow_id), ("ME 2 PVW Video", me_2.pvw_video_flow_id)):
+        sid = next(item["id"] for item in senders if item["label"] == label)
+        active = client.get(f"/x-nmos/connection/v1.2/single/senders/{sid}/active").json()
+        assert active["transport_params"][0]["mxl_flow_id"] == flow_id
+    assert ids.sender_name("me-1", "pvw-video") == "me-1-pvw-video"
+    assert ids.sender_name("me-2", "audio") == "me-2-pgm-audio"
+    mixer.stop()
+
+
+def test_no_pvw_senders_without_pvw_outputs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.pvw_outputs = False
+    mixer = VisionMixer(settings)
+    labels = {item["label"] for item in mixer.nmos.senders()}
+    assert labels == {"ME 1 PGM Video", "ME 1 PGM Audio"}
+
+
+def test_the_dsk_key_receiver_routes_the_key_input(tmp_path: Path) -> None:
+    mixer = VisionMixer(_settings(tmp_path))
+    client = TestClient(create_nmos_app(mixer.nmos))
+    key_dir = mixer.settings.mxl_root / "browser"
+    key_dir.mkdir(parents=True)
+    (key_dir / "domain_def.json").write_text(json.dumps({"id": CAM_DOMAIN}), encoding="utf-8")
+    _write_flow(key_dir, VIDEO_FLOW, grains=True)
+    calls: list = []
+    mixer._engine_call = lambda method, path, body, client=None: calls.append((method, path, body))
+    rid = ids.receiver_id(SEED, "dsk-1", "key")
+    response = client.patch(
+        f"/x-nmos/connection/v1.2/single/receivers/{rid}/staged",
+        json={
+            "sender_id": SENDER_ID,
+            "master_enable": True,
+            "activation": {"mode": "activate_immediate"},
+            "transport_params": [{"mxl_domain_id": CAM_DOMAIN, "mxl_flow_id": VIDEO_FLOW}],
+        },
+    )
+    assert response.status_code == 200
+    assert calls[-1] == ("PUT", "/key/1", {"domain": str(key_dir.resolve()), "flow": VIDEO_FLOW})
+    receiver = client.get(f"/x-nmos/node/v1.3/receivers/{rid}").json()
+    assert receiver["subscription"] == {"sender_id": SENDER_ID, "active": True}
+    # The key route belongs to the saved state.
+    routes = mixer.export_state()["nmos_receivers"]
+    assert {"input_id": "dsk-1", "role": "key", "mxl_flow_id": VIDEO_FLOW}.items() <= next(r for r in routes if r["role"] == "key").items()

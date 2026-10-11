@@ -32,10 +32,10 @@
       "targets": [{ "expr": "flowxer_nmos_registry_up", "refId": "A" }]
     },
     {
-      "title": "WebRTC peers",
+      "title": "Engine fps",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
-      "targets": [{ "expr": "flowxer_webrtc_peers", "refId": "A" }]
+      "targets": [{ "expr": "flowxer_engine_output_fps", "refId": "A" }]
     },
     {
       "title": "CPU %",
@@ -78,6 +78,22 @@
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [{ "expr": "increase(flowxer_tally_send_errors_total[5m])", "refId": "A" }]
+    },
+    {
+      "title": "Grains skipped, late, write failed",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "increase(flowxer_engine_output_grains_skipped_total[5m])", "legendFormat": "skipped", "refId": "A" },
+        { "expr": "increase(flowxer_engine_output_grains_late_total[5m])", "legendFormat": "late", "refId": "B" },
+        { "expr": "increase(flowxer_engine_output_write_failed_total[5m])", "legendFormat": "write failed", "refId": "C" }
+      ]
+    },
+    {
+      "title": "GPU ms per grain",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [{ "expr": "flowxer_engine_gpu_stage_ms{stage=~\"render|total\",stat=\"max\"}", "legendFormat": "{{stage}} max", "refId": "A" }]
     }
   ],
   "refresh": "5s",
