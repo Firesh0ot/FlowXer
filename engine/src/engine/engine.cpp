@@ -1119,6 +1119,11 @@ struct Engine::Impl
         std::lock_guard lock{keyMu};
         auto const users = [&](int s) { return std::count(keySlot.begin(), keySlot.end(), s); };
         int const old = keySlot[static_cast<std::size_t>(k - 1)];
+        if (old >= 0 && !video.flow.empty() && keys[static_cast<std::size_t>(old)]->videoRoute() == video)
+        {
+            // The same flow again: the reader keeps reading.
+            return true;
+        }
         keySlot[static_cast<std::size_t>(k - 1)] = -1;
         int shared = -1;
         for (int s = 0; s < static_cast<int>(keys.size()) && !video.flow.empty(); ++s)
