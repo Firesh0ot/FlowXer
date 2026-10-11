@@ -524,6 +524,9 @@ class WorkspaceConfig(BaseModel):
     stinger_count: int = Field(default=1, ge=1, le=8)
     keyers_per_me: int = Field(default=2, ge=0, le=8, description="Upstream keyers of every rendering ME")
     dsks_per_me: int = Field(default=1, ge=0, le=4, description="DSKs of every rendering ME")
+    stinger_players: int = Field(
+        default=1, ge=0, le=4, description="Stinger players (at most the rendering MEs; each plays one stinger at a time)"
+    )
     source_tile_aspect: str = Field(
         default="16:9",
         description="Operator source-tile picture ratio: 16:9 (landscape) or 9:16 (portrait).",
@@ -548,6 +551,7 @@ class WorkspaceUpdate(BaseModel):
     stinger_count: int | None = Field(default=None, ge=1, le=8)
     keyers_per_me: int | None = Field(default=None, ge=0, le=8)
     dsks_per_me: int | None = Field(default=None, ge=0, le=4)
+    stinger_players: int | None = Field(default=None, ge=0, le=4)
     source_tile_aspect: str | None = Field(
         default=None,
         description="16:9 or 9:16 source tiles on the operator deck",

@@ -145,6 +145,8 @@ class Settings(BaseSettings):
     # Upstream keyers (0-8) and DSKs (0-4) of every rendering ME; set: pinned like the panels.
     keyers_per_me: int | None = Field(default=None, ge=0, le=8)
     dsks_per_me: int | None = Field(default=None, ge=0, le=4)
+    # Stinger players (0-4, at most the rendering MEs; each plays one stinger at a time); set: pinned.
+    stinger_players: int | None = Field(default=None, ge=0, le=4)
     # Start Program after the state is restored: ME 1 on the first live input.
     program_autostart: bool = False
     # Raw tally per ME for the platform's tally calculator (flowxer.engine.tally_export):
@@ -153,7 +155,9 @@ class Settings(BaseSettings):
 
     mxl_domain_deprecated: bool = False
 
-    @field_validator("live_inputs", "clip_players", "panels", "render_mes", "keyers_per_me", "dsks_per_me", mode="before")
+    @field_validator(
+        "live_inputs", "clip_players", "panels", "render_mes", "keyers_per_me", "dsks_per_me", "stinger_players", mode="before"
+    )
     @classmethod
     def empty_is_unset(cls, value):
         # A Kubernetes value rendered as "" means "not set".
@@ -279,6 +283,8 @@ class Settings(BaseSettings):
             pinned["keyers_per_me"] = (self.keyers_per_me, "FLOWXER_KEYERS_PER_ME")
         if self.dsks_per_me is not None:
             pinned["dsks_per_me"] = (self.dsks_per_me, "FLOWXER_DSKS_PER_ME")
+        if self.stinger_players is not None:
+            pinned["stinger_players"] = (self.stinger_players, "FLOWXER_STINGER_PLAYERS")
         return pinned
 
     @property

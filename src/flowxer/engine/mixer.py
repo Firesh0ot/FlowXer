@@ -157,6 +157,11 @@ class VisionMixer:
         self._mixes: dict[str, tuple[str | None, str, float | None]] = {}
         # Panel id -> (position, outgoing, incoming) of a transition the T-bar holds.
         self._positions: dict[str, tuple[float, str | None, str]] = {}
+        # Stinger player -> the stinger it holds (its mezzanine), and the monotonic time until which
+        # it plays one; the last stinger taken (for the status).
+        self._stinger_cued: dict[int, str] = {}
+        self._stinger_until: dict[int, float] = {}
+        self._stinger_run: dict[str, Any] | None = None
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -548,7 +553,7 @@ class VisionMixer:
     def _push_key(self, keyer: Keyer, client: EngineClient | None = None) -> None:
         self._engine_call("PUT", f"/key/{self._keyer_number(keyer)}", self._key_route(keyer), client=client)
 
-    # ── stingers (configuration; stinger playback comes back in P3) ─────────
+    # ── stingers (slots and playback) ────────────────────────────────────────
 
     def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
         return self.configure_stinger_slot(slot_id, StingerSlotUpdate(stinger_id=stinger_id))
@@ -560,6 +565,11 @@ class VisionMixer:
         raise MixerError(f"unknown stinger slot {slot_id}")
 
     def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
+        slot = self._configure_stinger_slot(slot_id, payload)
+        self._cue_stingers()
+        return slot
+
+    def _configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
         slot = self.get_stinger_slot(slot_id)
         kind = payload.kind or slot.kind or "sequence"
         if kind not in {"sequence", "video"}:
@@ -726,6 +736,8 @@ class VisionMixer:
         ):
             self._push_player(updated)
         self._publish_tally()
+        if "stinger_slot_id" in patch:
+            self._cue_stingers()
         return updated
 
     def delete_input(self, input_id: str) -> None:
@@ -986,6 +998,7 @@ class VisionMixer:
         if self.engine is not None:
             for item in players:
                 self._push_player(item)
+            self._cue_stingers()
 
     def _on_library_job(self, job) -> None:
         if job.state in {"done", "failed", "cancelled"} and job.format_id == self.workspace.format_id:
@@ -1168,6 +1181,7 @@ class VisionMixer:
                 {"label": keyer.receiver_label, "me": self._panel_number(self.get_panel(keyer.panel_id)), "stage": keyer.stage.value}
                 for keyer in self.keyers
             ],
+            "FLOWXER_ENGINE_STINGER_PLAYERS": self._stinger_players(),
             "FLOWXER_ENGINE_PVW_OUTPUTS": self.settings.pvw_outputs,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN": output_domain,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": self.settings.resolved_output_domain_id,
@@ -1207,6 +1221,10 @@ class VisionMixer:
                 self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": keyer.enabled}, client=client)
             for panel in self.rendered_panels():
                 self._push_panel(panel, client)
+            # A new engine holds no stinger.
+            self._stinger_cued.clear()
+            self._stinger_until.clear()
+            self._cue_stingers(client)
 
     def _push_panel(self, panel: MixerPanel, client: EngineClient | None = None) -> None:
         m = self._panel_number(panel)
@@ -1481,13 +1499,19 @@ class VisionMixer:
         frames: int | None = None,
     ) -> MixerStatus:
         """Direct source → Program (source-tile right-click). A wipe uses the ME's wipe settings
-        (and its rate without a duration). A stinger is a cut in this version."""
+        (and its rate without a duration). A stinger plays `stinger_id` (or the slot by
+        direction); a cut plays the source's auto-stinger. A stinger that cannot play is a cut."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest(program_input_id=input_id, preview_input_id=input_id))
         panel = self.get_panel(panel_id)
         self._check_source(panel, input_id)
-        if transition == TransitionType.stinger:
-            self._note_stinger_cut()
+        if transition in (TransitionType.stinger, TransitionType.cut):
+            if transition == TransitionType.stinger:
+                slot = self._slot_for_stinger(stinger_id) or self._slot_for_target(input_id)
+            else:
+                slot, stinger_id = self._auto_stinger(input_id), None
+            if slot is not None and self._play_stinger_on(panel, slot, input_id, flip_flop=False, stinger_id=stinger_id):
+                return self.status()
             transition = TransitionType.cut
         if transition == TransitionType.wipe and not frames and not duration_ms:
             frames = panel.transition.rate_frames
@@ -1495,12 +1519,16 @@ class VisionMixer:
         return self.status()
 
     def cut(self, panel_id: str = "me-1") -> MixerStatus:
-        """Preview onto Program, Program onto Preview."""
+        """Preview onto Program, Program onto Preview. The Preview source's auto-stinger plays,
+        else an armed Wipe plays the stinger slot by direction (and is used up), as in FlowXer 14."""
         panel = self._ensure_running_panel(panel_id)
         incoming = self._preview_id(panel)
-        self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True)
-        if panel.wipe_armed:
+        slot = self._auto_stinger(incoming)
+        if slot is None and panel.wipe_armed:
             panel.wipe_armed = False
+            slot = self._slot_for_target(incoming)
+        if slot is None or not self._play_stinger_on(panel, slot, incoming, flip_flop=True):
+            self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True)
         return self.status()
 
     def fade(self, panel_id: str = "me-1", duration_ms: int = 400) -> MixerStatus:
@@ -1534,11 +1562,13 @@ class VisionMixer:
         except ValidationError as exc:
             raise MixerError(f"invalid transition: {exc.errors()[0]['msg']}") from exc
         self._push_transition(panel)
+        self._cue_stingers()
         return panel.transition
 
     def auto(self, panel_id: str = "me-1", frames: int | None = None) -> MixerStatus:
         """The ME's next transition from Preview to Program over its rate (or `frames`), then the
-        buses swap. A stinger is a cut in this version."""
+        buses swap. A stinger plays the ME's stinger slot (or the slot by direction) over its own
+        length."""
         panel = self._ensure_running_panel(panel_id)
         held = self._positions.pop(panel.id, None)
         if held is not None:
@@ -1554,7 +1584,8 @@ class VisionMixer:
         incoming = self._preview_id(panel)
         transition = panel.transition.type
         if transition == TransitionType.stinger:
-            self._note_stinger_cut()
+            if self._play_stinger_on(panel, self._transition_slot(panel, incoming), incoming, flip_flop=True):
+                return self.status()
             transition = TransitionType.cut
         self._put_on_program(panel, incoming, transition, flip_flop=True, frames=frames or panel.transition.rate_frames)
         return self.status()
@@ -1590,14 +1621,12 @@ class VisionMixer:
         return self.status()
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
-        """Arm (or toggle) Wipe. Wipes and stingers come in P3: an armed Wipe does not change the
-        next Cut yet."""
+        """Arm (or toggle) Wipe: the next Cut plays the stinger slot by direction (FlowXer 14's
+        meaning, kept for its clients)."""
         panel = self._ensure_running_panel(panel_id)
         panel.wipe_armed = (not panel.wipe_armed) if armed is None else armed
+        self._cue_stingers()
         return self.status()
-
-    def _note_stinger_cut(self) -> None:
-        log.info("stingers come back in P3: this stinger take is a cut")
 
     def _ensure_running_panel(self, panel_id: str) -> MixerPanel:
         if self.state != MixerState.running:
@@ -1621,10 +1650,11 @@ class VisionMixer:
         duration_ms: int = 0,
         frames: int = 0,
         send: bool = True,
+        sting: dict[str, int] | None = None,
     ) -> None:
         """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
         default); `flip_flop` puts the old Program on Preview. `send=False`: the engine does it
-        already (the T-bar)."""
+        already (the T-bar). A stinger: `sting` is its player and cut frame, `frames` its length."""
         held = self._positions.pop(panel.id, None)
         if held is not None:
             # A held T-bar transition ends first, as if it had run to its end (as in the engine).
@@ -1640,9 +1670,9 @@ class VisionMixer:
         swapped = flip_flop and outgoing and outgoing != source_id
         if swapped:
             panel.preview_input_id = outgoing
-        if transition in (TransitionType.mix, TransitionType.wipe):
+        if transition in (TransitionType.mix, TransitionType.wipe, TransitionType.stinger):
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
-            # Tally: both sources are on air (LH) for the whole mix or wipe.
+            # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + frames / self.settings.fps)
         else:
             frames = 0
@@ -1655,10 +1685,12 @@ class VisionMixer:
                 self.last_live_input_id = source_id
             self.program_bus = ProgramBus.live
         if send and self._rendered(panel):
-            body: dict[str, Any] = {"source": self._engine_source(source_id), "frames": frames}
-            if transition == TransitionType.wipe:
+            body: dict[str, Any] = {"source": self._engine_source(source_id), "frames": 0 if sting else frames}
+            if transition == TransitionType.wipe or sting:
                 # Without a type the engine mixes (frames > 0) or cuts.
                 body["type"] = transition.value
+            if sting:
+                body.update(sting)
             if swapped:
                 body["preview"] = self._engine_source(outgoing)
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/take", body)
@@ -1680,6 +1712,7 @@ class VisionMixer:
         if self._rendered(panel):
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/preview", {"source": self._engine_source(input_id)})
         self._publish_tally()
+        self._cue_stingers()
         return self.status()
 
     def play_stinger(
@@ -1691,18 +1724,174 @@ class VisionMixer:
         flip_flop: bool = False,
         panel_id: str | None = None,
     ) -> MixerStatus:
-        """Stingers come back in P3 (on the GPU): until then a stinger is a cut to the target."""
+        """Plays `stinger_id` (its slot's cut, else the stinger's own) to the target on the GPU; a
+        stinger that cannot play (it still converts, every player busy) is a cut."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest())
         panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
         self._check_source(panel, target_input_id)
-        self._note_stinger_cut()
-        self._put_on_program(panel, target_input_id, TransitionType.cut, flip_flop=flip_flop)
+        slot = self._slot_for_stinger(stinger_id) or self._slot_for_target(target_input_id, direction)
+        if not self._play_stinger_on(panel, slot, target_input_id, flip_flop=flip_flop, stinger_id=stinger_id):
+            self._put_on_program(panel, target_input_id, TransitionType.cut, flip_flop=flip_flop)
         return self.status()
 
     def advance_stinger(self, frames: int = 1) -> MixerStatus:
-        """No stinger runs in this version (kept for the API)."""
+        """The engine runs stingers on the grain clock (kept for the API)."""
         return self.status()
+
+    def _stinger_players(self) -> int:
+        """Stinger players of the engine: the workspace's, at most the rendering MEs."""
+        return min(self.workspace.stinger_players, self.render_count)
+
+    def _auto_stinger(self, input_id: str) -> StingerSlot | None:
+        """The auto-stinger slot of a source (played when it is cut or taken to Program)."""
+        source = self.inputs.get(input_id)
+        if source is None or not source.stinger_slot_id:
+            return None
+        return next((slot for slot in self.stinger_slots if slot.id == source.stinger_slot_id), None)
+
+    def _slot_for_target(self, target_input_id: str, direction: str | None = None) -> StingerSlot | None:
+        """The slot by direction: to a clip player (or "to_replay") an `in` slot, else `out`; a
+        shared slot serves both."""
+        if direction is None:
+            target = self.inputs.get(target_input_id)
+            direction = "to_replay" if target is not None and target.kind == InputKind.clip_player else "to_live"
+        role = "in" if direction == "to_replay" else "out"
+        for slot in self.stinger_slots:
+            if slot.role in {role, "shared"}:
+                return slot
+        return self.stinger_slots[0] if self.stinger_slots else None
+
+    def _slot_for_stinger(self, stinger_id: str | None) -> StingerSlot | None:
+        if not stinger_id:
+            return None
+        return next((slot for slot in self.stinger_slots if stinger_id in {slot.stinger_id, slot.library_item_id}), None)
+
+    def _transition_slot(self, panel: MixerPanel, incoming: str) -> StingerSlot | None:
+        """The slot of the ME's transition type stinger: its own, else the slot by direction."""
+        slot_id = panel.transition.stinger_slot_id
+        slot = next((slot for slot in self.stinger_slots if slot.id == slot_id), None) if slot_id else None
+        return slot or self._slot_for_target(incoming)
+
+    def _cue_slot(self, panel: MixerPanel) -> StingerSlot | None:
+        """The stinger the ME's next Cut or Auto plays: Preview's auto-stinger, an armed Wipe's
+        slot, or the slot of the transition type stinger."""
+        incoming = panel.preview_input_id
+        if not incoming:
+            return None
+        slot = self._auto_stinger(incoming)
+        if slot is None and panel.wipe_armed:
+            slot = self._slot_for_target(incoming)
+        if slot is None and panel.transition.type == TransitionType.stinger:
+            slot = self._transition_slot(panel, incoming)
+        return slot
+
+    def _stinger_media(self, slot: StingerSlot | None, stinger_id: str | None = None) -> tuple[dict[str, Any], int] | None:
+        """What a stinger player loads for the slot's stinger (or `stinger_id`), and its cut frame;
+        None while it has no mezzanine (it converts)."""
+        own = stinger_id is None or (slot is not None and stinger_id in {slot.stinger_id, slot.library_item_id})
+        if own and slot is not None and slot.library_item_id:
+            item = self.library.get(slot.library_item_id)
+        else:
+            name = stinger_id if not own else (slot.stinger_id if slot is not None else None)
+            item = self._find_library_stinger(name) if name else None
+        fmt = self.workspace.format_id
+        if item is None or item.kind != LibraryKind.stinger or not self.library.queue.ready_on_disk(item, fmt):
+            return None
+        conv = item.conversion_for(fmt)
+        cut = self._stinger_info_from_library(item).cut_frame
+        if own and slot is not None and not slot.library_item_id and slot.cut_ms is not None:
+            # A legacy stinger: its cut is the slot's (stinger.json), in ms of any rate.
+            cut = cut_frame_from_ms(slot.cut_ms, self.settings.fps, conv.frames)
+        alpha = self.library.alpha_path(item.id, fmt)
+        audio = self.library.audio_path(item.id, fmt)
+        body = {
+            "path": str(self.library.mezzanine_path(item.id, fmt)),
+            "alpha": str(alpha) if alpha else "",
+            "audio": str(audio) if audio else "",
+            "channels": conv.audio_channels,
+            "frames": conv.frames,
+        }
+        return body, cut
+
+    def _load_stinger(self, player: int, body: dict[str, Any], client: EngineClient | None = None) -> None:
+        if self._stinger_cued.get(player) != body["path"]:
+            self._engine_call("POST", f"/stinger/{player}/load", body, client=client)
+            self._stinger_cued[player] = body["path"]
+
+    def _cue_stingers(self, client: EngineClient | None = None) -> None:
+        """Stinger player k holds the stinger ME k's next Cut or Auto plays, so a take starts at
+        the next grain (a player that plays keeps its stinger)."""
+        if self.engine is None and client is None:
+            return
+        now = time.monotonic()
+        for number, panel in enumerate(self.rendered_panels()[: self._stinger_players()], 1):
+            slot = self._cue_slot(panel)
+            media = self._stinger_media(slot) if slot is not None and self._stinger_until.get(number, 0.0) <= now else None
+            if media is not None:
+                self._load_stinger(number, media[0], client)
+
+    def _play_stinger_on(
+        self, panel: MixerPanel, slot: StingerSlot | None, incoming: str, *, flip_flop: bool, stinger_id: str | None = None
+    ) -> bool:
+        """Plays a stinger on the ME to `incoming`: on the player that holds it, else on a free one
+        (loaded now; the engine starts it when its first frame is decoded). False when it cannot
+        play (no mezzanine yet, no free player): the caller cuts."""
+        media = self._stinger_media(slot, stinger_id)
+        if media is None or not self._rendered(panel):
+            log.warning("stinger %s is not ready: a cut", stinger_id or (slot.stinger_id if slot else None))
+            return False
+        body, cut = media
+        now = time.monotonic()
+        free = [p for p in range(1, self._stinger_players() + 1) if self._stinger_until.get(p, 0.0) <= now]
+        if not free:
+            log.warning("every stinger player plays a stinger: a cut")
+            return False
+        player = next((p for p in free if self._stinger_cued.get(p) == body["path"]), free[0])
+        self._load_stinger(player, body)
+        frames = max(1, int(body["frames"]))
+        seconds = frames / self.settings.fps
+        # The engine may wait for the first frame (at most 50 grains).
+        self._stinger_until[player] = now + seconds + 1.0
+        self._put_on_program(panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut})
+        self._stinger_run = {
+            "id": stinger_id or (slot.stinger_id if slot else None),
+            "panel_id": panel.id,
+            "player": player,
+            "frame_count": frames,
+            "cut_frame": cut,
+            "target_input_id": incoming,
+            "started": now,
+        }
+        # When it has played, the player cues the next stinger again.
+        timer = threading.Timer(seconds + 1.1, self._cue_stingers)
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def _stinger_status(self) -> dict[str, Any]:
+        """The last stinger taken, by the control plane's clock."""
+        run = self._stinger_run
+        if run is None:
+            return {"id": None, "phase": "idle", "frame": 0, "frame_count": 0, "cut_frame": 0, "cut_fired": False, "done": True,
+                    "target_input_id": None, "direction": None, "events": []}
+        frame = min(run["frame_count"], int((time.monotonic() - run["started"]) * self.settings.fps))
+        done = frame >= run["frame_count"]
+        cut_fired = frame >= run["cut_frame"]
+        return {
+            "id": run["id"],
+            "phase": "complete" if done else "cut" if cut_fired else "playing",
+            "frame": frame,
+            "frame_count": run["frame_count"],
+            "cut_frame": run["cut_frame"],
+            "cut_fired": cut_fired,
+            "done": done,
+            "target_input_id": run["target_input_id"],
+            "direction": None,
+            "panel_id": run["panel_id"],
+            "player": run["player"],
+            "events": [],
+        }
 
     # ── tally ────────────────────────────────────────────────────────────────
 
@@ -1888,18 +2077,7 @@ class VisionMixer:
             preview_input_id=self.preview_input_id,
             last_live_input_id=self.last_live_input_id,
             program_bus=self.program_bus,
-            stinger={
-                "id": None,
-                "phase": "idle",
-                "frame": 0,
-                "frame_count": 0,
-                "cut_frame": 0,
-                "cut_fired": False,
-                "done": True,
-                "target_input_id": None,
-                "direction": None,
-                "events": [],
-            },
+            stinger=self._stinger_status(),
             outputs=self.outputs,
             me_outputs=list(self.me_outputs.values()),
             render_mes=self.render_count,
