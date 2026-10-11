@@ -62,7 +62,7 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 ┌─ File  Settings  Tally  Help ─────────────── [CPU% RAM% format] ─┐
 │  [ME 1] [ME 2]                                                   │
 │  PREVIEW                       PROGRAM                           │
-│  [DSK 1 ON|AUTO|25 f]  Stinger ⚙                                 │
+│  [ME 1 Key 1 ON|AUTO|25 f|⚙] … [DSK 1 …]  Stinger ⚙             │
 │                                                                  │
 │  [Cam 1 ⚙] [Cam 2 ⚙] [Clip 1 ⚙] …   source tiles (16:9 or 9:16)  │
 │   left of picture = PVW · right = PGM   MIX WIPE STING  25 fr    │
@@ -237,7 +237,7 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 
 ### The media engine
 
-The engine reads the live inputs from MXL (one DMA upload per grain), plays the clip players, renders every ME on the GPU (ME 4 → ME 1, so re-entry is the same output frame), keys DSK 1, packs PGM and PVW to v210 and writes them with the PGM audio to MXL at a fixed latency on the TAI grid: when it is late it skips to the current grain and counts it; it never slides. It encodes the preview mosaic once with NVENC. [engine/README.md](engine/README.md) has the design, its configuration, its API and the lab measurements (P1: 4 MEs, 8 inputs and the mosaic at 3.4 ms GPU render time per grain and 0.13 CPU cores on an A16).
+The engine reads the live inputs from MXL (one DMA upload per grain), plays the clip players, renders every ME on the GPU (ME 4 → ME 1, so re-entry is the same output frame) with its transitions and keyers in one pass per ME, packs PGM and PVW to v210 and writes them with the PGM audio to MXL at a fixed latency on the TAI grid: when it is late it skips to the current grain and counts it; it never slides. It encodes the preview mosaic once with NVENC. [engine/README.md](engine/README.md) has the design, its configuration, its API and the lab measurements (P1: 4 MEs, 8 inputs and the mosaic at 3.4 ms GPU render time per grain and 0.13 CPU cores on an A16).
 
 FlowXer writes the engine's configuration (`FLOWXER_ENGINE_*`) itself, starts it with the GPU of the container, and after every start pushes the routes, clip players, keyers and buses. An engine that exits is started again after 1, 2, 5, then every 10 s; `GET /api/v1/health` (`engine`) and `GET /api/v1/engine` show its state. A crashed engine's MediaMTX is reaped by tini (PID 1).
 
