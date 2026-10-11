@@ -151,6 +151,9 @@ HttpResponse playerCommand(Engine& engine, int k, std::string const& action, jso
         command.action = PlayerCommand::Action::Load;
         command.path = text(body, "path");
         command.kind = text(body, "kind");
+        command.audio = text(body, "audio");
+        command.channels = body.contains("channels") && body["channels"].is_number_integer() ? body["channels"].get<int>() : 0;
+        command.frames = body.contains("frames") && body["frames"].is_number_integer() ? body["frames"].get<long long>() : 0;
         command.loop = body.value("loop", false);
         command.playOnCut = body.value("play_on_cut", false);
     }

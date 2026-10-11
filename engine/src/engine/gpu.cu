@@ -370,7 +370,61 @@ dim3 groupGrid(int groups, int height)
 {
     return dim3(static_cast<unsigned>((groups + 127) / 128), static_cast<unsigned>(height));
 }
+
+// A sample of a 4:4:4 decoder picture as a 10-bit code: 8 bits, or 10/12 bits in the high bits
+// of 16 (NVDEC's 16-bit surfaces; FFmpeg's yuv444p16).
+__device__ unsigned sample444(std::uint8_t const* plane, int pitch, int x, int y, bool deep)
+{
+    std::uint8_t const* row = plane + static_cast<std::size_t>(y) * static_cast<std::size_t>(pitch);
+    if (deep)
+    {
+        return reinterpret_cast<std::uint16_t const*>(row)[x] >> 6;
+    }
+    return static_cast<unsigned>(row[x]) << 2;
+}
+
+// One thread per 16-byte group of a v210 line: 6 luma samples, 3 chroma pairs. Chroma goes to
+// 4:2:2 as the mean of each pixel pair: exact for a 4:2:2 source that the library widened by
+// repeating each chroma sample, a box filter for true 4:4:4.
+__global__ void from444Kernel(std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width, int height,
+    std::uint8_t* v210, int rowBytes)
+{
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    if (row >= height || group * 16 >= rowBytes)
+    {
+        return;
+    }
+    std::uint32_t w[4] = {};
+    if (group * 6 < width)
+    {
+        std::uint16_t ys[6] = {};
+        std::uint16_t cbs[3] = {};
+        std::uint16_t crs[3] = {};
+        for (int i = 0; i < 6; ++i)
+        {
+            int const x = min(group * 6 + i, width - 1);
+            ys[i] = static_cast<std::uint16_t>(sample444(y, pitch, x, row, deep));
+        }
+        for (int i = 0; i < 3; ++i)
+        {
+            int const x0 = min(group * 6 + 2 * i, width - 1);
+            int const x1 = min(x0 + 1, width - 1);
+            cbs[i] = static_cast<std::uint16_t>((sample444(cb, pitch, x0, row, deep) + sample444(cb, pitch, x1, row, deep) + 1) / 2);
+            crs[i] = static_cast<std::uint16_t>((sample444(cr, pitch, x0, row, deep) + sample444(cr, pitch, x1, row, deep) + 1) / 2);
+        }
+        packGroup(ys, cbs, crs, w);
+    }
+    writeGroup(v210, rowBytes, row, group, w);
+}
 } // namespace
+
+cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
+    int height, std::uint8_t* v210, int rowBytes)
+{
+    from444Kernel<<<groupGrid(rowBytes / 16, height), 128, 0, stream>>>(y, cb, cr, pitch, deep, width, height, v210, rowBytes);
+    return cudaGetLastError();
+}
 
 std::size_t workBytes(WorkFormat format, int width, int height)
 {
@@ -627,6 +681,38 @@ bool selfTest(std::string& report)
             return false;
         }
         done += std::string(name) + " round trip max " + std::to_string(roundTrip) + ", dissolve max " + std::to_string(dissolve) + "; ";
+    }
+    // A clip picture: 4:4:4 16-bit planes (10 bits high) with each 4:2:2 chroma sample twice, as
+    // the library converts, to v210: exact.
+    {
+        std::size_t const plane = static_cast<std::size_t>(w) * h;
+        std::vector<std::uint16_t> p444(plane * 3);
+        for (int y = 0; y < h; ++y)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                std::size_t const i = static_cast<std::size_t>(y) * w + x;
+                std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x / 2;
+                p444[i] = static_cast<std::uint16_t>(pa.y[i] << 6);
+                p444[plane + i] = static_cast<std::uint16_t>(pa.cb[c] << 6);
+                p444[2 * plane + i] = static_cast<std::uint16_t>(pa.cr[c] << 6);
+            }
+        }
+        DeviceBytes d444(p444.size() * 2);
+        cudaMemcpy(d444.get(), p444.data(), p444.size() * 2, cudaMemcpyHostToDevice);
+        from444(nullptr, d444.get(), d444.get() + plane * 2, d444.get() + plane * 4, w * 2, true, w, h, dout.get(), rowBytes);
+        cudaError_t const err = cudaDeviceSynchronize();
+        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+        Planar422 got;
+        got.allocate(w, h);
+        unpackV210(back.data(), rowBytes, got);
+        int const diff = maxDiff(pa, got);
+        if (err != cudaSuccess || diff != 0)
+        {
+            report = "from444: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+            return false;
+        }
+        done += "from444 exact; ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;

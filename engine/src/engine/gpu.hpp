@@ -42,6 +42,12 @@ cudaError_t pack(cudaStream_t stream, WorkBuffer const& in, std::uint8_t* v210, 
 // A packed v210 picture of limited-range black.
 cudaError_t fillBlack(cudaStream_t stream, std::uint8_t* v210, int rowBytes, int width, int height);
 
+// A 4:4:4 decoder picture (three device planes of `pitch` bytes per line: 8-bit, or with `deep`
+// 16-bit samples holding 10 or 12 bits in their high bits) to packed v210; chroma goes to 4:2:2
+// as the mean of each pixel pair.
+cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
+    int height, std::uint8_t* v210, int rowBytes);
+
 struct MosaicSource
 {
     // Packed v210 on the device; null draws a black tile.
