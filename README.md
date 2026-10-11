@@ -48,7 +48,7 @@ flowchart LR
 - **MEs:** up to 4 (`FLOWXER_PANELS`), every rendering ME renders all the time on the TAI grid: PGM video + PGM audio and PVW video per ME, written to MXL. An ME can take the Program of a higher ME (re-entry, the same output frame).
 - **Sources** in slot order: live inputs (an MXL video + audio pair, routed over IS-05), clip players, Black.
 - **Clip players** play clips from the media library (decoded on the GPU) and stills (frame memory): loop, play on cut, cue, play, pause, stop. The colour bars ship as a library still.
-- **Transitions:** Cut, and per ME the next transition for Auto: Mix or Wipe (23 SMPTE wipe codes with soft edge, border width and colour, reverse and flip-flop), at the ME's rate in frames; Fade to Black. **Audio follows video** with an equal-power crossfade along the transition. Stingers play from P3 M3: until then a stinger is a cut.
+- **Transitions:** Cut, and per ME the next transition for Auto: Mix or Wipe (23 SMPTE wipe codes with soft edge, border width and colour, reverse and flip-flop), at the ME's rate in frames; a T-bar; Fade to Black of the ME's whole output (the DSKs and the sound too; the buses and the tally stay). **Audio follows video** with an equal-power crossfade along the transition. Stingers play from P3 M3: until then a stinger is a cut.
 - **DSK 1** on ME 1 keys a v210a fill + key flow (e.g. mxl-browser-source in `v210a` key mode) over ME 1 Program: on, off, auto. Keys have no preview: Preview shows only its source.
 - **Preview mosaic:** the engine encodes every source and every ME's Program and Preview once (NVENC); the console crops its pictures out of that one WebRTC stream. No audio preview.
 - **NMOS** IS-04/IS-05 node (BCP-007-03), **tally** over TSL UMD 5.0 (to receivers, and the raw tally for the platform's tally calculator), Prometheus metrics.
@@ -78,7 +78,7 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 - **File** takes the mixer on-air or off-air and opens the **clip and still library** and the stinger library.
 - **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots and keyers. What the production sets through the environment is greyed out.
 - The gear on a **source** (`PATCH /inputs/{id}`): name, kind (`mxl_live`, `clip_player`, `black`), flows of a live input, the clip or still of a clip player with loop and play on cut, and the auto-stinger.
-- **Transition section** (per ME): the type (MIX, WIPE, STING) and the rate in frames (`PATCH /panels/{id}/transition`); for WIPE the pattern picker (icons, the SMPTE code as a tooltip), reverse, flip-flop (the next wipe goes back), soft edge and border (0–100 % of the pattern's travel) and the border colour; for STING the slot. **CUT**, **AUTO** (`/mixer/auto`: the ME's transition) and **FTB** map to `/mixer/cut`, `/mixer/auto`, `/mixer/fade-to-black`.
+- **Transition section** (per ME): the type (MIX, WIPE, STING) and the rate in frames (`PATCH /panels/{id}/transition`); for WIPE the pattern picker (icons, the SMPTE code as a tooltip), reverse, flip-flop (the next wipe goes back), soft edge and border (0–100 % of the pattern's travel) and the border colour; for STING the slot. **CUT**, **AUTO** (`/mixer/auto`: the ME's transition) and **FTB** (lit while the output is black) map to `/mixer/cut`, `/mixer/auto`, `/mixer/fade-to-black`; the **T-bar** lever holds the transition at its position (`/mixer/position`) and follows an Auto.
 - **Tally → Receivers…** adds TSL UMD 5.0 listeners (Companion, VSM, BFE, Riedel HI, custom).
 - The **status chip** is a CPU / RAM / format pill; click it for the mixer state, NMOS, load and issues.
 
@@ -122,7 +122,7 @@ If `FLOWXER_API_TOKEN` is set, calls to **9610** need `Authorization: Bearer …
 | DSK ON/OFF, rate | `PATCH /keyers/{id}` (`enabled`, `rate_ms`) |
 | DSK AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
 | Transition type, rate, wipe pattern and edge | `PATCH /panels/{id}/transition` (`type`, `rate_frames`, `wipe`: `pattern`, `reverse`, `alternate`, `soft`, `border`, `border_color`; `stinger_slot_id`); `GET /console` `panels[].transition` |
-| T-bar (API only, no GUI fader yet) | `POST /mixer/position` (`panel_id`, `position` 0–1): off 0 starts the ME's transition and holds it, 1 completes it, 0 ends it without the swap; AUTO runs the rest; a stinger runs as an Auto |
+| T-bar lever | `POST /mixer/position` (`panel_id`, `position` 0–1): off 0 starts the ME's transition and holds it, 1 completes it, 0 ends it without the swap; AUTO runs the rest; a stinger runs as an Auto |
 | CUT / AUTO / FTB | `POST /mixer/cut`, `/mixer/auto` (`panel_id`, `frames`), `/mixer/fade-to-black`. Kept for API clients: `/mixer/fade` (a mix), `/mixer/wipe` (arms Wipe), `/mixer/take` (`transition`: `cut`, `mix`, `wipe`, `stinger`; `frames` or `duration_ms`) |
 | Stinger chip / ⚙ | `POST /stinger/play`, `PATCH /stinger-slots/{id}` |
 | File → libraries | `GET /library`, `POST /uploads`, `GET /jobs` |

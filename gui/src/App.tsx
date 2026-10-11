@@ -252,6 +252,8 @@ export default function App() {
         <TransitionSection
           panel={panel}
           stingerSlots={snapshot.stinger_slots}
+          fps={fps}
+          onPosition={(position) => void api.position(panel.id, position).catch((err: Error) => setError(err.message))}
           onChange={(patch) => void command(() => api.transition(panel.id, patch))}
           onCut={() => void command(() => api.cut(panel.id))}
           onAuto={() => void command(() => api.auto(panel.id))}

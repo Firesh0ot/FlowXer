@@ -44,6 +44,8 @@ export interface MixerPanel {
   wipe_armed?: boolean;
   last_transition?: string;
   transition: PanelTransition;
+  /** Fade to Black: the whole output is black. */
+  ftb?: boolean;
 }
 
 export interface DownstreamKeyer {
@@ -276,6 +278,13 @@ export const api = {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
+    }).then((r) => parse(r)),
+  /** The T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it. */
+  position: (panel_id: string, position: number) =>
+    fetch("/api/v1/mixer/position", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ panel_id, position }),
     }).then((r) => parse(r)),
   transition: (panel_id: string, patch: Record<string, unknown>) =>
     fetch(`/api/v1/panels/${panel_id}/transition`, {

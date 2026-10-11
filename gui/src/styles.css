@@ -160,7 +160,14 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .wipe-edge label.check { display: flex; align-items: center; gap: 6px; color: var(--text); }
 .wipe-edge .colour input { width: 100%; height: 22px; padding: 0; border: 1px solid var(--line); background: none; }
 .sting-slot { display: grid; gap: 4px; color: var(--muted); }
-.take-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; align-self: end; }
+.take-row { display: grid; grid-template-columns: 1fr 1fr 1fr 44px; gap: 8px; align-self: end; }
+.take-row .ftb.on { outline: 2px solid #e23b3b; }
+.tbar { position: relative; min-height: 96px; cursor: ns-resize; touch-action: none; }
+.tbar-slot { position: absolute; left: 50%; top: 0; bottom: 0; width: 6px; transform: translateX(-50%); background: #05070b; border: 1px solid var(--line); border-radius: 3px; }
+.tbar-handle {
+  position: absolute; left: 2px; right: 2px; height: 14px; transform: translateY(-50%);
+  background: linear-gradient(#d8dde6, #8d96a6); border: 1px solid #3a4456; border-radius: 3px;
+}
 .take-row button { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; min-height: 56px; border-radius: 8px; }
 .take-row .cut { background: #3a1518; border-color: #6a2a30; }
 .take-row .auto { background: #15243a; border-color: #2a4a6a; }
