@@ -112,7 +112,7 @@ def test_state_survives_a_restart(settings: Settings) -> None:
     assert len(again.inputs) == 4
     assert again.get_input("cam-1").label == "Studio A"
     assert [item.id for item in again.tally.receivers] == ["vsm"]
-    assert again.keyers[0].label == "Graphics"
+    assert again.get_keyer("dsk-1").label == "Graphics"
 
 
 def test_broken_state_file_starts_with_defaults(settings: Settings) -> None:
@@ -389,7 +389,12 @@ def test_env_structure_seeds_inputs_panels_and_nmos_labels(settings: Settings) -
         "Cam A Audio",
         "Cam B Video",
         "Cam B Audio",
+        "ME 1 Key 1",
+        "ME 1 Key 2",
         "DSK 1 Key",
+        "ME 2 Key 1",
+        "ME 2 Key 2",
+        "ME 2 DSK 1 Key",
     ]
     assert [item["label"] for item in mixer.nmos.senders()] == [
         "ME 1 PGM Video",
@@ -451,7 +456,7 @@ def test_env_structure_wins_over_saved_state_but_keeps_routes(settings: Settings
     assert str(again.get_input("cam-1").video.flow_id) == VIDEO_FLOW
     assert again.get_input("cam-2").stinger_slot_id == "shared-2"
     assert again.workspace.stinger_count == 2
-    assert again.keyers[0].label == "Graphics"
+    assert again.get_keyer("dsk-1").label == "Graphics"
     assert [item.id for item in again.tally.receivers] == ["vsm"]
 
 

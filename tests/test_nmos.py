@@ -243,9 +243,12 @@ def test_live_inputs_and_the_dsk_have_receivers_clip_players_and_black_none(tmp_
     client = TestClient(create_nmos_app(mixer.nmos))
     receivers = client.get("/x-nmos/node/v1.3/receivers").json()
     live = [item for item in mixer.list_inputs() if item.kind == InputKind.mxl_live]
-    assert len(receivers) == 2 * len(live) + 1
+    # Per input video and audio; per keyer of ME 1 (2 upstream, 1 DSK) its key input.
+    assert len(receivers) == 2 * len(live) + 3
     labels = {item["label"] for item in receivers}
-    assert {"Camera 1 Video", "Camera 1 Audio", "DSK 1 Key"} <= labels
+    assert {"Camera 1 Video", "Camera 1 Audio", "ME 1 Key 1", "ME 1 Key 2", "DSK 1 Key"} <= labels
+    usk = next(item for item in receivers if item["label"] == "ME 1 Key 2")
+    assert usk["id"] == ids.receiver_id(SEED, "me-1-key-2", "key") and usk["tags"]["urn:x-nmos:tag:grouphint/v1.0"] == ["me-1-key-2:Key"]
     assert not any(label.startswith(("Clip", "Black")) for label in labels)
     key = next(item for item in receivers if item["label"] == "DSK 1 Key")
     assert key["id"] == ids.receiver_id(SEED, "dsk-1", "key")
@@ -280,6 +283,8 @@ def test_workspace_count_does_not_leave_stale_receivers(tmp_path: Path) -> None:
         ids.receiver_id(SEED, "cam-1", "audio"),
         ids.receiver_id(SEED, "cam-2", "video"),
         ids.receiver_id(SEED, "cam-2", "audio"),
+        ids.receiver_id(SEED, "me-1-key-1", "key"),
+        ids.receiver_id(SEED, "me-1-key-2", "key"),
         ids.receiver_id(SEED, "dsk-1", "key"),
     }
 
@@ -544,7 +549,8 @@ def test_the_dsk_key_receiver_routes_the_key_input(tmp_path: Path) -> None:
         },
     )
     assert response.status_code == 200
-    assert calls[-1] == ("PUT", "/key/1", {"domain": str(key_dir.resolve()), "flow": VIDEO_FLOW})
+    # DSK 1 is ME 1's third keyer (after its 2 upstream keyers).
+    assert calls[-1] == ("PUT", "/key/3", {"domain": str(key_dir.resolve()), "flow": VIDEO_FLOW})
     receiver = client.get(f"/x-nmos/node/v1.3/receivers/{rid}").json()
     assert receiver["subscription"] == {"sender_id": SENDER_ID, "active": True}
     # The key route belongs to the saved state.

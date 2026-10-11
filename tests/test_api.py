@@ -118,7 +118,7 @@ def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer
     keyer = client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 800}).json()
     assert keyer["rate_ms"] == 800
     assert client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 0}).status_code == 422
-    assert mixer.keyers[0].rate_ms == 800
+    assert mixer.get_keyer("dsk-1").rate_ms == 800
 
 
 def test_health_and_config(client: TestClient) -> None:

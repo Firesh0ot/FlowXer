@@ -9,7 +9,7 @@ from flowxer.api.schemas import (
     ConsoleState,
     ConvertJobOut,
     DomainInfo,
-    DownstreamKeyer,
+    Keyer,
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
@@ -702,15 +702,25 @@ def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
     return ResourceInfo.model_validate(collect_resources(mixer))
 
 
+@router.get(
+    "/keyers",
+    response_model=list[Keyer],
+    tags=["keyers"],
+    summary="The upstream keyers and DSKs of every rendering ME, in order",
+)
+def list_keyers(mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
+    return mixer.keyers
+
+
 @router.patch(
     "/keyers/{keyer_id}",
-    response_model=DownstreamKeyer,
+    response_model=Keyer,
     tags=["keyers"],
-    summary="Downstream keyer on or off (at the next frame), or its label",
+    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma), luma source, clip, soft, gain, invert",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)
-) -> DownstreamKeyer:
+) -> Keyer:
     try:
         return mixer.update_keyer(keyer_id, **payload.model_dump(exclude_unset=True))
     except MixerError as exc:
@@ -724,13 +734,13 @@ def patch_keyer(
 
 @router.post(
     "/keyers/{keyer_id}/auto",
-    response_model=DownstreamKeyer,
+    response_model=Keyer,
     tags=["keyers"],
-    summary="Fade the downstream keyer on (or off when it is on)",
+    summary="Fade the keyer on (or off when it is on)",
 )
 def keyer_auto(
     keyer_id: str, payload: KeyerAutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
-) -> DownstreamKeyer:
+) -> Keyer:
     try:
         return mixer.keyer_auto(keyer_id, (payload or KeyerAutoRequest()).duration_ms)
     except MixerError as exc:

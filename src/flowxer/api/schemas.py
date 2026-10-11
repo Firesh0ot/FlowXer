@@ -448,14 +448,42 @@ class MixerPanel(BaseModel):
     ftb: bool = Field(default=False, description="Fade to Black: the ME's whole output (DSKs and sound too) is black")
 
 
-class DownstreamKeyer(BaseModel):
-    """A downstream keyer on ME 1: keys its key input (a v210a fill + key MXL flow, NMOS
-    receiver "<label> Key") over ME 1 Program only (keys have no preview)."""
+class KeyerStage(str, Enum):
+    upstream = "upstream"
+    downstream = "downstream"
+
+
+class KeyMode(str, Enum):
+    linear = "linear"
+    luma = "luma"
+
+
+class Keyer(BaseModel):
+    """An upstream keyer (before the transition) or a DSK (after it) of one ME. Keys show on the
+    ME's Program only (keys have no preview). Linear: its key input, a v210a fill + key MXL flow
+    (NMOS receiver `receiver_label`). Luma: a self key of a source the ME may take."""
 
     id: str
     label: str
+    panel_id: str = Field(default="me-1", description="The ME it keys")
+    stage: KeyerStage = Field(default=KeyerStage.downstream)
     enabled: bool = Field(default=False, description="On air")
     rate_ms: int = Field(default=500, ge=1, le=10000, description="Duration of its Auto (fade on or off)")
+    mode: KeyMode = Field(default=KeyMode.linear)
+    source_id: str | None = Field(default=None, description="Luma: the keyed source (an input or me-<n>)")
+    clip: float = Field(default=0.5, ge=0.0, le=1.0, description="Luma: the level that keys (0 black .. 1 white)")
+    soft: float = Field(default=0.1, ge=0.0, le=1.0, description="Luma: the softness above the clip")
+    gain: float = Field(default=1.0, ge=0.0, le=1.0, description="Scales the key")
+    invert: bool = Field(default=False, description="Luma: key the dark parts")
+
+    @property
+    def receiver_label(self) -> str:
+        """Its key input's NMOS receiver: `ME n Key k` (upstream) or `<label> Key` (DSK)."""
+        return self.label if self.stage == KeyerStage.upstream else f"{self.label} Key"
+
+
+# P2 name of the keyer model.
+DownstreamKeyer = Keyer
 
 
 class StingerSlot(BaseModel):
@@ -494,13 +522,22 @@ class WorkspaceConfig(BaseModel):
         description="shared = one TGA sequence for in and out; separate = dedicated in/out stingers",
     )
     stinger_count: int = Field(default=1, ge=1, le=8)
-    downstream_keyer_count: int = Field(
-        default=1, ge=0, le=8, description="Downstream keyers on ME 1 (this version has at most one)"
-    )
+    keyers_per_me: int = Field(default=2, ge=0, le=8, description="Upstream keyers of every rendering ME")
+    dsks_per_me: int = Field(default=1, ge=0, le=4, description="DSKs of every rendering ME")
     source_tile_aspect: str = Field(
         default="16:9",
         description="Operator source-tile picture ratio: 16:9 (landscape) or 9:16 (portrait).",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _p2_keyers(cls, data):
+        # P2: downstream_keyer_count (0 or 1, DSK 1 on ME 1) is the DSKs per ME now.
+        if isinstance(data, dict) and "downstream_keyer_count" in data:
+            data = dict(data)
+            count = data.pop("downstream_keyer_count")
+            data.setdefault("dsks_per_me", min(int(count or 0), 4))
+        return data
 
 
 class WorkspaceUpdate(BaseModel):
@@ -509,17 +546,33 @@ class WorkspaceUpdate(BaseModel):
     mixer_panel_count: int | None = Field(default=None, ge=1, le=4)
     stinger_mode: str | None = None
     stinger_count: int | None = Field(default=None, ge=1, le=8)
-    downstream_keyer_count: int | None = Field(default=None, ge=0, le=8)
+    keyers_per_me: int | None = Field(default=None, ge=0, le=8)
+    dsks_per_me: int | None = Field(default=None, ge=0, le=4)
     source_tile_aspect: str | None = Field(
         default=None,
         description="16:9 or 9:16 source tiles on the operator deck",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _p2_keyers(cls, data):
+        if isinstance(data, dict) and "downstream_keyer_count" in data:
+            data = dict(data)
+            count = data.pop("downstream_keyer_count")
+            data.setdefault("dsks_per_me", min(int(count or 0), 4) if count is not None else None)
+        return data
 
 
 class KeyerUpdate(BaseModel):
     enabled: bool | None = Field(default=None, description="On or off at the next frame")
     label: str | None = None
     rate_ms: int | None = Field(default=None, ge=1, le=10000, description="Duration of its Auto")
+    mode: KeyMode | None = None
+    source_id: str | None = None
+    clip: float | None = Field(default=None, ge=0.0, le=1.0)
+    soft: float | None = Field(default=None, ge=0.0, le=1.0)
+    gain: float | None = Field(default=None, ge=0.0, le=1.0)
+    invert: bool | None = None
 
 
 class StingerSlotUpdate(BaseModel):
@@ -626,7 +679,7 @@ class ConsoleState(BaseModel):
     formats: list[dict]
     inputs: list[LogicalInput]
     panels: list[MixerPanel]
-    keyers: list[DownstreamKeyer]
+    keyers: list[Keyer]
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
     resources: ResourceInfo

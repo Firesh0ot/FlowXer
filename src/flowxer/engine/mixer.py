@@ -12,8 +12,10 @@ from pydantic import ValidationError
 from flowxer import __version__
 from flowxer.api.schemas import (
     AudioEssence,
-    DownstreamKeyer,
     InputKind,
+    Keyer,
+    KeyerStage,
+    KeyMode,
     LogicalInput,
     LogicalInputCreate,
     LogicalInputUpdate,
@@ -81,8 +83,6 @@ DOMAIN_WATCH_S = 2.0
 AUTOSTART_BACKOFF_S = (2.0, 5.0, 10.0, 30.0)
 # Sources in slot order (the TSL INDEX): live inputs, clip players, then Black.
 KIND_ORDER = {InputKind.mxl_live: 0, InputKind.clip_player: 1, InputKind.black: 2}
-# This version has one downstream keyer (DSK 1 on ME 1).
-MAX_KEYERS = 1
 # The re-entered Program of ME n is the source "me-<n>" (TSL INDEX 1000 + n).
 REENTRY_INDEX = 1000
 
@@ -116,7 +116,7 @@ class VisionMixer:
         self.inputs: dict[str, LogicalInput] = {}
         self.workspace = self._pinned(WorkspaceConfig())
         self.panels: list[MixerPanel] = []
-        self.keyers: list[DownstreamKeyer] = []
+        self.keyers: list[Keyer] = []
         self.stinger_slots: list[StingerSlot] = []
         self.started_at = time.time()
         self.state = MixerState.idle
@@ -307,12 +307,29 @@ class VisionMixer:
             if self.preview_input_id:
                 self.panels[0].preview_input_id = self.preview_input_id
 
+    def _labels_pinned(self) -> bool:
+        pinned = self.settings.pinned_workspace
+        return "keyers_per_me" in pinned or "dsks_per_me" in pinned
+
     def _sync_keyers(self) -> None:
-        desired = min(self.workspace.downstream_keyer_count, MAX_KEYERS)
-        while len(self.keyers) < desired:
-            n = len(self.keyers) + 1
-            self.keyers.append(DownstreamKeyer(id=f"dsk-{n}", label=f"DSK {n}"))
-        self.keyers = self.keyers[:desired]
+        """keyers_per_me upstream keyers (`me-n-key-k`, "ME n Key k") and dsks_per_me DSKs on every
+        rendering ME, in the engine's order. ME 1's DSKs keep P2's ids and labels (`dsk-k`,
+        "DSK k"), the other MEs' are `me-n-dsk-k` ("ME n DSK k"). A keyer keeps its state by id."""
+        previous = {keyer.id: keyer for keyer in self.keyers}
+        keyers: list[Keyer] = []
+        for n, panel in enumerate(self.rendered_panels(), 1):
+            wanted = [(f"me-{n}-key-{k}", f"ME {n} Key {k}", KeyerStage.upstream) for k in range(1, self.workspace.keyers_per_me + 1)]
+            wanted += [
+                (f"dsk-{k}", f"DSK {k}", KeyerStage.downstream) if n == 1 else (f"me-{n}-dsk-{k}", f"ME {n} DSK {k}", KeyerStage.downstream)
+                for k in range(1, self.workspace.dsks_per_me + 1)
+            ]
+            for keyer_id, label, stage in wanted:
+                keyer = previous.get(keyer_id) or Keyer(id=keyer_id, label=label)
+                keyer.panel_id, keyer.stage = panel.id, stage
+                if self._labels_pinned():
+                    keyer.label = label
+                keyers.append(keyer)
+        self.keyers = keyers
         for keyer_id in list(self._key_routes):
             if not any(keyer.id == keyer_id for keyer in self.keyers):
                 del self._key_routes[keyer_id]
@@ -356,8 +373,6 @@ class VisionMixer:
         display_only = set(patch) <= {"source_tile_aspect"}
         if self.state == MixerState.running and not display_only:
             raise MixerError("stop the mixer before changing console layout")
-        if (patch.get("downstream_keyer_count") or 0) > MAX_KEYERS:
-            raise MixerError(f"this version has at most {MAX_KEYERS} downstream keyer (DSK 1 on ME 1)")
         data = self.workspace.model_dump()
         if patch.get("stinger_mode") not in {None, "shared", "separate"}:
             raise MixerError("stinger_mode must be shared or separate")
@@ -455,37 +470,62 @@ class VisionMixer:
 
     # ── keyers ───────────────────────────────────────────────────────────────
 
-    def get_keyer(self, keyer_id: str) -> DownstreamKeyer:
+    def get_keyer(self, keyer_id: str) -> Keyer:
         for keyer in self.keyers:
             if keyer.id == keyer_id:
                 return keyer
-        raise MixerError(f"unknown downstream keyer {keyer_id}")
+        raise MixerError(f"unknown keyer {keyer_id}")
 
-    def _keyer_number(self, keyer: DownstreamKeyer) -> int:
+    def _keyer_number(self, keyer: Keyer) -> int:
         return self.keyers.index(keyer) + 1
 
-    def update_keyer(
-        self, keyer_id: str, *, enabled: bool | None = None, label: str | None = None, rate_ms: int | None = None
-    ) -> DownstreamKeyer:
+    def update_keyer(self, keyer_id: str, **changes: Any) -> Keyer:
+        """On or off (at the next frame), rate, label, and the key: mode, luma source, clip, soft,
+        gain, invert."""
         keyer = self.get_keyer(keyer_id)
-        if rate_ms is not None:
-            keyer.rate_ms = rate_ms
+        label = changes.pop("label", None)
+        enabled = changes.pop("enabled", None)
         if label is not None and label != keyer.label:
+            if self._labels_pinned():
+                raise MixerError("keyer labels are fixed while FLOWXER_KEYERS_PER_ME or FLOWXER_DSKS_PER_ME sets the keyers")
             keyer.label = label
-            # The key receiver is "<label> Key".
+            # Its key receiver carries the label.
             self.nmos.mark_changed()
+        key = {name: value for name, value in changes.items() if name != "rate_ms" and value is not None}
+        if key:
+            try:
+                updated = Keyer.model_validate({**keyer.model_dump(), **key})
+            except ValidationError as exc:
+                raise MixerError(f"invalid key: {exc.errors()[0]['msg']}") from exc
+            if updated.mode == KeyMode.luma:
+                if not updated.source_id:
+                    raise MixerError("a luma key needs a source")
+                self._check_source(self.get_panel(keyer.panel_id), updated.source_id)
+            for name in key:
+                setattr(keyer, name, getattr(updated, name))
+            self._push_key_settings(keyer)
+        if changes.get("rate_ms") is not None:
+            keyer.rate_ms = changes["rate_ms"]
         if enabled is not None:
             keyer.enabled = enabled
-            self._engine_call("PUT", f"/dsk/{self._keyer_number(keyer)}", {"on": enabled})
+            self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
+        self._publish_tally()
         return keyer
 
-    def keyer_auto(self, keyer_id: str, duration_ms: int | None = None) -> DownstreamKeyer:
+    def keyer_auto(self, keyer_id: str, duration_ms: int | None = None) -> Keyer:
         """Fade the keyer on (or off when it is on) over duration_ms (default: its rate)."""
         keyer = self.get_keyer(keyer_id)
         keyer.enabled = not keyer.enabled
         frames = _frames(duration_ms or keyer.rate_ms, self.settings.fps)
-        self._engine_call("POST", f"/dsk/{self._keyer_number(keyer)}/auto", {"frames": frames})
+        self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
+        self._publish_tally()
         return keyer
+
+    def _push_key_settings(self, keyer: Keyer, client: EngineClient | None = None) -> None:
+        body: dict[str, Any] = {"mode": keyer.mode.value, "clip": keyer.clip, "soft": keyer.soft, "gain": keyer.gain, "invert": keyer.invert}
+        if keyer.mode == KeyMode.luma:
+            body["source"] = self._engine_source(keyer.source_id)
+        self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
 
     def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
         """IS-05 activation of a keyer's key receiver."""
@@ -498,14 +538,14 @@ class VisionMixer:
         self._key_routes[keyer.id] = (domain_id or self.settings.resolved_output_domain_id, flow_id if enabled else None)
         self._push_key(keyer)
 
-    def _key_route(self, keyer: DownstreamKeyer) -> dict[str, str]:
+    def _key_route(self, keyer: Keyer) -> dict[str, str]:
         domain_id, flow_id = self._key_routes.get(keyer.id, (None, None))
         if not flow_id:
             return {"domain": "", "flow": ""}
         path = self._mxl_source_path(keyer.id, "key", domain_id, flow_id)
         return {"domain": path or "", "flow": flow_id if path else ""}
 
-    def _push_key(self, keyer: DownstreamKeyer, client: EngineClient | None = None) -> None:
+    def _push_key(self, keyer: Keyer, client: EngineClient | None = None) -> None:
         self._engine_call("PUT", f"/key/{self._keyer_number(keyer)}", self._key_route(keyer), client=client)
 
     # ── stingers (configuration; stinger playback comes back in P3) ─────────
@@ -1123,7 +1163,10 @@ class VisionMixer:
             "FLOWXER_ENGINE_MES": self.render_count,
             "FLOWXER_ENGINE_INPUTS": [{"label": item.label} for item in live],
             "FLOWXER_ENGINE_PLAYERS": [{"label": item.label} for item in players],
-            "FLOWXER_ENGINE_KEYS": [{"label": f"{keyer.label} Key", "me": 1} for keyer in self.keyers],
+            "FLOWXER_ENGINE_KEYS": [
+                {"label": keyer.receiver_label, "me": self._panel_number(self.get_panel(keyer.panel_id)), "stage": keyer.stage.value}
+                for keyer in self.keyers
+            ],
             "FLOWXER_ENGINE_PVW_OUTPUTS": self.settings.pvw_outputs,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN": output_domain,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": self.settings.resolved_output_domain_id,
@@ -1159,7 +1202,8 @@ class VisionMixer:
                     self._push_player(item, client)
             for keyer in self.keyers:
                 self._push_key(keyer, client)
-                self._engine_call("PUT", f"/dsk/{self._keyer_number(keyer)}", {"on": keyer.enabled}, client=client)
+                self._push_key_settings(keyer, client)
+                self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": keyer.enabled}, client=client)
             for panel in self.rendered_panels():
                 self._push_panel(panel, client)
 
@@ -1702,11 +1746,22 @@ class VisionMixer:
                 mes.append(MeTally(reentry=reentry))
                 continue
             transition = self._mixes.get(panel.id)
-            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry))
+            keyers = [keyer for keyer in self.keyers if keyer.panel_id == panel.id]
+            keyed = tuple(k.source_id for k in keyers if k.enabled and k.mode == KeyMode.luma and k.source_id)
+            keys = tuple(self._key_tally(keyer) for keyer in keyers if keyer.mode == KeyMode.linear)
+            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
         return TallySnapshot(
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
         )
+
+    def _key_tally(self, keyer: Keyer) -> tuple[int, str, bool]:
+        """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
+        ME n) or 3000 + 100·n + k (DSK k), its receiver label, on air."""
+        same = [k for k in self.keyers if k.panel_id == keyer.panel_id and k.stage == keyer.stage]
+        base = 2000 if keyer.stage == KeyerStage.upstream else 3000
+        index = base + 100 * self._panel_number(self.get_panel(keyer.panel_id)) + same.index(keyer) + 1
+        return index, keyer.receiver_label, keyer.enabled
 
     # ── saved state and config export/import ─────────────────────────────────
 
@@ -1761,15 +1816,11 @@ class VisionMixer:
         if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
             raise MixerError(f"not a {STATE_FORMAT} document")
         try:
-            workspace_data = dict(data.get("workspace") or {})
-            # One downstream keyer in this version.
-            if int(workspace_data.get("downstream_keyer_count") or 0) > MAX_KEYERS:
-                workspace_data["downstream_keyer_count"] = MAX_KEYERS
-            workspace = self._pinned(WorkspaceConfig(**workspace_data))
+            workspace = self._pinned(WorkspaceConfig(**dict(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
-            keyers = [DownstreamKeyer(**item) for item in data.get("keyers") or []]
+            keyers = [Keyer(**item) for item in data.get("keyers") or []]
             slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])

@@ -39,9 +39,12 @@ def lit(mixer: VisionMixer, screen: int = 1, now: float | None = None) -> tuple[
     me = snapshot.mes[screen - 1]
     ids = {index: input_id for input_id, index in indexes.items()}
     ids.update({index: source_id for source_id, _label, index in me.reentry})
+    ids.update({index: str(index) for index, _label, _on in me.keys})
     messages = me_messages(snapshot, me, indexes, time.monotonic() if now is None else now)
-    # Every input, then the Programs of the higher MEs this ME can take (re-entry).
-    assert [message.text for message in messages] == [item.label for item in mixer.list_inputs()] + [label for _id, label, _index in me.reentry]
+    # Every input, the Programs of the higher MEs this ME can take (re-entry), the linear keys.
+    assert [message.text for message in messages] == (
+        [item.label for item in mixer.list_inputs()] + [label for _id, label, _index in me.reentry] + [label for _i, label, _on in me.keys]
+    )
     assert all(message.txt == TALLY_OFF and message.brightness == 3 for message in messages)
     assert {message.lh for message in messages} <= {TALLY_OFF, TALLY_RED}
     assert {message.rh for message in messages} <= {TALLY_OFF, TALLY_GREEN}
@@ -67,11 +70,24 @@ def test_program_lh_red_preview_rh_green(mixer: VisionMixer) -> None:
     assert lit(mixer) == (set(), set())
 
 
-def test_the_dsk_lights_nothing(mixer: VisionMixer) -> None:
-    # DSK 1 keys a v210a input that is not one of the sources.
+def test_keys_light_their_key_inputs_and_luma_sources(mixer: VisionMixer) -> None:
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # Each linear keyer's key input is an INDEX of its own: 2000/3000 + 100·n + k.
+    keys = mixer._tally_snapshot().mes[1].keys
+    assert keys == ((2201, "ME 2 Key 1", False), (2202, "ME 2 Key 2", False), (3201, "ME 2 DSK 1 Key", False))
+    assert mixer._tally_snapshot().mes[0].keys[2] == (3101, "DSK 1 Key", False)
+    # DSK 1 on: its key input red (LH only), the buses as before.
     mixer.update_keyer("dsk-1", enabled=True)
-    assert lit(mixer) == ({"cam-1"}, {"cam-2"})
+    assert lit(mixer) == ({"cam-1", "3101"}, {"cam-2"})
+    # A luma key of cam-3 on ME 1's upstream keyer 1: cam-3 red while it is on air.
+    mixer.update_keyer("me-1-key-1", mode="luma", source_id="cam-3")
+    assert lit(mixer) == ({"cam-1", "3101"}, {"cam-2"})
+    mixer.keyer_auto("me-1-key-1")
+    assert lit(mixer) == ({"cam-1", "3101", "cam-3"}, {"cam-2"})
+    # A luma key of ME 2's Program lights its re-entry INDEX 1002.
+    mixer.update_keyer("me-1-key-1", source_id="me-2")
+    assert lit(mixer)[0] == {"cam-1", "3101", "me-2"}
     assert len(mixer._tally_snapshot().inputs) == len(mixer.inputs)
 
 def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:

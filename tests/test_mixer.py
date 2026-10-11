@@ -149,21 +149,28 @@ def test_legacy_input_kinds_become_clip_players(mixer: VisionMixer) -> None:
         LogicalInputCreate(id="x", label="x", kind="hdmi")
 
 
-def test_one_downstream_keyer(mixer: VisionMixer) -> None:
-    assert [keyer.id for keyer in mixer.keyers] == ["dsk-1"]
-    with pytest.raises(MixerError, match="at most 1"):
-        mixer.apply_workspace(WorkspaceUpdate(downstream_keyer_count=2))
+def test_keyers_per_me(mixer: VisionMixer) -> None:
+    # Engine keyer numbers follow the list: ME 1 Key 1, Key 2, DSK 1.
+    assert [keyer.id for keyer in mixer.keyers] == ["me-1-key-1", "me-1-key-2", "dsk-1"]
     calls = _record_engine(mixer)
     mixer.update_keyer("dsk-1", enabled=True)
-    assert calls[-1] == ("PUT", "/dsk/1", {"on": True})
+    assert calls[-1] == ("POST", "/keyer/3", {"on": True})
     mixer.keyer_auto("dsk-1", duration_ms=500)
-    assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 25})
-    assert mixer.keyers[0].enabled is False
+    assert calls[-1] == ("POST", "/keyer/3/auto", {"frames": 25})
+    assert mixer.get_keyer("dsk-1").enabled is False
     # Auto without a duration takes the keyer's rate.
     mixer.update_keyer("dsk-1", rate_ms=1000)
     mixer.keyer_auto("dsk-1")
-    assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 50})
-    assert mixer.keyers[0].rate_ms == 1000 and mixer.keyers[0].enabled is True
+    assert calls[-1] == ("POST", "/keyer/3/auto", {"frames": 50})
+    assert mixer.get_keyer("dsk-1").rate_ms == 1000 and mixer.get_keyer("dsk-1").enabled is True
+    # A luma key of a camera on ME 1's upstream keyer 1.
+    mixer.update_keyer("me-1-key-1", mode="luma", source_id="cam-2", clip=0.4, soft=0.05, invert=True)
+    assert calls[-1] == ("POST", "/keyer/1/settings", {"mode": "luma", "clip": 0.4, "soft": 0.05, "gain": 1.0, "invert": True, "source": "in2"})
+    with pytest.raises(MixerError, match="needs a source"):
+        mixer.update_keyer("me-1-key-2", mode="luma")
+    assert mixer.get_keyer("me-1-key-2").mode.value == "linear"
+    with pytest.raises(MixerError, match="unknown keyer"):
+        mixer.update_keyer("dsk-9", enabled=True)
 
 
 def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:
