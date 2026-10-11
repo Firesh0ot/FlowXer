@@ -591,3 +591,46 @@ opened. Same format (HEVC Rext 4:4:4 10-bit from FFmpeg's `yuv444p16le`, repeate
   including probe, sound and thumbnail (80–89 frames/s; a minute of clip in about 35 s), NVENC
   at most 55 %, beside the mosaic's NVENC session: 0 skipped or late grains, 0 throttled
   periods, the mosaic at 25 frames/s with no dropped frame.
+
+## P2 M4: reconnect, upgrade, soak (lab, 2026-10-11)
+
+### Preview reconnect
+
+Built-in MediaMTX killed under a console page (headless Edge 155 and Firefox 140.9): every
+picture plays again 2.3–2.4 s later (was 12 s). The page connects again when no video packet
+came for 1 s and retries every 0.5 s; the engine checks its MediaMTX every 200 ms and the
+mosaic publisher retries within 0.5 s.
+
+### Upgrade from FlowXer 14.21.46 (`fxp2-upgrade.py`)
+
+Same `/config`, NMOS seed and output domain: ME 1 PGM keeps its flow ids, the live inputs'
+IS-05 activations are restored, their tally INDEX and Black's are unchanged; a multiviewer 1.4.1
+reading ME 1 PGM played again 3.2 s after the new image started. The top-level README
+(Upgrading from FlowXer 14) lists what an operator loses.
+
+### 2 h soak (`fxp2-soak.py`)
+
+Image `fxp2:m4a`, A16 GPU 0, `docker --cpus 6`, L = 4. 4 MEs (PVW on), 8 live inputs (test
+player Out 1–4, replay PGM/PVW, a lab pattern, mxl-browser-source), clip-1 looping a clip,
+clip-2 the colour bars, DSK 1 keyed from mxl-browser-source (v210a), 5 WHEP viewers (aiortc,
+decoding), a Cut or a 500 ms fade every 10 s on a rotating ME, the 10 s ProRes clip imported
+again every 15 min. One sample a minute, 121 samples:
+
+| | Result |
+|---|---|
+| Output, every ME | 0 skipped, 0 write failures |
+| Late grains (committed after their grain time) | 7 at start-up, 1 at about minute 100 (when the test player's own grains came late too) |
+| Output lag | 4.0 grains (L) in every sample; commit 10.4 ms into the window on average, max 16.4 |
+| GPU render / render + download | 3.59 ms (max 5.05) / 10.43 ms (max 12.21) |
+| Container CPU (engine, control plane, MediaMTX for 5 viewers, imports) | 0.71 cores average, max 0.91; 0 throttled periods |
+| GPU memory (`nvidia-smi`, GPU 0) | 1268 MiB from start to end (engine process 1255 MiB, its buffers 884 MB) |
+| NVENC / NVDEC | 1 session (the mosaic) in every sample, at most 4 %; NVDEC at most 5 % |
+| Mosaic | 25.00 fps (180 001 frames), 1 dropped at the encoder start |
+| Viewers | 5 readers throughout, each decoding 25.0 fps |
+| Clip-1 | 361 155 frames decoded, 3.0 ms each on average, 0 late |
+| Operator | 719 Cuts and fades, 0 API errors |
+| Imports | 8 of 8 ready, 5.1–5.6 s each |
+| Inputs | 0 missing; late grains of their own: test player 5–20 each (all after minute 90), replay PGM/PVW 4527 and 4049 |
+
+NVML's GPU utilization was 86 % on average; it counts the DMA copy time (P1a: 78 % with 4 MEs and
+no clip players).
