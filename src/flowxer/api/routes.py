@@ -174,17 +174,18 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
     description=(
         "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
         "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
-        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows "
-        "and Cut/Auto of one ME."
+        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
+        "Cut/Auto and the transition type (`transition=false` hides it) of one ME."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
+    transition = {"type": "boolean", "default": True, "title": "Transition type"}
     return [
         {
             "id": "bus",
             "title": "FlowXer bus",
-            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "params": {"type": "object", "properties": {"me": me, "transition": transition}, "required": ["me"]},
             "min_size": {"w": 480, "h": 150},
             "version": __version__,
         }

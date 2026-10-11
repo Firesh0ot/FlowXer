@@ -18,6 +18,24 @@ export interface LogicalInput {
   audio?: { flow_id?: string | null; media_type: string; channels: number } | null;
 }
 
+export type TransitionKind = "mix" | "wipe" | "stinger";
+
+/** An ME's next transition: what Auto runs. soft and border are 0..1 of the pattern's travel. */
+export interface PanelTransition {
+  type: TransitionKind;
+  rate_frames: number;
+  wipe: {
+    pattern: number;
+    reverse: boolean;
+    /** Flip-flop: reverse toggles after each wipe. */
+    alternate: boolean;
+    soft: number;
+    border: number;
+    border_color: string;
+  };
+  stinger_slot_id: string | null;
+}
+
 export interface MixerPanel {
   id: string;
   label: string;
@@ -25,6 +43,7 @@ export interface MixerPanel {
   preview_input_id: string | null;
   wipe_armed?: boolean;
   last_transition?: string;
+  transition: PanelTransition;
 }
 
 export interface DownstreamKeyer {
@@ -251,20 +270,21 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
-  fade: (panel_id: string) =>
-    fetch("/api/v1/mixer/fade", {
+  /** The ME's next transition (mix, wipe; a stinger is a cut for now) over its rate. */
+  auto: (panel_id: string) =>
+    fetch("/api/v1/mixer/auto", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
+  transition: (panel_id: string, patch: Record<string, unknown>) =>
+    fetch(`/api/v1/panels/${panel_id}/transition`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(patch),
+    }).then((r) => parse<PanelTransition>(r)),
   fadeToBlack: (panel_id: string) =>
     fetch("/api/v1/mixer/fade-to-black", {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({ panel_id }),
-    }).then((r) => parse(r)),
-  wipe: (panel_id: string) =>
-    fetch("/api/v1/mixer/wipe", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),

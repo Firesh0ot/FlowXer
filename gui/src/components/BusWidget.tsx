@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type ConsoleState } from "../api";
+import { api, type ConsoleState, type TransitionKind } from "../api";
 
 function post(message: Record<string, unknown>) {
   if (window.parent !== window) window.parent.postMessage(message, "*");
 }
 
-/** The `bus` widget: Program and Preview rows (the inputs and the higher MEs' Programs) and
- * Cut/Auto of ME `me`. */
-export function BusWidget({ me }: { me: number }) {
+const TYPES: { type: TransitionKind; label: string }[] = [
+  { type: "mix", label: "Mix" },
+  { type: "wipe", label: "Wipe" },
+  { type: "stinger", label: "Sting" },
+];
+
+/** The `bus` widget: Program and Preview rows (the inputs and the higher MEs' Programs), Cut/Auto
+ * of ME `me` and, unless `transition` is false, its transition type. */
+export function BusWidget({ me, transition = true }: { me: number; transition?: boolean }) {
   const [snapshot, setSnapshot] = useState<ConsoleState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const root = useRef<HTMLDivElement>(null);
@@ -109,11 +115,31 @@ export function BusWidget({ me }: { me: number }) {
               </div>
             </div>
           </div>
-          <div className="bus-actions">
+          <div className={`bus-actions${transition ? " with-type" : ""}`}>
+            {transition ? (
+              <div className="type-select" role="radiogroup" aria-label="Transition type">
+                {TYPES.map((item) => (
+                  <button
+                    key={item.type}
+                    role="radio"
+                    aria-checked={panel.transition.type === item.type}
+                    className={panel.transition.type === item.type ? "on" : ""}
+                    title={`Auto runs a ${item.label.toLowerCase()}`}
+                    onClick={() => void command(() => api.transition(panel.id, { type: item.type }))}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <button className="cut" title="Cut Preview to Program" onClick={() => void command(() => api.cut(panel.id))}>
               Cut
             </button>
-            <button className="auto" title="Fade Preview to Program" onClick={() => void command(() => api.fade(panel.id))}>
+            <button
+              className="auto"
+              title={`${panel.transition.type} Preview to Program over ${panel.transition.rate_frames} frames`}
+              onClick={() => void command(() => api.auto(panel.id))}
+            >
               Auto
             </button>
           </div>

@@ -110,6 +110,7 @@ def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> 
     bus = widgets[0]
     assert bus["params"]["required"] == ["me"]
     assert bus["params"]["properties"]["me"]["maximum"] == len(mixer.panels)
+    assert bus["params"]["properties"]["transition"] == {"type": "boolean", "default": True, "title": "Transition type"}
     assert bus["min_size"] == {"w": 480, "h": 150}
 
 

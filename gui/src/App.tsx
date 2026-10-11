@@ -10,7 +10,7 @@ import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { StatusChip } from "./components/StatusChip";
 import { TallySettingsModal } from "./components/TallySettingsModal";
-import { TransitionBank } from "./components/TransitionBank";
+import { TransitionSection } from "./components/TransitionSection";
 
 /** Frames per second of a frame rate such as "50/1" or "60000/1001". */
 function framesPerSecond(rate: string | undefined): number {
@@ -249,13 +249,13 @@ export default function App() {
             />
           ))}
         </div>
-        <TransitionBank
+        <TransitionSection
           panel={panel}
-          stingerPhase={snapshot.mixer.stinger.phase}
+          stingerSlots={snapshot.stinger_slots}
+          onChange={(patch) => void command(() => api.transition(panel.id, patch))}
           onCut={() => void command(() => api.cut(panel.id))}
-          onFade={() => void command(() => api.fade(panel.id))}
+          onAuto={() => void command(() => api.auto(panel.id))}
           onFadeToBlack={() => void command(() => api.fadeToBlack(panel.id))}
-          onWipe={() => void command(() => api.wipe(panel.id))}
         />
       </section>
 

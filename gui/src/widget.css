@@ -41,6 +41,10 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .bus-row.pgm button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
 .bus-row.pvw button.on { background: var(--pvw); border-color: var(--pvw); color: #041018; }
 .bus-actions { display: grid; grid-template-rows: 1fr 1fr; gap: 6px; }
+.bus-actions.with-type { grid-template-rows: auto 1fr 1fr; }
+.type-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+.bus-actions .type-select button { padding: 3px 0; font-size: 9px; letter-spacing: 0.02em; border-radius: 4px; }
+.bus-actions .type-select button.on { background: #2a4a6a; border-color: #4a7ab0; color: #fff; }
 .bus-actions button { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; border-radius: 8px; }
 .bus-actions .cut { background: #3a1518; border-color: #6a2a30; color: #fff; }
 .bus-actions .auto { background: #15243a; border-color: #2a4a6a; color: #fff; }

@@ -1,5 +1,6 @@
-// Operator-screen widget: /widget/bus?me=<n>[&theme=dark|light|transparent] shows one ME's Program
-// and Preview rows with Cut and Auto, without the console around it. It runs on flowxer-gui's own
+// Operator-screen widget: /widget/bus?me=<n>[&transition=false][&theme=dark|light|transparent] shows
+// one ME's Program and Preview rows with Cut, Auto and the transition type (hidden with
+// transition=false), without the console around it. It runs on flowxer-gui's own
 // origin (its /api); only the origins in WIDGET_FRAME_ANCESTORS may frame it. It posts
 // {type: "widget-ready"} and {type: "widget-size", w, h} to the page that frames it.
 import React from "react";
@@ -18,6 +19,6 @@ else scheme?.setAttribute("content", theme === "light" ? "light" : "dark");
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <BusWidget me={Number(params.get("me")) || 1} />
+    <BusWidget me={Number(params.get("me")) || 1} transition={params.get("transition") !== "false"} />
   </React.StrictMode>,
 );
