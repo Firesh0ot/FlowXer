@@ -122,6 +122,7 @@ If `FLOWXER_API_TOKEN` is set, calls to **9610** need `Authorization: Bearer …
 | DSK ON/OFF, rate | `PATCH /keyers/{id}` (`enabled`, `rate_ms`) |
 | DSK AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
 | Transition type, rate, wipe pattern and edge | `PATCH /panels/{id}/transition` (`type`, `rate_frames`, `wipe`: `pattern`, `reverse`, `alternate`, `soft`, `border`, `border_color`; `stinger_slot_id`); `GET /console` `panels[].transition` |
+| T-bar (API only, no GUI fader yet) | `POST /mixer/position` (`panel_id`, `position` 0–1): off 0 starts the ME's transition and holds it, 1 completes it, 0 ends it without the swap; AUTO runs the rest; a stinger runs as an Auto |
 | CUT / AUTO / FTB | `POST /mixer/cut`, `/mixer/auto` (`panel_id`, `frames`), `/mixer/fade-to-black`. Kept for API clients: `/mixer/fade` (a mix), `/mixer/wipe` (arms Wipe), `/mixer/take` (`transition`: `cut`, `mix`, `wipe`, `stinger`; `frames` or `duration_ms`) |
 | Stinger chip / ⚙ | `POST /stinger/play`, `PATCH /stinger-slots/{id}` |
 | File → libraries | `GET /library`, `POST /uploads`, `GET /jobs` |

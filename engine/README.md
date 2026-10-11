@@ -249,7 +249,8 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb"}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code |
 | `POST /me/{m}/take` | `{"source", "frames", "preview", "type"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, `stinger`), mixed (`mix`, the default) or wiped with the ME's wipe (`wipe`) |
 | `POST /me/{m}/cut` | – | the ME |
-| `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition; 409 while one runs |
+| `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition, or the rest of a held T-bar transition; 409 while one runs |
+| `POST /me/{m}/position` | `{"t": 0.4}` (0–1) | the T-bar: t > 0 starts the ME's next transition and holds it at t (audio ramps to it within a grain); 1 completes it after that grain, 0 ends it without the swap; a stinger runs as an Auto; 409 during an Auto |
 | `PUT /input/{k}` | `{"video": {"domain", "flow"}, "audio": {"domain", "flow"}}` | opens (or, without a flow, closes) the input's readers |
 | `PUT /key/{k}` | `{"domain", "flow"}` | the same for a key input (v210a) |
 | `POST /dsk/{k}` | `{"on": true}` | the DSK on or off at the next grain |
