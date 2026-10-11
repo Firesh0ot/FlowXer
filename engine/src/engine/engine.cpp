@@ -1885,10 +1885,15 @@ struct Engine::Impl
         std::unique_lock lock{statsMu};
         while (run.load())
         {
-            statsCv.wait_for(lock, std::chrono::seconds(1), [&] { return !run.load(); });
-            if (mediamtx && run.load())
+            // The own MediaMTX every 200 ms (a killed one is started again at once), the rest once a
+            // second.
+            for (int k = 0; k < 5 && run.load(); ++k)
             {
-                mediamtxRunning.store(mediamtx->poll());
+                statsCv.wait_for(lock, std::chrono::milliseconds(200), [&] { return !run.load(); });
+                if (mediamtx && run.load())
+                {
+                    mediamtxRunning.store(mediamtx->poll());
+                }
             }
             auto const cpuNow = threadCpu.sample();
             auto const gpuNow = nvml.sample();

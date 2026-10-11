@@ -3,7 +3,8 @@
 // one MediaStream inside a box with its tile's aspect ratio and overflow hidden, and a CSS
 // transform scales and moves the video so only the tile shows. That works in every browser
 // (object-view-box is Chromium only); mxl-replay 1.4.0 and mxl-multiviewer 1.4.1 do the same.
-// The session follows the console's map, stays for the page and connects again when it drops.
+// The session follows the console's map, stays for the page and connects again when it drops:
+// at once when no video packet came for a second (WebRTC itself notices only after 5 s or more).
 // No audio.
 import { useEffect, useState, type CSSProperties } from "react";
 
@@ -30,7 +31,11 @@ export interface PreviewMap {
   tiles: PreviewTile[];
 }
 
-const RETRY_MS = 2000;
+const RETRY_MS = 500;
+// No new video packet for this long: the stream stalled (e.g. its MediaMTX restarted). Before the
+// first packet (ICE, DTLS, the next key frame) the session gets longer.
+const STALL_MS = 1000;
+const FIRST_PACKET_MS = 4000;
 
 /** Where the page plays the mosaic from; "" when there is none. */
 export function whepUrl(map: PreviewMap | null): string {
@@ -97,6 +102,37 @@ class PreviewSession {
     this.connected = false;
   }
 
+  /** Connects again when the video stops arriving. */
+  private watch(pc: RTCPeerConnection) {
+    let packets = 0;
+    let changed = Date.now();
+    let busy = false;
+    const timer = window.setInterval(async () => {
+      if (this.pc !== pc) {
+        window.clearInterval(timer);
+        return;
+      }
+      if (busy) return;
+      busy = true;
+      let received = packets;
+      try {
+        (await pc.getStats()).forEach((report) => {
+          if (report.type === "inbound-rtp" && report.kind === "video") received = report.packetsReceived ?? received;
+        });
+      } catch {
+        // closed meanwhile
+      }
+      busy = false;
+      if (received !== packets) {
+        packets = received;
+        changed = Date.now();
+      } else if (Date.now() - changed > (packets ? STALL_MS : FIRST_PACKET_MS)) {
+        window.clearInterval(timer);
+        this.retry(pc);
+      }
+    }, 250);
+  }
+
   private retry(pc: RTCPeerConnection) {
     if (this.pc !== pc) return;
     const url = this.url;
@@ -141,6 +177,7 @@ class PreviewSession {
         else this.notify();
       };
       this.stream = stream;
+      this.watch(pc);
       this.notify();
     } catch {
       this.retry(pc);

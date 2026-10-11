@@ -213,7 +213,8 @@ void MosaicEncoder::encode(std::uint8_t const* luma, int lumaPitch, std::uint8_t
     {
         if (!s.openOutput())
         {
-            s.retryOutput = now + std::chrono::seconds(2);
+            // Connection refused is immediate: a MediaMTX that comes back is found within half a second.
+            s.retryOutput = now + std::chrono::milliseconds(500);
         }
         else
         {
@@ -266,7 +267,7 @@ void MosaicEncoder::encode(std::uint8_t const* luma, int lumaPitch, std::uint8_t
             {
                 s.fail("rtsp write: " + avError(rc));
                 s.closeOutput();
-                s.retryOutput = now + std::chrono::seconds(1);
+                s.retryOutput = now + std::chrono::milliseconds(200);
             }
         }
         av_packet_unref(s.packet);
