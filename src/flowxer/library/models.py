@@ -44,6 +44,8 @@ class ConversionInfo(BaseModel):
     audio_samples: int = 0
     audio_channels: int = 0
     mezz: str | None = None
+    # A clip's sound next to its mezzanine: raw float32, interleaved, exactly the clip's frames.
+    audio: str | None = None
     has_alpha: bool = False
     duration_s: float = 0.0
     error: str | None = None

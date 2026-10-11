@@ -22,11 +22,13 @@ from flowxer.library.ffmpeg import (
     FFmpeg,
     RunResult,
     build_clip_audio_command,
-    build_clip_mux_command,
     build_clip_video_command,
+    build_still_command,
+    build_still_filter,
     build_stinger_mezz_command,
     build_thumb_command,
     build_video_filter,
+    conversion_threads,
     conversion_timeout,
     has_alpha_pix_fmt,
     parse_frame_rate,
@@ -70,6 +72,7 @@ class ConversionQueue:
     ) -> None:
         self.store = store
         self.concurrency = max(1, min(8, concurrency))
+        self.threads = conversion_threads(self.concurrency)
         self.ffmpeg = ffmpeg or FFmpeg()
         self.ram_clip_max_s = ram_clip_max_s
         self.ram_budget_bytes = ram_budget_mb << 20
@@ -189,7 +192,7 @@ class ConversionQueue:
 
             def queued(item: LibraryItem) -> None:
                 # A ready conversion stays playable until the new one replaces it.
-                if not self._ready_on_disk(item, format_id):
+                if not self.ready_on_disk(item, format_id):
                     item.conversions[format_id] = ConversionInfo(status=ConversionStatus.queued)
 
             self.store.update(item_id, queued)
@@ -213,14 +216,17 @@ class ConversionQueue:
             except Exception:  # pragma: no cover - listener errors must not kill workers
                 log.exception("job listener failed")
 
-    def _ready_on_disk(self, item: LibraryItem, format_id: str) -> bool:
-        return item.is_ready(format_id) and self.store.mezz_path(item.id, format_id).is_file()
+    def ready_on_disk(self, item: LibraryItem, format_id: str) -> bool:
+        """Ready, and its files are there (a clip: its mezzanine and its sound)."""
+        if not item.is_ready(format_id) or not self.store.mezz_path(item.id, format_id, item.kind).is_file():
+            return False
+        return item.kind != LibraryKind.clip or self.store.audio_path(item.id, format_id).is_file()
 
     def _settle_item(self, job: ConvertJob, error: str) -> None:
         """After a failed or cancelled job: keep a ready mezzanine, else mark the item failed."""
 
         def settle(item: LibraryItem) -> None:
-            if self._ready_on_disk(item, job.format_id):
+            if self.ready_on_disk(item, job.format_id):
                 item.conversions[job.format_id].error = f"reconversion {error}"
             else:
                 item.conversions[job.format_id] = ConversionInfo(status=ConversionStatus.failed, error=error)
@@ -274,7 +280,7 @@ class ConversionQueue:
 
     def _run_job(self, job: ConvertJob, cancel: threading.Event) -> None:
         def converting(item: LibraryItem) -> None:
-            if not self._ready_on_disk(item, job.format_id):
+            if not self.ready_on_disk(item, job.format_id):
                 info = item.conversion_for(job.format_id)
                 info.status = ConversionStatus.converting
                 info.error = None
@@ -286,6 +292,8 @@ class ConversionQueue:
         fmt = format_by_id(job.format_id)
         if item.kind == LibraryKind.stinger:
             info = self._convert_stinger(item, fmt, job, cancel)
+        elif item.kind == LibraryKind.still:
+            info = self._convert_still(item, fmt, job, cancel)
         else:
             info = self._convert_clip(item, fmt, job, cancel)
         if info.status != ConversionStatus.ready:
@@ -317,6 +325,8 @@ class ConversionQueue:
         job.finished_at = time.time()
 
     def _append_log(self, item_id: str, text: str) -> None:
+        # x265 cannot set its NUMA policy in a container; it says so once per thread.
+        text = "\n".join(line for line in text.splitlines() if "set_mempolicy" not in line)
         try:
             with self.store.convert_log_path(item_id).open("a", encoding="utf-8") as handle:
                 handle.write(text)
@@ -357,11 +367,11 @@ class ConversionQueue:
             return ConversionInfo(status=ConversionStatus.failed, error="ffmpeg not available")
         original = self._original_path(item)
         directory = self.store.item_dir(item.id)
-        video_tmp = directory / f"video-tmp-{job.id}.mov"
-        audio_tmp = directory / f"audio-tmp-{job.id}.f32le"
-        mezz_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.mov"
+        video_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.mkv"
+        audio_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.f32"
         thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
-        mezz = self.store.mezz_path(item.id, fmt.id)
+        mezz = self.store.mezz_path(item.id, fmt.id, LibraryKind.clip)
+        audio_file = self.store.audio_path(item.id, fmt.id)
         thumb = self.store.thumb_path(item.id)
 
         probe = self.ffmpeg.probe(original)
@@ -370,8 +380,7 @@ class ConversionQueue:
         src_i = bool(vstream and "interlace" in (vstream.field_order or "").lower())
         color_space = (vstream.color_space if vstream else "") or item.original.get("color_space", "")
         src_audio_ch = int(astream.channels) if astream else 0
-        # Mono or stereo: GStreamer's MOV demuxer cannot play more PCM channels, and the
-        # mixer plays file inputs in stereo anyway (a 5.1 source is downmixed).
+        # Mono or stereo: the PGM sound is stereo (a 5.1 source is downmixed, mono plays on both).
         use_ch = 1 if item.options.map_channels == 1 else 2
         timeout = conversion_timeout(probe.duration, motion=item.options.fps_mode.value == "motion")
 
@@ -393,8 +402,12 @@ class ConversionQueue:
         try:
             job.progress = 0.2
             self._emit(job)
+            keyint = max(1, round(fmt.frame_rate_num / fmt.frame_rate_den))
             result = self._run(
-                item, build_clip_video_command(original=original, video_tmp=video_tmp, vf=vf), timeout, cancel
+                item,
+                build_clip_video_command(original=original, video_tmp=video_tmp, vf=vf, keyint=keyint, threads=self.threads),
+                timeout,
+                cancel,
             )
             if result.code != 0:
                 return ConversionInfo(status=ConversionStatus.failed, error="video transcode failed")
@@ -446,43 +459,67 @@ class ConversionQueue:
                     return ConversionInfo(status=ConversionStatus.failed, error="audio conform failed")
             crossfade_loop_file(audio_tmp, use_ch, need, int(item.options.crossfade_ms * 48))
 
-            job.progress = 0.75
+            job.progress = 0.85
             self._emit(job)
-            mx = self._run(
-                item,
-                build_clip_mux_command(video_tmp=video_tmp, audio_tmp=audio_tmp, audio_channels=use_ch, mezz=mezz_tmp),
-                timeout,
-                cancel,
-            )
-            if mx.code != 0:
-                return ConversionInfo(status=ConversionStatus.failed, error="mux failed")
-            self._run(item, build_thumb_command(mezz=mezz_tmp, thumb=thumb_tmp), 120.0, cancel)
-            self._publish(mezz_tmp, mezz)
+            self._run(item, build_thumb_command(mezz=video_tmp, thumb=thumb_tmp), 120.0, cancel)
+            self._publish(audio_tmp, audio_file)
+            self._publish(video_tmp, mezz)
             self._publish(thumb_tmp, thumb)
+            self._remove_prores_mezzanine(item, fmt.id)
         finally:
-            for tmp in (video_tmp, audio_tmp, mezz_tmp, thumb_tmp):
+            for tmp in (video_tmp, audio_tmp, thumb_tmp):
                 tmp.unlink(missing_ok=True)
 
         fps = fmt.frame_rate_num / fmt.frame_rate_den
-        decision = decide_ram_playback(
-            frames=frames,
-            fps=fps,
-            width=fmt.width,
-            height=fmt.height,
-            has_alpha=False,
-            ram_clip_max_s=self.ram_clip_max_s,
-            ram_budget_bytes=self.ram_budget_bytes,
-        )
         return ConversionInfo(
             status=ConversionStatus.ready,
             frames=frames,
             audio_samples=need,
             audio_channels=use_ch,
             mezz=mezz.name,
+            audio=audio_file.name,
             has_alpha=False,
             duration_s=frames / fps,
-            playback="ram" if decision.use_ram else "decode_ahead",
+            # The engine decodes ahead on the GPU.
+            playback="decode_ahead",
         )
+
+    def _remove_prores_mezzanine(self, item: LibraryItem, format_id: str) -> None:
+        """A clip converted before the engine had a ProRes mezzanine (mezz-<format>.mov). It is
+        derived, never the original, and the new mezzanine replaces it."""
+        old = self.store.item_dir(item.id) / f"mezz-{format_id}.mov"
+        if old.is_file() and item.original.get("path") != old.name:
+            old.unlink(missing_ok=True)
+            log.info("removed the ProRes mezzanine of %s (%s)", item.id, format_id)
+
+    def _convert_still(
+        self, item: LibraryItem, fmt: VideoFormat, job: ConvertJob, cancel: threading.Event
+    ) -> ConversionInfo:
+        """A still: its first picture at the raster, as one raw v210 picture."""
+        if not self.ffmpeg.which():
+            return ConversionInfo(status=ConversionStatus.failed, error="ffmpeg not available")
+        original = self._original_path(item)
+        directory = self.store.item_dir(item.id)
+        still = self.store.mezz_path(item.id, fmt.id, LibraryKind.still)
+        still_tmp = directory / f"{still.stem}.{job.id}.tmp.v210"
+        thumb = self.store.thumb_path(item.id)
+        thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
+        vf = build_still_filter(width=fmt.width, height=fmt.height, fit=item.options.fit.value)
+        picture_bytes = (fmt.width + 47) // 48 * 128 * fmt.height
+        try:
+            job.progress = 0.3
+            self._emit(job)
+            result = self._run(item, build_still_command(original=original, still_tmp=still_tmp, vf=vf), 300.0, cancel)
+            size = still_tmp.stat().st_size if still_tmp.is_file() else 0
+            if result.code != 0 or size != picture_bytes:
+                return ConversionInfo(status=ConversionStatus.failed, error="still conversion failed")
+            self._run(item, build_thumb_command(mezz=original, thumb=thumb_tmp), 120.0, cancel)
+            self._publish(still_tmp, still)
+            self._publish(thumb_tmp, thumb)
+        finally:
+            for tmp in (still_tmp, thumb_tmp):
+                tmp.unlink(missing_ok=True)
+        return ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=still.name, playback="ram")
 
     def _unpack_zip(self, item: LibraryItem, job: ConvertJob) -> None:
         """Unpack an uploaded TGA ZIP into sequence/ (done here, not in the upload request)."""
@@ -525,7 +562,7 @@ class ConversionQueue:
             self._unpack_zip(item, job)
         original = self._original_path(item)
         directory = self.store.item_dir(item.id)
-        mezz = self.store.mezz_path(item.id, fmt.id)
+        mezz = self.store.mezz_path(item.id, fmt.id, LibraryKind.stinger)
         mezz_tmp = directory / f"mezz-{fmt.id}.{job.id}.tmp.mov"
         thumb = self.store.thumb_path(item.id)
         thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
@@ -597,7 +634,7 @@ class ConversionQueue:
             self._emit(job)
             result = self._run(
                 item,
-                build_stinger_mezz_command(input_args=input_args, mezz=mezz_tmp, vf=vf),
+                build_stinger_mezz_command(input_args=input_args, mezz=mezz_tmp, vf=vf, threads=self.threads),
                 timeout,
                 cancel,
             )

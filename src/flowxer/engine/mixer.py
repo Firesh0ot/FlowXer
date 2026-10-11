@@ -855,14 +855,27 @@ class VisionMixer:
         return item
 
     def _player_media(self, item: LogicalInput) -> dict[str, Any]:
-        """What the engine loads for a clip player: its library item's file for the current
-        format (empty while it converts or without an item: the player shows black)."""
+        """What the engine loads for a clip player: its library item's files for the current
+        format (empty while it converts or without an item: the player shows black). A clip:
+        its HEVC 4:4:4 mezzanine, its sound file and frame count; a still: its v210 picture."""
         lib = self.library.get(item.library_item_id or "")
         if lib is None:
             return {"path": "", "kind": "", "loop": item.loop, "play_on_cut": item.play_on_cut}
-        path = self.library.mezzanine_path(lib.id, self.workspace.format_id)
-        kind = "still" if lib.kind == LibraryKind.still else "clip"
-        return {"path": str(path) if path else "", "kind": kind, "loop": item.loop, "play_on_cut": item.play_on_cut}
+        fmt = self.workspace.format_id
+        path = self.library.mezzanine_path(lib.id, fmt)
+        if lib.kind == LibraryKind.still:
+            return {"path": str(path) if path else "", "kind": "still", "loop": item.loop, "play_on_cut": item.play_on_cut}
+        conv = lib.conversion_for(fmt)
+        audio = self.library.audio_path(lib.id, fmt)
+        return {
+            "path": str(path) if path else "",
+            "kind": "clip",
+            "audio": str(audio) if audio else "",
+            "channels": conv.audio_channels,
+            "frames": conv.frames,
+            "loop": item.loop,
+            "play_on_cut": item.play_on_cut,
+        }
 
     def _push_player(self, item: LogicalInput, client: EngineClient | None = None) -> None:
         if item.kind != InputKind.clip_player:

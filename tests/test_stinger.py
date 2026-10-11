@@ -16,7 +16,8 @@ def test_the_default_stinger_is_generated_and_listed(client: TestClient, mixer: 
 
 def test_storage_clips_lists_what_a_clip_player_can_play(client: TestClient) -> None:
     clips = client.get("/api/v1/storage/clips").json()
-    assert clips == []
+    # A new library holds the colour bars still.
+    assert [c["name"] for c in clips] == ["Colour bars"]
 
 
 def test_replay_and_stinger_tick_routes_are_gone(client: TestClient) -> None:

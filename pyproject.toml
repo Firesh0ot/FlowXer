@@ -35,7 +35,7 @@ flowxer = "flowxer.app:run"
 where = ["src"]
 
 [tool.setuptools.package-data]
-flowxer = ["static/*", "graphics/*"]
+flowxer = ["static/*", "library/colour-bars.mkv"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

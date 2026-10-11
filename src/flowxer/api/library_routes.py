@@ -84,7 +84,7 @@ def list_library(
         try:
             parsed = LibraryKind(kind)
         except ValueError as exc:
-            raise HTTPException(422, detail="kind must be clip or stinger") from exc
+            raise HTTPException(422, detail="kind must be clip, still or stinger") from exc
     return [_item_out(mixer, item) for item in mixer.library.list_items(kind=parsed, query=q)]
 
 

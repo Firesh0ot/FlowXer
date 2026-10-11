@@ -621,7 +621,7 @@ class ConvertOptionsIn(BaseModel):
 class UploadInitRequest(BaseModel):
     name: str
     size: int = Field(..., ge=0)
-    kind: str = Field(default="clip", description="clip or stinger")
+    kind: str = Field(default="clip", description="clip, still or stinger")
     mode: str = Field(default="video", description="video | image_sequence | zip")
     options: ConvertOptionsIn = Field(default_factory=ConvertOptionsIn)
 
