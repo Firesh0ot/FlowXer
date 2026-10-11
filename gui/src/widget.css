@@ -49,6 +49,18 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .bus-actions .cut { background: #3a1518; border-color: #6a2a30; color: #fff; }
 .bus-actions .auto { background: #15243a; border-color: #2a4a6a; color: #fff; }
 .bus-widget button:hover { filter: brightness(1.15); }
+.keys-widget {
+  position: relative; min-width: 240px; min-height: 150px; height: 100%;
+  display: grid; align-content: start; gap: 6px; padding: 8px; background: var(--panel);
+}
+.key-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 64px; gap: 4px; align-items: stretch; min-height: 32px; }
+.key-label { display: flex; align-items: center; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key-row button {
+  font: inherit; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text); cursor: pointer;
+  background: var(--button); border: 1px solid var(--line); border-radius: 4px;
+}
+.key-row button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+.keys-widget button:hover { filter: brightness(1.15); }
 .empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 .widget-error {
   position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;

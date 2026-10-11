@@ -237,6 +237,16 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   display: flex; align-items: center; gap: 2px; padding: 0 6px; font-size: 11px; color: var(--muted);
   border: 1px solid var(--line); border-left: 0; border-radius: 0 4px 4px 0; background: #151b26;
 }
+.dsk-control { position: relative; }
+.dsk-control .gear { padding: 0 6px; border-left: 0; }
+.key-settings {
+  position: absolute; top: 100%; left: 0; z-index: 5; display: grid; gap: 4px; min-width: 220px; padding: 8px;
+  background: #10141d; border: 1px solid var(--line); border-radius: 4px; font-size: 11px; color: var(--muted);
+}
+.key-settings label { display: grid; gap: 2px; border: 0; padding: 0; background: none; }
+.key-settings label.check { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.key-settings input[type="range"] { width: 100%; }
+.key-settings select { background: #0b1220; color: var(--text); border: 1px solid var(--line); padding: 3px; }
 .dsk-control input {
   width: 44px; background: #0b1220; color: var(--text); border: 1px solid var(--line); font: inherit; padding: 1px 3px;
 }

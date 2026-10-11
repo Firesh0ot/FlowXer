@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { LibraryModal } from "./components/LibraryModal";
 import { Monitor } from "./components/Monitor";
-import { DskControl } from "./components/DskControl";
+import { KeyerControl } from "./components/KeyerControl";
 import { previewSession } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
@@ -75,6 +75,11 @@ export default function App() {
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
   const fps = framesPerSecond(snapshot.formats.find((item) => item.id === snapshot.workspace.format_id)?.frame_rate);
+  // A luma key may key any source the ME may take: the inputs and the Programs of higher MEs.
+  const keySources = [
+    ...snapshot.inputs.map((item) => ({ id: item.id, label: item.label })),
+    ...snapshot.panels.slice(snapshot.panels.indexOf(panel) + 1).map((item) => ({ id: item.id, label: item.label })),
+  ];
   const playable = (snapshot.library ?? []).filter((item) => item.ready && (item.kind === "clip" || item.kind === "still"));
 
   return (
@@ -186,15 +191,19 @@ export default function App() {
           </div>
         </div>
         <div className="aux-row">
-          {snapshot.keyers.map((keyer) => (
-            <DskControl
-              key={keyer.id}
-              keyer={keyer}
-              keyState={snapshot.sources?.[keyer.id]?.state}
-              fps={fps}
-              onCommand={(fn) => void command(fn)}
-            />
-          ))}
+          {/* The active ME's upstream keyers, then its DSKs (keys show on its Program only). */}
+          {snapshot.keyers
+            .filter((keyer) => keyer.panel_id === panel.id)
+            .map((keyer) => (
+              <KeyerControl
+                key={keyer.id}
+                keyer={keyer}
+                keyState={snapshot.sources?.[keyer.id]?.state}
+                sources={keySources}
+                fps={fps}
+                onCommand={(fn) => void command(fn)}
+              />
+            ))}
           {snapshot.stinger_slots.map((slot) => (
             <div key={slot.id} className="stinger-chip">
               <button

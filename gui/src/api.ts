@@ -48,12 +48,21 @@ export interface MixerPanel {
   ftb?: boolean;
 }
 
-export interface DownstreamKeyer {
+/** An upstream keyer or a DSK of one ME: linear (its v210a key input) or luma (a source). */
+export interface Keyer {
   id: string;
   label: string;
+  panel_id: string;
+  stage: "upstream" | "downstream";
   enabled: boolean;
   /** Duration of its Auto. */
   rate_ms: number;
+  mode: "linear" | "luma";
+  source_id: string | null;
+  clip: number;
+  soft: number;
+  gain: number;
+  invert: boolean;
 }
 
 /** What the engine reports for an input (GET /console `sources`); clip players add the transport. */
@@ -127,7 +136,8 @@ export interface WorkspaceConfig {
   mixer_panel_count: number;
   stinger_mode: string;
   stinger_count: number;
-  downstream_keyer_count: number;
+  keyers_per_me: number;
+  dsks_per_me: number;
   source_tile_aspect?: "16:9" | "9:16";
 }
 
@@ -219,7 +229,7 @@ export interface ConsoleState {
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
   inputs: LogicalInput[];
   panels: MixerPanel[];
-  keyers: DownstreamKeyer[];
+  keyers: Keyer[];
   stinger_slots: StingerSlot[];
   mixer: MixerStatus;
   resources: ResourceInfo;
@@ -312,7 +322,7 @@ export const api = {
     }).then((r) => parse<LogicalInput>(r)),
   keyerAuto: (id: string) =>
     fetch(`/api/v1/keyers/${id}/auto`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) =>
-      parse<DownstreamKeyer>(r),
+      parse<Keyer>(r),
     ),
   /** Clip player transport: cue (a frame, 0 = the first), play, pause, stop. */
   player: (inputId: string, action: "cue" | "play" | "pause" | "stop", frame = 0) =>
@@ -326,7 +336,7 @@ export const api = {
       method: "PATCH",
       headers: jsonHeaders,
       body: JSON.stringify(payload),
-    }).then((r) => parse<DownstreamKeyer>(r)),
+    }).then((r) => parse<Keyer>(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",

@@ -176,7 +176,8 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
         "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
         "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
         "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
-        "Cut/Auto and the transition type (`transition=false` hides it) of one ME."
+        "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
+        "upstream keyers and DSKs with On/Off and Auto."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
@@ -189,7 +190,14 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "params": {"type": "object", "properties": {"me": me, "transition": transition}, "required": ["me"]},
             "min_size": {"w": 480, "h": 150},
             "version": __version__,
-        }
+        },
+        {
+            "id": "keys",
+            "title": "FlowXer keys",
+            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "min_size": {"w": 240, "h": 150},
+            "version": __version__,
+        },
     ]
 
 
