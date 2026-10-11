@@ -33,18 +33,22 @@ control plane. One image, one code path; an NVIDIA GPU is required
 - DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
   (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM and
   PVW; on, off, auto.
-- Library: a clip's mezzanine is HEVC 4:4:4 10-bit (x265 CRF 8, a key frame
-  every second, no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32
-  sound file, instead of ProRes 422 HQ. The 4:2:2 picture goes in with each
-  chroma sample repeated, so the engine gets the 4:2:2 picture back. About
-  150–320 MB per minute at 1080p50, up to 1.5 GB with heavy grain. Stills
+- Library: a clip's mezzanine is HEVC 4:4:4 10-bit (a key frame every second,
+  no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32 sound file,
+  instead of ProRes 422 HQ. NVENC encodes it with constant QP 8 (about 90
+  frames/s on air: a minute of clip in about 35 s); without NVENC x265 with
+  CRF 8 (7–10 frames/s), logged once. The 4:2:2 picture goes in with each
+  chroma sample repeated, so the engine gets the 4:2:2 picture back. At least
+  56 dB PSNR, about 200–400 MB per minute at 1080p50 (x265: 150–320 MB), up
+  to 2.4 GB with heavy grain (x265: 1.5 GB). Stills
   (uploads, and pictures in the import dir) become one v210 picture. A clip
   converted before is converted again at the next start (the original stays,
-  the ProRes mezzanine goes). Conversions give the encoder the container's CPU
-  limit less two cores (8 threads without a limit) and decode and filter on one
-  thread, and numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`):
-  a conversion that filled the limit got the container throttled and the
-  engine skipped grains.
+  the ProRes mezzanine goes). A conversion uses the container's CPU limit less
+  two cores (8 threads without a limit): for decoding and scaling with NVENC,
+  for x265's workers otherwise (decoding and scaling then on one thread), and
+  numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`): a conversion
+  that filled the limit got the container throttled and the engine skipped
+  grains.
 - Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
   `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
   `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,

@@ -114,19 +114,52 @@ def test_build_video_filter_fill_motion():
 
 def test_clip_commands(tmp_path: Path):
     """The clip mezzanine is HEVC 4:4:4 10-bit (NVDEC has no 4:2:2), never 4:2:0: the 4:2:2
-    picture widened by repeating each chroma sample; no B-frames, a key frame per second; x265
-    with its thread budget, decoding and scaling with one thread each."""
-    video = build_clip_video_command(original=tmp_path / "in.mov", video_tmp=tmp_path / "v.mkv", vf="fps=50/1", keyint=50, threads=4)
+    picture widened by repeating each chroma sample; no B-frames, a key frame per second. NVENC
+    with constant QP (decoding and scaling get the thread budget), else x265 with CRF (x265 gets
+    the budget, decoding and scaling one thread each)."""
+    common = dict(original=tmp_path / "in.mov", video_tmp=tmp_path / "v.mkv", vf="fps=50/1", keyint=50, threads=4)
+    video = build_clip_video_command(**common, nvenc=True)
     assert video[0] == "ffmpeg"
+    assert video[video.index("-c:v") + 1] == "hevc_nvenc"
+    assert video[video.index("-profile:v") + 1] == "rext"
+    assert video[video.index("-rc") + 1] == "constqp" and video[video.index("-qp") + 1] == "8"
+    assert video[video.index("-bf") + 1] == "0" and video[video.index("-g") + 1] == "50"
+    assert video[video.index("-vf") + 1] == "fps=50/1,scale=flags=neighbor,format=yuv444p16le"
+    before_input = video[: video.index("-i")]
+    # The last -threads/-filter_threads before the input win: half the budget each.
+    assert before_input[len(before_input) - 1 - before_input[::-1].index("-threads") + 1] == "2"
+    assert before_input[len(before_input) - 1 - before_input[::-1].index("-filter_threads") + 1] == "2"
+    assert video[video.index("-protocol_whitelist") + 1] == "file"
+    assert video[-3:] == ["-f", "matroska", str(tmp_path / "v.mkv")]
+
+    video = build_clip_video_command(**common, nvenc=False)
     assert video[video.index("-threads") + 1] == "1" and video.index("-threads") < video.index("-i")
     assert video[video.index("-filter_threads") + 1] == "1"
+    assert video.count("-threads") == 1 and video.count("-filter_threads") == 1
     assert video[video.index("-c:v") + 1] == "libx265"
     assert video[video.index("-profile:v") + 1] == "main444-10"
     assert video[video.index("-vf") + 1] == "fps=50/1,scale=flags=neighbor,format=yuv444p10le"
     params = video[video.index("-x265-params") + 1]
     assert "keyint=50:min-keyint=50:bframes=0" in params and "crf=8" in params and "pools=4" in params
-    assert video[video.index("-protocol_whitelist") + 1] == "file"
     assert video[-3:] == ["-f", "matroska", str(tmp_path / "v.mkv")]
+
+
+def test_nvenc_is_probed_once_and_x265_is_the_fallback(caplog):
+    calls = []
+
+    def runner(cmd, timeout=None, cancel=None):
+        calls.append(cmd)
+        return RunResult(code=1, stderr="[hevc_nvenc] Cannot load libnvidia-encode.so.1")
+
+    ff = FFmpeg(runner=runner)
+    with caplog.at_level("WARNING"):
+        assert ff.has_nvenc() is False
+        assert ff.has_nvenc() is False
+    assert len(calls) == 1 and "hevc_nvenc" in calls[0]
+    assert [r.getMessage() for r in caplog.records if "NVENC" in r.getMessage()] == [
+        "NVENC cannot be opened ([hevc_nvenc] Cannot load libnvidia-encode.so.1): clip mezzanines are encoded with x265"
+    ]
+    assert FFmpeg(runner=lambda cmd, timeout=None, cancel=None: RunResult(code=0)).has_nvenc() is True
 
 
 def test_conversion_threads_leave_the_engine_two_cores(tmp_path: Path):

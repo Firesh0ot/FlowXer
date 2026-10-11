@@ -405,7 +405,14 @@ class ConversionQueue:
             keyint = max(1, round(fmt.frame_rate_num / fmt.frame_rate_den))
             result = self._run(
                 item,
-                build_clip_video_command(original=original, video_tmp=video_tmp, vf=vf, keyint=keyint, threads=self.threads),
+                build_clip_video_command(
+                    original=original,
+                    video_tmp=video_tmp,
+                    vf=vf,
+                    keyint=keyint,
+                    threads=self.threads,
+                    nvenc=self.ffmpeg.has_nvenc(),
+                ),
                 timeout,
                 cancel,
             )

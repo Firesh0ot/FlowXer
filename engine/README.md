@@ -569,3 +569,25 @@ of its conversion: its sound crossfade is the first use of numpy, whose OpenBLAS
 spinning thread per host core (a burst of 17 cores within 20 ms, `fxp2-cgsample.py`). With
 `OPENBLAS_NUM_THREADS=1` in the image, `fxp2-functional.py` (upload and conversion on air)
 saw 0 throttled periods, 0 skipped and 0 late grains in 2 of 2 runs.
+
+### NVENC import (2026-10-11, after M2)
+
+NVENC encodes the mezzanine by default since then; x265 is the fallback when NVENC cannot be
+opened. Same format (HEVC Rext 4:4:4 10-bit from FFmpeg's `yuv444p16le`, repeated chroma, GOP
+50 with an IDR each, no B-frames), constant QP 8: the lowest QP step that keeps the promo at
+56 dB. 10 s clips, PSNR of the round trip as in the table above:
+
+| Encoder | player-perf clip | its UHD scene | promo | heavy grain |
+|---|---|---|---|---|
+| NVENC QP 8 | 406 MB/min, 60.0 dB | 382 MB/min, 59.9 dB | 208 MB/min, 56.0 dB | 2399 MB/min, 52.1 dB |
+| NVENC QP 10 | 364 MB/min, 58.2 dB | 339 MB/min, 58.0 dB | 170 MB/min, 55.5 dB | 2037 MB/min, 50.7 dB |
+| x265 CRF 8 | 318 MB/min, 57.7 dB | 286 MB/min, 57.0 dB | 154 MB/min, 56.5 dB | 1535 MB/min, 48.4 dB |
+
+- A lossless NVENC clip (`-tune lossless`) plays bit for bit through NVDEC and the engine
+  (`fxp2-clip-test.py` 19/19), the QP 8 clip 18/18.
+- Speed is the CPU's decoding and scaling: with the 6-core limit, 1 + 1 threads 48 frames/s,
+  2 + 2 (what the library uses there) 93–99, 4 + 2 128, 4 + 4 159, all without a throttled
+  period. In FlowXer on air (`fxp2-functional.py`, upload of the 10 s ProRes clip): 5.6–6.2 s
+  including probe, sound and thumbnail (80–89 frames/s; a minute of clip in about 35 s), NVENC
+  at most 55 %, beside the mosaic's NVENC session: 0 skipped or late grains, 0 throttled
+  periods, the mosaic at 25 frames/s with no dropped frame.

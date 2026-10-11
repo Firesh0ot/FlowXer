@@ -117,9 +117,23 @@ class FFmpeg:
 
     def __init__(self, runner: Runner | None = None) -> None:
         self.runner = runner or default_runner
+        self._nvenc: bool | None = None
 
     def which(self) -> bool:
         return ffmpeg_available()
+
+    def has_nvenc(self) -> bool:
+        """NVENC opens for HEVC 4:4:4 10-bit (tried once, with a tiny picture); the result is
+        logged once."""
+        if self._nvenc is None:
+            result = self.runner(_NVENC_PROBE, timeout=30.0)
+            self._nvenc = result.code == 0
+            if self._nvenc:
+                log.info("NVENC available: clip mezzanines are encoded on the GPU")
+            else:
+                reason = (result.stderr or "").strip().splitlines()[-1:] or [str(result.code)]
+                log.warning("NVENC cannot be opened (%s): clip mezzanines are encoded with x265", reason[0])
+        return self._nvenc
 
     def probe(self, path: Path) -> ProbeResult:
         cmd = [
@@ -272,37 +286,50 @@ def conversion_timeout(duration_s: float, *, motion: bool = False) -> float:
     return 300.0 + max(duration_s, 0.0) * (60.0 if motion else 10.0)
 
 
-# The clip mezzanine: HEVC 4:4:4 10-bit, which NVDEC decodes (it has no 4:2:2 HEVC). The 4:2:2
+# The clip mezzanine: HEVC Main 4:4:4 10, which NVDEC decodes (it has no 4:2:2 HEVC). The 4:2:2
 # picture is widened by repeating each chroma sample, so the engine's 4:4:4 -> 4:2:2 (the mean of
-# each pair) gives the 4:2:2 picture back. CRF 8: 56-58 dB PSNR against the 4:2:2 source on the
-# lab's clips (48 dB on heavy grain). No B-frames and a key frame every second: a cue decodes at
-# most one second.
+# each pair) gives the 4:2:2 picture back. No B-frames and a key frame every second: a cue decodes
+# at most one second. NVENC with constant QP 8, else x265 with CRF 8: at least 56 dB PSNR against
+# the 4:2:2 source on the lab's clips (48-52 dB on heavy grain).
+CLIP_NVENC_QP = 8
 CLIP_CRF = 8
+# NVENC opens for HEVC 4:4:4 10-bit (FFmpeg's yuv444p16le holds 10 bits in the high bits).
+_NVENC_PROBE = [
+    "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:r=50:d=0.1",
+    "-vf", "format=yuv444p16le", "-c:v", "hevc_nvenc", "-profile:v", "rext", "-f", "null", "-",
+]
 
 
-def build_clip_video_command(*, original: Path, video_tmp: Path, vf: str, keyint: int, threads: int) -> list[str]:
+def build_clip_video_command(*, original: Path, video_tmp: Path, vf: str, keyint: int, threads: int, nvenc: bool) -> list[str]:
     """Clip picture to the HEVC 4:4:4 10-bit mezzanine (Matroska); the sound is conformed by its
-    own command into a raw file next to it. x265 gets `threads` workers (conversion_threads);
-    decoding and scaling, on one thread each, keep up with it."""
-    params = f"crf={CLIP_CRF}:keyint={keyint}:min-keyint={keyint}:bframes=0:scenecut=0:pools={threads}:log-level=error"
+    own command into a raw file next to it. `threads` is the conversion's CPU budget
+    (conversion_threads). NVENC encodes on the GPU, so decoding and scaling get the budget
+    (half each). x265 gets it for its workers; decoding and scaling, on one thread each, keep up
+    with it."""
+    if nvenc:
+        helpers = str(max(1, threads // 2))
+        # After _INPUT: these override its one-thread defaults.
+        threading_args = ["-filter_threads", helpers, "-threads", helpers]
+        picture = "yuv444p16le"
+        encoder = ["-c:v", "hevc_nvenc", "-profile:v", "rext", "-preset", "p5", "-tune", "hq", "-rc", "constqp",
+                   "-qp", str(CLIP_NVENC_QP), "-bf", "0", "-g", str(keyint)]
+    else:
+        params = f"crf={CLIP_CRF}:keyint={keyint}:min-keyint={keyint}:bframes=0:scenecut=0:pools={threads}:log-level=error"
+        threading_args = []
+        picture = "yuv444p10le"
+        encoder = ["-c:v", "libx265", "-profile:v", "main444-10", "-preset", "medium", "-x265-params", params]
     return [
         *_FFMPEG,
         *_INPUT,
+        *threading_args,
         "-i",
         str(original),
         "-an",
         "-sn",
         "-dn",
         "-vf",
-        f"{vf},scale=flags=neighbor,format=yuv444p10le",
-        "-c:v",
-        "libx265",
-        "-profile:v",
-        "main444-10",
-        "-preset",
-        "medium",
-        "-x265-params",
-        params,
+        f"{vf},scale=flags=neighbor,format={picture}",
+        *encoder,
         "-f",
         "matroska",
         str(video_tmp),
