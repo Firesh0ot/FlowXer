@@ -25,6 +25,26 @@ control plane. One image, one code path; an NVIDIA GPU is required
 - `GET /api/v1/engine` (timing, arrival lag per input, recommended latency),
   `GET /api/v1/preview` (the mosaic stream and its tile map),
   `POST /players/{id}/{action}`, `POST /keyers/{id}/auto`.
+- Clip players: a library clip plays from its mezzanine, decoded on the GPU
+  (NVDEC), with its sound in audio-follows-video; a still is uploaded once and
+  held (frame memory). Loop and play on cut (it starts when the player goes to
+  Program) on the input (`PATCH /inputs/{id}`); transport cue, play, pause,
+  stop. An empty player is black. The colour bars ship as a library still.
+- DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
+  (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM and
+  PVW; on, off, auto.
+- Library: a clip's mezzanine is HEVC 4:4:4 10-bit (x265 CRF 8, a key frame
+  every second, no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32
+  sound file, instead of ProRes 422 HQ. The 4:2:2 picture goes in with each
+  chroma sample repeated, so the engine gets the 4:2:2 picture back. About
+  150–320 MB per minute at 1080p50, up to 1.5 GB with heavy grain. Stills
+  (uploads, and pictures in the import dir) become one v210 picture. A clip
+  converted before is converted again at the next start (the original stays,
+  the ProRes mezzanine goes). Conversions give the encoder the container's CPU
+  limit less two cores (8 threads without a limit) and decode and filter on one
+  thread, and numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`):
+  a conversion that filled the limit got the container throttled and the
+  engine skipped grains.
 - Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
   `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
   `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,

@@ -1,15 +1,15 @@
-# flowxer-engine (prototype P1)
+# flowxer-engine
 
-A C++17/CUDA mix engine for the next FlowXer version. It reads up to 8 MXL v210 inputs (with
-their audio), renders 4 MEs (Program and Preview) every grain on the GPU, writes PGM video +
-audio and PVW video of every ME back to MXL, and publishes one preview mosaic (NVENC H.264 →
-MediaMTX → WHEP). A small control page drives it. The design is [DESIGN.md](DESIGN.md); this
-file says how to build, run and configure it, and what was measured.
+FlowXer's C++17/CUDA media engine. It reads the live MXL v210 inputs (with their audio), plays
+the clip players (clips decoded by NVDEC, stills), renders up to 4 MEs (Program and Preview)
+every grain on the GPU with the downstream keyer, writes PGM video + audio and PVW video of
+every ME back to MXL, and publishes one preview mosaic (NVENC H.264 → MediaMTX → WHEP).
 
-P1 has no NMOS and no designer integration: inputs and outputs are MXL flow ids from the
-configuration, and it is controlled over a small HTTP API and its page. It can stand in for a
-FlowXer instance by taking over that instance's output flow ids (see [Drop-in for a FlowXer
-instance](#drop-in-for-a-flowxer-instance)). The Python control plane drives it in P2.
+Since P2 it is FlowXer's media path: the Python control plane (`src/flowxer/engine/runtime.py`)
+starts it as a child process with a configuration file, restarts it with backoff, and drives
+it over its control API on 127.0.0.1 (NMOS, IS-05 routes, tally, the library and the GUI stay
+in Python). The P1 design is [DESIGN.md](DESIGN.md); the P1 sections below (drop-in,
+measurements) are kept as its record.
 
 ## How it works
 
@@ -21,11 +21,14 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   keeps its last grain on screen (counted as late); a re-created flow (FLOW_INVALID) is
   opened again; a missing one is retried.
 - **Render thread** (`fx-render`): wakes when output grain *i* becomes the current grain on
-  the TAI grid and composes it from input grains *i − L* (fixed latency, `L` = 2 by default).
+  the TAI grid and composes it from input grains *i − L* (fixed latency, `L` = 4 by default).
   It unpacks each input that an ME uses once, renders ME 4 → ME 1 (so ME 1 can take ME 2's
   Program from the same grain), packs all outputs to v210 and, every second grain, draws the
   mosaic. All of this is queued on one CUDA stream; the thread does not wait for the GPU.
   When it is late it skips to the current grain and counts the skip; it never slides.
+  The downstream keyer keys over its ME's Program and Preview there.
+- **Clip player threads** (`fx-cp1` …), one per clip player: decode the loaded clip ahead
+  (NVDEC) or upload the still once; see [Clip players](#clip-players).
 - **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
   queues the DMA download straight into the MXL grain on a separate download stream, waits
   for each copy and commits. Then it writes the PGM audio of grain *i* (see below). Upload,
@@ -34,8 +37,6 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   encodes it (one session, whatever the number of viewers) and sends it over RTSP/TCP to
   MediaMTX: the platform's shared one (`PREVIEW_PUBLISH_URL`) or, without it, the MediaMTX
   the engine starts itself (bundled in the image; restarted if it exits).
-- **Tally thread** (`fx-tally`, only with `FLOWXER_TALLY_TSL`): the raw TSL 5.0 tally of every
-  ME, on each change and once a second.
 - **Stats thread** (`fx-stats`): CPU per thread and GPU/NVENC load once a second; watches the
   own MediaMTX.
 
@@ -47,8 +48,9 @@ waits in MXL, condition variables): no busy loops.
 
 ### MEs
 
-- Sources: `in1`..`in8` and `me2`..`me4`. ME *m* may take the Program of ME *n* only when
-  *n > m* (re-entry, 0 frames, no loops possible).
+- Sources: the live inputs `in1`..`inN`, the clip players `cp1`..`cpC`, `black` and
+  `me2`..`me4`. ME *m* may take the Program of ME *n* only when *n > m* (re-entry, 0 frames,
+  no loops possible).
 - Program renders every grain into its own bus buffer (a copy, or the dissolve during a Mix);
   Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
   `<label> ME<m> PVW`).
@@ -59,8 +61,9 @@ waits in MXL, condition variables): no busy loops.
 
 ### PGM audio (audio follows video)
 
-- Each ME's PGM audio is the audio of its Program source: an input's audio flow, or the PGM
-  audio of the re-entered ME. Preview has no audio; the mosaic has none.
+- Each ME's PGM audio is the audio of its Program source: an input's audio flow, a clip
+  player's sound, or the PGM audio of the re-entered ME. Preview has no audio; the mosaic has
+  none.
 - During a Mix the two sources crossfade with **equal power** (gains cos and sin of t·90°, so
   two unrelated sources keep their loudness; −3 dB each in the middle). t ramps sample by
   sample through each grain, so there are no steps.
@@ -73,6 +76,50 @@ waits in MXL, condition variables): no busy loops.
   there (stalled, missing) is silent for that grain and counted; a skipped video grain still
   gets its audio, so the audio flow has no holes.
 
+### Clip players
+
+A clip player (`FLOWXER_ENGINE_PLAYERS`, `cp<k>`) shows a clip or a still from FlowXer's
+library, or black when it is empty. FlowXer loads it (`POST /player/<k>/load` with the files
+of the library item for the current format) and drives the transport.
+
+- **Clips** are the library's mezzanine: HEVC Main 4:4:4 10 (Ampere's NVDEC decodes HEVC
+  4:4:4 but no 4:2:2) at the engine's raster and rate, with a raw float32 sound file of exactly
+  the clip's frames. The player's thread decodes up to 5 frames ahead into CUDA frames (FFmpeg
+  with NVDEC, on the engine's CUDA context), converts each to v210 on the GPU (chroma 4:4:4 →
+  4:2:2 as the mean of each pixel pair: the library widened the 4:2:2 picture by repeating each
+  chroma sample, so this is exact) and reads its sound. Anything else (e.g. a ProRes file) is
+  refused: the library converts it.
+- **Stills** are one v210 picture at the raster, uploaded once: a frame memory.
+- **Transport** (`core/playout.cpp`): load cues the first frame; `cue` shows a frame and holds;
+  `play`; `pause` holds the frame shown; `stop` goes back to the first frame and holds. A
+  playing clip shows one frame per output grain on the TAI grid (grains the render thread
+  skipped advance it too). With **loop** it goes on over the end without a break; without,
+  it holds its last frame (`ended`; `play` starts it over). With **play on cut** a cued,
+  paused or ended clip starts when the player goes on air (into an ME's Program, or as the
+  incoming source of a Mix). Loading the file that is loaded already changes only loop and play
+  on cut.
+- **Sound:** the frame's samples on the library's grid (frame *f* starts at sample
+  ⌊f · 48000 · den / num⌋), so a loop has no drift; it plays only while the clip plays (held
+  frames are silent) and goes into audio-follows-video like an input's audio. A mono clip
+  plays on every channel.
+- A frame the decoder does not have in time (right after a load or cue) repeats the last
+  picture and counts as `late`. `GET /status` → `players`: state, frame, frames, loop, play on
+  cut, frames decoded ahead, decode time, late frames, error.
+- GPU memory: 9 v210 pictures per player (50 MB at 1080p) from the start, plus about 170 MB
+  for the NVDEC decoder while a clip is loaded (its surfaces and FFmpeg's frame pool, 4:4:4
+  16-bit). NVDEC: one 1080p50 player at 40–60 Mbit/s takes about 4 % of the A16 GPU's
+  decoders, 6 % of a CPU core.
+
+### Downstream keyer (DSK)
+
+`FLOWXER_ENGINE_KEYS` gives each key input (a v210a flow: the v210 fill followed by a 10-bit
+key plane, e.g. mxl-browser-source in `v210a` mode) its DSK on one ME (FlowXer: `DSK 1 Key` on
+ME 1). It keys linearly over the ME's Program and Preview (Preview shows what Program will look
+like): out = fill · α + background · (1 − α) with α = key / 1023 · gain, per sample (chroma: the
+mean α of its pixel pair), straight fill. The key is read at grain *i − L* like an input; an
+unrouted key input keys nothing. `POST /dsk/<k>` `{"on": bool}` cuts it, `/dsk/<k>/auto`
+`{"frames": n}` fades the gain over n grains.
+
 ### Working format
 
 `FLOWXER_ENGINE_WORK_FORMAT` selects the format the MEs render in:
@@ -81,19 +128,18 @@ waits in MXL, condition variables): no busy loops.
 
 ## Build
 
+The FlowXer image (the repository's `Dockerfile`) builds the engine in a CUDA stage, runs its
+unit tests and installs it as `/usr/local/bin/flowxer-engine`:
+
 ```bash
-docker build -t flowxer-engine:p1 engine/            # build + unit tests (no GPU needed)
-docker run --rm --gpus all flowxer-engine:p1 --selftest   # GPU kernels against the CPU reference
+docker build -t flowxer .
+docker run --rm --gpus all --entrypoint flowxer-engine flowxer --selftest   # GPU kernels against the CPU reference
 ```
 
-The image is CUDA 12.8.2 / Ubuntu 24.04 with MXL 218ddaa (as the multiviewer and replay
-images), Ubuntu's FFmpeg (`h264_nvenc`) and MediaMTX 1.20.1. The GPU, NVENC and NVML come from
-the NVIDIA container toolkit: run with a GPU and `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`
-(the image sets it).
-
-CI: `.github/workflows/engine-proto.yml` builds it on every push to `proto/mix-engine` that
-touches `engine/` and pushes `ghcr.io/firesh0ot/flowxer-engine:proto-<short sha>` and
-`:proto-latest`. It is separate from FlowXer's dev/stage/main workflows (no version bump).
+CUDA 12.8 / Ubuntu 24.04 with MXL 218ddaa, Ubuntu's FFmpeg (NVDEC, NVENC) and MediaMTX. The
+GPU, NVDEC, NVENC and NVML come from the NVIDIA container toolkit: run with a GPU and
+`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (the image sets it). CI builds the unit
+tests (`fxeng-tests`) and the image.
 
 Without Docker: CMake ≥ 3.24, a CUDA toolkit, MXL installed (`CMAKE_PREFIX_PATH`),
 `libavcodec/libavformat/libavutil` and nlohmann-json. `-DFXENG_BUILD_ENGINE=OFF` builds only
@@ -101,66 +147,63 @@ the unit tests (`fxeng-tests`), which need none of these except nlohmann-json.
 
 ## Run
 
-The engine needs the MXL domains (`/Volumes/mxl`) and a GPU. Without `PREVIEW_PUBLISH_URL`
-it runs its own MediaMTX for the mosaic (self-contained); on the platform it publishes to the
-shared one.
+FlowXer starts the engine (`FLOWXER_ENGINE_PORT`, default 9630, on 127.0.0.1). For tests it
+runs alone; it needs the MXL domains (`/Volumes/mxl`) and a GPU. Without `PREVIEW_PUBLISH_URL`
+it runs its own MediaMTX for the mosaic; on the platform it publishes to the shared one.
 
 ```bash
-docker run -d --name fxeng-engine --network host --user 1000:1000 --gpus '"device=0"' \
-  -v /Volumes/mxl:/Volumes/mxl \
-  -e FLOWXER_ENGINE_INPUTS='[{"domain":"/Volumes/mxl/player","video_flow":"<id>","audio_flow":"<id>","label":"Cam 1"}, ...]' \
-  -e FLOWXER_ENGINE_HTTP_BIND=0.0.0.0 \
-  flowxer-engine:p1
-docker run --rm -e FLOWXER_ENGINE_CONFIG=/cfg/engine.json -v $PWD:/cfg flowxer-engine:p1 --check   # resolved config
+docker run -d --name engine --network host --user 1000:1000 --gpus '"device=0"' \
+  -v /Volumes/mxl:/Volumes/mxl -v $PWD/media:/media:ro \
+  -e FLOWXER_ENGINE_INPUTS='[{"label":"Cam 1"},{"label":"Cam 2"}]' \
+  -e FLOWXER_ENGINE_PLAYERS='[{"label":"Clip 1"}]' \
+  --entrypoint flowxer-engine flowxer
+docker exec engine flowxer-engine --check   # the resolved configuration
 ```
-
-The control page is `http://<host>:9630/`: one row of input pictures, and per ME its Preview
-and Program pictures, PGM and PVW bus buttons (inputs, and the higher MEs for re-entry), CUT,
-AUTO with a duration in grains and the Mix progress. Red = Program, green = Preview, amber =
-the incoming source of a running Mix. It plays one WHEP session of the mosaic and shows each
-picture as a `<video>` on that one `MediaStream`, cropped with CSS `object-view-box: inset(…)`
-from `GET /mosaic/map` (Chrome/Edge 104+). No authentication: bind it to localhost (default)
-or a protected address. `/mosaic` is the plain test page (`?viewers=10` opens 10 independent
-WHEP sessions).
 
 The API with curl:
 
 ```bash
 curl -s localhost:9630/status | jq .output
-curl -s -X POST localhost:9630/me/1/preview -d '{"source":"in3"}'
+curl -s -X PUT localhost:9630/input/1 -d '{"video":{"domain":"/Volumes/mxl/player","flow":"<id>"},"audio":{"domain":"/Volumes/mxl/player","flow":"<id>"}}'
+curl -s -X POST localhost:9630/player/1/load -d '{"path":"/media/mezz-1080p50.mkv","kind":"clip","audio":"/media/mezz-1080p50.f32","channels":2,"loop":true}'
+curl -s -X POST localhost:9630/me/1/preview -d '{"source":"cp1"}'
 curl -s -X POST localhost:9630/me/1/auto -d '{"frames":25}'
+curl -s -X POST localhost:9630/player/1/play
 curl -s -X POST localhost:9630/me/1/program -d '{"source":"me2"}'   # re-entry
-curl -s -X POST localhost:9630/me/2/cut
 ```
 
 ## Configuration
 
 Environment variables, or the same keys in a JSON file named by `FLOWXER_ENGINE_CONFIG`
-(arrays as JSON, numbers as numbers; the environment wins). `flowxer-engine --check` prints
-what the engine will read and write. Example: [examples/friday-night-show-vmix1.json](examples/friday-night-show-vmix1.json).
+(arrays as JSON, numbers as numbers; the environment wins). FlowXer writes that file and
+passes no other `FLOWXER_ENGINE_*` variable. `flowxer-engine --check` prints what the engine
+will read and write.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FLOWXER_ENGINE_INPUTS` | (required) | JSON array of 1–8 `{"label", "domain", "video_flow", "audio_flow", "audio_domain"}`: `domain` is the MXL domain directory; no `video_flow` = black slot; no `audio_flow` = silent; `audio_domain` defaults to `domain` |
-| `FLOWXER_ENGINE_MES` | `4` | MEs (1–4), all rendering every grain |
-| `FLOWXER_ENGINE_LATENCY` | `2` | L: output grain *i* is made from input grains *i − L* (1–8) |
-| `FLOWXER_ENGINE_FORMAT` | `1080p50` | `720p`/`1080p`/`2160p` with `25`, `2997`, `30`, `50`, `5994`, `60`; inputs must match |
+| `FLOWXER_ENGINE_INPUTS` | (none) | JSON array of the live inputs in slot order, `{"label", "domain", "video_flow", "audio_flow", "audio_domain"}`; the routes are optional (`PUT /input/{k}` sets them at run time); no video flow = black slot, no audio flow = silent |
+| `FLOWXER_ENGINE_PLAYERS` | (none) | JSON array of the clip players `{"label"}`; inputs and players together at most 23 |
+| `FLOWXER_ENGINE_KEYS` | (none) | JSON array of up to 4 key inputs `{"label", "me", "domain", "flow"}`: a v210a flow and the ME of its DSK |
+| `FLOWXER_ENGINE_MES` | `1` | rendering MEs (1–4), all rendering every grain |
+| `FLOWXER_ENGINE_LATENCY` | `4` | L: output grain *i* is made from input grains *i − L* (1–10) |
+| `FLOWXER_ENGINE_FORMAT` | `1080p50` | `720p`/`1080p`/`2160p` with `25`, `2997`, `30`, `50`, `5994`, `60`; inputs and clips must match |
 | `FLOWXER_ENGINE_OUTPUT_DOMAIN` | `/Volumes/mxl/flowxer-engine` | MXL output domain directory of the MEs (created if missing) |
 | `FLOWXER_ENGINE_OUTPUT_DOMAIN_ID` | (generated) | `id` written to `domain_def.json` when the engine creates the domain (BCP-007-03 fields id, label, description, tags); an existing file is kept |
-| `FLOWXER_ENGINE_OUTPUTS` | (generated) | JSON array of `{"me", "domain", "domain_id", "pgm_video", "pgm_audio", "pvw_video"}`, all but `me` optional; an empty id is generated (stable for domain + ME + kind) |
+| `FLOWXER_ENGINE_OUTPUTS` | (generated) | JSON array of `{"me", "domain", "domain_id", "pgm_video", "pgm_audio", "pvw_video", "label", "group"}`, all but `me` optional; an empty id is generated (stable for domain + ME + kind) |
+| `FLOWXER_ENGINE_PVW_OUTPUTS` | `true` | write the PVW video flows; `false` renders PVW for the mosaic only |
 | `FLOWXER_ENGINE_AUDIO_CHANNELS` | `2` | channels of a PGM audio flow the engine creates |
-| `FLOWXER_ENGINE_LABEL` | `FlowXer engine` | prefix of the labels of the flows the engine creates |
+| `FLOWXER_ENGINE_AUDIO_WAIT_MS` | `8` | longest wait for input audio that is not there yet when its grain is written (0–40) |
+| `FLOWXER_ENGINE_LABEL` | `FlowXer` | prefix of the labels of the flows the engine creates |
 | `FLOWXER_ENGINE_WORK_FORMAT` | `yuv16` | `yuv16` or `rgba16f` |
 | `FLOWXER_ENGINE_GPU` | `0` | CUDA device index (inside the container) |
-| `FLOWXER_ENGINE_HTTP_BIND` | `127.0.0.1` | control page, API, metrics: address |
+| `FLOWXER_ENGINE_HTTP_BIND` | `127.0.0.1` | API and metrics: address |
 | `FLOWXER_ENGINE_HTTP_PORT` | `9630` | and port |
 | `FLOWXER_ENGINE_HOLD_GRAINS` | `0` | a stalled input holds its last grain this long, then black; 0 = until it comes back |
 | `FLOWXER_ENGINE_MOSAIC` | `true` | preview mosaic on/off |
 | `FLOWXER_ENGINE_MOSAIC_FPS` | `25` | mosaic frame rate (every second grain at 50p) |
 | `FLOWXER_ENGINE_MOSAIC_KBPS` | `6000` | NVENC bit rate (CBR) |
-| `FLOWXER_TALLY_TSL` | (empty) | raw TSL 5.0 tally, `udp://host:port` or `tcp://host:port`, as FlowXer's (below) |
 | `PREVIEW_PUBLISH_URL` | (empty) | shared MediaMTX to publish to (RTSP, e.g. `rtsp://mxl-mediamtx.mxl-platform.svc:8554`); empty: start the own MediaMTX |
-| `PREVIEW_PATH_PREFIX` | `flowxer-engine` | stream path prefix (`<production>/<function>`); the mosaic is `<prefix>/mosaic` |
+| `PREVIEW_PATH_PREFIX` | `flowxer` | stream path prefix (`<production>/<function>`); the mosaic is `<prefix>/mosaic` |
 | `PREVIEW_WHEP_URL` | (empty) | public WHEP base: the pages play `<base>/<prefix>/mosaic/whep`; empty: own MediaMTX on the page's host |
 | `PREVIEW_HLS_URL` | (empty) | public HLS base (`<base>/<prefix>/mosaic/index.m3u8`); empty: own MediaMTX |
 | `MEDIAMTX_RTSP_PORT` | `8654` | own MediaMTX: RTSP ingest, localhost only |
@@ -176,43 +219,43 @@ what the engine will read and write. Example: [examples/friday-night-show-vmix1.
 
 | Port | What | Notes |
 |---|---|---|
-| 9630/tcp | control page, API, `/status`, `/metrics`, `/mosaic` | localhost by default |
+| 9630/tcp | API, `/status`, `/metrics`, `/mosaic/map` | localhost by default |
 | 8654/tcp | own MediaMTX RTSP ingest | localhost only; not used with `PREVIEW_PUBLISH_URL` |
 | 8989/tcp | own MediaMTX WHEP | browsers |
 | 8988/tcp | own MediaMTX HLS | browsers |
 | 8289/udp+tcp | own MediaMTX ICE | browsers |
 | 9897/tcp | own MediaMTX API | localhost only |
 
-With `PREVIEW_PUBLISH_URL` set only 9630 is used (plus the outgoing TSL tally). The defaults
-avoid FlowXer (9610/9620), the multiviewer (8110) and mxl-webrtc-monitor (8100, MediaMTX
-8554/8888/8889/8189/9997/9998). RTMP, SRT and MoQ are off in the own MediaMTX.
-
-### Raw tally (`FLOWXER_TALLY_TSL`)
-
-The same contract as FlowXer's raw tally export (FlowXer README, "Raw tally export"), so the
-platform's tally calculator keeps working: TSL UMD 5.0, SCREEN = ME, INDEX = input slot from 0
-in configuration order (1000 + n for the re-entered Program of ME n), LH red on Program (both
-sources while a Mix runs), RH green on Preview, text tally off, brightness 3, TEXT = the input
-label in UTF-16LE. Every ME with all its sources, on each change and once a second; at most
-2048 bytes per packet; TCP with DLE/STX framing. After a failed send it retries after 1, 2, 5,
-then every 10 s (a UDP listener that is not up yet is not a failure). `/status` → `tally`
-counts packets and errors.
+With `PREVIEW_PUBLISH_URL` set only 9630 is used. The defaults avoid FlowXer (9610/9620), the
+multiviewer (8110) and mxl-webrtc-monitor (8100, MediaMTX 8554/8888/8889/8189/9997/9998).
+RTMP, SRT and MoQ are off in the own MediaMTX.
 
 ## API
+
+POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry).
 
 | Method and path | Body | Answer |
 |---|---|---|
 | `POST /me/{m}/preview` | `{"source": "in3"}` | the ME; 400 for a source the ME may not take, 409 during a Mix |
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
+| `POST /me/{m}/take` | `{"source", "frames", "preview"}` | Program to the source, cut (0 frames) or mixed, with an optional new Preview |
 | `POST /me/{m}/cut` | – | the ME |
 | `POST /me/{m}/auto` | `{"frames": 25}` (1–1000) | the ME; 409 while a Mix runs |
-| `GET /` | – | the control page |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs (video and audio state), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio`, `tally` |
+| `PUT /input/{k}` | `{"video": {"domain", "flow"}, "audio": {"domain", "flow"}}` | opens (or, without a flow, closes) the input's readers |
+| `PUT /key/{k}` | `{"domain", "flow"}` | the same for a key input (v210a) |
+| `POST /dsk/{k}` | `{"on": true}` | the DSK on or off at the next grain |
+| `POST /dsk/{k}/auto` | `{"frames": 25}` | fades the DSK on (or off when it is on) |
+| `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
+| `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
+| `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag), clip players, DSKs, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
 | `GET /metrics` | – | Prometheus text (`flowxer_engine_*`) |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
-| `GET /mosaic` | – | the test page |
+| `GET /livez` | – | `ok` |
 
 ## Drop-in for a FlowXer instance
+
+(P1. Since P2 the engine is FlowXer's media path, and ME 1 PGM keeps FlowXer's flow ids.)
 
 The engine can take over a FlowXer instance's outputs, so its consumers (multiviewer, monitor,
 replay) keep receiving without new IS-05 activations: they are activated on MXL flow ids.
@@ -438,3 +481,91 @@ output (video and PGM audio), 0 skipped, 2 late grains at start-up, lag 2.0 thro
 mosaic encoder connected once with 0 errors, the own MediaMTX never restarted. The replay
 outputs it reads have gaps of their own (157 and 166 invalid grains); the engine held the last
 grain and counted them per input.
+
+## P2 M2: clip players and DSK (lab, 2026-10-11)
+
+Lab host iptv-web-lab-1: A16 GPU 0, driver 595.84, Xeon Gold 6136; 1080p50.
+
+### Clip mezzanine
+
+`cuvidGetDecoderCaps` on the A16 (Ampere): HEVC 4:2:0 and 4:4:4 at 8, 10 and 12 bits are
+supported (2 NVDECs, up to 8192 × 8192), HEVC 4:2:2 is not. The mezzanine is therefore HEVC
+Main 4:4:4 10 with each 4:2:2 chroma sample repeated (never 4:2:0).
+
+10 s ProRes 422 HQ 4:2:2 10-bit sources, the library's settings (x265 `medium`, CRF 8, a key
+frame every second, no B-frames) on 8 cores; PSNR of the round trip back to 4:2:2; NVDEC flat
+out to CUDA frames (`ffmpeg -hwaccel cuda`):
+
+| Source | ProRes 422 HQ | Mezzanine | PSNR | x265 | NVDEC |
+|---|---|---|---|---|---|
+| player-perf clip (made from a 1080p H.264 file) | 1044 MB/min | 318 MB/min (42 Mbit/s) | 57.7 dB | 10.1 fps | 605 fps |
+| the same scene from its UHD ProRes | 1156 MB/min | 286 MB/min (38 Mbit/s) | 57.0 dB | 10.1 fps | |
+| a promo (1080p59.94 HEVC 4:2:2, conformed) | 2968 MB/min | 154 MB/min (21 Mbit/s) | 56.5 dB | 8.0 fps | 610 fps |
+| heavy grain (the UHD scene plus temporal noise) | 2914 MB/min | 1535 MB/min (204 Mbit/s) | 48.4 dB | 3.7 fps | 293 fps |
+
+- The preset `fast` is 1.3–1.6 × faster but up to a third larger (the first clip: 419 MB/min);
+  `medium` stays.
+- Round trip: a lossless HEVC 4:4:4 clip (repeated chroma) through NVDEC and the engine gives
+  every source frame bit for bit, and its sound sample for sample.
+- Not used, for comparison: NVENC (`hevc_nvenc`, Rext, constant QP 10) makes the first clip
+  at 364 MB/min and 58.2 dB at about 90 fps, on the GPU instead of the CPU.
+
+### Clip players
+
+Engine alone (1 ME, 4 players, no inputs, no mosaic), the CRF 8 clip looping on 0–4 players:
+
+| Playing | NVDEC | GPU (NVML) | Engine CPU | GPU memory |
+|---|---|---|---|---|
+| 0 | 0 % | 10 % | 0.02 cores | 377 MiB |
+| 1 | 4 % | 11 % | 0.07 cores | 547 MiB |
+| 2 | 7 % | 14 % | 0.16 cores | 713 MiB |
+| 3 | 11 % | 16 % | 0.21 cores | 880 MiB |
+| 4 | 14 % | 19 % | 0.25 cores | 1048 MiB |
+
+Decode and conversion 2.4–4.6 ms per frame on the player's own stream; the render total went
+from 2.10 to 2.25 ms. A loaded clip takes about 170 MiB for the decoder. Late frames only
+right after a load followed at once by play (2–3 per player).
+
+`fxp2-clip-test.py` (engine alone): 19 of 19 with the lossless clip (cued frame 0 holds bit for
+bit; play: every grain a source frame, one per grain, 153 pairs in order; the sound sample for
+sample; pause; cue 123; loop over the end; stop; the end without loop holds frame 499; play on
+cut; the bars still bit for bit; unload is black; a ProRes file and a wrong-size still are
+refused), 18 of 18 with the CRF 8 clip.
+
+### FlowXer with the engine (`fxp2-functional.py`)
+
+FlowXer image of this branch, 4 live inputs (test player), 2 clip players, 2 MEs, DSK 1,
+`docker --cpus 6`: the 37 M1 checks (IS-05, MEs, re-entry, NMOS, tally, arrival lag) and 27 new:
+
+- library: the colour bars are seeded and play on ME 1 PGM bit for bit (the still's v210);
+  a ProRes 422 HQ clip uploaded on air becomes the HEVC 4:4:4 mezzanine (319 MB/min) and its
+  sound file next to the original;
+- clip-1: cued holds; play makes a new picture every grain with the clip's sound on the PGM
+  audio (RMS 0.062); pause holds with silence; cue 480 + play loops; stop; play on cut starts
+  it with the Cut; without loop it ends on frame 499; an empty player is black;
+- DSK 1 from mxl-browser-source 1.1.0 (`BROWSER_KEY_MODE=v210a`, `transparency.html`: 0, 25,
+  50, 75, 100 % white, a red ramp) routed over IS-05 to "DSK 1 Key": ME 1 PGM over Black and
+  ME 1 PVW over a camera equal mix10(background, fill, key/1023) with a maximum error of 0
+  codes; the opaque white is 940; off; auto over 1 s rises 64 → 940 in even steps and falls
+  back; an unrouted key keys nothing.
+
+2 of 2 runs passed all 64 checks. GPU memory of that FlowXer (2 MEs, 4 inputs, a clip and the
+bars loaded, 1 key input, mosaic): 867 MiB.
+
+### Conversions on air
+
+A clip conversion runs in FlowXer's container next to the engine. With x265's own threading
+it filled the container's CPU limit and the whole container was throttled:
+
+| 10 s clip under a 6-core limit | x265 | Throttled periods | Engine skipped / late |
+|---|---|---|---|
+| x265 and ffmpeg threads automatic | 9.8 fps | 78 | 8 / 45 |
+| 4 x265 workers, decoding and filters on 2 threads (7 runs) | 7.0–9.5 fps | 0 | 0 / 0 |
+| 4 x265 workers, decoding and filters on 1 thread (2 runs) | 9.5 fps | 0 | 0 / 0 |
+
+So the library gives the encoder the limit less two cores and everything else one thread
+(`conversion_threads`). The first clip of a process still got 1–2 periods throttled at the end
+of its conversion: its sound crossfade is the first use of numpy, whose OpenBLAS started a
+spinning thread per host core (a burst of 17 cores within 20 ms, `fxp2-cgsample.py`). With
+`OPENBLAS_NUM_THREADS=1` in the image, `fxp2-functional.py` (upload and conversion on air)
+saw 0 throttled periods, 0 skipped and 0 late grains in 2 of 2 runs.

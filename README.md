@@ -421,15 +421,18 @@ cd gui && npm run dev
 
 ## Media library
 
-Clips and stingers share one ingest path: **upload → background conversion → intra-frame mezzanine → play**. Heavy work happens at ingest; playback decodes the mezzanine file (`playback` is `ram` for short items, `decode_ahead` for longer ones: a label of the RAM budget, both play from the file).
+Clips, stills and stingers share one ingest path: **upload → background conversion → mezzanine → play**. Heavy work happens at ingest. A clip player (`library_item_id` on its input) plays a clip from its mezzanine, decoded ahead on the GPU (NVDEC), or shows a still uploaded once to the GPU; the colour bars are a still that every new library starts with.
 
 Layout under `FLOWXER_LIBRARY_DIR` (default `storage/library/`):
 
 ```
 <id>/
   item.json
-  original… or sequence/
-  mezz-<format>.mov      # ProRes 422 HQ + stereo float PCM (clips) or ProRes 4444 with alpha, no sound (stingers)
+  original… or sequence/  # the uploaded file, never changed
+  mezz-<format>.mkv       # clip: HEVC 4:4:4 10-bit (x265 CRF 8)
+  mezz-<format>.f32       # clip: its sound, float32 48 kHz interleaved, stereo (or mono)
+  still-<format>.v210     # still: one v210 picture at the raster
+  mezz-<format>.mov       # stinger: ProRes 4444 with alpha, no sound
   thumb.jpg
   convert.log
 ```
@@ -439,9 +442,11 @@ Upload via the operator GUI (**File → Clip / Stinger library…**) or HTTP (`P
 - **Chunked upload:** `POST /uploads` with the file size (413 above `FLOWXER_UPLOAD_LIMIT_GB`, 507 when the library volume lacks the space), then `PUT /uploads/{id}/chunks/{n}` — every chunk exactly `chunk_size` bytes (8 MiB), the last one the rest (otherwise 413/422) — and `POST /uploads/{id}/complete`, which fails with 422 while a chunk is missing. Chunks go straight into place on disk and completing is a rename, so it answers at once; a repeated complete returns the same item. An upload idle for an hour is dropped, and leftovers are removed at start. A TGA ZIP is checked when the upload completes and unpacked by its conversion job. The GUI's nginx passes `/api/v1/uploads` through unbuffered and without a body size limit; the mixer enforces the limits.
 - **`POST /uploads/sequence`** (multipart: `name`, `sequence_fps`, `cut_frame`, `fit`, `files`): the frames are written to disk part by part, at most `FLOWXER_UPLOAD_LIMIT_GB` and 10 000 files. Frame names keep their padding, case (`.TGA`) and first number.
 - **Legacy storage:** files in `storage/clips` and `storage/stingers/<id>/` are imported in the background after start and referenced in place (not copied; their conversions wait behind uploads). Deleting an imported item leaves the legacy file alone and it is not imported again.
-- **Import dir** (`FLOWXER_IMPORT_DIR`): a file whose size held still for one scan (2 s) moves to `.processing/` and then into the library; a file that cannot be imported moves to `.failed/`. A read-only import dir is copied from, and each file (name, size, mtime) is imported once — also when it failed.
-- **Conversion:** ffmpeg runs under `nice -n 10` and `ionice -c3`, with a timeout that grows with the input length. The sound is padded or cut to whole frames inside ffmpeg and stored as stereo (or mono with `map_channels: 1`) big-endian float: GStreamer's MOV demuxer plays no more channels and reads float PCM as big-endian. A source with more channels is downmixed when its layout is known, else its first two channels are used. Cancelling a job (or deleting its item) kills its ffmpeg. A reconversion keeps the current mezzanine playable until the new one replaces it. A restart re-queues conversions it interrupted.
-- **Mixer state:** inputs and stinger slots that use the library are saved with `library_item_id` only; the mezzanine is looked up when the state (or `POST /config/import`) is loaded and again when a conversion ends. A clip assigned while it converts is black until then; a running Program picks it up at its next start.
+- **Import dir** (`FLOWXER_IMPORT_DIR`): a file whose size held still for one scan (2 s) moves to `.processing/` and then into the library (a picture such as `.png`, `.jpg` or `.tif` as a still, a ZIP as a stinger, anything else as a clip); a file that cannot be imported moves to `.failed/`. A read-only import dir is copied from, and each file (name, size, mtime) is imported once — also when it failed.
+- **Clip mezzanine:** the picture at the raster and rate as 10-bit 4:2:2, each chroma sample repeated to 4:4:4 (NVDEC decodes HEVC 4:4:4 but no 4:2:2; the engine takes the mean of each pair and gets the 4:2:2 picture back), HEVC Main 4:4:4 10 with x265 CRF 8, no B-frames and a key frame every second (a cue decodes at most one second). 56–58 dB PSNR against the 4:2:2 source and 150–320 MB per minute at 1080p50 on the lab's clips, 48 dB and 1.5 GB per minute with heavy film grain (ProRes 422 HQ: 1.0–2.9 GB). The sound is padded or cut to exactly the clip's frames inside ffmpeg and stored next to it as raw stereo (or mono with `map_channels: 1`) float. A source with more channels is downmixed when its layout is known, else its first two channels are used.
+- **Still:** its first picture at the raster (fit, fill or centre) as one limited-range BT.709 10-bit 4:2:2 v210 picture.
+- **Conversion:** ffmpeg runs under `nice -n 10` and `ionice -c3`, with a timeout that grows with the input length, and with at most the container's CPU limit less two cores for the encoder (cgroup `cpu.max`; 8 threads without a limit; shared by `FLOWXER_CONVERT_CONCURRENCY` jobs), decoders and filters on one thread each; numpy's OpenBLAS (the sound's loop crossfade) runs on one thread (`OPENBLAS_NUM_THREADS=1` in the image). A conversion that fills the limit gets the whole container throttled, the engine with it. x265 makes 7–10 frames/s with 4 threads on the lab's Xeon Gold 6136: a minute of 1080p50 takes 5–7 minutes. Cancelling a job (or deleting its item) kills its ffmpeg. A reconversion keeps the current mezzanine playable until the new one replaces it. A restart re-queues conversions it interrupted, and converts again a ready item whose files are missing, such as a clip with the ProRes mezzanine of earlier versions (that file is removed then; the original stays).
+- **Mixer state:** inputs and stinger slots that use the library are saved with `library_item_id` only; the mezzanine is looked up when the state (or `POST /config/import`) is loaded and again when a conversion ends. A clip assigned while it converts is black until then and is loaded (cued) when its conversion ends.
 
 A stinger that is still converting never blocks the mixer: `/stinger/play` and auto-stinger fall back to a hard cut and log a warning.
 
