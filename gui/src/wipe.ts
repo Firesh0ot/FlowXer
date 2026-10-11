@@ -1,6 +1,7 @@
 // The wipe patterns of the engine (engine/src/core/wipe.hpp) for the picker's icons: s(u, v) in
-// [0, 1] is the moment the edge reaches a point (0 first, 1 last). wipe-vectors.json holds values
-// of the C++ reference; the engine unit tests check them, and so does `npm run check`.
+// [0, 1] is the moment the edge reaches a point (0 first, 1 last). engine/tests/wipe-vectors.json
+// holds values of the C++ reference (checked by the engine's unit tests); scripts/check-wipe.ts
+// checks this port against them.
 
 export const WIPE_PATTERNS: { code: number; label: string }[] = [
   { code: 1, label: "Bar, left to right" },

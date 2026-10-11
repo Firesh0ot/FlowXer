@@ -9,10 +9,13 @@
 #include "core/v210.hpp"
 #include "core/wipe.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <set>
 
 using namespace fxeng;
@@ -300,4 +303,25 @@ TEST(wipe_soft_edge_and_border)
     CHECK_EQ(out.y[500], 900);
     CHECK_EQ(out.y[501], 100);
     CHECK_EQ(out.cb[250], 612);
+}
+
+TEST(wipe_vectors_for_the_gui)
+{
+    // The GUI's icons use a port of s(u, v) that is checked against these values.
+    std::ifstream file(FXENG_WIPE_VECTORS);
+    auto const doc = nlohmann::json::parse(file, nullptr, false);
+    CHECK(!doc.is_discarded() && doc["vectors"].size() == 23u * 11u);
+    if (doc.is_discarded())
+    {
+        return;
+    }
+    int const w = doc["width"].get<int>();
+    int const h = doc["height"].get<int>();
+    float worst = 0.f;
+    for (auto const& v : doc["vectors"])
+    {
+        float const s = patternAt(v[0].get<int>(), v[1].get<int>(), v[2].get<int>(), false, w, h);
+        worst = std::max(worst, std::abs(s - v[3].get<float>()));
+    }
+    CHECK(worst < 1e-5f);
 }
