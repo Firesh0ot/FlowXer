@@ -445,6 +445,7 @@ class MixerPanel(BaseModel):
     wipe_armed: bool = False
     last_transition: str = "cut"
     transition: PanelTransition = Field(default_factory=PanelTransition)
+    ftb: bool = Field(default=False, description="Fade to Black: the ME's whole output (DSKs and sound too) is black")
 
 
 class DownstreamKeyer(BaseModel):

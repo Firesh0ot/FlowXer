@@ -335,6 +335,25 @@ TEST(downstream_keyer_gain)
     CHECK(mixer.dskAuto(1, 0) == MixResult::BadFrames);
 }
 
+TEST(fade_to_black_over_the_whole_output)
+{
+    Mixer mixer(2, 2, 0, {1});
+    CHECK(mixer.frame(1).mes[1].ftb == 0.f);
+    // Auto over 4 grains on ME 1 only, following the grain index; the audio ramps from ftbPrev.
+    CHECK(mixer.ftbAuto(1, 4) == MixResult::Ok);
+    auto p = mixer.frame(2).mes;
+    CHECK(p[1].me == 1 && p[1].ftb == 0.25f && p[1].ftbPrev == 0.f && p[0].ftb == 0.f);
+    p = mixer.frame(5).mes;
+    CHECK(p[1].ftb == 1.f && p[1].ftbPrev == 0.25f && mixer.ftbGain(1) == 1.f);
+    // The buses are untouched; back up over 2 grains; on/off at once.
+    CHECK(p[1].a == in(1) && !p[1].mixing);
+    CHECK(mixer.ftbAuto(1, 2) == MixResult::Ok);
+    CHECK(mixer.frame(6).mes[1].ftb == 0.5f);
+    CHECK(mixer.frame(7).mes[1].ftb == 0.f);
+    CHECK(mixer.ftbSet(2, true) == MixResult::Ok && mixer.frame(8).mes[0].ftb == 1.f);
+    CHECK(mixer.ftbSet(3, true) == MixResult::BadMe && mixer.ftbAuto(1, 0) == MixResult::BadFrames);
+}
+
 // ---- mosaic map ------------------------------------------------------------------------
 
 TEST(mosaic_tile_map)

@@ -86,6 +86,7 @@ Mixer::Mixer(int mes, int inputs, int players, std::vector<int> dskMes)
     , inputs_(std::max(0, inputs))
     , players_(std::max(0, players))
     , state_(static_cast<std::size_t>(mes_))
+    , ftbs_(static_cast<std::size_t>(mes_))
 {
     // ME m starts on inputs 2m-1 (Program) and 2m (Preview), wrapped to the inputs there are;
     // Black without inputs. FlowXer sets the buses right after the start.
@@ -377,6 +378,87 @@ MixResult Mixer::position(int me, float t)
     return MixResult::Ok;
 }
 
+void Mixer::fadeSet(Dsk& fade, bool on)
+{
+    fade.on = on;
+    fade.pending = false;
+    fade.running = false;
+    fade.gain = on ? 1.f : 0.f;
+}
+
+void Mixer::fadeAuto(Dsk& fade, int frames)
+{
+    // An auto during an auto turns back from the gain it has reached.
+    fade.on = !fade.on;
+    fade.from = fade.gain;
+    fade.to = fade.on ? 1.f : 0.f;
+    fade.frames = std::max(1, static_cast<int>(static_cast<float>(frames) * std::abs(fade.to - fade.from) + 0.5f));
+    fade.pending = true;
+    fade.running = false;
+}
+
+bool Mixer::fadeAdvance(Dsk& fade, std::uint64_t index)
+{
+    if (fade.pending)
+    {
+        fade.pending = false;
+        fade.running = true;
+        fade.start = index;
+    }
+    if (!fade.running)
+    {
+        return false;
+    }
+    auto const done = index >= fade.start ? index - fade.start + 1 : 1;
+    float const t = std::min(1.f, static_cast<float>(done) / static_cast<float>(fade.frames));
+    fade.gain = fade.from + (fade.to - fade.from) * t;
+    if (t >= 1.f)
+    {
+        fade.running = false;
+        fade.gain = fade.to;
+        return true;
+    }
+    return false;
+}
+
+MixResult Mixer::ftbSet(int me, bool on)
+{
+    if (!validMe(me))
+    {
+        return MixResult::BadMe;
+    }
+    {
+        std::lock_guard lock{mu_};
+        fadeSet(ftbs_[static_cast<std::size_t>(me - 1)], on);
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::ftbAuto(int me, int frames)
+{
+    if (!validMe(me))
+    {
+        return MixResult::BadMe;
+    }
+    if (frames < 1 || frames > kMaxFrames)
+    {
+        return MixResult::BadFrames;
+    }
+    {
+        std::lock_guard lock{mu_};
+        fadeAuto(ftbs_[static_cast<std::size_t>(me - 1)], frames);
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+float Mixer::ftbGain(int me) const
+{
+    std::lock_guard lock{mu_};
+    return validMe(me) ? ftbs_[static_cast<std::size_t>(me - 1)].gain : 0.f;
+}
+
 MixResult Mixer::dskSet(int key, bool on)
 {
     if (key < 1 || key > static_cast<int>(dsks_.size()))
@@ -385,11 +467,7 @@ MixResult Mixer::dskSet(int key, bool on)
     }
     {
         std::lock_guard lock{mu_};
-        auto& dsk = dsks_[static_cast<std::size_t>(key - 1)];
-        dsk.on = on;
-        dsk.pending = false;
-        dsk.running = false;
-        dsk.gain = on ? 1.f : 0.f;
+        fadeSet(dsks_[static_cast<std::size_t>(key - 1)], on);
     }
     notify();
     return MixResult::Ok;
@@ -407,14 +485,7 @@ MixResult Mixer::dskAuto(int key, int frames)
     }
     {
         std::lock_guard lock{mu_};
-        auto& dsk = dsks_[static_cast<std::size_t>(key - 1)];
-        // An auto during an auto turns back from the gain it has reached.
-        dsk.on = !dsk.on;
-        dsk.from = dsk.gain;
-        dsk.to = dsk.on ? 1.f : 0.f;
-        dsk.frames = std::max(1, static_cast<int>(static_cast<float>(frames) * std::abs(dsk.to - dsk.from) + 0.5f));
-        dsk.pending = true;
-        dsk.running = false;
+        fadeAuto(dsks_[static_cast<std::size_t>(key - 1)], frames);
     }
     notify();
     return MixResult::Ok;
@@ -481,29 +552,16 @@ FramePlan Mixer::frame(std::uint64_t index)
                 ended = true;
             }
         }
+        auto& ftb = ftbs_[static_cast<std::size_t>(m - 1)];
+        plan.ftbPrev = ftb.gain;
+        ended = fadeAdvance(ftb, index) || ended;
+        plan.ftb = ftb.gain;
         out.mes.push_back(plan);
     }
     int key = 1;
     for (auto& dsk : dsks_)
     {
-        if (dsk.pending)
-        {
-            dsk.pending = false;
-            dsk.running = true;
-            dsk.start = index;
-        }
-        if (dsk.running)
-        {
-            auto const done = index >= dsk.start ? index - dsk.start + 1 : 1;
-            float const t = std::min(1.f, static_cast<float>(done) / static_cast<float>(dsk.frames));
-            dsk.gain = dsk.from + (dsk.to - dsk.from) * t;
-            if (t >= 1.f)
-            {
-                dsk.running = false;
-                dsk.gain = dsk.to;
-                ended = true;
-            }
-        }
+        ended = fadeAdvance(dsk, index) || ended;
         out.dsks.push_back(DskPlan{key++, dsk.me, dsk.gain});
     }
     lock.unlock();

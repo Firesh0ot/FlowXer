@@ -158,10 +158,10 @@ def test_fade_to_black_and_restore(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
     mixer.fade_to_black()
-    assert mixer.program_input_id == "black"
+    assert mixer.program_input_id == "cam-1" and mixer.panels[0].ftb
     assert mixer.preview_input_id == "cam-2"
     mixer.fade_to_black()
-    assert mixer.program_input_id == "cam-2"
+    assert mixer.program_input_id == "cam-1" and not mixer.panels[0].ftb
 
 
 def test_wipe_stays_armed_over_a_take(mixer: VisionMixer) -> None:
@@ -192,7 +192,7 @@ def test_transition_bank_api(client: TestClient) -> None:
     assert fade.json()["mixer"]["last_transition"] == "mix"
     ftb = client.post("/api/v1/mixer/fade-to-black", json={"panel_id": "me-1"})
     assert ftb.status_code == 200
-    assert ftb.json()["mixer"]["program_input_id"] == "black"
+    assert ftb.json()["mixer"]["program_input_id"] == "cam-2" and ftb.json()["mixer"]["panels"][0]["ftb"] is True
     cut = client.post("/api/v1/mixer/cut", json={"panel_id": "me-1"})
     assert cut.status_code == 200
 

@@ -442,6 +442,8 @@ struct Engine::Impl
     std::vector<Output*> pvwOf;
     std::map<std::string, mxlInstance> outInstances;
     std::uint8_t* black = nullptr;
+    // Black with a full key (v210a): the Fade to Black layer, last over an ME's output.
+    std::uint8_t* blackKey = nullptr;
     // Work pictures of the sources (inputs, then players), and of each ME's buses.
     std::vector<gpu::WorkBuffer> srcWork;
     std::vector<gpu::WorkBuffer> pgmWork;
@@ -591,6 +593,11 @@ struct Engine::Impl
 
         allocDevice(reinterpret_cast<void**>(&black), frameBytes, "black frame");
         check(gpu::fillBlack(renderStream, black, rowBytes, cfg.width, cfg.height), "fill black");
+        allocDevice(reinterpret_cast<void**>(&blackKey), keyBytes, "fade to black frame");
+        check(gpu::fillBlack(renderStream, blackKey, rowBytes, cfg.width, cfg.height), "fill black");
+        std::vector<std::uint32_t> const opaque((keyBytes - frameBytes) / 4, 0x3fffffffu);
+        check(cudaMemcpyAsync(blackKey + frameBytes, opaque.data(), keyBytes - frameBytes, cudaMemcpyHostToDevice, renderStream), "key plane");
+        check(cudaStreamSynchronize(renderStream), "key plane");
 
         // The ring keeps grains i-L .. newest (+1 for a source a grain ahead); in flight are at
         // most one grain per output slot and the one being uploaded.
@@ -1325,6 +1332,11 @@ struct Engine::Impl
                     job.layers[job.layerCount++] = gpu::KeyLayer{frame->data, dsk.gain};
                 }
             }
+            // Fade to Black: last, over everything (the DSKs too).
+            if (p.ftb > 0.f && job.layerCount < gpu::kMaxLayers)
+            {
+                job.layers[job.layerCount++] = gpu::KeyLayer{blackKey, p.ftb};
+            }
             gpu::compose(st, job, rowBytes, keyRowBytes, pgmWork[me]);
             gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
             cudaEventRecord(*mark++, st);
@@ -1711,6 +1723,18 @@ struct Engine::Impl
             else
             {
                 dst = *a;
+            }
+            // Fade to Black takes the sound with it, ramping within the grain.
+            if (plan.ftb > 0.f || plan.ftbPrev > 0.f)
+            {
+                for (std::size_t c = 0; c < ch; ++c)
+                {
+                    for (std::size_t s = 0; s < n; ++s)
+                    {
+                        float const g = plan.ftbPrev + (plan.ftb - plan.ftbPrev) * static_cast<float>(s + 1) / static_cast<float>(n);
+                        dst[c * n + s] *= 1.f - g;
+                    }
+                }
             }
             auto& output = *audioOutputs[static_cast<std::size_t>(plan.me - 1)];
             mxlMutableWrappedMultiBufferSlice slice{};
@@ -2243,6 +2267,7 @@ struct Engine::Impl
                 {"preview", sourceName(view.preview)},
                 {"mixing", view.mixing},
                 {"wiping", view.wiping},
+                {"ftb", round3(mixer.ftbGain(view.me))},
                 {"manual", view.manual},
                 {"t", round3(view.t)},
                 {"next_transition", transitionName(view.next.type)},

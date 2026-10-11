@@ -213,6 +213,28 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         auto const n = body.contains("frames") ? std::optional<int>(body["frames"].get<int>()) : std::nullopt;
         return mixResult(engine, mixer.autoTransition(me, n), me, "ME");
     }
+    if (action == "ftb" || action == "ftb/auto")
+    {
+        MixResult result = MixResult::Ok;
+        if (action == "ftb")
+        {
+            if (!body.contains("on") || !body["on"].is_boolean())
+            {
+                return error(400, "on must be true or false");
+            }
+            result = mixer.ftbSet(me, body["on"].get<bool>());
+        }
+        else
+        {
+            auto const n = frames(body, 25);
+            if (!n)
+            {
+                return error(400, "frames must be an integer");
+            }
+            result = mixer.ftbAuto(me, *n);
+        }
+        return result == MixResult::Ok ? reply(200, json{{"me", me}, {"ftb", mixer.ftbGain(me)}}) : mixResult(engine, result, me, "ME");
+    }
     if (action == "position")
     {
         if (!body.contains("t") || !body["t"].is_number())

@@ -83,9 +83,9 @@ def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
     assert lit(mixer)[0] == {"cam-2", "cam-3"}
     mixer.cut()
     assert lit(mixer) == ({"cam-1"}, {"cam-3"})
+    # Fade to Black lights nothing new: the buses stay.
     mixer.fade_to_black(duration_ms=600)
-    assert lit(mixer)[0] == {"cam-1", "black"}
-    assert lit(mixer, now=time.monotonic() + 0.7)[0] == {"black"}
+    assert lit(mixer) == ({"cam-1"}, {"cam-3"})
 
 
 def test_reentry_is_index_1000_plus_the_me(mixer: VisionMixer) -> None:

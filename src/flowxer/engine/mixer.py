@@ -1167,6 +1167,7 @@ class VisionMixer:
         m = self._panel_number(panel)
         self._engine_call("POST", f"/me/{m}/program", {"source": self._engine_source(panel.program_input_id)}, client=client)
         self._engine_call("POST", f"/me/{m}/preview", {"source": self._engine_source(panel.preview_input_id)}, client=client)
+        self._engine_call("POST", f"/me/{m}/ftb", {"on": panel.ftb}, client=client)
         self._push_transition(panel, client)
 
     def _push_transition(self, panel: MixerPanel, client: EngineClient | None = None) -> None:
@@ -1465,16 +1466,13 @@ class VisionMixer:
         return self.status()
 
     def fade_to_black(self, panel_id: str = "me-1", duration_ms: int = 600) -> MixerStatus:
-        """Fade Program to Black, or fade up from Black onto Preview."""
+        """Fade the ME's whole output (the DSKs and the sound too) to black, or back up. The
+        buses do not change; tally does not change."""
         panel = self._ensure_running_panel(panel_id)
-        black = next((item.id for item in self.list_inputs() if item.kind == InputKind.black), None)
-        if black is None:
-            raise MixerError("no black input is registered")
-        if panel.program_input_id == black:
-            target = self._preview_id(panel)
-        else:
-            target = black
-        self._put_on_program(panel, target, TransitionType.mix, flip_flop=False, duration_ms=duration_ms)
+        panel.ftb = not panel.ftb
+        if self._rendered(panel):
+            frames = _frames(duration_ms or 600, self.settings.fps)
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/ftb/auto", {"frames": frames})
         return self.status()
 
     def update_transition(self, panel_id: str, payload: PanelTransitionUpdate) -> PanelTransition:

@@ -76,6 +76,10 @@ struct MePlan
     bool wiping = false;
     WipeSettings wipe;
     Source preview;
+    // Fade to Black over the ME's whole output (after the DSKs): its gain now and at the grain
+    // before (the audio ramps between them).
+    float ftb = 0.f;
+    float ftbPrev = 0.f;
 };
 
 // A downstream keyer for one output grain: key input `key` over ME `me` with `gain` (0..1).
@@ -169,6 +173,11 @@ public:
     // `frames` grains (an auto during an auto turns back from where it is).
     MixResult dskSet(int key, bool on);
     MixResult dskAuto(int key, int frames);
+    // Fade to Black of ME m's whole output, keys included: on or off at the next grain, or a fade
+    // over `frames` grains (an auto during an auto turns back).
+    MixResult ftbSet(int me, bool on);
+    MixResult ftbAuto(int me, int frames);
+    [[nodiscard]] float ftbGain(int me) const;
 
     // Render thread: the plans of output grain `index`. A Mix starts at the first grain after the
     // command and its progress follows the grain index, so skipped grains do not stretch it. A
@@ -232,6 +241,11 @@ private:
     }
     // Ends a pending or running transition as if it had run to its end. Lock held.
     static void finishMix(Me& state);
+    // A keyer's or an FTB's fade: on/off, auto, and its gain at grain `index` (true when a fade
+    // ended). Lock held.
+    static void fadeSet(Dsk& fade, bool on);
+    static void fadeAuto(Dsk& fade, int frames);
+    static bool fadeAdvance(Dsk& fade, std::uint64_t index);
     void notify() const
     {
         if (changed_)
@@ -246,6 +260,8 @@ private:
     mutable std::mutex mu_;
     std::vector<Me> state_;
     std::vector<Dsk> dsks_;
+    // One Fade to Black per ME.
+    std::vector<Dsk> ftbs_;
     std::function<void()> changed_;
 };
 } // namespace fxeng

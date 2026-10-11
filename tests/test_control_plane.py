@@ -137,9 +137,9 @@ def test_the_engine_starts_gets_the_state_and_the_commands(engine_mixer, setting
     # A fade of 400 ms at 50p: 20 grains.
     mixer.fade("me-1", duration_ms=400)
     assert _commands(log)[-1]["body"] == {"source": "in1", "frames": 20, "preview": "in2"}
-    # Fade to Black: Program to black, Preview stays.
+    # Fade to Black: the whole output, the buses stay.
     mixer.fade_to_black("me-1", duration_ms=600)
-    assert _commands(log)[-1]["body"] == {"source": "black", "frames": 30}
+    assert _commands(log)[-1] == {"method": "POST", "path": "/me/1/ftb/auto", "body": {"frames": 30}, "pid": _commands(log)[-1]["pid"]}
     # Frames come from the engine's status.
     assert _wait(lambda: mixer.frames_rendered > 0)
     assert mixer.status().engine["state"] == "running"

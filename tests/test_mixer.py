@@ -114,12 +114,17 @@ def test_reentry_takes_the_program_of_a_higher_rendering_me(settings) -> None:
 def test_fade_to_black_and_back(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
     calls = _record_engine(mixer)
+    # The whole output fades (DSKs and sound too); the buses stay.
     mixer.fade_to_black("me-1", duration_ms=600)
-    assert mixer.program_input_id == "black" and mixer.preview_input_id == "cam-2"
-    assert calls[-1] == ("POST", "/me/1/take", {"source": "black", "frames": 30})
+    assert mixer.program_input_id == "cam-1" and mixer.preview_input_id == "cam-2" and mixer.panels[0].ftb
+    assert calls[-1] == ("POST", "/me/1/ftb/auto", {"frames": 30})
     mixer.fade_to_black("me-1", duration_ms=200)
-    assert mixer.program_input_id == "cam-2"
-    assert calls[-1] == ("POST", "/me/1/take", {"source": "in2", "frames": 10})
+    assert mixer.program_input_id == "cam-1" and not mixer.panels[0].ftb
+    assert calls[-1] == ("POST", "/me/1/ftb/auto", {"frames": 10})
+    # The engine gets the state when it starts.
+    mixer.fade_to_black("me-1")
+    mixer._on_engine_ready(None)
+    assert ("POST", "/me/1/ftb", {"on": True}) in calls
     mixer.stop()
 
 
