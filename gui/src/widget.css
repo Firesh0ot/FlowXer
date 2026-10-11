@@ -32,12 +32,12 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .row-label { display: grid; place-items: center; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
 .bus-row.pgm .row-label { color: var(--pgm); }
 .bus-row.pvw .row-label { color: var(--pvw); }
-.row-buttons { display: flex; flex-wrap: wrap; gap: 4px; align-content: stretch; }
+.row-buttons { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 4px; align-content: stretch; }
 .row-buttons button, .bus-actions button {
   font: inherit; color: var(--text); cursor: pointer;
   background: var(--button); border: 1px solid var(--line); border-radius: 4px;
 }
-.row-buttons button { flex: 1 1 64px; min-width: 56px; padding: 4px 6px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-buttons button { min-width: 0; padding: 4px 6px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bus-row.pgm button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
 .bus-row.pvw button.on { background: var(--pvw); border-color: var(--pvw); color: #041018; }
 .bus-actions { display: grid; grid-template-rows: 1fr 1fr; gap: 6px; }
