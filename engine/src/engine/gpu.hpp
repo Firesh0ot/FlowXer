@@ -48,6 +48,10 @@ cudaError_t fillBlack(cudaStream_t stream, std::uint8_t* v210, int rowBytes, int
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes);
 
+// Keys a v210a fill + key (device; the key plane follows the fill, `keyRowBytes` per line) over
+// a work picture: out = fill·α + out·(1 − α), α = key/1023 · gain (straight fill).
+cudaError_t keyV210a(cudaStream_t stream, std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, WorkBuffer& io);
+
 struct MosaicSource
 {
     // Packed v210 on the device; null draws a black tile.

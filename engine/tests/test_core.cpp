@@ -115,6 +115,30 @@ TEST(dissolve_maths)
     CHECK_EQ(previous, 940);
 }
 
+TEST(key_maths)
+{
+    // A v210a key line: three 10-bit keys per word.
+    std::uint32_t const line[2] = {0u | (512u << 10) | (1023u << 20), 257u};
+    auto const* bytes = reinterpret_cast<std::uint8_t const*>(line);
+    CHECK_EQ(keyAt(bytes, 0), 0u);
+    CHECK_EQ(keyAt(bytes, 1), 512u);
+    CHECK_EQ(keyAt(bytes, 2), 1023u);
+    CHECK_EQ(keyAt(bytes, 3), 257u);
+    CHECK_EQ(keyAlpha(0, 1.f), 0.f);
+    CHECK(std::abs(keyAlpha(1023, 1.f) - 1.f) < 1e-6f);
+    CHECK(std::abs(keyAlpha(1023, 0.5f) - 0.5f) < 1e-6f);
+    // Straight white fill (940) over black (64): key 0 is the background, 1023 the fill, and
+    // partial keys in between (the browser source's 25/50/75 % alpha).
+    CHECK_EQ(mix10(64, 940, keyAlpha(0, 1.f)), 64);
+    CHECK_EQ(mix10(64, 940, keyAlpha(1023, 1.f)), 940);
+    CHECK_EQ(mix10(64, 940, keyAlpha(257, 1.f)), 284);
+    CHECK_EQ(mix10(64, 940, keyAlpha(514, 1.f)), 504);
+    CHECK_EQ(mix10(64, 940, keyAlpha(766, 1.f)), 720);
+    // The keyer's gain (a fade) scales the key: a full key at half gain is the half mix.
+    CHECK_EQ(mix10(64, 940, keyAlpha(1023, 0.5f)), 502);
+    CHECK_EQ(mix10(300, 700, keyAlpha(1023, 0.f)), 300);
+}
+
 TEST(ycbcr_rgb_round_trip)
 {
     int worst = 0;

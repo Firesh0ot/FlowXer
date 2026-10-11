@@ -417,12 +417,108 @@ __global__ void from444Kernel(std::uint8_t const* y, std::uint8_t const* cb, std
     }
     writeGroup(v210, rowBytes, row, group, w);
 }
+
+// Linear key of a v210a fill + key over a work picture (straight fill): out = fill·α + out·(1 − α)
+// with α = key / 1023 · gain (pixel.hpp). One thread per 6-pixel group.
+__global__ void keyYuvKernel(std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, int width, int height, std::uint16_t* y,
+    std::uint16_t* cb, std::uint16_t* cr)
+{
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    if (row >= height || group * 6 >= width)
+    {
+        return;
+    }
+    std::uint16_t fy[6];
+    std::uint16_t fcb[3];
+    std::uint16_t fcr[3];
+    readGroup(v210a, rowBytes, row, group, fy, fcb, fcr);
+    std::uint8_t const* keyLine = v210a + static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(height) +
+                                  static_cast<std::size_t>(row) * static_cast<std::size_t>(keyRowBytes);
+    float a[6];
+    for (int i = 0; i < 6; ++i)
+    {
+        int const x = min(group * 6 + i, width - 1);
+        a[i] = keyAlpha(keyAt(keyLine, x), gain);
+    }
+    int const cw = width / 2;
+    std::size_t const yRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
+    std::size_t const cRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(cw);
+    for (int i = 0; i < 6; ++i)
+    {
+        int const x = group * 6 + i;
+        if (x < width && a[i] > 0.f)
+        {
+            y[yRow + x] = mix10(y[yRow + x], fy[i], a[i]);
+        }
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        int const cx = group * 3 + i;
+        float const ca = 0.5f * (a[2 * i] + a[2 * i + 1]);
+        if (cx < cw && ca > 0.f)
+        {
+            cb[cRow + cx] = mix10(cb[cRow + cx], fcb[i], ca);
+            cr[cRow + cx] = mix10(cr[cRow + cx], fcr[i], ca);
+        }
+    }
+}
+
+__global__ void keyRgbaKernel(std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, int width, int height, Half4* rgba)
+{
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    if (row >= height || group * 6 >= width)
+    {
+        return;
+    }
+    std::uint16_t fy[6];
+    std::uint16_t fcb[3];
+    std::uint16_t fcr[3];
+    readGroup(v210a, rowBytes, row, group, fy, fcb, fcr);
+    std::uint8_t const* keyLine = v210a + static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(height) +
+                                  static_cast<std::size_t>(row) * static_cast<std::size_t>(keyRowBytes);
+    std::size_t const base = static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
+    for (int i = 0; i < 6; ++i)
+    {
+        int const x = group * 6 + i;
+        if (x >= width)
+        {
+            continue;
+        }
+        float const a = keyAlpha(keyAt(keyLine, x), gain);
+        if (a <= 0.f)
+        {
+            continue;
+        }
+        Rgb const f = ycbcrToRgb(fy[i], fcb[i / 2], fcr[i / 2]);
+        Half4 const o = rgba[base + x];
+        float2 const rg = __half22float2(o.rg);
+        float2 const ba = __half22float2(o.ba);
+        rgba[base + x] = Half4{__floats2half2_rn(rg.x + (f.r - rg.x) * a, rg.y + (f.g - rg.y) * a), __floats2half2_rn(ba.x + (f.b - ba.x) * a, ba.y)};
+    }
+}
 } // namespace
 
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes)
 {
     from444Kernel<<<groupGrid(rowBytes / 16, height), 128, 0, stream>>>(y, cb, cr, pitch, deep, width, height, v210, rowBytes);
+    return cudaGetLastError();
+}
+
+cudaError_t keyV210a(cudaStream_t stream, std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, WorkBuffer& io)
+{
+    int const groups = (io.width + 5) / 6;
+    if (io.format == WorkFormat::Yuv16)
+    {
+        keyYuvKernel<<<groupGrid(groups, io.height), 128, 0, stream>>>(v210a, rowBytes, keyRowBytes, gain, io.width, io.height, planeY(io), planeCb(io),
+            planeCr(io));
+    }
+    else
+    {
+        keyRgbaKernel<<<groupGrid(groups, io.height), 128, 0, stream>>>(v210a, rowBytes, keyRowBytes, gain, io.width, io.height, static_cast<Half4*>(io.data));
+    }
     return cudaGetLastError();
 }
 
@@ -713,6 +809,65 @@ bool selfTest(std::string& report)
             return false;
         }
         done += "from444 exact; ";
+    }
+    // DSK: a v210a fill (pb) with a key ramp 0..1023 across the picture and gain 0.8 over pa
+    // (yuv16): every sample as the CPU reference (keyAt, keyAlpha, mix10) within 1 code.
+    {
+        int const keyRow = keyPlaneRowBytes(w);
+        std::vector<std::uint8_t> v210a(frameBytes + static_cast<std::size_t>(keyRow) * h, 0);
+        std::memcpy(v210a.data(), vb.data(), frameBytes);
+        std::uint8_t const* keys = v210a.data() + frameBytes;
+        for (int y = 0; y < h; ++y)
+        {
+            auto* words = reinterpret_cast<std::uint32_t*>(v210a.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+            for (int x = 0; x < w; ++x)
+            {
+                words[x / 3] |= static_cast<std::uint32_t>(x * 1023 / (w - 1)) << ((x % 3) * 10);
+            }
+        }
+        float const gain = 0.8f;
+        DeviceBytes dkey(v210a.size());
+        cudaMemcpy(dkey.get(), v210a.data(), v210a.size(), cudaMemcpyHostToDevice);
+        WorkBuffer io;
+        if (allocWork(io, WorkFormat::Yuv16, w, h) != cudaSuccess)
+        {
+            report = "key: allocWork failed";
+            return false;
+        }
+        unpack(nullptr, da.get(), rowBytes, io);
+        keyV210a(nullptr, dkey.get(), rowBytes, keyRow, gain, io);
+        pack(nullptr, io, dout.get(), rowBytes);
+        cudaError_t const err = cudaDeviceSynchronize();
+        freeWork(io);
+        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+        Planar422 got;
+        got.allocate(w, h);
+        unpackV210(back.data(), rowBytes, got);
+        Planar422 want;
+        want.allocate(w, h);
+        for (int y = 0; y < h; ++y)
+        {
+            std::uint8_t const* line = keys + static_cast<std::size_t>(y) * keyRow;
+            for (int x = 0; x < w; ++x)
+            {
+                std::size_t const i = static_cast<std::size_t>(y) * w + x;
+                want.y[i] = mix10(pa.y[i], pb.y[i], keyAlpha(keyAt(line, x), gain));
+            }
+            for (int x = 0; x < w / 2; ++x)
+            {
+                std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x;
+                float const a = 0.5f * (keyAlpha(keyAt(line, 2 * x), gain) + keyAlpha(keyAt(line, 2 * x + 1), gain));
+                want.cb[c] = mix10(pa.cb[c], pb.cb[c], a);
+                want.cr[c] = mix10(pa.cr[c], pb.cr[c], a);
+            }
+        }
+        int const diff = maxDiff(want, got);
+        if (err != cudaSuccess || diff > 1)
+        {
+            report = "key: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+            return false;
+        }
+        done += "key max " + std::to_string(diff) + "; ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;

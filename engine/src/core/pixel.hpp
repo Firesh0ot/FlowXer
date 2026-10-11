@@ -70,6 +70,21 @@ FXENG_HD inline std::uint16_t mix10(std::uint16_t a, std::uint16_t b, float t)
     return clamp10(fa + (static_cast<float>(b) - fa) * t);
 }
 
+// The 10-bit key of pixel x on a v210a key line.
+FXENG_HD inline unsigned keyAt(std::uint8_t const* keyLine, int x)
+{
+    std::uint32_t const word = reinterpret_cast<std::uint32_t const*>(keyLine)[x / 3];
+    return (word >> ((x % 3) * 10)) & 0x3ffu;
+}
+
+// A linear key's alpha: the key (0..1023, full range) times the keyer's gain. The keyed
+// sample is mix10(background, fill, alpha) (straight fill); chroma takes the mean alpha of its
+// pixel pair.
+FXENG_HD inline float keyAlpha(unsigned key, float gain)
+{
+    return static_cast<float>(key) * (gain / 1023.f);
+}
+
 // BT.709 limited range, 10-bit Y'CbCr <-> non-linear R'G'B' in 0..1. Values outside
 // 0..1 (sub-black, super-white, out-of-gamut test patterns) are kept, not clipped.
 struct Rgb

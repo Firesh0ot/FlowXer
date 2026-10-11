@@ -1288,12 +1288,37 @@ struct Engine::Impl
             int const s = sourceSlot(source);
             return s >= 0 ? srcWork[static_cast<std::size_t>(s)] : blackWork;
         };
-        // ME n before ME m (n > m): a re-entered Program is the same output grain.
+        // The key inputs the downstream keyers need now (grain i - L, like the inputs).
+        std::vector<std::shared_ptr<DevFrame>> keyFrames(keys.size());
+        for (auto const& dsk : plan.dsks)
+        {
+            auto const k = static_cast<std::size_t>(dsk.key - 1);
+            if (dsk.gain > 0.f && k < keys.size() && !keyFrames[k])
+            {
+                keyFrames[k] = pick(*keys[k], j, index);
+                if (keyFrames[k])
+                {
+                    cudaStreamWaitEvent(st, keyFrames[k]->ready, 0);
+                }
+            }
+        }
+        // ME n before ME m (n > m): a re-entered Program is the same output grain (with its keys).
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
             gpu::mix(st, workOf(p.a), p.mixing ? &workOf(p.b) : nullptr, p.mixing ? p.t : 0.f, pgmWork[me]);
             gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
+            // Downstream keyers over the ME's Program and Preview (Preview shows what Program
+            // will look like after the next transition).
+            for (auto const& dsk : plan.dsks)
+            {
+                auto const& frame = dsk.me == p.me && dsk.gain > 0.f ? keyFrames[static_cast<std::size_t>(dsk.key - 1)] : nullptr;
+                if (frame)
+                {
+                    gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pgmWork[me]);
+                    gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pvwWork[me]);
+                }
+            }
             cudaEventRecord(*mark++, st);
         }
         for (std::size_t me = 0; me < pgmWork.size(); ++me)
@@ -1308,11 +1333,14 @@ struct Engine::Impl
         }
         cudaEventRecord(*mark, st);
         slot.held.clear();
-        for (auto& frame : frames)
+        for (auto* list : {&frames, &keyFrames})
         {
-            if (frame)
+            for (auto& frame : *list)
             {
-                slot.held.push_back(std::move(frame));
+                if (frame)
+                {
+                    slot.held.push_back(std::move(frame));
+                }
             }
         }
         slot.players = std::move(playerFrames);
