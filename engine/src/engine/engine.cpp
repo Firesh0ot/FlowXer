@@ -446,7 +446,7 @@ struct Engine::Impl
     // Key flows: one reader (and upload) per distinct routed flow, shared by the keyers routed to
     // it; its frames are allocated when it is first routed. keySlot: keyer k's flow, or -1.
     std::vector<std::unique_ptr<Input>> keys;
-    std::mutex keyMu;
+    mutable std::mutex keyMu;
     std::vector<int> keySlot;
     int keyPoolSize = 0;
     std::vector<std::unique_ptr<ClipPlayer>> players;
