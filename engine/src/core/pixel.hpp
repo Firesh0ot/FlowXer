@@ -85,6 +85,25 @@ FXENG_HD inline float keyAlpha(unsigned key, float gain)
     return static_cast<float>(key) * (gain / 1023.f);
 }
 
+FXENG_HD inline float clamp01(float v)
+{
+    return v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+}
+
+// A luma key's alpha from a 10-bit Y: clamp(((Y − 64) / 876 − clip) / soft) (with no softness:
+// 1 above the clip, else 0), inverted, times the gain. The keyed sample is mix10(background,
+// source, alpha); chroma takes the mean alpha of its pixel pair.
+FXENG_HD inline float lumaAlpha(unsigned y, float clip, float soft, bool invert, float gain)
+{
+    float const v = (static_cast<float>(y) - 64.f) / 876.f - clip;
+    float a = soft > 0.f ? clamp01(v / soft) : (v > 0.f ? 1.f : 0.f);
+    if (invert)
+    {
+        a = 1.f - a;
+    }
+    return a * gain;
+}
+
 // BT.709 limited range, 10-bit Y'CbCr <-> non-linear R'G'B' in 0..1. Values outside
 // 0..1 (sub-black, super-white, out-of-gamut test patterns) are kept, not clipped.
 struct Rgb

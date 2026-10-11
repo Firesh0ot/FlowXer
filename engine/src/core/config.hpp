@@ -43,13 +43,14 @@ struct PlayerConfig
     std::string label;
 };
 
-// A key input (v210a fill + key in one flow) and the DSK that keys it over an ME's outputs.
+// A keyer and its key input (v210a fill + key in one flow): an upstream keyer (before the
+// transition) or a DSK (after it) on one ME's Program; keys have no preview.
 struct KeyConfig
 {
     std::string label;
     Route route;
-    // The ME whose Program the DSK keys (P2: ME 1); keys have no preview.
     int me = 1;
+    bool upstream = false;
 };
 
 // The MXL flows of one ME. An empty id is generated (stable for domain + ME + kind); an id
@@ -72,7 +73,8 @@ struct OutputConfig
 constexpr int kMaxMes = 4;
 // Live inputs and clip players together (with Black 24 sources, as FlowXer's console).
 constexpr int kMaxSources = 23;
-constexpr int kMaxKeys = 4;
+// 4 MEs × (8 upstream keyers + 4 DSKs).
+constexpr int kMaxKeys = 48;
 constexpr int kMaxLatency = 10;
 
 struct Config

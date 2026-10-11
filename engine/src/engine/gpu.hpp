@@ -50,12 +50,19 @@ cudaError_t fillBlack(cudaStream_t stream, std::uint8_t* v210, int rowBytes, int
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes);
 
-// A key layer: a v210a fill + key (device; the key plane follows the fill, `keyRowBytes` per
-// line) keyed at `gain`: out = fill·α + out·(1 − α), α = key/1023 · gain (straight fill).
+// A key layer: a linear key from a v210a fill + key (device; the key plane follows the fill,
+// `keyRowBytes` per line), α = key/1023 · gain (straight fill); or, with `luma` set, a luma key of
+// a work picture (yuv16 only), α = lumaAlpha(Y, clip, soft, invert, gain), the fill the picture
+// itself. out = fill·α + out·(1 − α) per sample, chroma with the pair's mean α.
 struct KeyLayer
 {
     std::uint8_t const* v210a = nullptr;
     float gain = 0.f;
+    bool luma = false;
+    WorkBuffer const* source = nullptr;
+    float clip = 0.f;
+    float soft = 0.f;
+    bool invert = false;
 };
 constexpr int kMaxLayers = 14;
 

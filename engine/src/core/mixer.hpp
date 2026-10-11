@@ -1,5 +1,6 @@
-// ME state: Program/Preview buses, Cut, Mix and Wipe, re-entry, the downstream keyers. No GPU, no
-// MXL: the control thread changes it, the render thread takes one plan per output grain.
+// ME state: Program/Preview buses, Cut, Mix and Wipe, re-entry, the keyers (upstream and
+// downstream), Fade to Black. No GPU, no MXL: the control thread changes it, the render thread
+// takes one plan per output grain.
 #pragma once
 
 #include "core/wipe.hpp"
@@ -82,19 +83,42 @@ struct MePlan
     float ftbPrev = 0.f;
 };
 
-// A downstream keyer for one output grain: key input `key` over ME `me` with `gain` (0..1).
-struct DskPlan
+// A keyer's settings: a linear key from its key input (v210a fill + key), or a luma key of a
+// source (the fill is the source itself): α = clamp(((Y − 64) / 876 − clip) / soft), inverted,
+// times the gain (pixel.hpp lumaAlpha). A linear key's α is key / 1023 · gain.
+struct KeySettings
+{
+    bool luma = false;
+    Source source;
+    float clip = 0.f;
+    float soft = 0.f;
+    float gain = 1.f;
+    bool invert = false;
+};
+
+// Where a keyer keys: over ME `me`, before the transition (upstream) or after it (a DSK).
+struct KeyerSpec
+{
+    int me = 1;
+    bool upstream = false;
+};
+
+// A keyer for one output grain: keyer `key` (1-based, in the configuration's order) with its fade
+// `gain` (0..1, on, off or fading) and settings.
+struct KeyPlan
 {
     int key = 1;
     int me = 1;
+    bool upstream = false;
     float gain = 0.f;
+    KeySettings settings;
 };
 
 struct FramePlan
 {
     // Render order: ME count .. 1.
     std::vector<MePlan> mes;
-    std::vector<DskPlan> dsks;
+    std::vector<KeyPlan> keys;
 };
 
 struct MeView
@@ -116,14 +140,16 @@ struct MeView
     TransitionSettings next;
 };
 
-struct DskView
+struct KeyView
 {
     int key = 1;
     int me = 1;
+    bool upstream = false;
     // On air (or going on air during an auto).
     bool on = false;
     bool transition = false;
     float gain = 0.f;
+    KeySettings settings;
 };
 
 enum class MixResult
@@ -134,13 +160,14 @@ enum class MixResult
     BadFrames,
     BadPattern,
     BadPosition,
+    BadKey,
     Busy
 };
 
 class Mixer
 {
 public:
-    Mixer(int mes, int inputs, int players = 0, std::vector<int> dskMes = {});
+    Mixer(int mes, int inputs, int players = 0, std::vector<KeyerSpec> keyers = {});
 
     // ME m may take the live inputs, the clip players, Black and the Program of ME n when n > m:
     // the MEs render in descending order, so the re-entered picture is from the same output
@@ -169,10 +196,12 @@ public:
     // stinger does not scrub: t > 0 starts it as an Auto. Busy while an Auto runs.
     MixResult position(int me, float t);
 
-    // Downstream keyer k (1-based): on or off at the next grain, or a fade to the other state over
-    // `frames` grains (an auto during an auto turns back from where it is).
-    MixResult dskSet(int key, bool on);
-    MixResult dskAuto(int key, int frames);
+    // Keyer k (1-based): on or off at the next grain, or a fade to the other state over `frames`
+    // grains (an auto during an auto turns back from where it is).
+    MixResult keySet(int key, bool on);
+    MixResult keyAuto(int key, int frames);
+    // Its mode and settings; a luma key's source must be one its ME may take.
+    MixResult keySettings(int key, KeySettings const& settings);
     // Fade to Black of ME m's whole output, keys included: on or off at the next grain, or a fade
     // over `frames` grains (an auto during an auto turns back).
     MixResult ftbSet(int me, bool on);
@@ -185,7 +214,7 @@ public:
     FramePlan frame(std::uint64_t index);
 
     [[nodiscard]] std::vector<MeView> view() const;
-    [[nodiscard]] std::vector<DskView> dskView() const;
+    [[nodiscard]] std::vector<KeyView> keyView() const;
     // Called (without the lock held) after every change of a bus or a Mix start/end. Set once
     // before the render thread starts.
     void onChange(std::function<void()> callback)
@@ -222,9 +251,12 @@ private:
         float tLast = 0.f;
         TransitionSettings next;
     };
-    struct Dsk
+    // A keyer's (with its place and settings) or an FTB's fade.
+    struct Fade
     {
         int me = 1;
+        bool upstream = false;
+        KeySettings settings;
         bool on = false;
         float from = 0.f;
         float to = 0.f;
@@ -243,9 +275,9 @@ private:
     static void finishMix(Me& state);
     // A keyer's or an FTB's fade: on/off, auto, and its gain at grain `index` (true when a fade
     // ended). Lock held.
-    static void fadeSet(Dsk& fade, bool on);
-    static void fadeAuto(Dsk& fade, int frames);
-    static bool fadeAdvance(Dsk& fade, std::uint64_t index);
+    static void fadeSet(Fade& fade, bool on);
+    static void fadeAuto(Fade& fade, int frames);
+    static bool fadeAdvance(Fade& fade, std::uint64_t index);
     void notify() const
     {
         if (changed_)
@@ -259,9 +291,9 @@ private:
     int players_;
     mutable std::mutex mu_;
     std::vector<Me> state_;
-    std::vector<Dsk> dsks_;
+    std::vector<Fade> keys_;
     // One Fade to Black per ME.
-    std::vector<Dsk> ftbs_;
+    std::vector<Fade> ftbs_;
     std::function<void()> changed_;
 };
 } // namespace fxeng

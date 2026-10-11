@@ -81,7 +81,7 @@ std::string transitionName(Transition type)
     return "stinger";
 }
 
-Mixer::Mixer(int mes, int inputs, int players, std::vector<int> dskMes)
+Mixer::Mixer(int mes, int inputs, int players, std::vector<KeyerSpec> keyers)
     : mes_(std::max(1, mes))
     , inputs_(std::max(0, inputs))
     , players_(std::max(0, players))
@@ -99,11 +99,12 @@ Mixer::Mixer(int mes, int inputs, int players, std::vector<int> dskMes)
             me.preview = Source{Source::Kind::Input, (2 * m - 1) % inputs_ + 1};
         }
     }
-    for (int me : dskMes)
+    for (auto const& spec : keyers)
     {
-        Dsk dsk;
-        dsk.me = std::clamp(me, 1, mes_);
-        dsks_.push_back(dsk);
+        Fade key;
+        key.me = std::clamp(spec.me, 1, mes_);
+        key.upstream = spec.upstream;
+        keys_.push_back(key);
     }
 }
 
@@ -378,7 +379,7 @@ MixResult Mixer::position(int me, float t)
     return MixResult::Ok;
 }
 
-void Mixer::fadeSet(Dsk& fade, bool on)
+void Mixer::fadeSet(Fade& fade, bool on)
 {
     fade.on = on;
     fade.pending = false;
@@ -386,7 +387,7 @@ void Mixer::fadeSet(Dsk& fade, bool on)
     fade.gain = on ? 1.f : 0.f;
 }
 
-void Mixer::fadeAuto(Dsk& fade, int frames)
+void Mixer::fadeAuto(Fade& fade, int frames)
 {
     // An auto during an auto turns back from the gain it has reached.
     fade.on = !fade.on;
@@ -397,7 +398,7 @@ void Mixer::fadeAuto(Dsk& fade, int frames)
     fade.running = false;
 }
 
-bool Mixer::fadeAdvance(Dsk& fade, std::uint64_t index)
+bool Mixer::fadeAdvance(Fade& fade, std::uint64_t index)
 {
     if (fade.pending)
     {
@@ -459,23 +460,46 @@ float Mixer::ftbGain(int me) const
     return validMe(me) ? ftbs_[static_cast<std::size_t>(me - 1)].gain : 0.f;
 }
 
-MixResult Mixer::dskSet(int key, bool on)
+MixResult Mixer::keySet(int key, bool on)
 {
-    if (key < 1 || key > static_cast<int>(dsks_.size()))
+    if (key < 1 || key > static_cast<int>(keys_.size()))
     {
         return MixResult::BadMe;
     }
     {
         std::lock_guard lock{mu_};
-        fadeSet(dsks_[static_cast<std::size_t>(key - 1)], on);
+        fadeSet(keys_[static_cast<std::size_t>(key - 1)], on);
     }
     notify();
     return MixResult::Ok;
 }
 
-MixResult Mixer::dskAuto(int key, int frames)
+MixResult Mixer::keySettings(int key, KeySettings const& settings)
 {
-    if (key < 1 || key > static_cast<int>(dsks_.size()))
+    if (key < 1 || key > static_cast<int>(keys_.size()))
+    {
+        return MixResult::BadMe;
+    }
+    auto const in01 = [](float v) { return v >= 0.f && v <= 1.f; };
+    if (!in01(settings.clip) || !in01(settings.soft) || !in01(settings.gain))
+    {
+        return MixResult::BadKey;
+    }
+    if (settings.luma && !sourceAllowed(keys_[static_cast<std::size_t>(key - 1)].me, settings.source))
+    {
+        return MixResult::BadSource;
+    }
+    {
+        std::lock_guard lock{mu_};
+        keys_[static_cast<std::size_t>(key - 1)].settings = settings;
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::keyAuto(int key, int frames)
+{
+    if (key < 1 || key > static_cast<int>(keys_.size()))
     {
         return MixResult::BadMe;
     }
@@ -485,7 +509,7 @@ MixResult Mixer::dskAuto(int key, int frames)
     }
     {
         std::lock_guard lock{mu_};
-        fadeAuto(dsks_[static_cast<std::size_t>(key - 1)], frames);
+        fadeAuto(keys_[static_cast<std::size_t>(key - 1)], frames);
     }
     notify();
     return MixResult::Ok;
@@ -559,10 +583,10 @@ FramePlan Mixer::frame(std::uint64_t index)
         out.mes.push_back(plan);
     }
     int key = 1;
-    for (auto& dsk : dsks_)
+    for (auto& keyer : keys_)
     {
-        ended = fadeAdvance(dsk, index) || ended;
-        out.dsks.push_back(DskPlan{key++, dsk.me, dsk.gain});
+        ended = fadeAdvance(keyer, index) || ended;
+        out.keys.push_back(KeyPlan{key++, keyer.me, keyer.upstream, keyer.gain, keyer.settings});
     }
     lock.unlock();
     if (ended)
@@ -596,14 +620,14 @@ std::vector<MeView> Mixer::view() const
     return views;
 }
 
-std::vector<DskView> Mixer::dskView() const
+std::vector<KeyView> Mixer::keyView() const
 {
-    std::vector<DskView> views;
+    std::vector<KeyView> views;
     std::lock_guard lock{mu_};
     int key = 1;
-    for (auto const& dsk : dsks_)
+    for (auto const& keyer : keys_)
     {
-        views.push_back(DskView{key++, dsk.me, dsk.on, dsk.pending || dsk.running, dsk.gain});
+        views.push_back(KeyView{key++, keyer.me, keyer.upstream, keyer.on, keyer.pending || keyer.running, keyer.gain, keyer.settings});
     }
     return views;
 }

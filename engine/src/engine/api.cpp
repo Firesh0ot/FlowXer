@@ -107,6 +107,8 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "pattern must be a wipe code of P3, soft and border 0..1");
     case MixResult::BadPosition:
         return error(400, "t must be 0..1");
+    case MixResult::BadKey:
+        return error(400, "clip, soft and gain must be 0..1");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -349,7 +351,7 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     {
         return playerCommand(engine, k, rest, body);
     }
-    if (int const k = pathNumber(request.path, "/dsk/", rest); k > 0)
+    if (int const k = pathNumber(request.path, "/keyer/", rest); k > 0)
     {
         auto& mixer = engine.mixer();
         MixResult result = MixResult::Ok;
@@ -359,7 +361,7 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
             {
                 return error(400, "on must be true or false");
             }
-            result = mixer.dskSet(k, body["on"].get<bool>());
+            result = mixer.keySet(k, body["on"].get<bool>());
         }
         else if (rest == "auto")
         {
@@ -368,24 +370,55 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
             {
                 return error(400, "frames must be an integer");
             }
-            result = mixer.dskAuto(k, *n);
+            result = mixer.keyAuto(k, *n);
+        }
+        else if (rest == "settings")
+        {
+            KeySettings set;
+            auto const mode = text(body, "mode");
+            if (mode != "linear" && mode != "luma")
+            {
+                return error(400, "mode must be linear or luma");
+            }
+            set.luma = mode == "luma";
+            if (set.luma)
+            {
+                auto const source = parseSource(text(body, "source"));
+                if (!source)
+                {
+                    return error(400, "a luma key needs a source (in<n>, cp<n>, black, me<n>)");
+                }
+                set.source = *source;
+            }
+            try
+            {
+                set.clip = body.value("clip", set.clip);
+                set.soft = body.value("soft", set.soft);
+                set.gain = body.value("gain", set.gain);
+                set.invert = body.value("invert", set.invert);
+            }
+            catch (json::exception const&)
+            {
+                return error(400, "clip, soft and gain must be numbers, invert a boolean");
+            }
+            result = mixer.keySettings(k, set);
         }
         else
         {
-            return error(404, "unknown DSK action " + rest);
+            return error(404, "unknown keyer action " + rest);
         }
         if (result != MixResult::Ok)
         {
-            return mixResult(engine, result, k, "DSK");
+            return mixResult(engine, result, k, "keyer");
         }
-        for (auto const& dsk : mixer.dskView())
+        for (auto const& key : mixer.keyView())
         {
-            if (dsk.key == k)
+            if (key.key == k)
             {
-                return reply(200, json{{"dsk", k}, {"on", dsk.on}, {"transition", dsk.transition}, {"gain", dsk.gain}});
+                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}});
             }
         }
-        return reply(200, json{{"dsk", k}});
+        return reply(200, json{{"key", k}});
     }
     return error(404, "not found");
 }

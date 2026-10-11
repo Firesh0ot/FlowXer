@@ -80,11 +80,6 @@ FXENG_HD inline float wipeAbs(float v)
     return v < 0.f ? -v : v;
 }
 
-FXENG_HD inline float clamp01(float v)
-{
-    return v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-}
-
 // atan(z) for z in [0, 1]: minimax polynomial, |error| < 2e-5 rad.
 FXENG_HD inline float atan01(float z)
 {

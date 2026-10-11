@@ -311,33 +311,80 @@ TEST(tbar_position)
 
 TEST(downstream_keyer_gain)
 {
-    Mixer mixer(2, 2, 0, {1});
-    CHECK(mixer.dskView().size() == 1u);
+    Mixer mixer(2, 2, 0, {KeyerSpec{1, false}});
+    CHECK(mixer.keyView().size() == 1u);
     auto f = mixer.frame(1);
-    CHECK(f.dsks.size() == 1u && f.dsks[0].gain == 0.f && f.dsks[0].me == 1);
-    CHECK(mixer.dskSet(1, true) == MixResult::Ok);
-    CHECK(mixer.frame(2).dsks[0].gain == 1.f);
-    CHECK(mixer.dskSet(2, true) == MixResult::BadMe);
+    CHECK(f.keys.size() == 1u && f.keys[0].gain == 0.f && f.keys[0].me == 1 && !f.keys[0].upstream);
+    CHECK(mixer.keySet(1, true) == MixResult::Ok);
+    CHECK(mixer.frame(2).keys[0].gain == 1.f);
+    CHECK(mixer.keySet(2, true) == MixResult::BadMe);
     // Auto off over 4 grains, following the grain index.
-    CHECK(mixer.dskAuto(1, 4) == MixResult::Ok);
-    CHECK(mixer.frame(3).dsks[0].gain == 0.75f);
-    CHECK(mixer.frame(5).dsks[0].gain == 0.25f);
+    CHECK(mixer.keyAuto(1, 4) == MixResult::Ok);
+    CHECK(mixer.frame(3).keys[0].gain == 0.75f);
+    CHECK(mixer.frame(5).keys[0].gain == 0.25f);
     // An auto during an auto turns back from where it is.
-    CHECK(mixer.dskAuto(1, 4) == MixResult::Ok);
-    CHECK(mixer.dskView()[0].on);
-    CHECK(mixer.frame(6).dsks[0].gain > 0.25f);
+    CHECK(mixer.keyAuto(1, 4) == MixResult::Ok);
+    CHECK(mixer.keyView()[0].on);
+    CHECK(mixer.frame(6).keys[0].gain > 0.25f);
     float last = 0.f;
     for (std::uint64_t i = 7; i < 12; ++i)
     {
-        last = mixer.frame(i).dsks[0].gain;
+        last = mixer.frame(i).keys[0].gain;
     }
-    CHECK(last == 1.f && !mixer.dskView()[0].transition);
-    CHECK(mixer.dskAuto(1, 0) == MixResult::BadFrames);
+    CHECK(last == 1.f && !mixer.keyView()[0].transition);
+    CHECK(mixer.keyAuto(1, 0) == MixResult::BadFrames);
+}
+
+TEST(keyers_per_me_and_luma_settings)
+{
+    // ME 2 and ME 1, each with an upstream keyer and a DSK, in the configuration's order.
+    Mixer mixer(2, 4, 1, {KeyerSpec{1, true}, KeyerSpec{1, false}, KeyerSpec{2, true}, KeyerSpec{2, false}});
+    auto f = mixer.frame(1);
+    CHECK(f.keys.size() == 4u && f.keys[0].upstream && !f.keys[1].upstream && f.keys[2].me == 2);
+    // A luma key of a clip player on ME 1's upstream keyer; ME 1 may key ME 2's Program too.
+    KeySettings luma;
+    luma.luma = true;
+    luma.source = Source{Source::Kind::Player, 1};
+    luma.clip = 0.3f;
+    luma.soft = 0.1f;
+    luma.gain = 0.8f;
+    luma.invert = true;
+    CHECK(mixer.keySettings(1, luma) == MixResult::Ok);
+    CHECK(mixer.keySet(1, true) == MixResult::Ok);
+    f = mixer.frame(2);
+    CHECK(f.keys[0].gain == 1.f && f.keys[0].settings.luma && f.keys[0].settings.source == (Source{Source::Kind::Player, 1}));
+    CHECK(f.keys[0].settings.invert && f.keys[0].settings.gain == 0.8f && f.keys[1].gain == 0.f);
+    luma.source = Source{Source::Kind::Me, 2};
+    CHECK(mixer.keySettings(1, luma) == MixResult::Ok);
+    // ME 2 may not key ME 1 (no loops), nor a player that does not exist; values 0..1.
+    CHECK(mixer.keySettings(3, luma) == MixResult::BadSource);
+    luma.source = Source{Source::Kind::Player, 2};
+    CHECK(mixer.keySettings(1, luma) == MixResult::BadSource);
+    luma.source = Source{Source::Kind::Input, 1};
+    luma.clip = 1.5f;
+    CHECK(mixer.keySettings(1, luma) == MixResult::BadKey);
+    // A linear key needs no source.
+    CHECK(mixer.keySettings(4, KeySettings{}) == MixResult::Ok && !mixer.keyView()[3].settings.luma);
+    CHECK(mixer.keySettings(5, KeySettings{}) == MixResult::BadMe);
+}
+
+TEST(luma_key_alpha)
+{
+    // Y 64 is 0, 940 is 1: clip 0.5 hard keys above the middle; soft 0.2 ramps over 0.5..0.7.
+    CHECK(lumaAlpha(940, 0.5f, 0.f, false, 1.f) == 1.f);
+    CHECK(lumaAlpha(64, 0.5f, 0.f, false, 1.f) == 0.f);
+    CHECK(lumaAlpha(502, 0.5f, 0.f, false, 1.f) == 0.f);
+    CHECK(lumaAlpha(503, 0.5f, 0.f, false, 1.f) == 1.f);
+    CHECK(std::abs(lumaAlpha(64 + 876 * 6 / 10, 0.5f, 0.2f, false, 1.f) - 0.5f) < 0.01f);
+    CHECK(lumaAlpha(940, 0.5f, 0.2f, false, 1.f) == 1.f);
+    // Invert and gain.
+    CHECK(lumaAlpha(940, 0.5f, 0.f, true, 1.f) == 0.f);
+    CHECK(lumaAlpha(64, 0.5f, 0.f, true, 0.5f) == 0.5f);
 }
 
 TEST(fade_to_black_over_the_whole_output)
 {
-    Mixer mixer(2, 2, 0, {1});
+    Mixer mixer(2, 2, 0, {KeyerSpec{1, false}});
     CHECK(mixer.frame(1).mes[1].ftb == 0.f);
     // Auto over 4 grains on ME 1 only, following the grain index; the audio ramps from ftbPrev.
     CHECK(mixer.ftbAuto(1, 4) == MixResult::Ok);
@@ -500,7 +547,10 @@ TEST(sources_players_and_keys)
     CHECK_EQ(cfg.players.size(), 3u);
     CHECK(cfg.players[1].label == "Clip 2");
     CHECK_EQ(cfg.keys.size(), 1u);
-    CHECK(cfg.keys[0].route.flow == "k1" && cfg.keys[0].me == 1);
+    CHECK(cfg.keys[0].route.flow == "k1" && cfg.keys[0].me == 1 && !cfg.keys[0].upstream);
+    auto const two = loadConfig({{"FLOWXER_ENGINE_MES", "2"}, {"FLOWXER_ENGINE_KEYS", R"([{"label":"ME 2 Key 1","me":2,"stage":"upstream"},{"me":2}])"}});
+    CHECK(two.keys[0].upstream && two.keys[0].me == 2 && !two.keys[1].upstream);
+    CHECK(configThrows({{"FLOWXER_ENGINE_KEYS", R"([{"stage":"middle"}])"}}));
     // 24 sources with Black at most.
     CHECK(configThrows({{"FLOWXER_ENGINE_INPUTS", many}, {"FLOWXER_ENGINE_PLAYERS", R"([{},{},{},{}])"}}));
     CHECK(configThrows({{"FLOWXER_ENGINE_KEYS", R"([{"flow":"k1"}])"}}));

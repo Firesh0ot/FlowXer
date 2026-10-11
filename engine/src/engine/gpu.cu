@@ -431,6 +431,11 @@ struct ComposeArgs
     Wipe wipe;
     std::uint8_t const* key[kMaxLayers];
     float gain[kMaxLayers];
+    // Luma layers: the source's Y, Cb, Cr planes (null for a linear layer), clip, soft, invert.
+    std::uint16_t const* luma[kMaxLayers][3];
+    float clip[kMaxLayers];
+    float soft[kMaxLayers];
+    bool invert[kMaxLayers];
     int layers;
     int width;
     int height;
@@ -488,16 +493,32 @@ __global__ void composeYuvKernel(ComposeArgs args)
     }
     for (int l = 0; l < args.layers; ++l)
     {
-        std::uint16_t fy[6];
-        std::uint16_t fcb[3];
-        std::uint16_t fcr[3];
-        readGroup(args.key[l], args.rowBytes, row, group, fy, fcb, fcr);
-        std::uint8_t const* keyLine = args.key[l] + static_cast<std::size_t>(args.rowBytes) * static_cast<std::size_t>(args.height) +
-                                      static_cast<std::size_t>(row) * static_cast<std::size_t>(args.keyRowBytes);
+        std::uint16_t fy[6] = {};
+        std::uint16_t fcb[3] = {};
+        std::uint16_t fcr[3] = {};
+        std::uint8_t const* keyLine = nullptr;
+        if (args.luma[l][0] != nullptr)
+        {
+            for (int p = 0; p < pairs; ++p)
+            {
+                fy[2 * p] = args.luma[l][0][yRow + 2 * p];
+                fy[2 * p + 1] = args.luma[l][0][yRow + 2 * p + 1];
+                fcb[p] = args.luma[l][1][cRow + p];
+                fcr[p] = args.luma[l][2][cRow + p];
+            }
+        }
+        else
+        {
+            readGroup(args.key[l], args.rowBytes, row, group, fy, fcb, fcr);
+            keyLine = args.key[l] + static_cast<std::size_t>(args.rowBytes) * static_cast<std::size_t>(args.height) +
+                      static_cast<std::size_t>(row) * static_cast<std::size_t>(args.keyRowBytes);
+        }
         for (int p = 0; p < pairs; ++p)
         {
-            float const a0 = keyAlpha(keyAt(keyLine, group * 6 + 2 * p), args.gain[l]);
-            float const a1 = keyAlpha(keyAt(keyLine, group * 6 + 2 * p + 1), args.gain[l]);
+            float const a0 = keyLine != nullptr ? keyAlpha(keyAt(keyLine, group * 6 + 2 * p), args.gain[l])
+                                                : lumaAlpha(fy[2 * p], args.clip[l], args.soft[l], args.invert[l], args.gain[l]);
+            float const a1 = keyLine != nullptr ? keyAlpha(keyAt(keyLine, group * 6 + 2 * p + 1), args.gain[l])
+                                                : lumaAlpha(fy[2 * p + 1], args.clip[l], args.soft[l], args.invert[l], args.gain[l]);
             y[2 * p] = mix10(y[2 * p], fy[2 * p], a0);
             y[2 * p + 1] = mix10(y[2 * p + 1], fy[2 * p + 1], a1);
             float const ca = 0.5f * (a0 + a1);
@@ -604,8 +625,15 @@ cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int k
         args.wipe = job.wipe;
         for (int l = 0; l < layers; ++l)
         {
-            args.key[l] = job.layers[l].v210a;
-            args.gain[l] = job.layers[l].gain;
+            auto const& layer = job.layers[l];
+            args.key[l] = layer.v210a;
+            args.gain[l] = layer.gain;
+            args.luma[l][0] = layer.luma ? planeY(*layer.source) : nullptr;
+            args.luma[l][1] = layer.luma ? planeCb(*layer.source) : nullptr;
+            args.luma[l][2] = layer.luma ? planeCr(*layer.source) : nullptr;
+            args.clip[l] = layer.clip;
+            args.soft[l] = layer.soft;
+            args.invert[l] = layer.invert;
         }
         args.layers = layers;
         args.width = out.width;
@@ -626,8 +654,13 @@ cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int k
     {
         mix(stream, *job.a, job.b, job.t, out);
     }
+    // rgba16f: linear layers only (a luma key needs yuv16).
     for (int l = 0; l < layers; ++l)
     {
+        if (job.layers[l].luma)
+        {
+            continue;
+        }
         keyRgbaKernel<<<groupGrid(groups, out.height), 128, 0, stream>>>(job.layers[l].v210a, rowBytes, keyRowBytes, job.layers[l].gain, out.width,
             out.height, static_cast<Half4*>(out.data));
     }
@@ -997,9 +1030,10 @@ bool selfTest(std::string& report)
         }
         done += "wipes exact (" + std::to_string(cases) + " cases); ";
     }
-    // The fused compose: a circle wipe with soft edge and border, then two key layers (pb with a
-    // key ramp 0..1023 across the picture at gain 0.8, pa with a key of 512 at gain 1), against the
-    // CPU reference (wipeFrame, then keyAt, keyAlpha, mix10 per layer): exact.
+    // The fused compose: a circle wipe with soft edge and border, then two linear key layers (pb
+    // with a key ramp 0..1023 across the picture at gain 0.8, pa with a key of 512 at gain 1) and a
+    // luma key of pb (clip 0.3, soft 0.2, gain 0.9), against the CPU reference (wipeFrame, then
+    // keyAt/keyAlpha or lumaAlpha and mix10 per layer): exact.
     {
         int const keyRow = keyPlaneRowBytes(w);
         std::size_t const keyBytes = frameBytes + static_cast<std::size_t>(keyRow) * h;
@@ -1042,9 +1076,16 @@ bool selfTest(std::string& report)
         job.t = 0.4f;
         job.wiping = true;
         job.wipe = makeWipe(set, job.t, w, h);
-        job.layers[0] = KeyLayer{dramp.get(), 0.8f};
-        job.layers[1] = KeyLayer{dflat.get(), 1.f};
-        job.layerCount = 2;
+        job.layers[0].v210a = dramp.get();
+        job.layers[0].gain = 0.8f;
+        job.layers[1].v210a = dflat.get();
+        job.layers[1].gain = 1.f;
+        job.layers[2].luma = true;
+        job.layers[2].source = &wb;
+        job.layers[2].clip = 0.3f;
+        job.layers[2].soft = 0.2f;
+        job.layers[2].gain = 0.9f;
+        job.layerCount = 3;
         compose(nullptr, job, rowBytes, keyRow, wo);
         pack(nullptr, wo, dout.get(), rowBytes);
         cudaError_t const err = cudaDeviceSynchronize();
@@ -1079,13 +1120,23 @@ bool selfTest(std::string& report)
                 }
             }
         }
+        for (std::size_t i = 0; i < want.y.size(); ++i)
+        {
+            want.y[i] = mix10(want.y[i], pb.y[i], lumaAlpha(pb.y[i], 0.3f, 0.2f, false, 0.9f));
+        }
+        for (std::size_t c = 0; c < want.cb.size(); ++c)
+        {
+            float const a = 0.5f * (lumaAlpha(pb.y[2 * c], 0.3f, 0.2f, false, 0.9f) + lumaAlpha(pb.y[2 * c + 1], 0.3f, 0.2f, false, 0.9f));
+            want.cb[c] = mix10(want.cb[c], pb.cb[c], a);
+            want.cr[c] = mix10(want.cr[c], pb.cr[c], a);
+        }
         int const diff = maxDiff(want, got);
         if (err != cudaSuccess || diff != 0)
         {
             report = "compose: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
             return false;
         }
-        done += "compose (wipe + 2 key layers) exact; ";
+        done += "compose (wipe + 2 linear + 1 luma key layers) exact; ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;
