@@ -2479,7 +2479,7 @@ struct Engine::Impl
         {
             stingerList.push_back(json::parse(player->statusJson()));
         }
-        out["stingers"] = {{"players", stingerList}, {"waits", mixer.stingerWaits()}, {"cuts", mixer.stingerCuts()}};
+        out["stingers"] = {{"players", stingerList}, {"played", mixer.stingersPlayed()}, {"waits", mixer.stingerWaits()}, {"cuts", mixer.stingerCuts()}};
         json mes = json::array();
         auto const flow = [](Output const& o) {
             return json{{"flow", o.id}, {"domain", o.domain}, {"label", o.label}, {"existing", o.existing}, {"committed", o.committed.load()},
@@ -2685,6 +2685,8 @@ std::string Engine::metricsText() const
             metric("input_running", input["state"] == "running" ? 1.0 : 0.0, l);
             metric("input_arrival_ms", input["arrival_ms"]["avg"].get<double>(), l + ",essence=\"video\",stat=\"avg\"");
             metric("input_arrival_ms", input["arrival_ms"]["max"].get<double>(), l + ",essence=\"video\",stat=\"max\"");
+            metric("input_upload_ms", input["upload_ms"]["avg"].get<double>(), l + ",stat=\"avg\"");
+            metric("input_upload_ms", input["upload_ms"]["max"].get<double>(), l + ",stat=\"max\"");
             if (input.contains("audio"))
             {
                 auto const& a = input["audio"];
@@ -2703,6 +2705,33 @@ std::string Engine::metricsText() const
         metric("player_frames_late_total", player.value("late", 0.0), l);
         metric("player_frames_decoded_total", player.value("decoded", 0.0), l);
         metric("player_decode_ms", player.value("decode_ms", 0.0), l + ",stat=\"avg\"");
+    }
+    // Stingers (P3): played, grains waited for a first frame, fallbacks to a cut; per player.
+    auto const& stingers = s["stingers"];
+    metric("stingers_played_total", stingers["played"].get<double>());
+    metric("stinger_wait_grains_total", stingers["waits"].get<double>());
+    metric("stinger_cuts_total", stingers["cuts"].get<double>());
+    for (auto const& player : stingers["players"])
+    {
+        std::string const l = "player=\"" + std::to_string(player["player"].get<int>()) + "\"";
+        for (char const* state : {"empty", "cued", "playing", "paused", "ended"})
+        {
+            metric("stinger_player_state", player["state"] == state ? 1.0 : 0.0, l + ",state=\"" + state + "\"");
+        }
+        metric("stinger_frames_late_total", player.value("late", 0.0), l);
+        metric("stinger_frames_decoded_total", player.value("decoded", 0.0), l);
+        metric("stinger_decode_ms", player.value("decode_ms", 0.0), l + ",stat=\"avg\"");
+    }
+    // Keyers (P3): on air, and whether the key flow of a linear key runs (else NO KEY).
+    auto const& keyList = s["keys"];
+    for (auto const& key : s["keyers"])
+    {
+        auto const k = key["key"].get<std::size_t>();
+        std::string const label = k >= 1 && k <= keyList.size() ? keyList[k - 1]["label"].get<std::string>() : std::to_string(k);
+        std::string const l = "keyer=\"" + label + "\",me=\"" + std::to_string(key["me"].get<int>()) + "\",stage=\"" +
+            key["stage"].get<std::string>() + "\",mode=\"" + key["mode"].get<std::string>() + "\"";
+        metric("keyer_on_air", key["on"].get<bool>() ? 1.0 : 0.0, l);
+        metric("keyer_key_running", k >= 1 && k <= keyList.size() && keyList[k - 1]["state"] == "running" ? 1.0 : 0.0, l);
     }
     auto const& mosaic = s["mosaic"];
     metric("mosaic_frames_total", mosaic["frames"].get<double>());

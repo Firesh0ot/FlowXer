@@ -137,7 +137,7 @@ def render_prometheus(mixer) -> str:
         "# TYPE flowxer_transitions_total counter",
     ]
     counts = getattr(mixer, "transition_counts", {}) or {}
-    for kind in ("cut", "mix", "stinger"):
+    for kind in ("cut", "mix", "wipe", "stinger"):
         lines.append(_line("flowxer_transitions_total", int(counts.get(kind, 0)), {"type": kind}))
     lines += [
         "# HELP flowxer_input_state 1 for the current per-essence input state",

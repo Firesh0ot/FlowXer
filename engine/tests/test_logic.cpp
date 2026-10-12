@@ -321,7 +321,7 @@ TEST(stinger_cut_point_and_end)
     CHECK(mixer.take(1, in(2), 0, in(1), Transition::Stinger, Sting{1, 6, 3}) == MixResult::Ok);
     // Its first frame is not decoded yet: it waits (A, no overlay), counted; Auto is busy.
     auto p = mixer.frame(100, notReady).mes[1];
-    CHECK(p.stinger == 0 && p.background() == in(1) && mixer.stingerWaits() == 1);
+    CHECK(p.stinger == 0 && p.background() == in(1) && mixer.stingerWaits() == 1 && mixer.stingersPlayed() == 0);
     CHECK(mixer.view()[0].mixing && mixer.view()[0].stinger == 1);
     CHECK(mixer.autoTransition(1) == MixResult::Busy);
     // Ready at grain 101: frame f in grain 101 + f, the background B from grain 104 (the cut).
@@ -359,6 +359,8 @@ TEST(stinger_cut_point_and_end)
     CHECK(mixer.stingerWaits() == waits + static_cast<std::uint64_t>(Mixer::kStingerWait) && mixer.stingerCuts() == 0);
     p = mixer.frame(400 + static_cast<std::uint64_t>(Mixer::kStingerWait), notReady).mes[1];
     CHECK(p.stinger == 0 && p.a == in(4) && mixer.stingerCuts() == 1 && !mixer.view()[0].mixing);
+    // Played: the three stingers whose first frame went on air, not the one that became a cut.
+    CHECK(mixer.stingersPlayed() == 3);
     // A cut point past the end is clamped to the length (B only after the swap).
     CHECK(mixer.take(1, in(2), 0, std::nullopt, Transition::Stinger, Sting{1, 3, 9}) == MixResult::Ok);
     CHECK(!mixer.frame(500, ready).mes[1].cutDone && !mixer.frame(502, ready).mes[1].cutDone);

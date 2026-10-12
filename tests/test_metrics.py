@@ -14,6 +14,7 @@ def test_metrics_and_probes(client: TestClient, mixer) -> None:
     assert "flowxer_on_air 0" in text
     assert "flowxer_nmos_registry_up" in text
     assert "flowxer_transitions_total{type=\"cut\"}" in text
+    assert "flowxer_transitions_total{type=\"wipe\"} 0" in text
     api = client.get("/api/v1/metrics")
     assert api.status_code == 200
     assert "flowxer_process_memory_bytes" in api.text

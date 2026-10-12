@@ -568,6 +568,10 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
             state.pending = false;
             state.mixing = true;
             state.start = index;
+            if (state.sting.player > 0)
+            {
+                ++stingersPlayed_;
+            }
         }
         MePlan plan;
         plan.me = m;
@@ -689,6 +693,12 @@ std::uint64_t Mixer::stingerCuts() const
 {
     std::lock_guard lock{mu_};
     return stingerCuts_;
+}
+
+std::uint64_t Mixer::stingersPlayed() const
+{
+    std::lock_guard lock{mu_};
+    return stingersPlayed_;
 }
 
 std::vector<KeyView> Mixer::keyView() const

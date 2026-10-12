@@ -252,9 +252,11 @@ public:
     {
         return mes_;
     }
-    // Grains stingers waited for their first frame, and stingers that became cuts after waiting.
+    // Grains stingers waited for their first frame, stingers that became cuts after waiting, and
+    // stingers that played (their first frame went on air).
     [[nodiscard]] std::uint64_t stingerWaits() const;
     [[nodiscard]] std::uint64_t stingerCuts() const;
+    [[nodiscard]] std::uint64_t stingersPlayed() const;
 
     static constexpr int kMaxFrames = 1000;
     static constexpr int kStingerWait = 50;
@@ -330,6 +332,7 @@ private:
     std::vector<Fade> ftbs_;
     std::uint64_t stingerWaits_ = 0;
     std::uint64_t stingerCuts_ = 0;
+    std::uint64_t stingersPlayed_ = 0;
     std::function<void()> changed_;
 };
 } // namespace fxeng
