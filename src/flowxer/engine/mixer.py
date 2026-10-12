@@ -106,6 +106,10 @@ GRAB_TIMEOUT_S = 3.0
 AUDIO_SAMPLES_PER_MS = 48
 # A fader that moves sends up to 20 values a second: its changes are saved at most this often.
 PERSIST_INTERVAL_S = 1.0
+# GET /audio/meters: one engine call per 100 ms block, however many viewers poll.
+METERS_CACHE_S = 0.08
+# Meter values below this are this (silence).
+METER_FLOOR_DB = -120.0
 
 
 def _autostart_pause(attempt: int) -> float:
@@ -260,6 +264,10 @@ class VisionMixer:
         self._persist_lock = threading.Lock()
         self._persist_at = 0.0
         self._persist_timer: threading.Timer | None = None
+        # The engine's last /audio/meters and when it was fetched.
+        self._meters_lock = threading.Lock()
+        self._meters_raw: dict[str, Any] | None = None
+        self._meters_at = 0.0
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -2543,6 +2551,73 @@ class VisionMixer:
                 },
             }
         self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio", body, client=client)
+
+    def audio_meters(self) -> dict[str, Any]:
+        """GET /audio/meters: the engine's last 100 ms block with FlowXer's ids (live inputs and clip
+        players by id, stinger players as stinger-<k>, panels by id with their strips). At most
+        100 ms old, one engine call however many viewers poll. Off-air (or in simulate) every
+        meter is silence (-120) and each strip shows what its settings and AFV give."""
+        with self._meters_lock:
+            now = time.monotonic()
+            if now - self._meters_at >= METERS_CACHE_S:
+                raw = None
+                if self.engine is not None and self.engine.ready:
+                    try:
+                        raw = self.engine.call("GET", "/audio/meters")
+                    except EngineError:
+                        raw = None
+                self._meters_raw, self._meters_at = raw if isinstance(raw, dict) else None, now
+            raw = self._meters_raw
+        return self._meters_view(raw)
+
+    def _meters_view(self, raw: dict[str, Any] | None) -> dict[str, Any]:
+        channels = self.audio_channels()
+        floor = [METER_FLOOR_DB] * channels
+        live = [item for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        players = [item for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        engine_sources = (raw or {}).get("sources") or {}
+        sources: dict[str, Any] = {}
+        for prefix, items in (("in", live), ("cp", players)):
+            for k, item in enumerate(items, 1):
+                entry = engine_sources.get(f"{prefix}{k}") or {}
+                sources[item.id] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        for k in range(1, self._stinger_players() + 1):
+            entry = engine_sources.get(f"st{k}") or {}
+            sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        engine_mes = (raw or {}).get("mes") or {}
+        panels: dict[str, Any] = {}
+        pairs = (channels + 1) // 2
+        for panel in self.rendered_panels():
+            entry = engine_mes.get(str(self._panel_number(panel))) or {}
+            engine_strips = entry.get("strips") or {}
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            strips = {}
+            for strip_id, _label, kind in self.audio_strips(panel):
+                measured = engine_strips.get(self._engine_strip(strip_id))
+                if measured is None:
+                    setting = audio.strips.get(strip_id) or AudioStrip()
+                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
+                    measured = {"gain_db": gain, "heard": gain > -90.0}
+                strips[strip_id] = measured
+            panels[panel.id] = {
+                "peak_dbfs": entry.get("peak_dbfs", floor),
+                "true_peak_dbtp": entry.get("true_peak_dbtp", floor),
+                "rms_dbfs": entry.get("rms_dbfs", floor),
+                "loudness": entry.get("loudness")
+                or [{"pair": p, "momentary": METER_FLOOR_DB, "short_term": METER_FLOOR_DB, "integrated": METER_FLOOR_DB} for p in range(1, pairs + 1)],
+                "overs": int(entry.get("overs") or 0),
+                "strips": strips,
+            }
+        return {"block": (raw or {}).get("block"), "channels": channels, "sources": sources, "panels": panels}
+
+    def reset_loudness(self, panel_id: str) -> dict[str, Any]:
+        """The panel's integrated loudness from now on (the engine's next 100 ms block)."""
+        panel = self._audio_panel(panel_id)
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio/loudness/reset", {})
+        with self._meters_lock:
+            self._meters_at = 0.0
+        return {"panel_id": panel.id, "loudness_reset": True}
 
     def _prune_audio(self) -> None:
         """When the structure changes: the audio of inputs that are no live input any more, of panels

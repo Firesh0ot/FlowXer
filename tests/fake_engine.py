@@ -57,6 +57,20 @@ def status() -> dict:
         }
 
 
+def audio_meters() -> dict:
+    """The engine's /audio/meters with every input at -20 dBFS and loudness -23 LUFS."""
+    channels = int(config.get("FLOWXER_ENGINE_AUDIO_CHANNELS") or 2)
+    level = {"peak_dbfs": [-20.0] * channels, "rms_dbfs": [-23.0] * channels}
+    sources = {f"in{k}": level for k in range(1, len(inputs) + 1)}
+    sources.update({f"cp{k}": level for k in range(1, len(players) + 1)})
+    mes_out = {}
+    for m in range(1, mes + 1):
+        strips = {f"in{k}": {"gain_db": 0.0 if k == m else -90.0, "heard": k == m} for k in range(1, len(inputs) + 1)}
+        mes_out[str(m)] = {"peak_dbfs": [-20.0] * channels, "true_peak_dbtp": [-19.5] * channels, "rms_dbfs": [-23.0] * channels,
+                           "loudness": [{"pair": 1, "momentary": -23.0, "short_term": -23.1, "integrated": -23.0}], "overs": 0, "strips": strips}
+    return {"block": 17921903012, "channels": channels, "sources": sources, "mes": mes_out}
+
+
 def mosaic_map() -> dict:
     tiles = [{"id": f"in{k}", "kind": "input", "source": f"in{k}", "x": 0, "y": 0, "w": 480, "h": 270} for k in range(1, len(inputs) + 1)]
     tiles += [{"id": f"cp{k}", "kind": "player", "source": f"cp{k}", "x": 0, "y": 0, "w": 480, "h": 270} for k in range(1, len(players) + 1)]
@@ -88,6 +102,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, "flowxer_engine_output_fps 50\n")
         elif self.path == "/mosaic/map":
             self._reply(200, mosaic_map())
+        elif self.path == "/audio/meters":
+            self._reply(200, audio_meters())
         else:
             self._reply(404, {"error": "not found"})
 

@@ -928,6 +928,38 @@ def patch_audio_strip(
         raise _audio_error(exc)
 
 
+@router.post(
+    "/audio/panels/{panel_id}/loudness/reset",
+    tags=["audio"],
+    summary="The ME's integrated loudness (EBU R 128) from now on",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def reset_audio_loudness(panel_id: str, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.reset_loudness(panel_id)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.get(
+    "/audio/meters",
+    tags=["audio"],
+    summary="The meters of the last 100 ms block: per source peak and RMS, per ME PGM also true peak, loudness, overs and its strips",
+    description=(
+        "`sources`: live inputs (after their delay and channel map, before the fader) and clip players by id, "
+        "stinger players as `stinger-<k>`: `peak_dbfs` and `rms_dbfs` per channel. `panels`: per rendering ME "
+        "its PGM (what goes to MXL): `peak_dbfs`, `true_peak_dbtp` (BS.1770-4, 4x), `rms_dbfs` per channel, "
+        "`loudness` per channel pair (`momentary` 400 ms, `short_term` 3 s, `integrated` since the start or the "
+        "last reset; LUFS, EBU R 128), `overs` (samples at or above 0 dBFS since the engine started) and "
+        "`strips`: per strip its `gain_db` in PGM now and whether it is `heard`. `block`: the 100 ms block's "
+        "number (its first 48 kHz sample index / 4800); null off-air. Values below -120 dB are -120. Poll at "
+        "10 Hz at most: the answer changes every 100 ms."
+    ),
+)
+def get_audio_meters(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_meters()
+
+
 @router.patch(
     "/stinger-slots/{slot_id}",
     response_model=StingerSlot,

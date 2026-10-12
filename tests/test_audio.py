@@ -183,6 +183,43 @@ def test_the_engine_gets_the_audio(engine_mixer) -> None:
     assert _commands(log)[-1]["body"] == {"delay_ms": 5.0, "map": []}
 
 
+def test_meters_off_air(client: TestClient, mixer: VisionMixer) -> None:
+    _two_mes(mixer)
+    mixer.panels[0].program_input_id = "cam-1"
+    client.patch("/api/v1/audio/panels/me-1/strips/cam-3", json={"afv": False, "fader_db": -6})
+    meters = client.get("/api/v1/audio/meters").json()
+    assert meters["block"] is None and meters["channels"] == 2
+    assert meters["sources"]["cam-1"] == {"peak_dbfs": [-120.0, -120.0], "rms_dbfs": [-120.0, -120.0]}
+    assert "clip-1" in meters["sources"] and "stinger-1" in meters["sources"] and "black" not in meters["sources"]
+    me1 = meters["panels"]["me-1"]
+    assert me1["true_peak_dbtp"] == [-120.0, -120.0] and me1["overs"] == 0
+    assert me1["loudness"] == [{"pair": 1, "momentary": -120.0, "short_term": -120.0, "integrated": -120.0}]
+    # Off-air the strips show what their settings and AFV give (Program cam 1, cam 3 AFV off).
+    assert me1["strips"]["cam-1"] == {"gain_db": 0.0, "heard": True}
+    assert me1["strips"]["cam-3"] == {"gain_db": -6.0, "heard": True}
+    assert me1["strips"]["cam-2"]["heard"] is False and me1["strips"]["stinger"]["heard"] is False
+    assert client.post("/api/v1/audio/panels/me-1/loudness/reset").json() == {"panel_id": "me-1", "loudness_reset": True}
+    assert client.post("/api/v1/audio/panels/me-7/loudness/reset").status_code == 404
+
+
+def test_meters_from_the_engine(engine_mixer) -> None:
+    mixer, log = engine_mixer
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    meters = mixer.audio_meters()
+    assert meters["block"] == 17921903012
+    assert meters["sources"]["cam-1"]["peak_dbfs"] == [-20.0, -20.0] and meters["sources"]["clip-1"]["rms_dbfs"] == [-23.0, -23.0]
+    me1 = meters["panels"]["me-1"]
+    assert me1["loudness"][0]["integrated"] == -23.0 and me1["true_peak_dbtp"] == [-19.5, -19.5]
+    # The engine's strips by FlowXer's ids; the ones it does not report from the settings.
+    assert me1["strips"]["cam-1"] == {"gain_db": 0.0, "heard": True} and me1["strips"]["cam-2"]["heard"] is False
+    # One engine call per 100 ms however many viewers poll.
+    before = mixer._meters_at
+    mixer.audio_meters()
+    assert mixer._meters_at == before
+    mixer.reset_loudness("me-1")
+    assert _commands(log)[-1]["path"] == "/me/1/audio/loudness/reset"
+
+
 def test_a_moving_fader_is_saved_at_most_once_a_second(client: TestClient, settings: Settings) -> None:
     state = Path(settings.state_dir) / "state.json"
     client.patch("/api/v1/audio/panels/me-1/strips/cam-1", json={"fader_db": -1})
