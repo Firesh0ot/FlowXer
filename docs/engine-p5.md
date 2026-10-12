@@ -261,6 +261,9 @@ T(k) is the start of grain *k* on the TAI clock, and d is the input's delay.
     covers how late its audio arrives; L still only has to cover the inputs' arrival.
   - The recommended latency (`recommended_latency_grains`) counts a delayed input's audio
     arrival lag minus its delay.
+  - It counts an input's audio only while some ME hears it (on air, in a transition, AFV off and
+    not muted): a source's bursty audio that no PGM reads (on small a browser source, 533 ms, not
+    on air) does not raise it. Video and key flows count as before.
 - **Range:** 0 to `FLOWXER_AUDIO_MAX_DELAY_MS` (default 1000 ms, at most 5000), in whole samples
   (1/48 ms). The GUI steps by 1 ms and by 1 frame.
 - **Not in P5: negative delays** (audio earlier than its video). They would read samples newer
@@ -310,7 +313,9 @@ As built in #97 (`core/audiomix`, `engine/engine.cpp` fx-audio, `engine/api.cpp`
   `startup` count every routed input (P4: only Program's sources). Before a route's first sample
   (its delay at the start) and in the start-up window: `startup`.
 - **The recommended latency** counts a delayed input's audio lag minus its delay
-  (`inputs[].audio.delay_ms` in `/status`).
+  (`inputs[].audio.delay_ms` in `/status`), and only while some ME hears it
+  (`inputs[].audio.heard`: `AudioMix::heardInputs` of the last grain). The lag itself stays in
+  `/status` and the metrics.
 - **Engine API** as designed, plus `GET /audio` (the settings: per ME `master_db` and per strip
   `fader_db`, `mute`, `afv`, `gain_db`, `heard`; per input `delay_ms`, `delay_samples`, `map`,
   `channels`, `held_ms`), also `/status` `audio`.

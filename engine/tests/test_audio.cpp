@@ -594,7 +594,6 @@ TEST(audio_changes_are_click_free)
         }
     };
     StripRef const in1{StripRef::Kind::Input, 1};
-    StripRef const in2{StripRef::Kind::Input, 2};
     run(in(1), 5);
     for (float db : {-1.f, -2.f, -4.f, -8.f, -14.f, -20.f, -12.f, -4.f, 0.f})
     {

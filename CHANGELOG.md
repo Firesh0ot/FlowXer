@@ -22,7 +22,10 @@ in `docs/platform-integration-plan.md` §8.
   (a P4 state loads with the defaults). New: `FLOWXER_AUDIO_MAX_DELAY_MS`.
 - The engine's audio runs on its own thread (`fx-audio`) and reads every routed input into a delay
   line each grain; `audio.missing` counts every routed input. `recommended_latency_grains` counts a
-  delayed input's audio lag minus its delay.
+  delayed input's audio lag minus its delay, and an input's audio only while some ME hears it (on
+  air, in a transition, AFV off and not muted; `audio.heard` in the engine's `/status`): on small
+  a browser source's bursty audio (533 ms, not on air) drove it to 28 grains. The lag stays in
+  `/status` and the metrics.
 - GUI: AUDIO opens the active ME's audio strip (meters, faders, MUTE, AFV, ON AIR, the master with
   the loudness and RESET); a live input's ⚙ has an Audio section (delay, channel map). New widget
   `audio`: `/widget/audio?me=n[&faders=false]` (480 × 240). Grafana: an audio row.

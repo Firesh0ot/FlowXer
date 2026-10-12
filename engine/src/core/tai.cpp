@@ -61,7 +61,9 @@ int recommendedLatency(nlohmann::json const& status, double periodMs)
     for (auto const& input : status.value("inputs", nlohmann::json::array()))
     {
         take(input, "arrival_ms");
-        if (input.contains("audio"))
+        // Its audio only while some ME hears it (on air, in a transition, AFV off at a level): a
+        // source's bursty audio that no PGM reads does not hold L up.
+        if (input.contains("audio") && input["audio"].value("heard", false))
         {
             take(input["audio"], "lag_ms", input["audio"].value("delay_ms", 0.0));
         }

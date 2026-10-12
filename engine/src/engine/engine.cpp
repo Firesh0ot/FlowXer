@@ -329,6 +329,9 @@ struct Input
     std::vector<int> audioMap;
     std::atomic<std::uint64_t> audioHeld{0};
     std::atomic<std::uint32_t> audioChannels{0};
+    // Whether some ME hears its audio in the last grain (AudioMix::heardInputs), published by
+    // fx-audio: only then does its audio lag count for recommended_latency_grains.
+    std::atomic<bool> audioHeard{false};
 
     [[nodiscard]] Route videoRoute() const
     {
@@ -2383,9 +2386,11 @@ struct Engine::Impl
                 map = in.audioMap;
             }
             auto const window = delayedSamples(cfg.rate, index, cfg.latency, delay);
+            bool const isHeard = k < heard.size() && heard[k];
+            in.audioHeard.store(isHeard);
             if (r.reader != nullptr)
             {
-                fillLine(in, r, span.end, window.end, k < heard.size() && heard[k], deadline, n);
+                fillLine(in, r, span.end, window.end, isHeard, deadline, n);
             }
             in.audioHeld.store(r.line.started() ? r.line.end() - r.line.start() : 0);
             if (r.route.flow.empty())
@@ -3120,6 +3125,7 @@ struct Engine::Impl
                 {"waits", in.audioWaits.load()},
                 {"reopens", in.audioReopens.load()},
                 {"lag_ms", in.audioLag.toJson(true)},
+                {"heard", in.audioHeard.load()},
                 {"delay_ms", round3(static_cast<double>(delay) * 1000.0 / static_cast<double>(kAudioRate))},
                 {"map", map},
                 {"channels", in.audioChannels.load()},
