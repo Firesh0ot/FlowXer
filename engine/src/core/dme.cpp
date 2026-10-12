@@ -70,6 +70,9 @@ DmeBox makeDmeBox(DmeSettings const& set, DmeKind kind, int width, int height)
     b.shadowDy = set.shadowDy;
     b.shadowBlur = set.shadowBlur;
     b.shadowOpacity = set.shadowOpacity;
+    b.invSoft = b.soft > 0.f ? 1.f / b.soft : 0.f;
+    b.invBorderSoft = b.borderSoft > 0.f ? 1.f / b.borderSoft : 0.f;
+    b.invBlur = 1.f / (b.shadowBlur > 0.f ? b.shadowBlur : 1.f);
     // Outside this area every α is 0: the compose skips it.
     float pad = b.borderWidth + b.borderSoft + b.soft + 2.f;
     if (b.shadowOpacity > 0.f)
@@ -144,11 +147,12 @@ void dmeLayerCpu(DmeDraw const& d, Planar422& picture)
     int const cw = picture.width / 2;
     for (int row = b.ey0; row < b.ey1; ++row)
     {
+        DmeAxis const ry = dmeRowAxis(b, row);
         for (int x = b.ex0 & ~1; x < b.ex1; x += 2)
         {
             std::size_t const yi = static_cast<std::size_t>(row) * static_cast<std::size_t>(picture.width) + static_cast<std::size_t>(x);
             std::size_t const ci = static_cast<std::size_t>(row) * static_cast<std::size_t>(cw) + static_cast<std::size_t>(x / 2);
-            dmePair(d, x, row, &picture.y[yi], picture.cb[ci], picture.cr[ci]);
+            dmePair(d, ry, x, row, &picture.y[yi], picture.cb[ci], picture.cr[ci]);
         }
     }
 }

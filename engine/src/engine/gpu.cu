@@ -511,9 +511,10 @@ __global__ void __launch_bounds__(128, 6) composeYuvKernel(ComposeArgs args)
             DmeDraw const& d = args.boxes[args.box[l]];
             if (row >= d.box.ey0 && row < d.box.ey1 && group * 6 + 6 > d.box.ex0 && group * 6 < d.box.ex1)
             {
+                DmeAxis const ry = dmeRowAxis(d.box, row);
                 for (int p = 0; p < pairs; ++p)
                 {
-                    dmePair(d, group * 6 + 2 * p, row, &y[2 * p], cb[p], cr[p]);
+                    dmePair(d, ry, group * 6 + 2 * p, row, &y[2 * p], cb[p], cr[p]);
                 }
             }
             continue;

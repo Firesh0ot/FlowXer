@@ -129,6 +129,10 @@ struct DmeBox
     float shadowDy = 0.f;
     float shadowBlur = 0.f;
     float shadowOpacity = 0.f;
+    // 1 / soft (0 without), 1 / borderSoft, 1 / shadowBlur (1 without a blur).
+    float invSoft = 0.f;
+    float invBorderSoft = 0.f;
+    float invBlur = 1.f;
 };
 
 FXENG_HD inline float dmeMin(float a, float b)
@@ -450,15 +454,15 @@ void dmeDispatch(int taps, F&& f)
 }
 
 // Coverage of the pixel [x, x + 1) by [l, r): the exact area for a hard edge (a one-pixel
-// anti-aliased edge), else a linear ramp over `soft` px inside the edge.
-FXENG_HD inline float dmeCover(float x, float l, float r, float soft)
+// anti-aliased edge), else a linear ramp over `soft` px inside the edge (`inv` = 1 / soft).
+FXENG_HD inline float dmeCover(float x, float l, float r, float soft, float inv)
 {
     if (soft <= 0.f)
     {
         return clamp01(dmeMin(x + 1.f, r) - dmeMax(x, l));
     }
     float const c = x + 0.5f;
-    return clamp01((dmeMin(c - l, r - c) + 0.5f) / soft);
+    return clamp01((dmeMin(c - l, r - c) + 0.5f) * inv);
 }
 
 FXENG_HD inline float dmeSmooth(float t)
@@ -467,32 +471,38 @@ FXENG_HD inline float dmeSmooth(float t)
     return t * t * (3.f - 2.f * t);
 }
 
-// The geometric αs of raster pixel (x, y): the shadow (the outer rectangle moved by the offset,
-// a smoothstep ramp over `blur` px at each edge), the border (the outer rectangle, soft on its
-// outside, times its opacity) and the picture.
-FXENG_HD inline void dmeAlphas(DmeBox const& b, int x, int y, float& shadow, float& border, float& picture)
+// The factors of one axis at raster position v (a column or a row): the picture's and the
+// border's coverage and the shadow's ramp. [lo, hi) is the picture on that axis, `shift` the
+// shadow's offset. The border is the outer rectangle (picture + width), soft on its outside; the
+// shadow is the outer rectangle moved by the offset, a smoothstep ramp over `blur` px at each
+// edge. A pixel's αs are the products of its column's and its row's factors.
+struct DmeAxis
 {
-    float const fx = static_cast<float>(x);
-    float const fy = static_cast<float>(y);
+    float picture = 0.f;
+    float border = 0.f;
+    float shadow = 0.f;
+};
+
+FXENG_HD inline DmeAxis dmeAxis(DmeBox const& b, float v, float lo, float hi, float shift)
+{
+    DmeAxis a;
     float const bw = b.borderWidth;
     bool const hasBorder = bw > 0.f;
-    float const ps = hasBorder ? 0.f : b.soft;
-    picture = dmeCover(fx, b.L, b.R, ps) * dmeCover(fy, b.T, b.B, ps);
-    float const oL = b.L - bw;
-    float const oR = b.R + bw;
-    float const oT = b.T - bw;
-    float const oB = b.B + bw;
-    border = hasBorder ? dmeCover(fx, oL, oR, b.borderSoft) * dmeCover(fy, oT, oB, b.borderSoft) * b.borderOpacity : 0.f;
-    shadow = 0.f;
+    a.picture = hasBorder ? dmeCover(v, lo, hi, 0.f, 0.f) : dmeCover(v, lo, hi, b.soft, b.invSoft);
+    float const ol = lo - bw;
+    float const oh = hi + bw;
+    a.border = hasBorder ? dmeCover(v, ol, oh, b.borderSoft, b.invBorderSoft) : 0.f;
     if (b.shadowOpacity > 0.f)
     {
-        float const bl = b.shadowBlur > 0.f ? b.shadowBlur : 1.f;
-        float const c = fx + 0.5f - b.shadowDx;
-        float const d = fy + 0.5f - b.shadowDy;
-        float const ax = dmeSmooth((c - oL) / bl + 0.5f) * dmeSmooth((oR - c) / bl + 0.5f);
-        float const ay = dmeSmooth((d - oT) / bl + 0.5f) * dmeSmooth((oB - d) / bl + 0.5f);
-        shadow = b.shadowOpacity * ax * ay;
+        float const c = v + 0.5f - shift;
+        a.shadow = dmeSmooth((c - ol) * b.invBlur + 0.5f) * dmeSmooth((oh - c) * b.invBlur + 0.5f);
     }
+    return a;
+}
+
+FXENG_HD inline DmeAxis dmeRowAxis(DmeBox const& b, int row)
+{
+    return dmeAxis(b, static_cast<float>(row), b.T, b.B, b.shadowDy);
 }
 
 // A box layer as the compose draws it: the box, its buffer, and the keyer's gain and luma key.
@@ -506,18 +516,24 @@ struct DmeDraw
     bool invert = false;
 };
 
-// The box layer on the pixel pair (x, x + 1) of raster row `row` (x even): shadow towards black,
+// The box layer on the pixel pair (x, x + 1) of raster row `row` (x even; `ry` its dmeRowAxis):
+// shadow towards black,
 // then the border colour, then the picture, each rounded to 10 bits. The keyer's gain scales
 // every α; chroma takes the pair's mean α. A pip is opaque; a luma box keys its picture by its
 // luma; a linear box is premultiplied over: out = bg · (1 − a) + black · a + P · g.
-FXENG_HD inline void dmePair(DmeDraw const& d, int x, int row, std::uint16_t y[2], std::uint16_t& cb, std::uint16_t& cr)
+FXENG_HD inline void dmePair(DmeDraw const& d, DmeAxis const& ry, int x, int row, std::uint16_t y[2], std::uint16_t& cb, std::uint16_t& cr)
 {
     DmeBox const& b = d.box;
     float sh[2];
     float bo[2];
     float pc[2];
-    dmeAlphas(b, x, row, sh[0], bo[0], pc[0]);
-    dmeAlphas(b, x + 1, row, sh[1], bo[1], pc[1]);
+    for (int i = 0; i < 2; ++i)
+    {
+        DmeAxis const rx = dmeAxis(b, static_cast<float>(x + i), b.L, b.R, b.shadowDx);
+        pc[i] = rx.picture * ry.picture;
+        bo[i] = rx.border * ry.border * b.borderOpacity;
+        sh[i] = b.shadowOpacity * rx.shadow * ry.shadow;
+    }
     int const lx = x - b.bx;
     int const ly = row - b.by;
     float fy[2] = {0.f, 0.f};
