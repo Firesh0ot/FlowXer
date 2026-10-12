@@ -66,6 +66,10 @@ constexpr std::size_t kGrabsPerGrain = 4;
 constexpr std::size_t kGrabBuffers = 8;
 constexpr std::size_t kGrabHistory = 32;
 
+// A sample later than this is no arrival but a grain the clock cannot place (index 0 of a mirror
+// flow that was just created): it would hold the peak forever (small: 1.79e12 ms on a new mirror).
+constexpr double kMaxArrivalMs = 10'000.0;
+
 void check(cudaError_t err, char const* what)
 {
     if (err != cudaSuccess)
@@ -1102,6 +1106,14 @@ struct Engine::Impl
         return currentIndex() + static_cast<std::uint64_t>(cfg.latency) + kGraceGrains;
     }
 
+    static void addArrival(Input& in, double ms)
+    {
+        if (ms < kMaxArrivalMs)
+        {
+            in.arrival.add(ms);
+        }
+    }
+
     // True in a source's start-up window and kLagSettleNs after it: its lag statistics skip that time.
     [[nodiscard]] bool settling(std::uint64_t graceUntil) const
     {
@@ -1246,7 +1258,7 @@ struct Engine::Impl
             if (next == runtime.headIndex && runtime.lastWriteTime != 0 && !settling(in.graceUntil.load()))
             {
                 auto const due = indexToTimestamp(cfg.rate, next);
-                in.arrival.add(runtime.lastWriteTime > due ? static_cast<double>(runtime.lastWriteTime - due) / 1e6 : 0.0);
+                addArrival(in, runtime.lastWriteTime > due ? static_cast<double>(runtime.lastWriteTime - due) / 1e6 : 0.0);
             }
             mxlGrainInfo grain{};
             std::uint8_t* payload = nullptr;
@@ -1278,7 +1290,7 @@ struct Engine::Impl
             {
                 auto const now = mxlGetTime();
                 auto const due = indexToTimestamp(cfg.rate, grain.index);
-                in.arrival.add(now > due ? static_cast<double>(now - due) / 1e6 : 0.0);
+                addArrival(in, now > due ? static_cast<double>(now - due) / 1e6 : 0.0);
             }
             next = grain.index + 1;
             if ((grain.flags & MXL_GRAIN_FLAG_INVALID) != 0 || grain.grainSize < in.bytes)
@@ -2118,7 +2130,11 @@ struct Engine::Impl
         }
         auto const now = timestampToIndex(Rate{kAudioRate, 1}, nowNs);
         double const behind = now > runtime.headIndex ? static_cast<double>(now - runtime.headIndex) : 0.0;
-        in.audioLag.add(behind * 1000.0 / static_cast<double>(kAudioRate));
+        double const behindMs = behind * 1000.0 / static_cast<double>(kAudioRate);
+        if (behindMs < kMaxArrivalMs)
+        {
+            in.audioLag.add(behindMs);
+        }
     }
 
     // `count` samples of every channel ending at `end`, channel-major into dst (channels the

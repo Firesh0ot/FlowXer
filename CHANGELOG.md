@@ -44,6 +44,8 @@ in `docs/platform-integration-plan.md` §8.
   start-up window and 2 s after it, at every (re)route: on small one 546 ms audio peak while the
   routes were applied at an Up held the recommendation at 28 grains although the steady state
   needs about 3.
+- Arrival and audio lag samples later than 10 s are ignored: they are no arrivals but grains the
+  clock cannot place (index 0 of a mirror flow that was just created showed 1.79e12 ms on small).
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 
