@@ -5,13 +5,13 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
-### Added: audio (P5 M1, M2)
+### Added: audio (P5 M1–M3)
 
 - Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
   and the stinger, each with a fader (−90 = off … +10 dB), mute and AFV (audio follows video; off:
   always in the mix), and a master per ME. A live input has a delay (0 …
   `FLOWXER_AUDIO_MAX_DELAY_MS`, default 1000 ms) and a channel map for every ME. Every change ramps
-  over one grain; a Cut now crossfades over its grain (equal power). With the defaults the sound is
+  over one grain (S-shaped, no click); a Cut now crossfades over its grain (equal power). With the defaults the sound is
   P4's, except the Cut, the first grain of a new route (it fades in) and a 1-channel live input
   (now on every PGM channel).
 - Meters: per source peak and RMS, per ME PGM sample peak, true peak, RMS, overs and EBU R 128
@@ -23,6 +23,9 @@ in `docs/platform-integration-plan.md` §8.
 - The engine's audio runs on its own thread (`fx-audio`) and reads every routed input into a delay
   line each grain; `audio.missing` counts every routed input. `recommended_latency_grains` counts a
   delayed input's audio lag minus its delay.
+- GUI: AUDIO opens the active ME's audio strip (meters, faders, MUTE, AFV, ON AIR, the master with
+  the loudness and RESET); a live input's ⚙ has an Audio section (delay, channel map). New widget
+  `audio`: `/widget/audio?me=n[&faders=false]` (480 × 240). Grafana: an audio row.
 - Metrics: `flowxer_engine_audio_level_dbfs`, `flowxer_engine_pgm_audio_level_dbfs`,
   `flowxer_engine_pgm_loudness_lufs`, `flowxer_engine_pgm_audio_overs_total`,
   `flowxer_engine_audio_strip_heard`, `flowxer_engine_audio_ms`, `flowxer_engine_audio_wait_ms`,

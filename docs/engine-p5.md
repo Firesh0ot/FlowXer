@@ -1,9 +1,10 @@
 # FlowXer engine P5: audio
 
 Status: the user answered the 11 open questions "all as suggested" on 2026-10-12
-([§14](#14-open-questions-for-the-user)). M1 (the mix) and M2 (meters) are implemented in #97, with
-the details in [Implementation notes (M1)](#implementation-notes-m1) and
-[Implementation notes (M2)](#implementation-notes-m2). P5 builds on P2 (the C++/CUDA engine is
+([§14](#14-open-questions-for-the-user)). M1 (the mix), M2 (meters) and M3 (the AUDIO strip, the
+source's Audio section, the `audio` widget) are implemented in #97, with the details in
+[Implementation notes (M1)](#implementation-notes-m1), [(M2)](#implementation-notes-m2) and
+[(M3)](#implementation-notes-m3). P5 builds on P2 (the C++/CUDA engine is
 FlowXer's media path, #86), P3 (transitions and keying, #89) and P4 (DME boxes and frame grab, #91).
 The numbers come from a CPU prototype of the audio path on the lab host (Xeon Gold 6136) on
 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
@@ -450,6 +451,23 @@ The control plane writes the new configuration value `FLOWXER_ENGINE_AUDIO_MAX_D
   AFV, and the fader unless `faders=false`) and its master meter with the loudness
   ([open question 5](#14-open-questions-for-the-user)).
 - Listed in `GET /widgets`. Its minimum size is about 480 × 240 (to be checked).
+
+### Implementation notes (M3)
+
+As built in #97 (`gui/src/components/AudioStrip.tsx`, `AudioWidget.tsx`, `src/fader.ts`):
+
+- **AUDIO** sits in the keyer row (the console has no room under the transition section); the strip
+  is a row under the deck, closed by default, remembered in the browser (`flowxer.audioOpen`).
+- **The fader law** (`src/fader.ts`) is piecewise linear in dB: −∞ (−90) at the bottom, −60 at 5 %,
+  −40 at 15 %, −30 at 25 %, −20 at 40 %, −10 at 55 %, 0 dB at 75 %, +10 at the top, sent to 0.1 dB;
+  the meters run from −60 to 0 dBFS (−40 at 20 %, −20 at 50 %, −10 at 70 %). `scripts/check-fader.ts`
+  checks both against vectors in CI.
+- **Fader moves** send the latest value, one request at a time (as the box editor does): at most
+  one value per round trip, the last one always.
+- **The stinger strip's meter** shows the loudest stinger player; a re-entered ME's strip shows that
+  ME's PGM meter.
+- **The `audio` widget** is the same strip without the console, `faders=false` shows the level as
+  text instead of the fader; nginx checks `me` (1–4) and `faders` (true, false).
 
 ## 9. Tally and NMOS
 

@@ -67,13 +67,15 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 ┌─ File  Settings  Tally  Help ─────────────── [CPU% RAM% format] ─┐
 │  [ME 1] [ME 2]                                                   │
 │  PREVIEW                       PROGRAM                           │
-│  [ME 1 Key 1 ON|AUTO|25 f|⚙] … [DSK 1 …]  Stinger ⚙             │
+│  [ME 1 Key 1 ON|AUTO|25 f|⚙] … [DSK 1 …]  Stinger ⚙      AUDIO  │
 │                                                                  │
 │  [Cam 1 ⚙] [Cam 2 ⚙] [Clip 1 ⚙] …   source tiles (16:9 or 9:16)  │
 │   left of picture = PVW · right = PGM   MIX WIPE STING  25 fr    │
 │   clip players: [item ▾] · 00:03.12 −00:06.37 · ⏮ ▶ ⏸ ■ LOOP AUTO │
 │                                         [wipe pattern icons]     │
 │                                         CUT     AUTO     FTB     │
+│  AUDIO (open): [Cam 1][Cam 2]…[Clip 1][ME 2][Stinger] [ME 1 PGM] │
+│   meter · fader · MUTE · AFV · ● on air      M S I · RESET       │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,8 +85,9 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 - **Box editor:** the active ME's Program picture shows the outline of each of its boxes (dashed while off air, ON AIR while on air): drag a box to move it, a corner handle to scale it (the opposite corner stays). The changes go to the mixer while dragging.
 - **File** takes the mixer on-air or off-air and opens the **clip and still library** and the stinger library.
 - **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots, stinger players and keyers. What the production sets through the environment is greyed out.
-- The gear on a **source** (`PATCH /inputs/{id}`): name, kind (`mxl_live`, `clip_player`, `black`), flows of a live input, the clip or still of a clip player with loop and play on cut, and the auto-stinger.
+- The gear on a **source** (`PATCH /inputs/{id}`): name, kind (`mxl_live`, `clip_player`, `black`), flows of a live input, the clip or still of a clip player with loop and play on cut, and the auto-stinger. A live input's **Audio** section (`PATCH /audio/inputs/{id}`): its delay (±1 ms, ±1 frame) and channel map (per PGM channel the input channel or silent; 1:1, Mono), for every ME.
 - **Transition section** (per ME): the type (MIX, WIPE, STING) and the rate in frames (`PATCH /panels/{id}/transition`); the next transition's elements **BKGD**, **KEY 1** … (lit when tied; a keyer on air has a red underline; the last one lit stays) and **GRAB** (ME Program to the library); for WIPE the pattern picker (icons, the SMPTE code as a tooltip), reverse, flip-flop (the next wipe goes back), soft edge and border (0–100 % of the pattern's travel) and the border colour; for STING the slot. **CUT**, **AUTO** (`/mixer/auto`: the ME's transition) and **FTB** (lit while the output is black) map to `/mixer/cut`, `/mixer/auto`, `/mixer/fade-to-black`; the **T-bar** lever holds the transition at its position (`/mixer/position`) and follows an Auto.
+- **AUDIO** (in the keyer row) opens and closes the active ME's audio strip under the deck (remembered in the browser; P5, `docs/engine-p5.md`): one column per strip (live inputs, clip players, the Programs of higher MEs, the stinger) with its meter (up to 2 bars: with more channels the loudest odd and even channels; a 1 s peak hold and a red over mark), a fader (+10 … −∞; double click: 0 dB; the values go to the mixer while it moves), **MUTE**, **AFV** (audio follows video; off: always in the mix), a red dot while the strip is heard in PGM and a delayed input's delay; then the master: the PGM meter (the true peak as a line, OVER with a count), the loudness of channels 1–2 (M, S, I in LUFS), **RESET** (integrated from now on) and the master fader. Meters poll at 10 Hz only while it is open. No audio preview.
 - **Frame grab:** right click on a source tile or on the Preview or Program monitor: *Grab still*, or *Grab to <clip player>* (the frame memory); a toast names the new still.
 - **Tally → Receivers…** adds TSL UMD 5.0 listeners (Companion, VSM, BFE, Riedel HI, custom).
 - The **status chip** is a CPU / RAM / format pill; click it for the mixer state, NMOS, load and issues.
@@ -102,9 +105,10 @@ Operator screens (the platform's production designer) frame single controls of F
 | `bus` | `me` (required, 1..number of MEs), `transition` (default true) | 480×150 | that ME's Program and Preview rows (the inputs and the Programs of the higher MEs) with Cut and Auto and, unless `transition=false`, its transition type (MIX / WIPE / STING) and keyer ties (BG, K1 …); tally colours |
 | `keys` | `me` (required) | 240×150 | that ME's upstream keyers and DSKs with On/Off and Auto |
 | `dme` | `me`, `keyer` (required: upstream keyer 1..8) | 320×120 | that keyer's box: On/Off, Auto (a fly with FLY), Run back and forth, Stop and the presets; editing stays in the console |
+| `audio` | `me` (required), `faders` (default true) | 480×240 | that ME's audio strips (meter, MUTE, AFV and, unless `faders=false`, the fader) and its master meter with the loudness (M, S, I) and RESET; meters at 10 Hz |
 
 - `GET /widgets` lists them with a JSON schema of their parameters (from the mixer's `GET /api/v1/widgets`); it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`.
-- `GET /widget/bus?me=<n>[&transition=false][&theme=dark|light|transparent]` (and `/widget/keys?me=<n>`, `/widget/dme?me=<n>&keyer=<k>`) is the page without the console around it, on the GUI's own origin (its `/api`). A bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>`; none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
+- `GET /widget/bus?me=<n>[&transition=false][&theme=dark|light|transparent]` (and `/widget/keys?me=<n>`, `/widget/dme?me=<n>&keyer=<k>`, `/widget/audio?me=<n>[&faders=false]`) is the page without the console around it, on the GUI's own origin (its `/api`). A bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>`; none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
 - `WIDGET_FRAME_ANCESTORS` is set on the **gui** container: a CSP source list, default `'self'` (an invalid value stops nginx with exit code 78).
 
 ## API
