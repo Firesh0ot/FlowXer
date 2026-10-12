@@ -184,6 +184,7 @@ MixResult Mixer::setProgram(int me, Source source)
         state.sting = Sting{};
         state.waiting = false;
         state.program = source;
+        endTies(me, true);
     }
     notify();
     return MixResult::Ok;
@@ -225,6 +226,10 @@ MixResult Mixer::setTransition(int me, TransitionSettings const& settings)
     {
         return MixResult::BadPattern;
     }
+    if (!tiesValid(me, settings.ties))
+    {
+        return MixResult::BadTies;
+    }
     {
         std::lock_guard lock{mu_};
         state_[static_cast<std::size_t>(me - 1)].next = settings;
@@ -233,7 +238,7 @@ MixResult Mixer::setTransition(int me, TransitionSettings const& settings)
     return MixResult::Ok;
 }
 
-MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview, Transition type, Sting sting)
+MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> preview, Transition type, Sting sting, bool ties)
 {
     if (!validMe(me))
     {
@@ -251,6 +256,8 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
         std::lock_guard lock{mu_};
         auto& state = state_[static_cast<std::size_t>(me - 1)];
         finishMix(state);
+        endTies(me, true);
+        std::vector<int> const tied = ties ? state.next.ties : std::vector<int>{};
         if (type == Transition::Stinger && sting.player > 0 && sting.frames > 0)
         {
             state.target = target;
@@ -259,6 +266,10 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
             state.sting = sting;
             state.sting.cut = std::clamp(sting.cut, 0, sting.frames);
             state.pending = true;
+            for (int k : tied)
+            {
+                tieStart(keys_[static_cast<std::size_t>(k - 1)], me, true);
+            }
         }
         else if (frames == 0 || type == Transition::Cut || type == Transition::Stinger)
         {
@@ -266,6 +277,11 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
             if (preview)
             {
                 state.preview = *preview;
+            }
+            for (int k : tied)
+            {
+                auto& keyer = keys_[static_cast<std::size_t>(k - 1)];
+                cutKey(keyer, !keyer.on);
             }
         }
         else
@@ -276,6 +292,10 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
             state.pending = true;
             state.wiping = type == Transition::Wipe;
             state.wipe = state.next.wipe;
+            for (int k : tied)
+            {
+                tieStart(keys_[static_cast<std::size_t>(k - 1)], me, false);
+            }
         }
     }
     notify();
@@ -290,13 +310,16 @@ MixResult Mixer::cut(int me)
     }
     Source program;
     Source preview;
+    bool running = false;
     {
         std::lock_guard lock{mu_};
         auto const& state = state_[static_cast<std::size_t>(me - 1)];
         program = state.program;
         preview = state.preview;
+        running = state.pending || state.mixing;
     }
-    return take(me, preview, 0, program);
+    // A Cut during a transition ends it there: the buses and the tied keyers as at its end.
+    return take(me, preview, 0, program, Transition::Cut, {}, !running);
 }
 
 MixResult Mixer::autoTransition(int me, std::optional<int> frames)
@@ -344,7 +367,7 @@ MixResult Mixer::autoTransition(int me, std::optional<int> frames)
         notify();
         return MixResult::Ok;
     }
-    return take(me, preview, frames.value_or(next.frames), program, next.type);
+    return take(me, preview, frames.value_or(next.frames), program, next.type, {}, true);
 }
 
 MixResult Mixer::position(int me, float t)
@@ -382,6 +405,10 @@ MixResult Mixer::position(int me, float t)
                 state.mixing = true;
                 state.manual = true;
                 state.tLast = 0.f;
+                for (int k : state.next.ties)
+                {
+                    tieStart(keys_[static_cast<std::size_t>(k - 1)], me, false);
+                }
             }
         }
         state.t = t;
@@ -507,14 +534,22 @@ void Mixer::startRun(Fade& key, int to, DmeLoop loop, bool reverse)
 
 void Mixer::stopRun(Fade& key)
 {
-    if (key.flying && (key.runPending || key.runActive) && !key.on)
+    bool const tiedFly = key.tieMe > 0 && key.tieFly && !key.tieAtCut;
+    if (!key.on && ((key.flying && (key.runPending || key.runActive)) || tiedFly))
     {
-        // A fly off that stops: the box is still visible, so the keyer stays on air.
+        // A fly off that stops (its own or a tied one): the box is still visible, so the keyer
+        // stays on air.
         key.on = true;
     }
     key.runPending = false;
     key.runActive = false;
     key.flying = false;
+    if (tiedFly)
+    {
+        // Out of its tie: on air where the box is.
+        untie(key);
+        key.gain = 1.f;
+    }
 }
 
 bool Mixer::runAdvance(Fade& key, std::uint64_t index)
@@ -542,6 +577,144 @@ bool Mixer::runAdvance(Fade& key, std::uint64_t index)
     return state.done;
 }
 
+void Mixer::cutKey(Fade& key, bool on)
+{
+    untie(key);
+    if (canFly(key))
+    {
+        // A cut of a flying keyer jumps: on at the last keyframe, off at keyframe 0.
+        stopRun(key);
+        jumpTo(key, on ? static_cast<int>(key.keyframes.size()) - 1 : 0);
+    }
+    fadeSet(key, on);
+}
+
+void Mixer::tieStart(Fade& key, int me, bool atCut)
+{
+    key.tieMe = me;
+    key.tieAtCut = atCut;
+    if (atCut)
+    {
+        // With a stinger the keyer cuts at its cut point (as it is then).
+        return;
+    }
+    // The keyer goes to its other state with the transition: its own fade or fly stops where it
+    // is, a fly on starts at keyframe 0 unless it turns back a fly off.
+    bool const turningBack = key.flying && (key.runPending || key.runActive);
+    key.tieFly = canFly(key);
+    key.tieGain0 = key.gain;
+    key.pending = false;
+    key.running = false;
+    key.runPending = false;
+    key.runActive = false;
+    key.flying = false;
+    key.on = !key.on;
+    if (!key.tieFly)
+    {
+        key.tieFrom = key.gain;
+        key.tieTo = key.on ? 1.f : 0.f;
+        return;
+    }
+    if (key.on && !turningBack)
+    {
+        jumpTo(key, 0);
+    }
+    key.tieTarget = key.on ? static_cast<int>(key.keyframes.size()) - 1 : 0;
+    key.tieOnPath = key.onPath;
+    key.tieU0 = key.u;
+    key.tieU1 = dmeKeyTime(key.keyframes, key.tieTarget);
+    key.tieBox = key.settings.dme;
+}
+
+void Mixer::tieAdvance(Fade& key, float t)
+{
+    if (!key.tieFly)
+    {
+        key.gain = tieAt(key.tieFrom, key.tieTo, t);
+        return;
+    }
+    // A fly: on air while it runs; the keyframes' timeline squeezed into the transition (a
+    // fractional position), or straight to the target keyframe with its ease from off the path.
+    key.gain = 1.f;
+    auto const& target = key.keyframes[static_cast<std::size_t>(key.tieTarget)];
+    if (key.tieOnPath)
+    {
+        key.u = tieAt(key.tieU0, key.tieU1, t);
+        key.settings.dme = dmePathAt(key.keyframes, key.u, key.settings.dme);
+        key.onPath = true;
+    }
+    else
+    {
+        key.settings.dme = dmeBetween(key.settings.dme, key.tieBox, target.box, easeAt(target.ease, t));
+        key.onPath = t >= 1.f;
+        key.u = key.tieU1;
+    }
+    key.keyframe = key.tieTarget;
+}
+
+void Mixer::tieEnd(Fade& key, bool complete)
+{
+    if (key.tieMe == 0)
+    {
+        return;
+    }
+    if (key.tieAtCut)
+    {
+        // Its stinger ended before its cut point (or became a cut): the keyer cuts with it.
+        untie(key);
+        if (complete)
+        {
+            cutKey(key, !key.on);
+        }
+        return;
+    }
+    tieAdvance(key, complete ? 1.f : 0.f);
+    if (!complete)
+    {
+        // The T-bar back at 0: as it was.
+        key.on = !key.on;
+        key.gain = key.tieGain0;
+    }
+    else if (key.tieFly && !key.on)
+    {
+        // A fly off ends at keyframe 0: off from the next grain.
+        key.gain = 0.f;
+    }
+    untie(key);
+}
+
+void Mixer::untie(Fade& key)
+{
+    key.tieMe = 0;
+    key.tieAtCut = false;
+}
+
+void Mixer::endTies(int me, bool complete)
+{
+    for (auto& keyer : keys_)
+    {
+        if (keyer.tieMe == me)
+        {
+            tieEnd(keyer, complete);
+        }
+    }
+}
+
+bool Mixer::tiesValid(int me, std::vector<int> const& ties) const
+{
+    for (auto it = ties.begin(); it != ties.end(); ++it)
+    {
+        int const k = *it;
+        bool const known = k >= 1 && k <= static_cast<int>(keys_.size());
+        if (!known || keys_[static_cast<std::size_t>(k - 1)].me != me || !keys_[static_cast<std::size_t>(k - 1)].upstream ||
+            std::find(ties.begin(), it, k) != it)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 MixResult Mixer::keySet(int key, bool on)
 {
     if (key < 1 || key > static_cast<int>(keys_.size()))
@@ -550,14 +723,7 @@ MixResult Mixer::keySet(int key, bool on)
     }
     {
         std::lock_guard lock{mu_};
-        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
-        if (canFly(keyer))
-        {
-            // A cut of a flying keyer jumps: on at the last keyframe, off at keyframe 0.
-            stopRun(keyer);
-            jumpTo(keyer, on ? static_cast<int>(keyer.keyframes.size()) - 1 : 0);
-        }
-        fadeSet(keyer, on);
+        cutKey(keys_[static_cast<std::size_t>(key - 1)], on);
     }
     notify();
     return MixResult::Ok;
@@ -714,12 +880,15 @@ MixResult Mixer::keyAuto(int key, int frames)
     {
         std::lock_guard lock{mu_};
         auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        // Out of a tied transition where it is (a tied fly turns back as its own does).
+        bool const tiedFly = keyer.tieMe > 0 && keyer.tieFly && !keyer.tieAtCut;
+        untie(keyer);
         if (canFly(keyer))
         {
             // A fly: the keyer is on (gain 1) while its box runs. Auto on starts at keyframe 0
             // (the off state) unless it turns back a fly off; every fly runs from where the box
             // is.
-            bool const turningBack = keyer.flying && (keyer.runPending || keyer.runActive);
+            bool const turningBack = (keyer.flying && (keyer.runPending || keyer.runActive)) || tiedFly;
             keyer.on = !keyer.on;
             keyer.pending = false;
             keyer.running = false;
@@ -745,9 +914,11 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
     FramePlan out;
     bool ended = false;
     std::unique_lock lock{mu_};
+    std::vector<TieStep> ties(static_cast<std::size_t>(mes_));
     for (int m = mes_; m >= 1; --m)
     {
         auto& state = state_[static_cast<std::size_t>(m - 1)];
+        auto& tie = ties[static_cast<std::size_t>(m - 1)];
         if (state.pending && state.sting.player > 0)
         {
             // A stinger waits for its first frame (counted), at most kStingerWait grains; then
@@ -770,6 +941,7 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
             {
                 ++stingerCuts_;
                 finishMix(state);
+                tie.cut = true;
                 ended = true;
             }
         }
@@ -798,9 +970,12 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
             plan.t = state.t;
             plan.tPrev = state.tLast;
             state.tLast = state.t;
+            tie.active = true;
+            tie.t = state.t;
             if (state.t >= 1.f)
             {
                 finishMix(state);
+                tie.end = true;
                 ended = true;
             }
             else if (state.t <= 0.f)
@@ -809,6 +984,8 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
                 state.manual = false;
                 state.wiping = false;
                 state.after.reset();
+                tie.active = false;
+                tie.back = true;
                 ended = true;
             }
         }
@@ -824,9 +1001,11 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
             plan.tPrev = stingerFadeT(f - 1, state.sting.cut, state.frames);
             plan.t = stingerFadeT(f, state.sting.cut, state.frames);
             state.position = f + 1;
+            tie.cut = plan.cutDone;
             if (f >= state.frames - 1)
             {
                 finishMix(state);
+                tie.end = true;
                 ended = true;
             }
         }
@@ -841,10 +1020,13 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
             plan.t = step >= state.frames ? 1.f : state.from + span * (static_cast<float>(step) / static_cast<float>(state.frames));
             plan.tPrev = state.from + span * (static_cast<float>(step - 1) / static_cast<float>(state.frames));
             state.position = step;
+            tie.active = true;
+            tie.t = plan.t;
             if (step >= state.frames)
             {
                 // The last grain shows the target in full; from the next one it is Program.
                 finishMix(state);
+                tie.end = true;
                 ended = true;
             }
         }
@@ -857,9 +1039,40 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
     int key = 1;
     for (auto& keyer : keys_)
     {
+        // A tied keyer: with its ME's transition (cut before this grain, follow its t, back where
+        // it was, or end after this grain).
+        bool tieEnded = false;
+        if (keyer.tieMe > 0)
+        {
+            auto const& tie = ties[static_cast<std::size_t>(keyer.tieMe - 1)];
+            if (keyer.tieAtCut)
+            {
+                if (tie.cut)
+                {
+                    cutKey(keyer, !keyer.on);
+                    ended = true;
+                }
+                tieEnded = tie.end && !tie.cut;
+            }
+            else if (tie.back)
+            {
+                tieEnd(keyer, false);
+                ended = true;
+            }
+            else if (tie.active)
+            {
+                tieAdvance(keyer, tie.t);
+                tieEnded = tie.end;
+            }
+        }
         ended = fadeAdvance(keyer, index) || ended;
         bool const runEnded = runAdvance(keyer, index);
         out.keys.push_back(KeyPlan{key++, keyer.me, keyer.upstream, keyer.gain, keyer.settings});
+        if (tieEnded)
+        {
+            tieEnd(keyer, true);
+            ended = true;
+        }
         if (runEnded)
         {
             // A fly off ends: this grain showed keyframe 0, from the next one the keyer is off.
@@ -898,6 +1111,14 @@ std::vector<MeView> Mixer::view() const
         view.manual = state.manual;
         view.t = state.manual ? state.t : 0.f;
         view.stinger = view.mixing ? state.sting.player : 0;
+        view.start = state.start;
+        for (std::size_t k = 0; k < keys_.size(); ++k)
+        {
+            if (keys_[k].tieMe == m)
+            {
+                view.tied.push_back(static_cast<int>(k) + 1);
+            }
+        }
         view.next = state.next;
         views.push_back(view);
     }
@@ -936,8 +1157,8 @@ std::vector<KeyView> Mixer::keyView() const
             run.loop = DmeLoop::Off;
             run.keyframe = dmeKeyframeOf(keyer.keyframes, keyer.settings.dme);
         }
-        views.push_back(KeyView{key++, keyer.me, keyer.upstream, keyer.on, keyer.pending || keyer.running || run.fly, keyer.gain, keyer.settings,
-            keyer.keyframes, run});
+        views.push_back(KeyView{key++, keyer.me, keyer.upstream, keyer.on, keyer.pending || keyer.running || run.fly || keyer.tieMe > 0,
+            keyer.tieMe, keyer.gain, keyer.settings, keyer.keyframes, run});
     }
     return views;
 }

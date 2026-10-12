@@ -63,7 +63,17 @@ struct TransitionSettings
     // The rate in grains.
     int frames = 25;
     WipeSettings wipe;
+    // Keyer ties (docs/engine-p4.md §5): the ME's upstream keyers (engine keyer numbers) that Cut,
+    // Auto and the T-bar turn on or off with the background.
+    std::vector<int> ties;
 };
+
+// A tied keyer's gain (a fade) or timeline position (a fly) at the transition's t: `from` at 0 and
+// `to` at 1 exactly.
+inline float tieAt(float from, float to, float t)
+{
+    return from * (1.f - t) + to * t;
+}
 
 // A stinger of a take: stinger player `player` (1-based) with its loaded stinger's frames and cut
 // frame (the background switches there).
@@ -168,6 +178,10 @@ struct MeView
     float t = 0.f;
     // The stinger player of a running (or waiting) stinger, else 0.
     int stinger = 0;
+    // The first grain of the running (or the last) transition.
+    std::uint64_t start = 0;
+    // The keyers tied to the running transition.
+    std::vector<int> tied;
     TransitionSettings next;
 };
 
@@ -193,9 +207,11 @@ struct KeyView
     int key = 1;
     int me = 1;
     bool upstream = false;
-    // On air (or going on air during an auto or a fly).
+    // On air (or going on air during an auto, a fly or a tied transition).
     bool on = false;
     bool transition = false;
+    // The ME whose transition it is tied to (0: none).
+    int tie = 0;
     float gain = 0.f;
     // The box in `settings.dme` is the one of the last grain rendered.
     KeySettings settings;
@@ -214,6 +230,7 @@ enum class MixResult
     BadKey,
     BadDme,
     BadKeyframes,
+    BadTies,
     Busy
 };
 
@@ -233,25 +250,34 @@ public:
     MixResult setProgram(int me, Source source);
     // Immediate; a running transition keeps going (and no longer changes Preview at its end).
     MixResult setPreview(int me, Source source);
-    // The ME's next transition (type, rate, wipe). A running transition keeps its own.
+    // The ME's next transition (type, rate, wipe, ties: upstream keyers of that ME, each once). A
+    // running transition keeps its own.
     MixResult setTransition(int me, TransitionSettings const& settings);
     // Program goes to `target`: at the next grain (a cut, or frames 0), by a Mix or the ME's Wipe
     // over `frames` grains, or by the stinger `sting` (a stinger without one is a cut). Preview
     // becomes `preview` when it is given (at the end of the transition). A take during a
-    // transition ends that one first (buses as at its end).
-    MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix, Sting sting = {});
-    // Program and Preview swap at the next grain; a running transition ends there.
+    // transition ends that one first (buses and tied keyers as at its end). With `ties` the ME's
+    // tied keyers go on or off with it: with a cut at once; with a Mix or Wipe a fading keyer fades
+    // with its t and a flying keyer flies along its keyframes with t (squeezed into the
+    // transition's frames); with a stinger they cut at its cut point.
+    MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix, Sting sting = {},
+        bool ties = false);
+    // Program and Preview swap at the next grain and the tied keyers cut; a running transition ends
+    // there instead (buses and tied keyers as at its end).
     MixResult cut(int me);
     // The ME's next transition from Program to Preview over `frames` grains (its rate when not
-    // given), then the buses swap. From a held T-bar position it runs the rest at that rate.
+    // given), with its tied keyers, then the buses swap. From a held T-bar position it runs the
+    // rest at that rate.
     MixResult autoTransition(int me, std::optional<int> frames = std::nullopt);
-    // The T-bar: t > 0 starts the ME's next transition (Program to Preview) and holds it at t;
-    // t = 1 completes it (the buses swap after that grain); t = 0 ends it without the swap. A
-    // stinger does not scrub: t > 0 starts it as an Auto. Busy while an Auto runs.
+    // The T-bar: t > 0 starts the ME's next transition (Program to Preview, with its tied keyers)
+    // and holds it at t; t = 1 completes it (the buses swap after that grain); t = 0 ends it
+    // without the swap (the tied keyers as they were). A stinger does not scrub: t > 0 starts it
+    // as an Auto. Busy while an Auto runs.
     MixResult position(int me, float t);
 
     // Keyer k (1-based): on or off at the next grain, or a fade to the other state over `frames`
-    // grains (an auto during an auto turns back from where it is). A keyer that flies (`fly`, a
+    // grains (an auto during an auto turns back from where it is). Either takes the keyer out of a
+    // tied transition where it is. A keyer that flies (`fly`, a
     // box, at least 2 keyframes): its Auto on turns it on and runs its box from keyframe 0 to the
     // last; Auto off runs from where the box is to keyframe 0 and turns it off after that grain;
     // an Auto during a fly turns back from where the box is. Cut on and off jump to the last
@@ -360,6 +386,32 @@ private:
         DmeRun run;
         // The run is the keyer's Auto (a fly; off when `on` is false).
         bool flying = false;
+        // Tied to ME `tieMe`'s transition (0: none). With a stinger it cuts at the cut point
+        // (tieAtCut). Else a fade from gain tieFrom to tieTo with the transition's t, or (tieFly) a
+        // fly to keyframe tieTarget: on the path from u tieU0 to tieU1, or off it from box tieBox.
+        // tieGain0: its gain before (a T-bar back at 0 returns there).
+        int tieMe = 0;
+        bool tieAtCut = false;
+        bool tieFly = false;
+        float tieFrom = 0.f;
+        float tieTo = 0.f;
+        float tieGain0 = 0.f;
+        bool tieOnPath = false;
+        float tieU0 = 0.f;
+        float tieU1 = 0.f;
+        int tieTarget = 0;
+        DmeSettings tieBox;
+    };
+    // What ME m's transition does to its tied keyers in one grain: they follow its t (`active`),
+    // cut (`cut`: the stinger's cut point, before the grain), end with it (`end`, after the grain)
+    // or go back to where they were (`back`: the T-bar at 0).
+    struct TieStep
+    {
+        bool active = false;
+        float t = 0.f;
+        bool cut = false;
+        bool end = false;
+        bool back = false;
     };
 
     [[nodiscard]] bool validMe(int me) const
@@ -382,6 +434,17 @@ private:
     static void startRun(Fade& key, int to, DmeLoop loop, bool reverse);
     static void stopRun(Fade& key);
     static bool runAdvance(Fade& key, std::uint64_t index);
+    // Keyer ties (lock held): a cut of a keyer (to its last keyframe or keyframe 0 when it flies);
+    // a keyer tied to ME me's transition (to its stinger's cut point with atCut); its state at the
+    // transition's t; its end (complete, or back where it was); out of its tie where it is; the end
+    // of every keyer tied to ME me; whether `ties` are upstream keyers of ME me, each once.
+    static void cutKey(Fade& key, bool on);
+    static void tieStart(Fade& key, int me, bool atCut);
+    static void tieAdvance(Fade& key, float t);
+    static void tieEnd(Fade& key, bool complete);
+    static void untie(Fade& key);
+    void endTies(int me, bool complete);
+    [[nodiscard]] bool tiesValid(int me, std::vector<int> const& ties) const;
     void notify() const
     {
         if (changed_)
