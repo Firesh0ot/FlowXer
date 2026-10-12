@@ -55,6 +55,8 @@ constexpr int kSlots = 3;
 constexpr int kMosaicSlots = 2;
 // Samples per statistics window (5 s at 50p).
 constexpr int kWindow = 250;
+// Windows in a statistic's `recent` maximum (1 min at 50p): what the latency recommendation uses.
+constexpr std::size_t kRecentWindows = 12;
 // Output grains after a route (or the start) during which a missing grain or missing audio is a
 // start-up window, not counted as missing.
 constexpr std::uint64_t kGraceGrains = 4;
@@ -83,7 +85,8 @@ double round3(double v)
     return std::round(v * 1000.0) / 1000.0;
 }
 
-// Average and maximum over windows of `size` samples, and the peak since the last reset.
+// Average and maximum over windows of `size` samples, the maximum of the last kRecentWindows
+// windows (`recent`) and the peak since the last reset.
 // value() is the last full window, or the running one until the first is full.
 class Window
 {
@@ -105,6 +108,8 @@ public:
         {
             done_ = Value{sum_ / n_, max_};
             full_ = true;
+            maxima_[next_] = max_;
+            next_ = (next_ + 1) % kRecentWindows;
             sum_ = 0;
             max_ = 0;
             n_ = 0;
@@ -121,6 +126,8 @@ public:
         count_ = 0;
         full_ = false;
         done_ = Value{};
+        maxima_ = {};
+        next_ = 0;
     }
 
     [[nodiscard]] Value value() const
@@ -139,6 +146,13 @@ public:
         return peak_;
     }
 
+    // The maximum of the running window and the last kRecentWindows full ones.
+    [[nodiscard]] double recent() const
+    {
+        std::lock_guard lock{mu_};
+        return std::max(max_, *std::max_element(maxima_.begin(), maxima_.end()));
+    }
+
     [[nodiscard]] std::uint64_t count() const
     {
         std::lock_guard lock{mu_};
@@ -151,6 +165,7 @@ public:
         json out{{"avg", round3(v.avg)}, {"max", round3(v.max)}};
         if (withPeak)
         {
+            out["recent"] = round3(recent());
             out["peak"] = round3(peak());
         }
         return out;
@@ -165,6 +180,8 @@ private:
     std::uint64_t count_ = 0;
     Value done_;
     bool full_ = false;
+    std::array<double, kRecentWindows> maxima_{};
+    std::size_t next_ = 0;
 };
 
 // One grain of an input on the device, packed v210 as in MXL (v210a: the key plane follows).
