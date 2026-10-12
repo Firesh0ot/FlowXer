@@ -23,6 +23,7 @@ from flowxer.api.schemas import (
     AudioEssence,
     InputKind,
     LogicalInputUpdate,
+    MixerStartRequest,
     StingerSlotUpdate,
     VideoEssence,
 )
@@ -39,6 +40,7 @@ from flowxer.library.ffmpeg import (
     RunResult,
     build_clip_audio_command,
     build_clip_video_command,
+    build_grab_original_command,
     build_still_command,
     build_still_filter,
     build_video_filter,
@@ -184,6 +186,117 @@ def test_still_command_and_filter(tmp_path: Path):
     assert cmd[cmd.index("-c:v") + 1] == "v210"
     assert cmd[-3:] == ["-f", "rawvideo", str(tmp_path / "s.v210")]
     assert cmd[cmd.index("-protocol_whitelist") + 1] == "file"
+
+
+def test_grab_original_command(tmp_path: Path):
+    cmd = build_grab_original_command(picture=tmp_path / "still.v210", original_tmp=tmp_path / "o.mkv", width=1920, height=1080)
+    # The raw v210 picture in, FFV1 10-bit 4:2:2 in Matroska out: lossless.
+    assert cmd[cmd.index("-f") + 1] == "v210" and cmd[cmd.index("-video_size") + 1] == "1920x1080"
+    assert cmd[cmd.index("-c:v") + 1] == "ffv1" and cmd[cmd.index("-pix_fmt") + 1] == "yuv422p10le"
+    assert cmd[-3:] == ["-f", "matroska", str(tmp_path / "o.mkv")]
+    # Without a filter (a grab's original at its own raster) the still command keeps the samples.
+    assert "-vf" not in build_still_command(original=tmp_path / "o.mkv", still_tmp=tmp_path / "s.v210", vf=None)
+
+
+class _GrabEngine:
+    """The engine for frame grabs: writes the picture to the path it is given, then says done (or
+    failed)."""
+
+    ready = True
+
+    def __init__(self, picture: bytes, fail: str = "") -> None:
+        self.picture, self.fail, self.calls = picture, fail, []
+
+    def call(self, method: str, path: str, body=None):
+        self.calls.append((method, path, body))
+        if (method, path) == ("POST", "/grab"):
+            if not self.fail:
+                Path(body["path"]).write_bytes(self.picture)
+            return {"grab": 7, "state": "pending"}
+        if path == "/grab/7":
+            return {"grab": 7, "state": "failed" if self.fail else "done", "error": self.fail, "index": 1234, "tai": 99, "source_index": 1230}
+        return {}
+
+
+def test_a_frame_grab_becomes_a_still(client, mixer):
+    """POST /library/grab: the engine writes the next grain's picture into the new item, which is a
+    ready still at once (its mezzanine as grabbed), named Grab <source> <date time>; `player` loads
+    it into a clip player."""
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    size = (mixer.settings.width + 47) // 48 * 128 * mixer.settings.height
+    picture = bytes(range(256)) * (size // 256)
+    engine = _GrabEngine(picture)
+    mixer.engine = engine
+    try:
+        reply = client.post("/api/v1/library/grab", json={"source": "cam-2"})
+        assert reply.status_code == 200, reply.text
+        item = reply.json()
+        assert (item["kind"], item["source"], item["tags"], item["status"], item["ready"]) == ("still", "grab", ["grab"], "ready", True)
+        assert re.fullmatch(r"Grab Camera 2 \d{4}-\d\d-\d\d \d\d:\d\d:\d\d", item["name"])
+        fmt = mixer.workspace.format_id
+        mezz = mixer.library.store.mezz_path(item["id"], fmt, LibraryKind.still)
+        assert engine.calls[0] == ("POST", "/grab", {"source": "in2", "bus": "pgm", "path": str(mezz)})
+        assert mezz.read_bytes() == picture and mixer.library.mezzanine_path(item["id"]) == mezz
+        stored = mixer.library.get(item["id"])
+        assert stored.original["source_kind"] == "grab" and stored.original["format_id"] == fmt
+        assert stored.original["grab"] == {"source": "cam-2", "label": "Camera 2", "index": 1234, "tai": 99, "source_index": 1230}
+        # An ME's Preview, named, into clip player 1 (the frame memory): it loads the still.
+        engine.calls.clear()
+        reply = client.post("/api/v1/library/grab", json={"source": "me-1:pvw", "name": "Freeze", "player": "clip-1"})
+        assert reply.status_code == 200, reply.text
+        grabbed = reply.json()
+        assert grabbed["name"] == "Freeze" and engine.calls[0][2]["source"] == "me1" and engine.calls[0][2]["bus"] == "pvw"
+        assert mixer.get_input("clip-1").library_item_id == grabbed["id"]
+        load = next(body for method, path, body in engine.calls if path == "/player/1/load")
+        assert load["kind"] == "still" and load["path"].endswith(f"still-{fmt}.v210") and grabbed["id"] in load["path"]
+        # The Program: "ME 1 PGM".
+        assert client.post("/api/v1/library/grab", json={"source": "me-1"}).json()["name"].startswith("Grab ME 1 PGM ")
+        # Refused: unknown sources and players (404), Black, a live input as the player.
+        for body, code in (({"source": "nope"}, 404), ({"source": "me-1:aux"}, 404), ({"source": "black"}, 409),
+                           ({"source": "cam-1", "player": "cam-2"}, 409), ({"source": "cam-1", "player": "nope"}, 404)):
+            assert client.post("/api/v1/library/grab", json=body).status_code == code, body
+        # A grab that fails leaves nothing behind.
+        before = set(mixer.library.store.list_ids())
+        mixer.engine = _GrabEngine(picture, fail="cannot write")
+        reply = client.post("/api/v1/library/grab", json={"source": "cam-1"})
+        assert reply.status_code == 409 and "cannot write" in reply.json()["detail"]
+        assert set(mixer.library.store.list_ids()) == before
+        assert len([path for path in mixer.library.store.root.iterdir() if not path.name.startswith("_")]) == len(before)
+    finally:
+        mixer.engine = None
+    # Off-air there is nothing to grab.
+    assert client.post("/api/v1/library/grab", json={"source": "cam-1"}).status_code == 409
+    mixer.stop()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
+def test_a_grabs_original_is_lossless(mixer):
+    """The background job makes the grab's FFV1 original and thumbnail; at the grab's raster the
+    original converts back to the same samples."""
+    size = (mixer.settings.width + 47) // 48 * 128 * mixer.settings.height
+    fmt = mixer.workspace.format_id
+    item_id, path = mixer.library.grab_target(fmt)
+    # 10-bit samples in legal range in every v210 word (bits 30-31 clear).
+    words = [(64 + (i * 37) % 876) | (512 + (i * 11) % 400) << 10 | (100 + (i * 5) % 800) << 20 for i in range(size // 4)]
+    picture = b"".join(word.to_bytes(4, "little") for word in words)
+    path.write_bytes(picture)
+    mixer.library.add_grab(item_id, fmt, name="Grab test", grab={})
+    store = mixer.library.store
+    for _ in range(100):
+        if (store.item_dir(item_id) / "original.mkv").is_file() and store.thumb_path(item_id).is_file():
+            break
+        time.sleep(0.1)
+    assert (store.item_dir(item_id) / "original.mkv").is_file() and store.thumb_path(item_id).is_file()
+    assert path.read_bytes() == picture
+    # A reconversion at the same raster: the same picture from the original.
+    path.unlink()
+    mixer.library.reconvert(item_id)
+    for _ in range(100):
+        item = mixer.library.get(item_id)
+        if path.is_file() and item.is_ready(fmt):
+            break
+        time.sleep(0.1)
+    assert path.read_bytes() == picture
 
 
 def test_player_media_of_a_clip_and_a_still(mixer):

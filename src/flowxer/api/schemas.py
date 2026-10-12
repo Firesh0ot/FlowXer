@@ -82,6 +82,18 @@ class PanelTransition(BaseModel):
     rate_frames: int = Field(default=25, ge=1, le=1000, description="Duration of Auto in frames")
     wipe: WipeSettings = Field(default_factory=WipeSettings)
     stinger_slot_id: str | None = Field(default=None, description="The stinger slot of type stinger")
+    ties: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Keyer ties: the ME's upstream keyers (ids) that Cut, Auto and the T-bar turn on or off with the "
+            "background (a fading keyer fades with the transition, a flying keyer flies with it, with a stinger "
+            "they cut at its cut point)"
+        ),
+    )
+    background: bool = Field(
+        default=True,
+        description="BKGD: the background transitions; false: only the tied keyers (key only: Cut cuts them, Auto runs each one's Auto)",
+    )
 
     @field_validator("type")
     @classmethod
@@ -96,6 +108,8 @@ class PanelTransitionUpdate(BaseModel):
     rate_frames: int | None = None
     wipe: WipeSettingsUpdate | None = None
     stinger_slot_id: str | None = None
+    ties: list[str] | None = None
+    background: bool | None = None
 
 
 class StingerPhase(str, Enum):
@@ -892,6 +906,19 @@ class LibraryItemOut(BaseModel):
     source: str = "upload"
     legacy_path: str | None = None
     in_use: bool = False
+
+
+class GrabRequest(BaseModel):
+    """A frame grab (docs/engine-p4.md §6): the picture of the next output grain as a library still."""
+
+    source: str = Field(
+        ...,
+        description="A live input or clip player id, a panel id (its Program; also <panel id>:pgm) or <panel id>:pvw (its Preview)",
+    )
+    player: str | None = Field(default=None, description="A clip player to load the still into once it is ready (the frame memory)")
+    name: str | None = Field(
+        default=None, min_length=1, max_length=128, description="Default: Grab <source label> <YYYY-MM-DD HH:MM:SS> (local time)"
+    )
 
 
 class LibraryItemPatch(BaseModel):

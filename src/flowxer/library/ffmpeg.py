@@ -350,9 +350,10 @@ def build_clip_video_command(
     ]
 
 
-def build_still_command(*, original: Path, still_tmp: Path, vf: str) -> list[str]:
+def build_still_command(*, original: Path, still_tmp: Path, vf: str | None) -> list[str]:
     """The first picture of an image (or video) as one raw v210 picture: the clip player
-    uploads it once and shows it as a frame memory."""
+    uploads it once and shows it as a frame memory. Without `vf` (a frame grab's lossless
+    original at its own raster) the samples stay as they are."""
     return [
         *_FFMPEG,
         *_INPUT,
@@ -363,13 +364,38 @@ def build_still_command(*, original: Path, still_tmp: Path, vf: str) -> list[str
         "-dn",
         "-frames:v",
         "1",
-        "-vf",
-        vf,
+        *(["-vf", vf] if vf else []),
         "-c:v",
         "v210",
         "-f",
         "rawvideo",
         str(still_tmp),
+    ]
+
+
+def build_grab_original_command(*, picture: Path, original_tmp: Path, width: int, height: int) -> list[str]:
+    """A frame grab's raw v210 picture as its lossless original: FFV1 10-bit 4:2:2 in Matroska (as
+    the colour bars), which decodes to the same samples."""
+    return [
+        *_FFMPEG,
+        *_INPUT,
+        "-f",
+        "v210",
+        "-video_size",
+        f"{width}x{height}",
+        "-i",
+        str(picture),
+        "-frames:v",
+        "1",
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+        "-pix_fmt",
+        "yuv422p10le",
+        "-f",
+        "matroska",
+        str(original_tmp),
     ]
 
 

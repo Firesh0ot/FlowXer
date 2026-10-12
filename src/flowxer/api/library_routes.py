@@ -11,13 +11,14 @@ from starlette.concurrency import run_in_threadpool
 from flowxer.api.schemas import (
     ConvertJobOut,
     ConvertOptionsIn,
+    GrabRequest,
     LibraryItemOut,
     LibraryItemPatch,
     ReconvertRequest,
     UploadInitRequest,
     UploadInitResponse,
 )
-from flowxer.engine.mixer import VisionMixer
+from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.library.models import ConvertOptions, FitMode, FpsMode, LibraryKind, UploadMode
 from flowxer.library.multipart import receive_files
 from flowxer.library.uploads import UploadBusy, UploadError, UploadNoSpace, UploadTooLarge
@@ -86,6 +87,23 @@ def list_library(
         except ValueError as exc:
             raise HTTPException(422, detail="kind must be clip, still or stinger") from exc
     return [_item_out(mixer, item) for item in mixer.library.list_items(kind=parsed, query=q)]
+
+
+@router.post(
+    "/library/grab",
+    response_model=LibraryItemOut,
+    summary=(
+        "Frame grab: the next grain of an input, a clip player, or an ME's Program or Preview as a still "
+        "(production raster, no conversion), optionally loaded into a clip player"
+    ),
+)
+def grab_still(payload: GrabRequest, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
+    try:
+        item = mixer.grab(payload.source, player=payload.player, name=payload.name)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise HTTPException(code, detail=str(exc)) from exc
+    return _item_out(mixer, item)
 
 
 @router.get(
