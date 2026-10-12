@@ -94,6 +94,55 @@
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
       "targets": [{ "expr": "flowxer_engine_gpu_stage_ms{stage=~\"render|total\",stat=\"max\"}", "legendFormat": "{{stage}} max", "refId": "A" }]
+    },
+    {
+      "title": "GPU ms per grain: download, upload, per ME",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"download\",stat=\"max\"}", "legendFormat": "download max", "refId": "A" },
+        { "expr": "sum(flowxer_engine_input_upload_ms{stat=\"avg\"})", "legendFormat": "upload, inputs and key flows", "refId": "B" },
+        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"me\",stat=\"max\"}", "legendFormat": "ME {{me}} max", "refId": "C" }
+      ]
+    },
+    {
+      "title": "GPU memory (MB) and NVENC sessions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        { "expr": "flowxer_engine_gpu_device_used_mb", "legendFormat": "GPU used", "refId": "A" },
+        { "expr": "flowxer_engine_gpu_engine_allocated_mb", "legendFormat": "engine", "refId": "B" },
+        { "expr": "flowxer_engine_gpu_encoder_sessions", "legendFormat": "NVENC sessions", "refId": "C" }
+      ]
+    },
+    {
+      "title": "Stingers: played, waited grains, cuts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        { "expr": "increase(flowxer_engine_stingers_played_total[5m])", "legendFormat": "played", "refId": "A" },
+        { "expr": "increase(flowxer_engine_stinger_wait_grains_total[5m])", "legendFormat": "grains waited for a first frame", "refId": "B" },
+        { "expr": "increase(flowxer_engine_stinger_cuts_total[5m])", "legendFormat": "cuts (not ready)", "refId": "C" },
+        { "expr": "increase(flowxer_engine_stinger_frames_late_total[5m])", "legendFormat": "late frames, player {{player}}", "refId": "D" }
+      ]
+    },
+    {
+      "title": "Stinger players",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [{ "expr": "flowxer_engine_stinger_player_state == 1", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "Keyers on air per ME",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "targets": [{ "expr": "sum by (me, stage) (flowxer_engine_keyer_on_air)", "legendFormat": "ME {{me}} {{stage}}", "refId": "A" }]
+    },
+    {
+      "title": "Linear keys without a key signal (NO KEY)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+      "targets": [{ "expr": "flowxer_engine_keyer_key_running{mode=\"linear\"} == 0", "format": "table", "refId": "A" }]
     }
   ],
   "refresh": "5s",
