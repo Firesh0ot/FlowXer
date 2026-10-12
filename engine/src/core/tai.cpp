@@ -52,7 +52,9 @@ int recommendedLatency(nlohmann::json const& status, double periodMs)
     auto const take = [&](nlohmann::json const& item, char const* window) {
         if (item.value("state", "") == "running" && item.contains(window))
         {
-            worst = std::max(worst, item[window].value("peak", 0.0));
+            // The last minute's maximum: a transient (a mirror catching up at a route) ages out.
+            auto const& stat = item[window];
+            worst = std::max(worst, stat.value("recent", stat.value("peak", 0.0)));
         }
     };
     for (auto const& input : status.value("inputs", nlohmann::json::array()))
