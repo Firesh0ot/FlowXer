@@ -5,8 +5,9 @@ DME on linear and luma keyers, API, GUI fields, tally; M1 gate met (0.29 ms per 
 with border and shadow on the A16). M2 (keyframes, fly with the keyer's Auto, presets, the box
 editor, the `dme` widget) implemented in #91, with the details in
 [Implementation notes (M2)](#implementation-notes-m2). M3 (keyer ties, frame grab) implemented in
-#91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4: `dme_ms`, the
-worst case with boxes in the running engine ([M4 as built](#m4-as-built)) and the 2 h soak. P4 builds on P3 (transitions and keying, #89) and on P2
+#91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4 (budget, soak) done
+in #91: `dme_ms`, the worst case with boxes in the running engine, the recommended box limit and the
+2 h soak ([M4 as built](#m4-as-built)). P4 builds on P3 (transitions and keying, #89) and on P2
 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
 the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
@@ -453,35 +454,96 @@ The A4000 has 2.24 × the A16's memory bandwidth (P3 §10), so its estimate divi
 
 ### M4 as built
 
-Measured in the running engine (`fxp4-worst.py`, image from #91, lab A16 GPU 3, PCIe Gen4 x4) on top
-of P3's worst case: 4 MEs (PGM + PVW), 8 live inputs, a looping clip, the bars, the mosaic, a wipe
-held at 0.5 on every ME and 24 linear keys on one key flow (upstream keyers 1–2 and 4 DSKs per ME,
-`FLOWXER_KEYERS_PER_ME=8`). The boxes have a 4 px border and a shadow. 60 s per phase (5 s windows):
+Measured in the running engine (image from #91, lab A16 GPU 3, PCIe Gen4 x4) on top of P3's worst
+case: 4 MEs (PGM + PVW), 8 live inputs, a looping clip, the bars, the mosaic, a wipe held at 0.5 on
+every ME and 24 linear keys on one key flow (upstream keyers 1–2 and 4 DSKs per ME,
+`FLOWXER_KEYERS_PER_ME=8`). The boxes have a 4 px border and a shadow. Two runs: `fxp4-worst.py`
+(rows 1–3 and the last two) and `fxp4-worst2.py` after the soak (its base: 12.54 / 13.98 ms). 60 s per
+phase (5 s windows):
 
 | Phase | Boxes | Render avg / max | Download | Render + download avg / max | `dme_ms` per ME (avg) | Skipped / late | Engine memory |
 |---|---|---|---|---|---|---|---|
 | P3's worst case | 0 | 5.73 / 6.47 ms | 6.89 ms | **12.61 / 14.04 ms** | 0.01 | 0 / 0 | 964 MiB |
 | + a half-size pip on every ME | 4 | 7.03 / 7.83 | 7.03 | **14.06 / 15.46** | 0.24–0.35 | 0 / 0 | +47.5 MiB |
 | + ME 1 a quad, MEs 2–4 a half pip | 7 | 7.89 / 8.74 | 7.24 | **15.13 / 16.36** | 0.87 (ME 1), 0.24–0.37 | 0 / 0 | +83 MiB |
+| + 2 half-size pips on every ME (the defaults) | 8 | 8.24 / 9.05 | 7.24 | **15.47 / 16.86** | 0.46–0.71 | 0 / 0 | +95 MiB |
+| + 8 pips at 1/4 on ME 1 only (its keys 1–2 too) | 8 | 7.46 / 9.22 | 7.12 | **14.57 / 16.69** | 1.75 (ME 1) | 0 / 0 | +166 MiB (14 buffers) |
+| + 6 pips at 1/4 on every ME (keys 1–2 stay linear keys) | 24 | 11.30 / 12.09 | 7.93 | 19.23 / 20.15 | 1.20–1.49 | 0 / 1246 | +309 MiB (26 buffers) |
 | 8 boxes at 1/4 on every ME (2 of them linear) | 32 | 21.96 / 24.45 | 7.43 | 29.39 / 31.85 | 3.97–4.03 | 435 / 2602 | +380 MiB |
 | the same 32, 24 of them flying (pingpong) | 32 | 21.88 / 24.38 | 7.43 | 29.30 / 31.38 | 3.95–4.00 | 422 / 2620 | +380 MiB |
 
-- **Per box in the running engine:** a half-size pip with border and shadow adds 0.36 ms to its ME
-  (resample and box layer; `dme_ms` 0.24–0.35 ms of it) under this load; the isolated M1 bench had
-  0.29 ms. A box at 1/4 costs about 0.5 ms on average in the 32-box phase: two of each ME's eight
-  are linear boxes, which resample the v210a key flow (fill and key) and cost more.
+- **Per box in the running engine** (the render over P3's worst case, divided by the boxes):
+  - a half-size pip with border and shadow: 0.31–0.33 ms (4, 7 and 8 boxes; the isolated M1 bench
+    had 0.29 ms); `dme_ms` is 0.23–0.35 ms of it;
+  - a pip at 1/4: 0.22–0.23 ms (8 on one ME, 24 on four);
+  - **a linear box at 1/4: about 1.33 ms, as much as 4 half-size pips** (the 32 boxes against the
+    24 pips: 8 linear boxes more). It reads the packed v210a fill and key at every tap and
+    premultiplies there (`dmeFetchLinear`); a pip reads the unpacked work picture.
 - **A moving box costs what a static one does** (fly32 against box32), as in M2.
-- **GPU memory:** 11.9 MiB (12.4 MB) per keyer with a box, allocated when its box is first enabled,
-  as designed; with 32 boxes +380 MiB.
-- **On the lab A16** P3's worst case leaves room for about 4–6 half-size boxes in all before the
-  15 ms target (1 half pip per ME: 14.1 ms, max 15.5); 32 boxes do not fit (render 22 ms > the 20 ms
-  grain: skipped and late grains).
-- **A4000 estimate** (render ÷ 2.24, the same download on Gen3 x8, as P3 §10): P3's worst case
-  9.4 ms; + a half pip per ME 10.2 ms (max 11.2); + a quad on ME 1 10.8 ms (max 11.7); a box adds
-  about 0.16 ms (half size) to 0.23 ms (the 1/4 mix with linear boxes). So the defaults (2 boxes on
-  every ME) fit with room (≈ 10.7 ms), and about 24 boxes in all fit next to P3's worst case; 32
-  boxes at 1/4 on 4 MEs (≈ 17.2 ms) do not. Boxes on fewer MEs (or without P3's 24 keys and held
-  wipes) leave room for more; the engine shows each ME's box time (`flowxer_engine_dme_ms`).
+- **GPU memory:** 11.9 MiB (12.4 MB) per keyer whose box has been used, allocated when its box is
+  first enabled and kept until the engine restarts (the second run kept 8, 14 and 26 buffers:
+  +95, +166, +309 MiB); with 32 boxes +380 MiB.
+- **On the lab A16** (a 20 ms grain; render + download is over the 15 ms target from 8 boxes on): the
+  defaults (8 half-size pips) and 8 pips on one ME run without a late grain; 24 pips at 1/4 come
+  late (1246 of 3000 grains, 0 skipped); 32 boxes skip grains.
+- **A4000 estimate** (render ÷ 2.24, the same download on Gen3 x8, as P3 §10); a box costs about
+  0.14 ms (half-size pip), 0.10 ms (pip at 1/4) and 0.6 ms (linear box at 1/4):
+
+| Case (on top of P3's worst case) | Boxes | A4000 render + download avg / max | Inside 15 ms |
+|---|---|---|---|
+| P3's worst case | 0 | 9.4 / 10.5 ms | yes |
+| + a half pip on every ME | 4 | 10.2 / 11.2 | yes |
+| + ME 1 a quad, a half pip on the others | 7 | 10.8 / 11.7 | yes |
+| + 2 half pips on every ME (the defaults) | 8 | 10.9 / 12.0 | yes |
+| + 8 pips at 1/4 on ME 1 | 8 | 10.4 / 12.1 | yes |
+| + 6 pips at 1/4 on every ME | 24 | 13.0 / 13.6 | yes, 1.4 ms left: the edge |
+| 8 boxes at 1/4 on every ME, 2 of them linear | 32 | 17.2 / 19.3 | no |
+
+**Recommended box limit (1080p50, A4000 on Gen3 x8):**
+- **4 MEs at P3's full load** (a held wipe and 6 keys on every ME): **at most 4 boxes per ME**
+  (`FLOWXER_KEYERS_PER_ME=4`), 16 in all: about 12.0 ms (max ≈ 13.2; 16 half-size pips from the
+  cost per box), 2 ms below the target. Stingers on all 4 MEs at the same moment add about 0.8 ms
+  (max 1.9, P3) and bring the maximum to the target.
+- **Boxes on one or two MEs:** up to 8 per ME (the same 16 in all; 8 on ME 1 measured: 10.4 / 12.1 ms).
+- **A linear box counts as 4** (measured at 1/4 size): with 4 MEs at full load, one linear box per ME
+  and no other box.
+- **The defaults (2 per ME) fit with room** (10.9 / 12.0 ms). 6 per ME on 4 MEs is the edge
+  (13.0 / 13.6 ms; late grains on the A16); 8 per ME on 4 MEs does not fit.
+- Less load (no held wipe on every ME, fewer keys) leaves room for more. FlowXer sets no hard
+  limit: `flowxer_engine_dme_ms{me}` shows each ME's boxes, `flowxer_engine_gpu_stage_ms{stage="total"}`
+  render + download (keep it at or below 15 ms).
+- On the lab A16: the defaults, or 8 boxes on one ME. 2160p50: × 4, boxes on 1 ME.
+
+**Disk per grab** (1080p; measured with FlowXer's ffmpeg command): the v210 still 5.53 MB, a
+thumbnail of 1–7 kB and the FFV1 original, whose size depends on the picture: 43–46 kB for the lab's
+pattern flows, 0.24–0.29 MB for the test clips, 2.7 / 3.4 / 4.4 MB for a test picture with ffmpeg's
+noise at 8 / 20 / 60, 5.2 MB for random samples (the worst case). A camera picture is about 8–9 MB per
+grab, at most 10.8 MB; × 4 at 2160p. Grabs stay in the library until they are deleted.
+
+**2 h soak** (`fxp4-soak.py`, image `fxp4:m4a`: this branch's engine, ee74d35; A16 GPU 3,
+`docker --cpus 6`, L = 4; 2026-10-12, 15:08 to 17:08):
+- 2 MEs with PVW, 4 live inputs on the lab's pattern flows, clip-1 for the grabs, clip-2 the bars; the
+  default 2 upstream keyers per ME, all pips with border and shadow:
+  - ME 1: key 1 a pip of the bars that fades, key 2 a pip of cam 3 that flies (FLY, 3 keyframes);
+    both tied to ME 1's transitions;
+  - ME 2: key 1 a pip of cam 1 that the presets fly between the corners and full; key 2 a pip of the
+    bars that its own Auto flies on and off.
+- Every 1.5–4 s one of: a tied Auto on ME 1 (mix or wipe, 10–40 frames), a tied Cut, a T-bar sweep,
+  a grab of a random source (the cams, the bars, ME 1 and 2 PGM and PVW; one in five into clip-1), a
+  preset on ME 2 key 1, ME 2 key 2's Auto; every 60 s a tied stinger. The soak deleted the grabs older
+  than the last 20. One sample every 10 s, 720 samples.
+
+| | Result |
+|---|---|
+| Operator | 682 tied Autos (mix, wipe), 157 tied Cuts, 164 T-bar sweeps, 117 tied stingers, 170 presets on air, 303 flies of ME 2 key 2, 849 grabs; 0 API errors |
+| Output, every ME | 0 skipped and 0 late grains in 2 h |
+| Output lag | 4.0 grains (L) in every sample |
+| GPU render / render + download | 2.61 ms (10 s windows 1.55–3.22, max 4.38) / 6.01 ms (4.95–6.62, max 7.78) |
+| `dme_ms` | ME 1 0.25 ms on average (max 0.96), ME 2 0.32 ms (max 0.72) |
+| GPU memory | engine buffers 594.4 MiB from start to end; engine process 767 MiB, from the first stinger (minute 1) to the end 1043 MiB (the stinger player's decoders, 276 MiB, as in P3 M3) |
+| Grabs | 849: live inputs 381, ME PGM 191, ME PVW 186, clip player 91; 0 failed, 0 pending; 24.0 ms from request to file on average, max 418 ms (one grab at 1 h 47 min, the maximum before it 81 ms; no grain late, nothing in the host's journal) |
+| Grabs of the bars | 91 of 91 equal to the bars still bit for bit |
+| Library | every grab still left (47, with the M3 tests') has its FFV1 original and thumbnail; 0 failed conversions |
 
 ## 10. Milestones
 

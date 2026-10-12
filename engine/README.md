@@ -787,11 +787,22 @@ The tables are in `docs/engine-p3.md` ("M4 as built"). In short, on A16 GPU 0 (P
   late grains, lag 4, render + download 10.81 ms (max 12.74), GPU memory flat at 1993 MiB, 0 API
   errors.
 
-## P4 M4: worst case with boxes (lab, 2026-10-12)
+## P4 M4: worst case with boxes and soak (lab, 2026-10-12)
 
-The table is in `docs/engine-p4.md` ("M4 as built"). On A16 GPU 3, on top of P3's worst case (4 MEs,
-8 inputs, 24 linear keys, held wipes, the mosaic: render + download 12.61 ms): a half-size pip on
-every ME 14.06 ms (max 15.46, 0 skipped), a quad on ME 1 and a pip on the others 15.13 ms (max
-16.36, 0 skipped); 32 boxes at 1/4 render in 22 ms (> 20 ms: skipped grains). A half-size box adds
-0.36 ms to its ME, `flowxer_engine_dme_ms` shows its resample (0.24–0.35 ms); a moving box costs
-what a static one does; 12.4 MB of GPU memory per keyer with a box.
+The tables are in `docs/engine-p4.md` ("M4 as built"). In short, on A16 GPU 3 (PCIe Gen4 x4):
+
+- **Worst case with boxes**, on top of P3's worst case (4 MEs, 8 inputs, 24 linear keys, held
+  wipes, the mosaic: render + download 12.61 ms): a half-size pip on every ME 14.06 ms (max 15.46),
+  a quad on ME 1 and a pip on the others 15.13 ms (max 16.36), 2 half-size pips on every ME (the
+  defaults) 15.47 ms (max 16.86), 8 pips at 1/4 on ME 1 14.57 ms (max 16.69): 0 skipped, 0 late.
+  6 pips at 1/4 on every ME (24) 19.23 ms: late grains; 32 boxes at 1/4 render in 22 ms (> 20 ms:
+  skipped grains).
+- **Per box:** a half-size pip 0.31–0.33 ms, a pip at 1/4 0.22–0.23 ms, a linear box at 1/4 about
+  1.33 ms (it resamples the packed v210a fill and key); `flowxer_engine_dme_ms` shows each ME's
+  resample; a moving box costs what a static one does; 12.4 MB of GPU memory per keyer with a box.
+- **A4000 estimate:** the defaults 10.9 ms (max 12.0), 24 pips 13.0 ms (max 13.6). Recommended at
+  1080p50 with 4 MEs at full load: at most 4 boxes per ME (16 in all, about 12 ms); up to 8 per ME
+  on one or two MEs; a linear box counts as 4.
+- **2 h soak** (2 MEs, 4 pips fading, flying and tied; tied Autos, Cuts, T-bar, stingers, 849
+  grabs): 0 skipped, 0 late, lag 4, render + download 6.01 ms (max 7.78), engine GPU memory flat at
+  594 MiB, 0 failed grabs, 91 of 91 grabs of the bars exact, 0 API errors.

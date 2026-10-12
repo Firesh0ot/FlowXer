@@ -10,7 +10,10 @@ in `docs/platform-integration-plan.md` §8.
 - `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes
   (their box layers are part of the ME's time). Grafana shows it next to the ME times.
 - Measured with boxes on top of P3's worst case (`docs/engine-p4.md`, "M4 as built"): a half-size
-  box adds about 0.36 ms to its ME on the lab A16 (≈ 0.16 ms estimated on an RTX A4000).
+  box adds about 0.31–0.33 ms on the lab A16 (≈ 0.14 ms estimated on an RTX A4000).
+- Recommended at 1080p50 with 4 MEs at full load: at most 4 boxes per ME, up to 8 per ME on one or
+  two MEs; a linear box costs as much as 4 pips. The 2 h soak with flies, ties, stingers and 849
+  grabs: 0 skipped, 0 late, GPU memory flat, 0 failed grabs.
 
 ### Added: keyer ties and frame grab (P4 M3)
 
