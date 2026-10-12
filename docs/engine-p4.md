@@ -325,48 +325,54 @@ sources. No new senders or receivers.
 **Target:** at most 15 ms per grain on the A4000, render plus download (P3 §10). P3's worst case
 is ≈ 12.4 ms on the lab (max ≈ 14) and ≈ 6–9.4 ms on the A4000.
 
-### Measured cost per box (A16 GPU 3, 1080p, Catmull-Rom)
+### Measured cost per box (A16 GPU 3, 1080p, Catmull-Rom, with border and shadow)
 
-| | Resample (prototype) | Box layer in the compose (plain / border + shadow) |
-|---|---|---|
-| corner PiP, 1/3 size | 0.72 ms | +0.004 / +0.033 ms |
-| half-size PiP | 0.90 ms | +0.009 / +0.062 ms |
-| full size (a fly at size 1) | 1.77 ms | +0.069 / +0.237 ms |
-| split, 2 boxes at 1/2 | 1.79 ms | +0.050 / +0.175 ms |
-| quad, 4 boxes at 1/2 | 3.58 ms | +0.118 / +0.355 ms |
-| 8 boxes at 1/4 | 4.71 ms | +0.103 / +0.291 ms |
+Two prototype versions ([Appendix](#appendix-lab-measurements-2026-10-12)): v1 computes every
+weight per sample; v2 uses weight tables, a 16-bit intermediate, only the needed rows, and keeps
+each column's weights over 16 rows.
 
-- **The box layer is cheap:** it costs what a P3 key layer costs, scaled by the box area.
-- **The prototype's resample is too slow.** It computes every weight per sample, in float, over
-  every source row: compute-bound, 6–10 × above its memory floor.
-  - Its memory floor: a half-size box reads its crop (8.3 MB) and writes 4 MB + 2 MB, about
-    0.1 ms at the lab's 164 GB/s.
-  - The engine version precomputes the weights per box ([§3](#resample)), uses a 16-bit
-    intermediate, runs the horizontal pass over the needed rows only, and batches all boxes of an
-    ME into one launch per pass.
-  - **M1 gate:** a half-size box ≤ 0.3 ms and a full-size box ≤ 0.6 ms on the A16, or M1 adds a
-    cheaper path for moves at size 1 (bilinear phase shift).
-- **Lanczos-3** costs 2.5–3.3 × the cubic; Catmull-Rom is the default.
+| Layout | v1: resample + box layers | v2: resample + box layers | Box layers alone (in v2) |
+|---|---|---|---|
+| corner PiP, 1/3 size | 0.75 ms | **0.53 ms** | +0.03 ms |
+| half-size PiP | 0.97 ms | **0.60 ms** | +0.06 ms |
+| full size (a fly at size 1) | 2.03 ms | **1.41 ms** | +0.24 ms |
+| split, 2 boxes at 1/2 | 1.96 ms | **1.24 ms** | +0.18 ms |
+| quad, 4 boxes at 1/2 | 3.93 ms | **2.43 ms** | +0.35 ms |
+| 8 boxes at 1/4 | 5.00 ms | **4.27 ms** | +0.29 ms |
+
+- **The box layer is cheap:** about what a P3 key layer costs, scaled by the box area.
+- **The resample is the cost, and it is still above its memory floor.**
+  - The floor: a half-size box reads its crop (8.3 MB) and writes 4 + 2 MB, about 0.1 ms at the
+    lab's 164 GB/s.
+  - v2 is 1.4–1.7 × faster than v1, but a box still costs ≥ 0.5 ms however small it is. The
+    horizontal pass reads every source row with up to 16 taps and keeps its weights in local
+    memory.
+  - **M1 work:** the tap count as a template parameter (weights in registers); shared-memory
+    tiles; a 2:1 pre-reduction for sizes ≤ 1/2; all boxes of an ME in one launch per pass; the
+    resample skipped for a static box on a still.
+  - **M1 gate:** a half-size box with border and shadow ≤ 0.3 ms on the A16 (≤ 0.15 ms on the
+    A4000).
+- **Lanczos-3** costs 1.1–1.7 × the cubic in v2 (2.5–3.3 × in v1). Catmull-Rom is the default.
+- **Bilinear** saves little in v2 (0.43 against 0.52 ms at 1/2 size): it is no reason to give up
+  quality.
 
 ### Limits
 
-With the M1 gate met (≈ 0.3 ms per half-size box with border and shadow on the A16, ≈ 0.13 ms on
-the A4000, which has 2.24 × the memory bandwidth):
+The A4000 has 2.24 × the A16's memory bandwidth (P3 §10), so its estimate divides by 2.24.
 
-| Case (1080p50) | A16 lab | A4000 |
-|---|---|---|
-| P3 worst case | ≈ 12.4 ms | ≈ 6–9.4 ms |
-| + 1 PiP on each of 4 MEs | + 1.2 ms → ≈ 13.6 ms | + 0.5 ms → ≈ 6.5–9.9 ms |
-| + a quad on one ME and 1 PiP on the others | + 2.1 ms → ≈ 14.5 ms | + 0.9 ms → ≈ 7–10.3 ms |
-| + 8 boxes on each of 4 MEs (32 boxes) | + 7–10 ms: does not fit | + 3–4 ms → ≈ 9–13.5 ms |
+| Case (1080p50) | A16 lab, v2 measured | A4000, v2 | A4000 with the M1 gate |
+|---|---|---|---|
+| P3 worst case | ≈ 12.4 ms | ≈ 6–9.4 ms | ≈ 6–9.4 ms |
+| + 1 half PiP on each of 4 MEs | + 2.4 → ≈ 14.8 ms | + 1.1 → ≈ 7.1–10.5 ms | + 0.6 → ≈ 6.6–10 ms |
+| + a quad on one ME, 1 PiP on the others | + 4.2 → ≈ 16.6 ms: no | + 1.9 → ≈ 7.9–11.3 ms | + 1.0 → ≈ 7–10.4 ms |
+| + 8 boxes at 1/4 on each of 4 MEs (32) | + 17 ms: no | + 7.6 → ≈ 13.6–17 ms: no on Gen3 x8 | + 3.7 → ≈ 9.7–13.1 ms |
 
-- **Per ME on the A4000:** up to 8 boxes with border and shadow fit within 15 ms next to P3's
-  worst case on the other MEs. The A4000 is time-sliced with the node's other GPU functions, so
-  the engine reports the box ms per ME (`flowxer_engine_dme_ms{me}`) and the budget is checked in
-  M4.
-- **On the lab A16:** at most about 8 boxes in all next to P3's worst case.
+- **Per ME on the A4000:** with v2, 2 boxes on every ME fit (the defaults). Up to 8 per ME need
+  the M1 gate.
+- **On the lab A16:** about 4 half-size boxes in all next to P3's worst case.
+- The A4000 is time-sliced with the node's other GPU functions. The engine reports the box ms per
+  ME (`flowxer_engine_dme_ms{me}`), and M4 checks the budget.
 - **2160p50:** everything × 4; boxes only on 1 ME, as P3's keys.
-- **The prototype as it is** would fit only 2–4 boxes in all; hence the M1 gate.
 
 ## 10. Milestones
 
@@ -437,10 +443,29 @@ with the user's OK. One PR into `dev`, growing per milestone, as #86 and #89 did
 `fxp4-bench.cu` is on the lab host in `~/mxl-lab/fxp4/`, not in this PR. It becomes engine code
 in M1.
 
-`fxp4-bench`: CUDA events, 300 runs each, 1080p yuv16, random pictures. The prototype computes
-each weight per output sample, in float (the M1 version uses weight tables, [§9](#9-gpu-budget)).
+`fxp4-bench`: CUDA events, 300 runs each, 1080p yuv16, random pictures. Two versions:
+- **v1** computes each weight per output sample, with a float intermediate, over every source row;
+- **v2** computes the weights once per box (one small kernel), with a 16-bit intermediate (the
+  value × 16), over the needed rows only, each thread keeping its column's weights over 16 rows.
+  v2 and v1 differ by at most 1 code (the 16-bit intermediate; 0.9 % of the samples); each matches
+  its own CPU reference.
 
-### Resample of one box (horizontal + vertical pass, ms)
+### Resample of one box, v2 (horizontal + vertical pass, Y, Cb, Cr, ms)
+
+| Size | bilinear | triangle (widened) | Catmull-Rom (widened) | Lanczos-3 (widened) |
+|---|---|---|---|---|
+| 1.0 | 1.062 | 1.059 | 1.164 | 1.328 |
+| 0.75 | 0.745 | 0.741 | 0.896 | 0.951 |
+| 0.5 | 0.430 | 0.424 | 0.520 | 0.775 |
+| 0.333 | 0.313 | 0.314 | 0.494 | 0.793 |
+| 0.25 | 0.219 | 0.220 | 0.504 | 0.868 |
+| 1.5 | 0.993 | 0.981 | 1.031 | 1.148 |
+
+v2 with border, soft and shadow, resample + compose (the background alone 0.139 ms): corner PiP
+1/3 0.668, half PiP 0.734, split 2 × 1/2 1.374, quad 4 × 1/2 2.569, 8 × 1/4 4.405, full 1.0
+1.549 ms.
+
+### Resample of one box, v1 (ms)
 
 Y, Cb, Cr (an opaque source):
 
@@ -456,7 +481,7 @@ Y, Cb, Cr (an opaque source):
 With the key plane (a `linear` box), Catmull-Rom: 2.49 / 1.99 / 1.33 / 1.07 / 0.88 / 2.49 ms
 for the same sizes.
 
-### Compose with boxes (ms)
+### Compose with boxes, v1 (ms)
 
 The background alone through the compose kernel: 0.143.
 
