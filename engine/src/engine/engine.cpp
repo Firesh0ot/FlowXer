@@ -475,6 +475,10 @@ struct Engine::Impl
     std::vector<gpu::WorkBuffer> pvwWork;
     // Black in the working format (the Black source, an empty clip player).
     gpu::WorkBuffer blackWork;
+    // DME (yuv16): the weight table of the resample, and keyer k's box buffer at k − 1
+    // (allocated when its box is first drawn).
+    gpu::DmeScratch dmeScratch;
+    std::vector<std::int16_t*> boxBuffers;
     std::array<Slot, kSlots> slots;
     std::array<MosaicSlot, kMosaicSlots> mosaicSlots;
     std::vector<MosaicTile> tiles;
@@ -692,6 +696,12 @@ struct Engine::Impl
         addWork(pvwWork, static_cast<std::size_t>(cfg.mes));
         check(gpu::allocWork(blackWork, work, cfg.width, cfg.height), "work buffer");
         allocated += blackWork.bytes;
+        if (work == gpu::WorkFormat::Yuv16)
+        {
+            check(gpu::allocDmeScratch(dmeScratch, cfg.width, cfg.height), "dme scratch");
+            allocated += dmeScratch.bytes;
+        }
+        boxBuffers.assign(cfg.keys.size(), nullptr);
         check(gpu::unpack(renderStream, black, rowBytes, blackWork), "black work");
 
         std::size_t const outCount = static_cast<std::size_t>(2 * cfg.mes);
@@ -1353,11 +1363,11 @@ struct Engine::Impl
             }
         }
         // A clip player is on air when it is in an ME's Program (or the incoming source of a Mix),
-        // or the source of a luma key on air.
+        // or the source of a luma key or a pip on air.
         std::vector<bool> onAir(players.size(), false);
         for (auto const& key : plan.keys)
         {
-            if (key.gain > 0.f && key.settings.luma && key.settings.source.kind == Source::Kind::Player)
+            if (key.gain > 0.f && (key.settings.luma || key.settings.pip) && key.settings.source.kind == Source::Kind::Player)
             {
                 onAir[static_cast<std::size_t>(key.settings.source.index - 1)] = true;
             }
@@ -1411,7 +1421,7 @@ struct Engine::Impl
         }
         for (auto const& key : plan.keys)
         {
-            if (key.gain > 0.f && key.settings.luma)
+            if (key.gain > 0.f && (key.settings.luma || key.settings.pip))
             {
                 need(key.settings.source);
             }
@@ -1452,7 +1462,7 @@ struct Engine::Impl
         for (auto const& key : plan.keys)
         {
             int const s = slots[static_cast<std::size_t>(key.key - 1)];
-            if (key.gain > 0.f && !key.settings.luma && s >= 0 && !keyFrames[static_cast<std::size_t>(s)])
+            if (key.gain > 0.f && !key.settings.luma && !key.settings.pip && s >= 0 && !keyFrames[static_cast<std::size_t>(s)])
             {
                 auto& frame = keyFrames[static_cast<std::size_t>(s)];
                 frame = pick(*keys[static_cast<std::size_t>(s)], j, index);
@@ -1470,6 +1480,9 @@ struct Engine::Impl
             // the upstream keyers, the stinger, the DSKs, Fade to Black. Keys have no preview
             // (Preview shows only its source).
             gpu::Compose job;
+            // The ME's boxes (upstream keyers with DME): resampled first, drawn as layers.
+            std::array<DmeDraw, gpu::kMaxBoxes> draws;
+            int boxCount = 0;
             job.a = &workOf(p.background());
             job.b = p.mixing ? &workOf(p.b) : nullptr;
             job.t = p.mixing ? p.t : 0.f;
@@ -1504,6 +1517,52 @@ struct Engine::Impl
                     auto const& set = key.settings;
                     gpu::KeyLayer layer;
                     layer.gain = key.gain * set.gain;
+                    if (upstream && set.dme.enabled)
+                    {
+                        // A box: yuv16 only.
+                        if (work != gpu::WorkFormat::Yuv16 || boxCount >= gpu::kMaxBoxes)
+                        {
+                            continue;
+                        }
+                        DmeKind const kind = set.pip ? DmeKind::Pip : set.luma ? DmeKind::Luma : DmeKind::Linear;
+                        DmeSource source;
+                        if (kind == DmeKind::Linear)
+                        {
+                            int const s = slots[static_cast<std::size_t>(key.key - 1)];
+                            auto const& frame = s >= 0 ? keyFrames[static_cast<std::size_t>(s)] : nullptr;
+                            if (!frame)
+                            {
+                                continue;
+                            }
+                            source = gpu::dmeSource(frame->data, cfg.width, cfg.height, rowBytes, keyRowBytes);
+                        }
+                        else
+                        {
+                            source = gpu::dmeSource(workOf(set.source));
+                        }
+                        auto& buffer = boxBuffers[static_cast<std::size_t>(key.key - 1)];
+                        if (buffer == nullptr)
+                        {
+                            std::size_t const bytes = gpu::dmeBufferBytes(cfg.width, cfg.height);
+                            if (cudaMalloc(reinterpret_cast<void**>(&buffer), bytes) != cudaSuccess)
+                            {
+                                buffer = nullptr;
+                                continue;
+                            }
+                            allocated += bytes;
+                        }
+                        DmeDraw& d = draws[static_cast<std::size_t>(boxCount++)];
+                        d.box = makeDmeBox(set.dme, kind, cfg.width, cfg.height);
+                        d.buffer = buffer;
+                        d.gain = layer.gain;
+                        d.clip = set.clip;
+                        d.soft = set.soft;
+                        d.invert = set.invert;
+                        gpu::dmeResample(st, d.box, source, dmeScratch, buffer);
+                        layer.dme = &d;
+                        job.layers[job.layerCount++] = layer;
+                        continue;
+                    }
                     if (set.luma)
                     {
                         layer.luma = true;
@@ -2294,6 +2353,15 @@ struct Engine::Impl
             }
         }
         gpu::freeWork(blackWork);
+        gpu::freeDmeScratch(dmeScratch);
+        for (auto* buffer : boxBuffers)
+        {
+            if (buffer != nullptr)
+            {
+                cudaFree(buffer);
+            }
+        }
+        boxBuffers.clear();
         for (auto& slot : slots)
         {
             for (auto* out : slot.out)
@@ -2538,7 +2606,8 @@ struct Engine::Impl
         for (auto const& key : mixer.keyView())
         {
             keyers.push_back({{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on},
-                {"transition", key.transition}, {"gain", round3(key.gain)}, {"mode", key.settings.luma ? "luma" : "linear"}});
+                {"transition", key.transition}, {"gain", round3(key.gain)}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"},
+                {"dme", {{"enabled", key.settings.dme.enabled}, {"x", key.settings.dme.x}, {"y", key.settings.dme.y}, {"size", key.settings.dme.size}}}});
         }
         out["keyers"] = keyers;
         json mosaic = {{"enabled", cfg.mosaic}, {"fps", cfg.mosaicFps}, {"frames", mosaicFrames.load()}, {"dropped", mosaicDropped.load()}, {"encode_ms", encodeMs.toJson()}};

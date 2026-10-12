@@ -2,6 +2,7 @@
 
 #include "core/audio.hpp"
 #include "core/config.hpp"
+#include "core/dme.hpp"
 #include "core/mixer.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
@@ -324,4 +325,252 @@ TEST(wipe_vectors_for_the_gui)
         worst = std::max(worst, std::abs(s - v[3].get<float>()));
     }
     CHECK(worst < 1e-6f);
+}
+
+namespace
+{
+// A 1080p picture with a pattern (values 64..940), and its yuv16 planes as a DME source.
+Planar422 dmePattern()
+{
+    Planar422 p;
+    p.allocate(1920, 1080);
+    for (int y = 0; y < 1080; ++y)
+    {
+        for (int x = 0; x < 1920; ++x)
+        {
+            p.y[static_cast<std::size_t>(y) * 1920 + x] = static_cast<std::uint16_t>(64 + (x * 3 + y * 7) % 877);
+        }
+        for (int x = 0; x < 960; ++x)
+        {
+            p.cb[static_cast<std::size_t>(y) * 960 + x] = static_cast<std::uint16_t>(64 + (x * 5 + y) % 877);
+            p.cr[static_cast<std::size_t>(y) * 960 + x] = static_cast<std::uint16_t>(64 + (x + y * 11) % 877);
+        }
+    }
+    return p;
+}
+
+DmeSource dmeSourceOf(Planar422 const& p)
+{
+    DmeSource s;
+    s.width = p.width;
+    s.height = p.height;
+    s.plane[0] = p.y.data();
+    s.plane[1] = p.cb.data();
+    s.plane[2] = p.cr.data();
+    return s;
+}
+} // namespace
+
+TEST(dme_geometry)
+{
+    DmeSettings set;
+    set.x = 0.75f;
+    set.y = 0.25f;
+    set.size = 0.5f;
+    DmeBox b = makeDmeBox(set, DmeKind::Pip, 1920, 1080);
+    // The picture: centred at (1440, 270), 960 × 540.
+    CHECK(b.L == 960.f && b.R == 1920.f && b.T == 0.f && b.B == 540.f);
+    CHECK(b.bx == 960 && b.bw == 960 && b.by == 0 && b.bh == 540 && b.cols == 1920);
+    CHECK(b.taps == 8 && b.fs == 0.5f && b.sup == 4.f);
+    // Output pixel centre 960.5 maps to source luma index 0.5 (u = 1); chroma sample k sits at
+    // luma 2k: index (u − ½) / 2.
+    CHECK(dmeLumaIndex(b, 0) == 0.5f && dmeChromaIndex(b, 0) == 0.25f && dmeRowIndex(b, 0) == 0.5f);
+    // A crop cuts the picture without moving it; columns on even samples.
+    set.cropLeft = 0.25f;
+    set.cropTop = 0.1f;
+    b = makeDmeBox(set, DmeKind::Linear, 1920, 1080);
+    CHECK(b.cl == 480 && b.ct == 108 && b.L == 1200.f && b.T == 54.f && b.cols == 3 * b.bw && b.bx % 2 == 0 && b.bw % 2 == 0);
+    // Shrinking widens the filter, up to 32 taps; upscaled it is the plain cubic.
+    set.size = 0.1f;
+    CHECK(makeDmeBox(set, DmeKind::Pip, 1920, 1080).taps == 32);
+    set.size = 1.5f;
+    CHECK(makeDmeBox(set, DmeKind::Pip, 1920, 1080).taps == 4);
+    // Off the raster: no box buffer.
+    set.x = -1.f;
+    set.size = 0.3f;
+    CHECK(makeDmeBox(set, DmeKind::Pip, 1920, 1080).bw == 0);
+    // Ranges.
+    DmeSettings bad;
+    CHECK(dmeValid(bad));
+    bad.cropLeft = 0.6f;
+    bad.cropRight = 0.4f;
+    CHECK(!dmeValid(bad));
+    bad = DmeSettings{};
+    bad.size = 2.5f;
+    CHECK(!dmeValid(bad));
+    bad = DmeSettings{};
+    bad.shadowDx = 200.f;
+    CHECK(!dmeValid(bad));
+}
+
+TEST(dme_weights_and_coverage)
+{
+    // Catmull-Rom: 1 at 0, 0 at the other integers, normalised weights sum to 1.
+    CHECK(catmullRom(0.f) == 1.f && catmullRom(1.f) == 0.f && catmullRom(2.f) == 0.f && catmullRom(-1.f) == 0.f);
+    float w[kDmeMaxTaps];
+    for (float c : {0.f, 0.3f, 7.5f, 100.25f})
+    {
+        for (float fs : {1.f, 0.5f, 0.125f})
+        {
+            int const taps = fs == 1.f ? 4 : fs == 0.5f ? 8 : 32;
+            dmeWeights(c, fs, 2.f / fs, taps, w);
+            float sum = 0.f;
+            for (int i = 0; i < taps; ++i)
+            {
+                sum += w[i];
+            }
+            CHECK(std::fabs(sum - 1.f) < 1e-5f);
+        }
+    }
+    // A hard edge at 10.25: the pixel [10, 11) is 0.75 inside, its neighbours all or nothing;
+    // the coverage of both sides of an edge sums to 1.
+    CHECK(dmeCover(10.f, 10.25f, 100.f, 0.f, 0.f) == 0.75f && dmeCover(9.f, 10.25f, 100.f, 0.f, 0.f) == 0.f && dmeCover(11.f, 10.25f, 100.f, 0.f, 0.f) == 1.f);
+    CHECK(dmeCover(10.f, 10.25f, 100.f, 0.f, 0.f) + dmeCover(10.f, 0.f, 10.25f, 0.f, 0.f) == 1.f);
+    // A soft edge ramps over `soft` px inside the rectangle.
+    CHECK(dmeCover(9.f, 10.f, 100.f, 4.f, 0.25f) == 0.f && dmeCover(12.f, 10.f, 100.f, 4.f, 0.25f) == 0.75f && dmeCover(20.f, 10.f, 100.f, 4.f, 0.25f) == 1.f);
+}
+
+TEST(dme_identity_and_crop_edges)
+{
+    Planar422 const src = dmePattern();
+    // Size 1 at the centre: every output sample sits on a source sample, the box is the source.
+    DmeSettings set;
+    set.size = 1.f;
+    DmeBox b = makeDmeBox(set, DmeKind::Pip, 1920, 1080);
+    std::vector<std::int16_t> buf;
+    dmeResampleCpu(b, dmeSourceOf(src), buf);
+    CHECK(b.bw == 1920 && b.bh == 1080);
+    bool same = true;
+    for (int y = 0; y < 1080 && same; y += 7)
+    {
+        for (int x = 0; x < 1920 && same; ++x)
+        {
+            same = buf[static_cast<std::size_t>(y) * b.cols + x] == src.y[static_cast<std::size_t>(y) * 1920 + x];
+        }
+        for (int x = 0; x < 960 && same; ++x)
+        {
+            same = buf[static_cast<std::size_t>(y) * b.cols + 1920 + x] == src.cb[static_cast<std::size_t>(y) * 960 + x] &&
+                   buf[static_cast<std::size_t>(y) * b.cols + 2880 + x] == src.cr[static_cast<std::size_t>(y) * 960 + x];
+        }
+    }
+    CHECK(same);
+    // A crop of a flat 500 region inside a 1023 frame: nothing from outside the crop bleeds in.
+    Planar422 framed;
+    framed.allocate(1920, 1080);
+    std::fill(framed.y.begin(), framed.y.end(), static_cast<std::uint16_t>(1023));
+    std::fill(framed.cb.begin(), framed.cb.end(), static_cast<std::uint16_t>(1023));
+    std::fill(framed.cr.begin(), framed.cr.end(), static_cast<std::uint16_t>(1023));
+    for (int y = 108; y < 972; ++y)
+    {
+        std::fill(framed.y.begin() + y * 1920 + 192, framed.y.begin() + y * 1920 + 1728, static_cast<std::uint16_t>(500));
+        std::fill(framed.cb.begin() + y * 960 + 96, framed.cb.begin() + y * 960 + 864, static_cast<std::uint16_t>(500));
+        std::fill(framed.cr.begin() + y * 960 + 96, framed.cr.begin() + y * 960 + 864, static_cast<std::uint16_t>(500));
+    }
+    set.size = 0.37f;
+    set.x = 0.4f + 0.3f / 1920.f;
+    set.cropLeft = set.cropRight = 0.1f;
+    set.cropTop = set.cropBottom = 0.1f;
+    b = makeDmeBox(set, DmeKind::Pip, 1920, 1080);
+    dmeResampleCpu(b, dmeSourceOf(framed), buf);
+    int worst = 0;
+    for (auto v : buf)
+    {
+        worst = std::max(worst, std::abs(v - 500));
+    }
+    CHECK(worst == 0);
+}
+
+TEST(dme_box_layer)
+{
+    Planar422 const src = dmePattern();
+    Planar422 bg;
+    bg.allocate(1920, 1080);
+    std::fill(bg.y.begin(), bg.y.end(), static_cast<std::uint16_t>(400));
+    std::fill(bg.cb.begin(), bg.cb.end(), static_cast<std::uint16_t>(512));
+    std::fill(bg.cr.begin(), bg.cr.end(), static_cast<std::uint16_t>(512));
+    DmeSettings set;
+    set.x = 0.5f;
+    set.y = 0.5f;
+    set.size = 0.5f;
+    set.borderWidth = 4.f;
+    set.borderY = 940;
+    set.shadowDx = 10.f;
+    set.shadowDy = 10.f;
+    set.shadowOpacity = 1.f;
+    DmeDraw d;
+    d.box = makeDmeBox(set, DmeKind::Pip, 1920, 1080);
+    std::vector<std::int16_t> buf;
+    dmeResampleCpu(d.box, dmeSourceOf(src), buf);
+    d.buffer = buf.data();
+    d.gain = 1.f;
+    Planar422 out = bg;
+    dmeLayerCpu(d, out);
+    auto const at = [&](int x, int y) { return out.y[static_cast<std::size_t>(y) * 1920 + x]; };
+    // The picture (480..1440 × 270..810) is the box buffer; the 4 px border is white; the shadow
+    // (moved by 10 px, a 1 px ramp) is black right of and below the border; outside untouched.
+    CHECK(at(960, 540) == buf[static_cast<std::size_t>(540 - 270) * d.box.cols + (960 - 480)]);
+    CHECK(at(477, 540) == 940 && at(960, 267) == 940 && at(1442, 540) == 940);
+    CHECK(at(1450, 540) == 64 && at(960, 818) == 64);
+    CHECK(at(470, 540) == 400 && at(1460, 540) == 400 && at(100, 100) == 400);
+    // At gain 0 nothing changes.
+    d.gain = 0.f;
+    out = bg;
+    dmeLayerCpu(d, out);
+    CHECK(out.y == bg.y && out.cb == bg.cb);
+}
+
+TEST(dme_linear_premultiplied)
+{
+    // A v210a fill (white) with a key of 0 left of column 960 and 1023 from there: shrunk, the
+    // transparent half leaves the background, the opaque half is white, and the edge between has
+    // no dark fringe (premultiplied, the fill limited by its key): no Y below the background.
+    int const w = 1920;
+    int const h = 1080;
+    int const rowBytes = v210RowBytes(w);
+    int const keyRow = keyPlaneRowBytes(w);
+    Planar422 white;
+    white.allocate(w, h);
+    std::fill(white.y.begin(), white.y.end(), static_cast<std::uint16_t>(940));
+    std::fill(white.cb.begin(), white.cb.end(), static_cast<std::uint16_t>(512));
+    std::fill(white.cr.begin(), white.cr.end(), static_cast<std::uint16_t>(512));
+    std::vector<std::uint8_t> v210a(static_cast<std::size_t>(rowBytes) * h + static_cast<std::size_t>(keyRow) * h, 0);
+    packV210(white, v210a.data(), rowBytes);
+    for (int y = 0; y < h; ++y)
+    {
+        auto* k = reinterpret_cast<std::uint32_t*>(v210a.data() + static_cast<std::size_t>(rowBytes) * h + static_cast<std::size_t>(y) * keyRow);
+        for (int x = 960; x < w; ++x)
+        {
+            k[x / 3] |= 1023u << ((x % 3) * 10);
+        }
+    }
+    DmeSource src;
+    src.width = w;
+    src.height = h;
+    src.v210a = v210a.data();
+    src.rowBytes = rowBytes;
+    src.keyRowBytes = keyRow;
+    DmeSettings set;
+    set.size = 0.43f;
+    set.x = 0.5f + 0.37f / 1920.f;
+    DmeDraw d;
+    d.box = makeDmeBox(set, DmeKind::Linear, w, h);
+    std::vector<std::int16_t> buf;
+    dmeResampleCpu(d.box, src, buf);
+    d.buffer = buf.data();
+    d.gain = 1.f;
+    Planar422 out;
+    out.allocate(w, h);
+    std::fill(out.y.begin(), out.y.end(), static_cast<std::uint16_t>(200));
+    std::fill(out.cb.begin(), out.cb.end(), static_cast<std::uint16_t>(512));
+    std::fill(out.cr.begin(), out.cr.end(), static_cast<std::uint16_t>(512));
+    dmeLayerCpu(d, out);
+    int const row = 540;
+    bool inRange = true;
+    for (int x = 0; x < w; ++x)
+    {
+        auto const v = out.y[static_cast<std::size_t>(row) * w + x];
+        inRange = inRange && v >= 200;
+    }
+    CHECK(inRange);
+    CHECK(out.y[static_cast<std::size_t>(row) * w + 700] == 200 && out.y[static_cast<std::size_t>(row) * w + 1200] == 940);
 }

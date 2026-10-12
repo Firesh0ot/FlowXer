@@ -450,6 +450,36 @@ TEST(keyers_per_me_and_luma_settings)
     CHECK(mixer.keySettings(5, KeySettings{}) == MixResult::BadMe);
 }
 
+TEST(keyers_pip_and_dme_settings)
+{
+    Mixer mixer(2, 4, 1, {KeyerSpec{1, true}, KeyerSpec{1, false}, KeyerSpec{2, true}});
+    // A pip of input 2 on ME 1's upstream keyer: its box is always on.
+    KeySettings pip;
+    pip.pip = true;
+    pip.source = Source{Source::Kind::Input, 2};
+    pip.dme.x = 0.75f;
+    pip.dme.size = 0.4f;
+    CHECK(mixer.keySettings(1, pip) == MixResult::Ok);
+    auto const view = mixer.keyView()[0];
+    CHECK(view.settings.pip && view.settings.dme.enabled && view.settings.dme.x == 0.75f && view.settings.source == (Source{Source::Kind::Input, 2}));
+    // A pip of ME 2 on ME 1 (re-entry), not of ME 1 on ME 2; no pip or box on a DSK.
+    pip.source = Source{Source::Kind::Me, 2};
+    CHECK(mixer.keySettings(1, pip) == MixResult::Ok);
+    pip.source = Source{Source::Kind::Me, 1};
+    CHECK(mixer.keySettings(3, pip) == MixResult::BadSource);
+    pip.source = Source{Source::Kind::Input, 1};
+    CHECK(mixer.keySettings(2, pip) == MixResult::BadDme);
+    KeySettings linear;
+    linear.dme.enabled = true;
+    CHECK(mixer.keySettings(2, linear) == MixResult::BadDme);
+    CHECK(mixer.keySettings(3, linear) == MixResult::Ok && mixer.keyView()[2].settings.dme.enabled);
+    // Ranges, and pip and luma at once.
+    linear.dme.size = 3.f;
+    CHECK(mixer.keySettings(3, linear) == MixResult::BadDme);
+    pip.luma = true;
+    CHECK(mixer.keySettings(1, pip) == MixResult::BadKey);
+}
+
 TEST(luma_key_alpha)
 {
     // Y 64 is 0, 940 is 1: clip 0.5 hard keys above the middle; soft 0.2 ramps over 0.5..0.7.

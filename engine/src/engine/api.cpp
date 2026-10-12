@@ -55,7 +55,7 @@ Route routeOf(json const& body)
 }
 
 // "#RRGGBB" as 10-bit BT.709 limited-range Y'CbCr.
-bool parseColour(std::string const& text, WipeSettings& wipe)
+bool parseColour(std::string const& text, std::uint16_t& y, std::uint16_t& cb, std::uint16_t& cr)
 {
     unsigned r = 0;
     unsigned g = 0;
@@ -65,9 +65,60 @@ bool parseColour(std::string const& text, WipeSettings& wipe)
     {
         return false;
     }
-    rgbToYcbcr(Rgb{static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f, static_cast<float>(b) / 255.f}, wipe.borderY, wipe.borderCb,
-        wipe.borderCr);
+    rgbToYcbcr(Rgb{static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f, static_cast<float>(b) / 255.f}, y, cb, cr);
     return true;
+}
+
+// A keyer's box (docs/engine-p4.md §3): {enabled, x, y, size, soft, crop {left, right, top,
+// bottom}, border {width, soft, color, opacity}, shadow {dx, dy, blur, opacity}}; missing fields
+// keep their defaults. An error text, or empty.
+std::string parseDme(json const& body, DmeSettings& dme)
+{
+    try
+    {
+        dme.enabled = body.value("enabled", dme.enabled);
+        dme.x = body.value("x", dme.x);
+        dme.y = body.value("y", dme.y);
+        dme.size = body.value("size", dme.size);
+        dme.soft = body.value("soft", dme.soft);
+        if (auto const it = body.find("crop"); it != body.end())
+        {
+            dme.cropLeft = it->value("left", dme.cropLeft);
+            dme.cropRight = it->value("right", dme.cropRight);
+            dme.cropTop = it->value("top", dme.cropTop);
+            dme.cropBottom = it->value("bottom", dme.cropBottom);
+        }
+        if (auto const it = body.find("border"); it != body.end())
+        {
+            dme.borderWidth = it->value("width", dme.borderWidth);
+            dme.borderSoft = it->value("soft", dme.borderSoft);
+            dme.borderOpacity = it->value("opacity", dme.borderOpacity);
+            if (it->contains("color") && !parseColour(text(*it, "color"), dme.borderY, dme.borderCb, dme.borderCr))
+            {
+                return "dme border color must be #RRGGBB";
+            }
+        }
+        if (auto const it = body.find("shadow"); it != body.end())
+        {
+            dme.shadowDx = it->value("dx", dme.shadowDx);
+            dme.shadowDy = it->value("dy", dme.shadowDy);
+            dme.shadowBlur = it->value("blur", dme.shadowBlur);
+            dme.shadowOpacity = it->value("opacity", dme.shadowOpacity);
+        }
+    }
+    catch (json::exception const&)
+    {
+        return "dme fields must be numbers (enabled a boolean)";
+    }
+    return {};
+}
+
+json dmeJson(DmeSettings const& d)
+{
+    return json{{"enabled", d.enabled}, {"x", d.x}, {"y", d.y}, {"size", d.size}, {"soft", d.soft},
+        {"crop", {{"left", d.cropLeft}, {"right", d.cropRight}, {"top", d.cropTop}, {"bottom", d.cropBottom}}},
+        {"border", {{"width", d.borderWidth}, {"soft", d.borderSoft}, {"opacity", d.borderOpacity}, {"ycbcr", {d.borderY, d.borderCb, d.borderCr}}}},
+        {"shadow", {{"dx", d.shadowDx}, {"dy", d.shadowDy}, {"blur", d.shadowBlur}, {"opacity", d.shadowOpacity}}}};
 }
 
 json transitionJson(TransitionSettings const& next)
@@ -110,6 +161,8 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "t must be 0..1");
     case MixResult::BadKey:
         return error(400, "clip, soft and gain must be 0..1");
+    case MixResult::BadDme:
+        return error(400, "pip and dme only on upstream keyers, dme within its ranges (docs/engine-p4.md §3)");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -172,7 +225,7 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "pattern must be an integer, reverse a boolean, soft and border numbers");
         }
-        if (body.contains("border_color") && !parseColour(text(body, "border_color"), wipe))
+        if (body.contains("border_color") && !parseColour(text(body, "border_color"), wipe.borderY, wipe.borderCb, wipe.borderCr))
         {
             return error(400, "border_color must be #RRGGBB");
         }
@@ -413,19 +466,31 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             KeySettings set;
             auto const mode = text(body, "mode");
-            if (mode != "linear" && mode != "luma")
+            if (mode != "linear" && mode != "luma" && mode != "pip")
             {
-                return error(400, "mode must be linear or luma");
+                return error(400, "mode must be linear, luma or pip");
             }
             set.luma = mode == "luma";
-            if (set.luma)
+            set.pip = mode == "pip";
+            if (set.luma || set.pip)
             {
                 auto const source = parseSource(text(body, "source"));
                 if (!source)
                 {
-                    return error(400, "a luma key needs a source (in<n>, cp<n>, black, me<n>)");
+                    return error(400, "a luma key or a pip needs a source (in<n>, cp<n>, black, me<n>)");
                 }
                 set.source = *source;
+            }
+            if (auto const it = body.find("dme"); it != body.end())
+            {
+                if (!it->is_object())
+                {
+                    return error(400, "dme must be an object");
+                }
+                if (auto const failed = parseDme(*it, set.dme); !failed.empty())
+                {
+                    return error(400, failed);
+                }
             }
             try
             {
@@ -452,7 +517,7 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             if (key.key == k)
             {
-                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}});
+                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}, {"dme", dmeJson(key.settings.dme)}});
             }
         }
         return reply(200, json{{"key", k}});

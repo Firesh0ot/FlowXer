@@ -751,6 +751,28 @@ void freeDmeScratch(DmeScratch& scratch)
     scratch = DmeScratch{};
 }
 
+DmeSource dmeSource(WorkBuffer const& work)
+{
+    DmeSource s;
+    s.width = work.width;
+    s.height = work.height;
+    s.plane[0] = planeY(work);
+    s.plane[1] = planeCb(work);
+    s.plane[2] = planeCr(work);
+    return s;
+}
+
+DmeSource dmeSource(std::uint8_t const* v210a, int width, int height, int rowBytes, int keyRowBytes)
+{
+    DmeSource s;
+    s.width = width;
+    s.height = height;
+    s.v210a = v210a;
+    s.rowBytes = rowBytes;
+    s.keyRowBytes = keyRowBytes;
+    return s;
+}
+
 cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer)
 {
     if (box.bw == 0 || box.bh == 0)

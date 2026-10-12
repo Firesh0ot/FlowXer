@@ -500,13 +500,24 @@ MixResult Mixer::keySettings(int key, KeySettings const& settings)
     {
         return MixResult::BadKey;
     }
-    if (settings.luma && !sourceAllowed(keys_[static_cast<std::size_t>(key - 1)].me, settings.source))
+    auto const& spec = keys_[static_cast<std::size_t>(key - 1)];
+    if (settings.luma && settings.pip)
+    {
+        return MixResult::BadKey;
+    }
+    if ((settings.luma || settings.pip) && !sourceAllowed(spec.me, settings.source))
     {
         return MixResult::BadSource;
     }
+    if ((settings.pip || settings.dme.enabled) && (!spec.upstream || !dmeValid(settings.dme)))
+    {
+        return MixResult::BadDme;
+    }
     {
         std::lock_guard lock{mu_};
-        keys_[static_cast<std::size_t>(key - 1)].settings = settings;
+        auto& stored = keys_[static_cast<std::size_t>(key - 1)].settings;
+        stored = settings;
+        stored.dme.enabled = settings.pip || settings.dme.enabled;
     }
     notify();
     return MixResult::Ok;

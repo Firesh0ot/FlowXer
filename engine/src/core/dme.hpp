@@ -559,6 +559,21 @@ FXENG_HD inline void dmePair(DmeDraw const& d, DmeAxis const& ry, int x, int row
         pc[0] = 0.f;
         pc[1] = 0.f;
     }
+    // A linear box: the key clamped to 0..1, and the premultiplied fill to what that key allows
+    // (a straight fill of 0..1023): the cubic's ringing at a hard key edge leaves no dark or
+    // colour fringe where the key is 0.
+    float ka[2] = {1.f, 1.f};
+    if (b.kind == DmeKind::Linear)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            ka[i] = clamp01(fk[i] * (1.f / 1023.f));
+            fy[i] = dmeMax(dmeMin(fy[i], 959.f * ka[i]), -64.f * ka[i]);
+        }
+        float const kc = 0.5f * (ka[0] + ka[1]);
+        fcb = dmeMax(dmeMin(fcb, 511.f * kc), -512.f * kc);
+        fcr = dmeMax(dmeMin(fcr, 511.f * kc), -512.f * kc);
+    }
     float as[2];
     float ab[2];
     float ap[2];
@@ -569,7 +584,7 @@ FXENG_HD inline void dmePair(DmeDraw const& d, DmeAxis const& ry, int x, int row
         ab[i] = bo[i] * d.gain;
         gp[i] = pc[i] * d.gain;
         ap[i] = b.kind == DmeKind::Luma     ? pc[i] * lumaAlpha(static_cast<unsigned>(fy[i]), d.clip, d.soft, d.invert, d.gain)
-                : b.kind == DmeKind::Linear ? clamp01(fk[i] * (1.f / 1023.f)) * gp[i]
+                : b.kind == DmeKind::Linear ? ka[i] * gp[i]
                                             : gp[i];
         std::uint16_t v = mix10(y[i], 64, as[i]);
         v = mix10(v, b.borderY, ab[i]);

@@ -3,6 +3,7 @@
 // takes one plan per output grain.
 #pragma once
 
+#include "core/dme.hpp"
 #include "core/wipe.hpp"
 
 #include <cstdint>
@@ -104,17 +105,21 @@ struct MePlan
     }
 };
 
-// A keyer's settings: a linear key from its key input (v210a fill + key), or a luma key of a
+// A keyer's settings: a linear key from its key input (v210a fill + key), a luma key of a
 // source (the fill is the source itself): α = clamp(((Y − 64) / 876 − clip) / soft), inverted,
-// times the gain (pixel.hpp lumaAlpha). A linear key's α is key / 1023 · gain.
+// times the gain (pixel.hpp lumaAlpha), or a pip: a source as an opaque picture in a box. A
+// linear key's α is key / 1023 · gain. With dme.enabled (always for a pip; upstream keyers only)
+// the fill and key are cropped, scaled and placed in a box (core/dme.hpp, docs/engine-p4.md).
 struct KeySettings
 {
     bool luma = false;
+    bool pip = false;
     Source source;
     float clip = 0.f;
     float soft = 0.f;
     float gain = 1.f;
     bool invert = false;
+    DmeSettings dme;
 };
 
 // Where a keyer keys: over ME `me`, before the transition (upstream) or after it (a DSK).
@@ -184,6 +189,7 @@ enum class MixResult
     BadPattern,
     BadPosition,
     BadKey,
+    BadDme,
     Busy
 };
 
@@ -224,7 +230,8 @@ public:
     // grains (an auto during an auto turns back from where it is).
     MixResult keySet(int key, bool on);
     MixResult keyAuto(int key, int frames);
-    // Its mode and settings; a luma key's source must be one its ME may take.
+    // Its mode and settings; a luma key's or a pip's source must be one its ME may take. A pip
+    // and a box (dme) only on upstream keyers, with the ranges of dmeValid.
     MixResult keySettings(int key, KeySettings const& settings);
     // Fade to Black of ME m's whole output, keys included: on or off at the next grain, or a fade
     // over `frames` grains (an auto during an auto turns back).
