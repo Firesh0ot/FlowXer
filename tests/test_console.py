@@ -10,7 +10,8 @@ def test_default_console_has_sources_panel_and_dsk(mixer: VisionMixer) -> None:
     assert mixer.workspace.logical_source_count == 8
     assert len(mixer.list_inputs()) == 8
     assert mixer.panels[0].id == "me-1"
-    assert mixer.keyers[0].id == "dsk-1"
+    # Per rendering ME 2 upstream keyers and 1 DSK; ME 1's DSK keeps P2's id.
+    assert [keyer.id for keyer in mixer.keyers] == ["me-1-key-1", "me-1-key-2", "dsk-1"]
     assert mixer.stinger_slots[0].role == "shared"
     # Live inputs, a clip player, Black (no test sources or replay input any more).
     assert [item.kind.value for item in mixer.list_inputs()] == ["mxl_live"] * 6 + ["clip_player", "black"]
@@ -27,7 +28,8 @@ def test_workspace_settings_resize_console(mixer: VisionMixer) -> None:
             mixer_panel_count=2,
             stinger_mode="separate",
             stinger_count=1,
-            downstream_keyer_count=0,
+            keyers_per_me=0,
+            dsks_per_me=0,
         )
     )
     assert mixer.settings.width == 1280
@@ -37,8 +39,12 @@ def test_workspace_settings_resize_console(mixer: VisionMixer) -> None:
     assert len(mixer.panels) == 2
     assert [slot.role for slot in mixer.stinger_slots] == ["in", "out"]
     assert mixer.keyers == []
-    with pytest.raises(MixerError, match="at most 1"):
-        mixer.apply_workspace(WorkspaceUpdate(downstream_keyer_count=2))
+    # P2's downstream_keyer_count is the DSKs per ME.
+    mixer.apply_workspace(WorkspaceUpdate(downstream_keyer_count=1, keyers_per_me=1))
+    assert [keyer.id for keyer in mixer.keyers] == ["me-1-key-1", "dsk-1", "me-2-key-1", "me-2-dsk-1"]
+    assert [keyer.label for keyer in mixer.keyers] == ["ME 1 Key 1", "DSK 1", "ME 2 Key 1", "ME 2 DSK 1"]
+    with pytest.raises(ValueError):
+        WorkspaceUpdate(dsks_per_me=5)
 
 
 def test_source_tile_aspect_while_running(mixer: VisionMixer) -> None:
@@ -158,10 +164,10 @@ def test_fade_to_black_and_restore(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     mixer.set_preview("cam-2")
     mixer.fade_to_black()
-    assert mixer.program_input_id == "black"
+    assert mixer.program_input_id == "cam-1" and mixer.panels[0].ftb
     assert mixer.preview_input_id == "cam-2"
     mixer.fade_to_black()
-    assert mixer.program_input_id == "cam-2"
+    assert mixer.program_input_id == "cam-1" and not mixer.panels[0].ftb
 
 
 def test_wipe_stays_armed_over_a_take(mixer: VisionMixer) -> None:
@@ -192,7 +198,7 @@ def test_transition_bank_api(client: TestClient) -> None:
     assert fade.json()["mixer"]["last_transition"] == "mix"
     ftb = client.post("/api/v1/mixer/fade-to-black", json={"panel_id": "me-1"})
     assert ftb.status_code == 200
-    assert ftb.json()["mixer"]["program_input_id"] == "black"
+    assert ftb.json()["mixer"]["program_input_id"] == "cam-2" and ftb.json()["mixer"]["panels"][0]["ftb"] is True
     cut = client.post("/api/v1/mixer/cut", json={"panel_id": "me-1"})
     assert cut.status_code == 200
 

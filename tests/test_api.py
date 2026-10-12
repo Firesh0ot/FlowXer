@@ -106,10 +106,12 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus"]
+    assert [w["id"] for w in widgets] == ["bus", "keys"]
+    assert widgets[1]["params"]["required"] == ["me"] and widgets[1]["min_size"] == {"w": 240, "h": 150}
     bus = widgets[0]
     assert bus["params"]["required"] == ["me"]
     assert bus["params"]["properties"]["me"]["maximum"] == len(mixer.panels)
+    assert bus["params"]["properties"]["transition"] == {"type": "boolean", "default": True, "title": "Transition type"}
     assert bus["min_size"] == {"w": 480, "h": 150}
 
 
@@ -117,7 +119,7 @@ def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer
     keyer = client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 800}).json()
     assert keyer["rate_ms"] == 800
     assert client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 0}).status_code == 422
-    assert mixer.keyers[0].rate_ms == 800
+    assert mixer.get_keyer("dsk-1").rate_ms == 800
 
 
 def test_health_and_config(client: TestClient) -> None:

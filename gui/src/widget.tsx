@@ -1,10 +1,13 @@
-// Operator-screen widget: /widget/bus?me=<n>[&theme=dark|light|transparent] shows one ME's Program
-// and Preview rows with Cut and Auto, without the console around it. It runs on flowxer-gui's own
+// Operator-screen widgets, without the console around them:
+// /widget/bus?me=<n>[&transition=false][&theme=dark|light|transparent] shows one ME's Program and
+// Preview rows with Cut, Auto and the transition type (hidden with transition=false);
+// /widget/keys?me=<n>[&theme=...] shows one ME's keyers and DSKs with On/Off and Auto. It runs on flowxer-gui's own
 // origin (its /api); only the origins in WIDGET_FRAME_ANCESTORS may frame it. It posts
 // {type: "widget-ready"} and {type: "widget-size", w, h} to the page that frames it.
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BusWidget } from "./components/BusWidget";
+import { KeysWidget } from "./components/KeysWidget";
 import "./widget.css";
 
 const params = new URLSearchParams(location.search);
@@ -18,6 +21,10 @@ else scheme?.setAttribute("content", theme === "light" ? "light" : "dark");
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <BusWidget me={Number(params.get("me")) || 1} />
+    {location.pathname.endsWith("/keys") ? (
+      <KeysWidget me={Number(params.get("me")) || 1} />
+    ) : (
+      <BusWidget me={Number(params.get("me")) || 1} transition={params.get("transition") !== "false"} />
+    )}
   </React.StrictMode>,
 );

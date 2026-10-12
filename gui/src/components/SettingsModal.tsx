@@ -23,7 +23,7 @@ export function SettingsModal({
       <div className="modal" onClick={(event) => event.stopPropagation()}>
         <h2>Settings</h2>
         <p className="hint">
-          Mixer must be off-air to change format, source count, MEs, stingers or downstream keyers.
+          Mixer must be off-air to change format, source count, MEs, stingers or keyers.
           Source tile aspect can change while on-air. Per-stinger media and cut frame are on the ⚙
           next to each stinger. Auto-stinger for a source is on that source’s ⚙.
         </p>
@@ -100,13 +100,36 @@ export function SettingsModal({
           />
         </label>
         <label>
-          Downstream keyers (HTML graphics)
+          Upstream keyers per ME
           <input
             type="number"
             min={0}
             max={8}
-            value={form.downstream_keyer_count}
-            onChange={(e) => set("downstream_keyer_count", Number(e.target.value))}
+            value={form.keyers_per_me}
+            disabled={Boolean(pinned.keyers_per_me)}
+            onChange={(e) => set("keyers_per_me", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          DSKs per ME
+          <input
+            type="number"
+            min={0}
+            max={4}
+            value={form.dsks_per_me}
+            disabled={Boolean(pinned.dsks_per_me)}
+            onChange={(e) => set("dsks_per_me", Number(e.target.value))}
+          />
+        </label>
+        <label>
+          Stinger players
+          <input
+            type="number"
+            min={0}
+            max={4}
+            value={form.stinger_players}
+            disabled={Boolean(pinned.stinger_players)}
+            onChange={(e) => set("stinger_players", Number(e.target.value))}
           />
         </label>
         {error ? <p className="error">{error}</p> : null}

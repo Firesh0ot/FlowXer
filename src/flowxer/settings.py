@@ -90,8 +90,6 @@ class Settings(BaseSettings):
     # Optional watched drop folder for auto-ingest (empty disables).
     import_dir: Path | None = None
     convert_concurrency: int = Field(default=1, ge=1, le=8)
-    ram_clip_max_s: float = Field(default=20.0, ge=0.0, le=600.0)
-    ram_budget_mb: int = Field(default=4096, ge=64, le=262144)
     upload_limit_gb: float = Field(default=20.0, ge=0.1, le=500.0)
     # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
     mxl_revision: str = ""
@@ -142,6 +140,11 @@ class Settings(BaseSettings):
     # The first n MEs render (PGM, PVW, senders and flows); empty: every panel. More than there
     # are panels renders every panel.
     render_mes: int | None = Field(default=None, ge=1, le=4)
+    # Upstream keyers (0-8) and DSKs (0-4) of every rendering ME; set: pinned like the panels.
+    keyers_per_me: int | None = Field(default=None, ge=0, le=8)
+    dsks_per_me: int | None = Field(default=None, ge=0, le=4)
+    # Stinger players (0-4, at most the rendering MEs; each plays one stinger at a time); set: pinned.
+    stinger_players: int | None = Field(default=None, ge=0, le=4)
     # Start Program after the state is restored: ME 1 on the first live input.
     program_autostart: bool = False
     # Raw tally per ME for the platform's tally calculator (flowxer.engine.tally_export):
@@ -150,7 +153,9 @@ class Settings(BaseSettings):
 
     mxl_domain_deprecated: bool = False
 
-    @field_validator("live_inputs", "clip_players", "panels", "render_mes", mode="before")
+    @field_validator(
+        "live_inputs", "clip_players", "panels", "render_mes", "keyers_per_me", "dsks_per_me", "stinger_players", mode="before"
+    )
     @classmethod
     def empty_is_unset(cls, value):
         # A Kubernetes value rendered as "" means "not set".
@@ -272,6 +277,12 @@ class Settings(BaseSettings):
             pinned["logical_source_count"] = (count, ", ".join(names))
         if self.panels is not None:
             pinned["mixer_panel_count"] = (self.panels, "FLOWXER_PANELS")
+        if self.keyers_per_me is not None:
+            pinned["keyers_per_me"] = (self.keyers_per_me, "FLOWXER_KEYERS_PER_ME")
+        if self.dsks_per_me is not None:
+            pinned["dsks_per_me"] = (self.dsks_per_me, "FLOWXER_DSKS_PER_ME")
+        if self.stinger_players is not None:
+            pinned["stinger_players"] = (self.stinger_players, "FLOWXER_STINGER_PLAYERS")
         return pinned
 
     @property

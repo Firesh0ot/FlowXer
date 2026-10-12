@@ -48,8 +48,9 @@ flowchart LR
 - **MEs:** up to 4 (`FLOWXER_PANELS`), every rendering ME renders all the time on the TAI grid: PGM video + PGM audio and PVW video per ME, written to MXL. An ME can take the Program of a higher ME (re-entry, the same output frame).
 - **Sources** in slot order: live inputs (an MXL video + audio pair, routed over IS-05), clip players, Black.
 - **Clip players** play clips from the media library (decoded on the GPU) and stills (frame memory): loop, play on cut, cue, play, pause, stop. The colour bars ship as a library still.
-- **Transitions:** Cut, Fade (mix), Fade to Black. **Audio follows video** with an equal-power crossfade. Stingers and wipe patterns come back in P3: until then a stinger take is a cut.
-- **DSK 1** on ME 1 keys a v210a fill + key flow (e.g. mxl-browser-source in `v210a` key mode) over ME 1 Program: on, off, auto. Keys have no preview: Preview shows only its source.
+- **Transitions:** Cut, and per ME the next transition for Auto: Mix or Wipe (23 SMPTE wipe codes with soft edge, border width and colour, reverse and flip-flop), at the ME's rate in frames, or a Stinger over its own length; a T-bar; Fade to Black of the ME's whole output (the DSKs and the sound too; the buses and the tally stay). **Audio follows video** with an equal-power crossfade along the transition.
+- **Stingers** play on the GPU with alpha and sound, over the upstream keys and under the DSKs: the background switches at the stinger's cut point, its sound crossfades over the 4 frames around it, and the stinger's own sound goes into PGM ([Stinger convention](#stinger-convention)).
+- **Keyers** on every rendering ME: upstream keyers (`FLOWXER_KEYERS_PER_ME`, 0–8, default 2) under the transition and DSKs (`FLOWXER_DSKS_PER_ME`, 0–4, default 1) over it, each linear (its own v210a fill + key input, e.g. mxl-browser-source in `v210a` key mode or a chroma-key function) or luma (a self key of a source the ME may take): on, off, auto. Keyers routed to the same flow share one reader. Keys have no preview: Preview shows only its source.
 - **Preview mosaic:** the engine encodes every source and every ME's Program and Preview once (NVENC); the console crops its pictures out of that one WebRTC stream. No audio preview.
 - **NMOS** IS-04/IS-05 node (BCP-007-03), **tally** over TSL UMD 5.0 (to receivers, and the raw tally for the platform's tally calculator), Prometheus metrics.
 - Runs in **Docker** (`vision-mixer` + `gui`) or on Kubernetes with the MXL domains mounted.
@@ -62,22 +63,23 @@ The GUI is a **separate React service** (Vite + TypeScript). Every control on th
 ┌─ File  Settings  Tally  Help ─────────────── [CPU% RAM% format] ─┐
 │  [ME 1] [ME 2]                                                   │
 │  PREVIEW                       PROGRAM                           │
-│  [DSK 1 ON|AUTO|25 f]  Stinger ⚙                                 │
+│  [ME 1 Key 1 ON|AUTO|25 f|⚙] … [DSK 1 …]  Stinger ⚙             │
 │                                                                  │
 │  [Cam 1 ⚙] [Cam 2 ⚙] [Clip 1 ⚙] …   source tiles (16:9 or 9:16)  │
-│   left of picture = PVW · right = PGM          Cut     Fade      │
+│   left of picture = PVW · right = PGM   MIX WIPE STING  25 fr    │
 │   clip players: [item ▾] · 00:03.12 −00:06.37 · ⏮ ▶ ⏸ ■ LOOP AUTO │
-│                                                Fade to Black Wipe │
+│                                         [wipe pattern icons]     │
+│                                         CUT     AUTO     FTB     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 - **Pictures:** every source tile and the Preview and Program monitors are crops of the engine's one preview mosaic: the page opens **one WHEP session** (`GET /api/v1/preview` gives the stream and the tile map) and reconnects by itself when it drops. Each picture is a box of its tile's aspect ratio with `overflow: hidden`, holding a `<video>` on that one stream that a CSS `transform: scale(…) translate(…)` stretches and moves so only the tile shows. That works in every browser (no `object-view-box`). Black has no tile; off-air the monitors say why there is no picture.
 - **Clip players** pick the library clip or still they play in their tile's header (an empty player is black), show the position and remaining time over the picture, and have the transport under it: ⏮ cue the first frame, ▶ play, ⏸ pause, ■ stop (back to the first frame), **LOOP**, **AUTO** (play on cut: start when taken to Program). A still shows **FRAME MEM**.
-- **DSK** (per keyer): ON/OFF cuts it, **AUTO** fades it over its rate (in frames; kept with the keyer), `· NO KEY` when its key input has no signal.
+- **Keyers** of the active ME (its upstream keyers, then its DSKs): ON/OFF cuts it, **AUTO** fades it over its rate (in frames; kept with the keyer), `· NO KEY` when a linear key's input has no signal; ⚙ sets the key: linear, or luma of a source with clip, soft and invert, and the gain.
 - **File** takes the mixer on-air or off-air and opens the **clip and still library** and the stinger library.
-- **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots and keyers. What the production sets through the environment is greyed out.
+- **Settings → Console layout…** (`PUT /workspace`): video format (off-air), source tiles 16:9 or 9:16 (display only, also on air), the number of sources, MEs, stinger slots, stinger players and keyers. What the production sets through the environment is greyed out.
 - The gear on a **source** (`PATCH /inputs/{id}`): name, kind (`mxl_live`, `clip_player`, `black`), flows of a live input, the clip or still of a clip player with loop and play on cut, and the auto-stinger.
-- **Cut / Fade / Fade to Black / Wipe** map to `/mixer/cut`, `/mixer/fade`, `/mixer/fade-to-black`, `/mixer/wipe`.
+- **Transition section** (per ME): the type (MIX, WIPE, STING) and the rate in frames (`PATCH /panels/{id}/transition`); for WIPE the pattern picker (icons, the SMPTE code as a tooltip), reverse, flip-flop (the next wipe goes back), soft edge and border (0–100 % of the pattern's travel) and the border colour; for STING the slot. **CUT**, **AUTO** (`/mixer/auto`: the ME's transition) and **FTB** (lit while the output is black) map to `/mixer/cut`, `/mixer/auto`, `/mixer/fade-to-black`; the **T-bar** lever holds the transition at its position (`/mixer/position`) and follows an Auto.
 - **Tally → Receivers…** adds TSL UMD 5.0 listeners (Companion, VSM, BFE, Riedel HI, custom).
 - The **status chip** is a CPU / RAM / format pill; click it for the mixer state, NMOS, load and issues.
 
@@ -91,10 +93,10 @@ Operator screens (the platform's production designer) frame single controls of F
 
 | Widget | Query | Minimum size | Shows |
 |---|---|---|---|
-| `bus` | `me` (required, 1..number of MEs) | 480×150 | that ME's Program and Preview rows (the inputs and the Programs of the higher MEs) with Cut and Auto; tally colours |
+| `bus` | `me` (required, 1..number of MEs), `transition` (default true) | 480×150 | that ME's Program and Preview rows (the inputs and the Programs of the higher MEs) with Cut and Auto and, unless `transition=false`, its transition type (MIX / WIPE / STING); tally colours |
 
 - `GET /widgets` lists them with a JSON schema of their parameters (from the mixer's `GET /api/v1/widgets`); it answers an `Origin` that `WIDGET_FRAME_ANCESTORS` names (or `*`) with `Access-Control-Allow-Origin`.
-- `GET /widget/bus?me=<n>[&theme=dark|light|transparent]` is the page without the console around it, on the GUI's own origin (its `/api`). A bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>`; none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
+- `GET /widget/bus?me=<n>[&transition=false][&theme=dark|light|transparent]` is the page without the console around it, on the GUI's own origin (its `/api`). A bad parameter answers 400, an unknown widget 404. Only these routes carry `Content-Security-Policy: frame-ancestors <WIDGET_FRAME_ANCESTORS>`; none carries `X-Frame-Options`. The page posts `{type: "widget-ready"}` and `{type: "widget-size", w, h}` to its parent.
 - `WIDGET_FRAME_ANCESTORS` is set on the **gui** container: a CSP source list, default `'self'` (an invalid value stops nginx with exit code 78).
 
 ## API
@@ -118,9 +120,11 @@ If `FLOWXER_API_TOKEN` is set, calls to **9610** need `Authorization: Bearer …
 | Source left click (PVW) / right click (PGM) | `POST /mixer/preview`, `POST /mixer/take` |
 | Source ⚙, clip player item, loop, play on cut | `PATCH /inputs/{id}` (`library_item_id`, `loop`, `play_on_cut`, `stinger_slot_id`) |
 | Clip player transport | `POST /players/{id}/cue` (`{"frame": n}`), `/play`, `/pause`, `/stop` |
-| DSK ON/OFF, rate | `PATCH /keyers/{id}` (`enabled`, `rate_ms`) |
-| DSK AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
-| Cut / Fade / Fade to Black / Wipe | `POST /mixer/cut`, `/fade`, `/fade-to-black`, `/wipe` |
+| Keyers | `GET /keyers`; `PATCH /keyers/{id}` (`enabled`, `rate_ms`, `mode`: `linear`/`luma`, `source_id`, `clip`, `soft`, `gain`, `invert`); ids `me-<n>-key-<k>`, `dsk-<k>` (ME 1), `me-<n>-dsk-<k>` |
+| Keyer AUTO | `POST /keyers/{id}/auto` (`duration_ms`, default the keyer's rate) |
+| Transition type, rate, wipe pattern and edge | `PATCH /panels/{id}/transition` (`type`, `rate_frames`, `wipe`: `pattern`, `reverse`, `alternate`, `soft`, `border`, `border_color`; `stinger_slot_id`); `GET /console` `panels[].transition` |
+| T-bar lever | `POST /mixer/position` (`panel_id`, `position` 0–1): off 0 starts the ME's transition and holds it, 1 completes it, 0 ends it without the swap; AUTO runs the rest; a stinger runs as an Auto |
+| CUT / AUTO / FTB | `POST /mixer/cut`, `/mixer/auto` (`panel_id`, `frames`), `/mixer/fade-to-black`. Kept for API clients: `/mixer/fade` (a mix), `/mixer/wipe` (arms Wipe), `/mixer/take` (`transition`: `cut`, `mix`, `wipe`, `stinger`; `frames` or `duration_ms`) |
 | Stinger chip / ⚙ | `POST /stinger/play`, `PATCH /stinger-slots/{id}` |
 | File → libraries | `GET /library`, `POST /uploads`, `GET /jobs` |
 | Tally → Receivers… | `PUT /tally/receivers`, `POST /tally/refresh` |
@@ -234,11 +238,11 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 
 ### The media engine
 
-The engine reads the live inputs from MXL (one DMA upload per grain), plays the clip players, renders every ME on the GPU (ME 4 → ME 1, so re-entry is the same output frame), keys DSK 1, packs PGM and PVW to v210 and writes them with the PGM audio to MXL at a fixed latency on the TAI grid: when it is late it skips to the current grain and counts it; it never slides. It encodes the preview mosaic once with NVENC. [engine/README.md](engine/README.md) has the design, its configuration, its API and the lab measurements (P1: 4 MEs, 8 inputs and the mosaic at 3.4 ms GPU render time per grain and 0.13 CPU cores on an A16).
+The engine reads the live inputs from MXL (one DMA upload per grain), plays the clip players, renders every ME on the GPU (ME 4 → ME 1, so re-entry is the same output frame) with its transitions and keyers in one pass per ME, packs PGM and PVW to v210 and writes them with the PGM audio to MXL at a fixed latency on the TAI grid: when it is late it skips to the current grain and counts it; it never slides. It encodes the preview mosaic once with NVENC. [engine/README.md](engine/README.md) has the design, its configuration, its API and the lab measurements (P1: 4 MEs, 8 inputs and the mosaic at 3.4 ms GPU render time per grain and 0.13 CPU cores on an A16).
 
 FlowXer writes the engine's configuration (`FLOWXER_ENGINE_*`) itself, starts it with the GPU of the container, and after every start pushes the routes, clip players, keyers and buses. An engine that exits is started again after 1, 2, 5, then every 10 s; `GET /api/v1/health` (`engine`) and `GET /api/v1/engine` show its state. A crashed engine's MediaMTX is reaped by tini (PID 1).
 
-GPU memory: about 0.6 GiB for 1 ME up to 0.8 GiB for 4 MEs with 8 inputs and the mosaic, about 50 MB per clip player and 170 MB per loaded clip (lab: 867 MiB with 2 MEs, 4 inputs, a clip and a still, 1 key input and the mosaic).
+GPU memory: about 0.6 GiB for 1 ME up to 0.8 GiB for 4 MEs with 8 inputs and the mosaic, about 50 MB per clip player and 170 MB per loaded clip, about 350 MB per stinger player with a stinger loaded, about 80 MB per distinct routed key flow (lab: 867 MiB with 2 MEs, 4 inputs, a clip and a still, 1 key input and the mosaic). Key flows also take PCIe: next to 8 inputs at 1080p50, 8 distinct key flows are the edge of a Gen4 x4 or Gen3 x8 link; under full load (wipes and stingers on every ME) a grain can come late now and then. FlowXer sets no limit and gives no warning (measured: `docs/engine-p3.md`, M4 as built).
 
 ### Saved state, export and import
 
@@ -255,13 +259,15 @@ The platform's production designer sets the mixer's structure through the enviro
 | `FLOWXER_FORMAT` | `format_id`, raster and rate | `1080p50` |
 | `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_CLIP_PLAYERS` | The input list: `logical_source_count` and each input's id, kind and label | `4`; `["Cam 1","Cam 2","Cam 3","Cam 4"]` or `Cam 1,Cam 2,Cam 3,Cam 4`; `2` |
 | `FLOWXER_PANELS` | `mixer_panel_count` (MEs, 1–4) | `2` |
+| `FLOWXER_KEYERS_PER_ME`, `FLOWXER_DSKS_PER_ME` | `keyers_per_me` (0–8, default 2) and `dsks_per_me` (0–4, default 1) of every rendering ME; set, the keyer labels are fixed | `2`, `1` |
+| `FLOWXER_STINGER_PLAYERS` | `stinger_players` (0–4, default 1, at most the rendering MEs): stingers that can play at once | `1` |
 
 With the input list set, the inputs are in this order (the slot order, the TSL INDEX): `cam-1`..`cam-N` (`mxl_live`, labelled from `FLOWXER_INPUT_LABELS`, the rest `Camera n`), `clip-1`..`clip-C` (clip players, `Clip n`), then `black` (Black). Live inputs and clip players together are at most 23 (24 sources with Black). More labels than live inputs, a duplicate or empty label, or an unknown format stop the process with exit code 78. `FLOWXER_CLIP_PLAYERS` replaces `FLOWXER_TEST_SOURCES`, which is no longer read; saved states and API clients with test, file or replay inputs get clip players.
 
 - **Kept from the saved state:** receiver connections (IS-05), and per input the essences, group hint, library item, loop, play on cut and auto-stinger when its id and kind stay the same; keyers, stingers, tally and the other workspace fields. Routes of an input the environment removed are dropped; Program or Preview on it starts empty.
 - **API and GUI:** what the environment sets cannot be changed (409, the message names the variable): `PUT /workspace` with another `format_id`, `logical_source_count` or `mixer_panel_count`; `POST` and `DELETE /inputs`; `PATCH /inputs/{id}` with another `label` or `kind`. The current values pass, so a client may send whole documents. `GET /console` lists these fields in `pinned`; the GUI greys them out.
 - **Export and import:** an imported document gets the environment's structure, as at a start; everything else in it is imported.
-- **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input and `DSK 1 Key` (v210a) for the keyer; per rendering ME the senders `ME <n> PGM Video`, `ME <n> PGM Audio` and `ME <n> PVW Video`, each with its own flow. ME 1 PGM keeps FlowXer's flow ids across versions.
+- **NMOS labels** follow the structure: receivers `<input label> Video` and `<input label> Audio` for each live input, and one v210a receiver per keyer of each rendering ME: `ME <n> Key <k>` (upstream), `DSK <k> Key` (ME 1, P2's id kept), `ME <n> DSK <k> Key`; per rendering ME the senders `ME <n> PGM Video`, `ME <n> PGM Audio` and `ME <n> PVW Video`, each with its own flow. ME 1 PGM keeps FlowXer's flow ids across versions.
 - `FLOWXER_PROGRAM_AUTOSTART=true` starts Program once the state is restored: ME 1 Program on the first live input (else the first input), Preview on the next one. A start that fails is logged and shown in `GET /mixer`, and tried again after 2, 5, 10, then every 30 s until Program runs or an operator starts or stops it. An input routed to an MXL domain that does not exist yet (a fabrics mirror after a node reboot) is black and silent and reads its flow once the domain appears.
 
 ```bash
@@ -290,25 +296,27 @@ FLOWXER_PROGRAM_AUTOSTART=true
 
 | What | Metrics |
 |---|---|
-| On air, Program | `flowxer_on_air`, `flowxer_program_stalled`, `flowxer_frames_rendered_total`, `flowxer_frames_dropped_total` (grains skipped to stay on the TAI grid), `flowxer_transitions_total{type}`, `flowxer_program_input`, `flowxer_preview_input` |
+| On air, Program | `flowxer_on_air`, `flowxer_program_stalled`, `flowxer_frames_rendered_total`, `flowxer_frames_dropped_total` (grains skipped to stay on the TAI grid), `flowxer_transitions_total{type}` (`cut`, `mix`, `wipe`, `stinger`), `flowxer_program_input`, `flowxer_preview_input` |
 | Engine output | `flowxer_engine_up`, `flowxer_engine_restarts_total`, `flowxer_engine_output_fps`, `flowxer_engine_output_grains_rendered_total`, `_committed_total`, `_skipped_total`, `_late_total`, `flowxer_engine_output_write_failed_total`, `flowxer_engine_output_lag_grains{stat}`, `flowxer_engine_output_commit_ms{stat}` |
 | Latency | `flowxer_latency_grains`, `flowxer_recommended_latency_grains` (covers the latest arrival seen) |
 | Inputs (FlowXer ids) | `flowxer_input_arrival_ms{input,essence,stat}`, `flowxer_input_late_total{input}`, `flowxer_input_missing_total{input,essence}`, `flowxer_input_state{input,essence,state}` |
-| Inputs (engine names `in<n>`, `key<n>`) | `flowxer_engine_input_running`, `_grains_total`, `_late_total`, `_missing_total`, `_resyncs_total`, `_reopens_total`, `flowxer_engine_input_audio_blocks_total`, `_audio_missing_total`, `_audio_waits_total` |
+| Inputs (engine names `in<n>`, `key<n>`) | `flowxer_engine_input_running`, `_grains_total`, `_late_total`, `_missing_total`, `_resyncs_total`, `_reopens_total`, `flowxer_engine_input_upload_ms{stat}` (also of each key flow), `flowxer_engine_input_audio_blocks_total`, `_audio_missing_total`, `_audio_waits_total` |
 | GPU time | `flowxer_engine_gpu_stage_ms{stage,stat}` with `stage` = `upload_per_input`, `unpack`, `me` (and `me="<n>"`, per ME), `pack`, `mosaic`, `render`, `download`, `total`; `flowxer_engine_gpu_utilization_percent`, `flowxer_engine_gpu_device_used_mb`, `flowxer_engine_gpu_engine_allocated_mb` |
 | Clip players | `flowxer_engine_player_playing{player}`, `flowxer_engine_player_frames_decoded_total`, `flowxer_engine_player_frames_late_total`, `flowxer_engine_player_decode_ms{stat}` |
+| Stingers | `flowxer_engine_stingers_played_total`, `flowxer_engine_stinger_wait_grains_total` (grains a take waited for its first frame), `flowxer_engine_stinger_cuts_total` (takes that became a cut after 50 grains), `flowxer_stinger_fallbacks_total{reason}` (takes the control plane made a cut: `not_ready`, still converting; `busy`, no stinger player free within 0.5 s), per player `flowxer_engine_stinger_player_state{player,state}` (1 for `empty`, `cued`, `playing`, `paused` or `ended`), `flowxer_engine_stinger_frames_decoded_total`, `_frames_late_total`, `flowxer_engine_stinger_decode_ms{stat}` |
+| Keyers | `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` (on or fading), `flowxer_engine_keyer_key_running{…}` (its key flow runs; 0 for a linear key is NO KEY) |
 | Preview mosaic | `flowxer_engine_mosaic_frames_total`, `_dropped_total`, `flowxer_engine_mosaic_encode_ms`, `flowxer_engine_mosaic_connected` (publishing), `flowxer_engine_mosaic_bytes_total`, `flowxer_engine_gpu_encoder_sessions`, `flowxer_engine_gpu_encoder_percent`; own MediaMTX: `flowxer_engine_preview_mediamtx_running`, `_restarts_total` |
 | Library | `flowxer_library_jobs{state=queued\|running}`, `flowxer_library_conversions_total{result}`, `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc` |
 | Control plane | `flowxer_control_plane_busy_seconds`, `flowxer_nmos_registry_up`, `flowxer_nmos_activations_total{result}`, `flowxer_tally_export_*`, `flowxer_engine_cpu_percent{thread}`, `flowxer_process_cpu_percent`, `flowxer_process_memory_bytes` |
 
-Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains and GPU time.
+Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains, GPU time (render, download, upload, per ME), GPU memory and NVENC sessions, stingers (played, waits, cuts, player state) and keyers (on air per ME, linear keys without a key signal).
 
 ### Upgrading from FlowXer 14
 
 The P2 image replaces 14.x in place with the same `/config` (the saved state), the same NMOS seed and the same output domain. Lab, from 14.21.46 with 4 live inputs routed over IS-05, 2 test sources, 2 MEs and a multiviewer reading ME 1 PGM: ME 1 PGM keeps its flow ids, the IS-05 activations of the live inputs are restored, their tally INDEX stays 0..N−1 and Black keeps its number; the multiviewer had no signal while the images were swapped and played again 3.2 s after the new one started.
 
 - **Environment:** `FLOWXER_TEST_SOURCES` is no longer read: set `FLOWXER_CLIP_PLAYERS` instead (the designer's `testSources` becomes `clipPlayers`). Set a GPU (`nvidia.com/gpu`, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`) and drop `FLOWXER_GPU`, `FLOWXER_GST_MODE`, `FLOWXER_MONITOR_FPS` and `FLOWXER_WEBRTC_*`. `WIDGET_FRAME_ANCESTORS` goes to the gui container.
-- **What an operator loses:** test sources become clip players at the same TSL INDEX, empty (black) until a clip or the colour bars are put on them; the Replay input (the last INDEX) is gone, its role is a clip player's; the HTML overlay is gone, so DSK 1 stays on but keys nothing until a v210a key (e.g. mxl-browser-source in `v210a` mode) is routed to its receiver `DSK 1 Key`; 14.x showed the overlay on Preview too, P2 keys Program only (keys have no preview); stingers and Wipe are cuts until P3; the per-source WebRTC and JPEG previews are replaced by the mosaic; clips of the library are converted again (NVENC, about 35 s per minute of clip) and black until then.
+- **What an operator loses:** test sources become clip players at the same TSL INDEX, empty (black) until a clip or the colour bars are put on them; the Replay input (the last INDEX) is gone, its role is a clip player's; the HTML overlay is gone, so DSK 1 stays on but keys nothing until a v210a key (e.g. mxl-browser-source in `v210a` mode) is routed to its receiver `DSK 1 Key`; 14.x showed the overlay on Preview too, P2 keys Program only (keys have no preview); the per-source WebRTC and JPEG previews are replaced by the mosaic; clips of the library are converted again (NVENC, about 35 s per minute of clip) and black until then.
 - **New on the tally:** an ME's re-entry source, INDEX 1000 + n.
 - **Known in 14.21.46:** started with its live inputs unrouted (autostart, or a start before the first IS-05 activation) its MXL sources crash the process (exit 139, a general protection fault in libstdc++ in an `mxlsrc` thread). With the routes in the saved state it starts. P2 has no such path.
 - **Rollback** (not tested): 14.x does not know clip players and ignores a state that P2 saved (it starts from its environment and defaults). Keep the 14.x state (`GET /api/v1/config/export`, or a copy of `/config`) before the upgrade to roll back with it.
@@ -369,30 +377,40 @@ Layout under `FLOWXER_LIBRARY_DIR` (default `storage/library/`):
 <id>/
   item.json
   original… or sequence/  # the uploaded file, never changed
-  mezz-<format>.mkv       # clip: HEVC 4:4:4 10-bit (x265 CRF 8)
-  mezz-<format>.f32       # clip: its sound, float32 48 kHz interleaved, stereo (or mono)
+  mezz-<format>.mkv       # clip, and a stinger's colour: HEVC 4:4:4 10-bit
+  mezz-<format>-alpha.mkv # stinger: its alpha as the luma of lossless HEVC 4:2:0 10-bit (none: opaque)
+  mezz-<format>.f32       # clip or stinger: its sound, float32 48 kHz interleaved, stereo (or mono); a silent stinger has none
   still-<format>.v210     # still: one v210 picture at the raster
-  mezz-<format>.mov       # stinger: ProRes 4444 with alpha, no sound
   thumb.jpg
   convert.log
 ```
 
-Upload via the operator GUI (**File → Clip and still library…** or **Stinger library…**) or HTTP (`POST /uploads` chunked, or `POST /uploads/sequence` for a TGA folder). Options include fit/fill, sequence framerate, and cut frame. Changing the mixer format (off-air) re-queues conversion for every item.
+Upload via the operator GUI (**File → Clip and still library…** or **Stinger library…**) or HTTP (`POST /uploads` chunked, or `POST /uploads/sequence` for a TGA or PNG folder with an optional WAV). Options include fit/fill, sequence framerate, and cut frame. Changing the mixer format (off-air) re-queues conversion for every item.
 
-- **Chunked upload:** `POST /uploads` with the file size (413 above `FLOWXER_UPLOAD_LIMIT_GB`, 507 when the library volume lacks the space), then `PUT /uploads/{id}/chunks/{n}` — every chunk exactly `chunk_size` bytes (8 MiB), the last one the rest (otherwise 413/422) — and `POST /uploads/{id}/complete`, which fails with 422 while a chunk is missing. Chunks go straight into place on disk and completing is a rename, so it answers at once; a repeated complete returns the same item. An upload idle for an hour is dropped, and leftovers are removed at start. A TGA ZIP is checked when the upload completes and unpacked by its conversion job. The GUI's nginx passes `/api/v1/uploads` through unbuffered and without a body size limit; the mixer enforces the limits.
+- **Chunked upload:** `POST /uploads` with the file size (413 above `FLOWXER_UPLOAD_LIMIT_GB`, 507 when the library volume lacks the space), then `PUT /uploads/{id}/chunks/{n}` — every chunk exactly `chunk_size` bytes (8 MiB), the last one the rest (otherwise 413/422) — and `POST /uploads/{id}/complete`, which fails with 422 while a chunk is missing. Chunks go straight into place on disk and completing is a rename, so it answers at once; a repeated complete returns the same item. An upload idle for an hour is dropped, and leftovers are removed at start. A sequence ZIP (TGA or PNG frames, one optional WAV next to them) is checked when the upload completes and unpacked by its conversion job. The GUI's nginx passes `/api/v1/uploads` through unbuffered and without a body size limit; the mixer enforces the limits.
 - **`POST /uploads/sequence`** (multipart: `name`, `sequence_fps`, `cut_frame`, `fit`, `files`): the frames are written to disk part by part, at most `FLOWXER_UPLOAD_LIMIT_GB` and 10 000 files. Frame names keep their padding, case (`.TGA`) and first number.
 - **Legacy storage:** files in `storage/clips` and `storage/stingers/<id>/` are imported in the background after start and referenced in place (not copied; their conversions wait behind uploads). Deleting an imported item leaves the legacy file alone and it is not imported again.
 - **Import dir** (`FLOWXER_IMPORT_DIR`): a file whose size held still for one scan (2 s) moves to `.processing/` and then into the library (a picture such as `.png`, `.jpg` or `.tif` as a still, a ZIP as a stinger, anything else as a clip); a file that cannot be imported moves to `.failed/`. A read-only import dir is copied from, and each file (name, size, mtime) is imported once — also when it failed.
 - **Clip mezzanine:** the picture at the raster and rate as 10-bit 4:2:2, each chroma sample repeated to 4:4:4 (NVDEC decodes HEVC 4:4:4 but no 4:2:2; the engine takes the mean of each pair and gets the 4:2:2 picture back), HEVC Main 4:4:4 10, no B-frames and a key frame every second (a cue decodes at most one second). NVENC encodes it with constant QP 8; when NVENC cannot be opened (tried once, logged) x265 with CRF 8. On the lab's clips at 1080p50: NVENC 56–60 dB PSNR against the 4:2:2 source and 200–400 MB per minute, x265 56–58 dB and 150–320 MB; with heavy film grain 2.4 GB (NVENC) and 1.5 GB (x265) per minute at 48–52 dB (ProRes 422 HQ: 1.0–2.9 GB). The sound is padded or cut to exactly the clip's frames inside ffmpeg and stored next to it as raw stereo (or mono with `map_channels: 1`) float. A source with more channels is downmixed when its layout is known, else its first two channels are used.
 - **Still:** its first picture at the raster (fit, fill or centre) as one limited-range BT.709 10-bit 4:2:2 v210 picture.
+- **Stinger mezzanine** (NVDEC decodes no alpha): its colour as the clip mezzanine, its alpha as the luma of HEVC 4:2:0 10-bit (chroma 512, no range conversion), lossless with NVENC (x265 lossless without it), and its sound as a clip's: a sequence's WAV (aligned to frame 0) or a video's first audio stream; without one the stinger is silent. Sources: TGA or PNG sequences (8 or 16 bits, converted from R'G'B' with the BT.709 matrix) and video with alpha: ProRes 4444 (XQ), QuickTime Animation, PNG or RGBA in MOV, FFV1, VP9 with alpha in WebM (decoded with libvpx). A video without alpha (also HEVC or H.264 with Apple's alpha layer, whose alpha FFmpeg does not read) is an opaque stinger. Bars around a stinger that does not fill the raster are transparent. On the lab (1080p50): a graphic stinger takes about 3 MB per minute (alpha 0.2 MB), a full-frame photo stinger about 400 MB (alpha 7 MB); a stinger converted before (ProRes 4444) is converted again at the next start (the original stays).
 - **Conversion:** ffmpeg runs under `nice -n 10` and `ionice -c3`, with a timeout that grows with the input length, and with at most the container's CPU limit less two cores (cgroup `cpu.max`; 8 threads without a limit; shared by `FLOWXER_CONVERT_CONCURRENCY` jobs): with NVENC for decoding and scaling (half each), with x265 for its workers (decoding and scaling then on one thread each); numpy's OpenBLAS (the sound's loop crossfade) runs on one thread (`OPENBLAS_NUM_THREADS=1` in the image). A conversion that fills the limit gets the whole container throttled, the engine with it. On the lab (A16, Xeon Gold 6136, 6-core limit, on air): NVENC about 90 frames/s, a minute of 1080p50 in about 35 s, beside the engine's mosaic encoder; x265 7–10 frames/s, a minute in 5–7 minutes. Cancelling a job (or deleting its item) kills its ffmpeg. A reconversion keeps the current mezzanine playable until the new one replaces it. A restart re-queues conversions it interrupted, and converts again a ready item whose files are missing, such as a clip with the ProRes mezzanine of earlier versions (that file is removed then; the original stays).
 - **Mixer state:** inputs and stinger slots that use the library are saved with `library_item_id` only; the mezzanine is looked up when the state (or `POST /config/import`) is loaded and again when a conversion ends. A clip assigned while it converts is black until then and is loaded (cued) when its conversion ends.
 
-A stinger that is still converting never blocks the mixer: `/stinger/play` and auto-stinger fall back to a hard cut and log a warning.
+A stinger that is still converting never blocks the mixer: a stinger take falls back to a hard cut and logs a warning. When every stinger player is playing (or has just played), a take waits up to 0.5 s for one to be free, then plays; only if none is free by then is it a cut (`flowxer_stinger_fallbacks_total{reason="busy"}`).
 
 ## Stinger convention
 
-Stingers and wipe patterns come back in P3, on the GPU. Until then a stinger take, an auto-stinger and an armed Wipe followed by a Cut are plain cuts; the stinger slots, their library items and settings are kept so they work again then.
+Stingers play on the GPU: a stinger player (`FLOWXER_STINGER_PLAYERS`, default 1) decodes its colour and alpha in lockstep (NVDEC) and the ME keys it over its upstream keys, under its DSKs. A stinger taken at grain s shows its frame f in grain s + f; the background switches from the old Program to the new one at grain s + cut frame; after its last frame the buses swap (Program has shown the new source since the cut). The background sound crossfades (equal power) over the frames cut − 2 … cut + 1, and the stinger's sound is added to the ME's PGM audio, to the sample. Tally: both sources are red (LH) for the whole stinger, as for a mix.
+
+What plays a stinger:
+
+- a **Cut** to a source with an **auto-stinger** (`stinger_slot_id` on the source), and a take of such a source to Program;
+- a **Cut** with **Wipe armed** (`POST /mixer/wipe`, FlowXer 14's meaning): the stinger slot by direction. The armed Wipe is used up by that Cut; a Cut that plays Preview's auto-stinger leaves it armed for the next Cut, as in FlowXer 14;
+- **Auto** (or the T-bar, which does not scrub a stinger) when the ME's transition type is **STING**: its stinger slot, or the slot by direction;
+- `POST /stinger/play` and `POST /mixer/take` with `transition: "stinger"` (and optionally `stinger_id`).
+
+The slot by direction: going to a clip player uses an `in` slot, anything else an `out` slot (a `shared` slot serves both). Stinger player k holds the stinger that ME k's next Cut or Auto plays (Preview's auto-stinger, an armed Wipe's slot, the STING type's slot), so that take starts at the next grain. Another stinger (a direct take, a second ME) is loaded on demand: it starts when its first frame is decoded (a few grains; the engine counts the wait and cuts after 1 s).
 
 Each stinger slot can use a **library item**, a legacy **TGA sequence** or a **video file**, and has a **cut frame**: the moment Program switches while the sting covers the picture (`cut_frame`, with `cut_ms` stored alongside). Legacy sequences under `storage/stingers/<id>/` are imported into the library at start:
 
@@ -403,7 +421,7 @@ frame_00001.tga
 stinger.json   # { "kind": "sequence", "frame_count", "cut_frame", "cut_ms", "pattern": "frame_%05d.tga" }
 ```
 
-Video stingers live in the same tree (`kind: "video"` plus `media_path`). TGA folders and ZIP uploads are validated (natural sort, gap detection, Zip-Slip / bomb limits, alpha warning). `python scripts/generate_stinger.py --dest storage/stingers/replay-wipe` generates the bundled wipe.
+Video stingers live in the same tree (`kind: "video"` plus `media_path`). TGA or PNG folders and ZIP uploads are validated (natural sort, gap detection, Zip-Slip / bomb limits, alpha warning). `python scripts/generate_stinger.py --dest storage/stingers/replay-wipe` generates the bundled wipe.
 
 ## Tally and UMD (TSL 5.0)
 
@@ -438,7 +456,7 @@ For the platform's tally calculator, which works out from this raw tally what is
 | TEXT | Source label, UTF-16LE (FLAGS bit 0) |
 
 - **INDEX:** at start the sources are numbered from 0 in slot order: with the production structure from the environment `cam-1`..`cam-N`, `clip-1`..`clip-C`, `black`. An input added later (`POST /inputs`, only without that structure) gets the next number. A number stays with its input while the process runs; after a restart the numbering starts again from the slots.
-- **Lights nothing:** the downstream keyer (its key input is no source of the ME).
+- **Keys** light LH only (keys have no preview): a luma key's source while the key is on air; each linear keyer's key input as INDEX `2000 + 100·n + k` (upstream keyer k of ME n) or `3000 + 100·n + k` (DSK k of ME n; ME 1 DSK 1 = 3101), TEXT its receiver label, red while the keyer is on air. Fade to Black lights nothing new.
 - **When:** each update holds every source of every ME, the ones that are off included. It goes out on each change (also when a mix starts and ends) and every second. While Program is stopped every lamp is off; the last update at shutdown says so.
 - **Transport:** a packet holds at most 2048 bytes; a larger update is split. Over TCP each packet is wrapped in DLE/STX … DLE/ETX with DLE stuffing. The host name is resolved when the export connects and again after a failure. After a failure the export tries again after 1, 2, 5, then every 10 s and logs at most once a minute. A thread of its own takes the state and sends.
 - **Metrics** (`/metrics`, only while the export is set): `flowxer_tally_export_packets_total`, `flowxer_tally_export_send_errors_total` and `flowxer_tally_export_last_success_timestamp_seconds`.

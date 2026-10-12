@@ -93,9 +93,11 @@ struct Media
     std::string kind;
     FileId id;
     long long frames = 1;
-    // Clip: the demuxer (probed), its video stream and the sound file.
+    // Clip: the demuxer (probed), its video stream and the sound file; a stinger's alpha stream.
     AVFormatContext* format = nullptr;
     int stream = -1;
+    AVFormatContext* alphaFormat = nullptr;
+    int alphaStream = -1;
     int audioFd = -1;
     int audioChannels = 0;
     // Still: the picture until the decode thread uploads it.
@@ -105,6 +107,7 @@ struct Media
     ~Media()
     {
         avformat_close_input(&format);
+        avformat_close_input(&alphaFormat);
         if (audioFd >= 0)
         {
             close(audioFd);
@@ -112,9 +115,12 @@ struct Media
     }
 };
 
-// The NVDEC decoder of the loaded clip (decode thread only).
+// An NVDEC decoder of the loaded clip, or of a stinger's alpha (decode thread only).
 struct Decoder
 {
+    // The demuxer (owned by the Media) and its video stream.
+    AVFormatContext* format = nullptr;
+    int stream = -1;
     AVCodecContext* codec = nullptr;
     AVBufferRef* device = nullptr;
     AVPacket* packet = nullptr;
@@ -162,6 +168,35 @@ CUcontext currentContext()
 bool mezzanineFormat(AVPixelFormat format)
 {
     return format == AV_PIX_FMT_YUV444P10LE || format == AV_PIX_FMT_YUV444P12LE || format == AV_PIX_FMT_YUV444P;
+}
+
+// A stinger's alpha: the luma of HEVC 4:2:0, 10 bits (8 decode too).
+bool alphaFormat(AVPixelFormat format)
+{
+    return format == AV_PIX_FMT_YUV420P10LE || format == AV_PIX_FMT_YUV420P;
+}
+
+// Opens and probes an HEVC file: its demuxer and video stream, or an error.
+std::string openHevc(std::string const& path, char const* what, AVFormatContext*& format, int& stream)
+{
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "protocol_whitelist", "file", 0);
+    int rc = avformat_open_input(&format, path.c_str(), nullptr, &options);
+    av_dict_free(&options);
+    if (rc < 0)
+    {
+        return std::string("cannot open ") + what + " " + path + ": " + avError(rc);
+    }
+    if ((rc = avformat_find_stream_info(format, nullptr)) < 0)
+    {
+        return std::string("cannot read ") + what + " " + path + ": " + avError(rc);
+    }
+    stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0)
+    {
+        return std::string(what) + " " + path + " has no picture";
+    }
+    return {};
 }
 } // namespace
 
@@ -232,26 +267,13 @@ struct ClipPlayer::Impl
             out = m;
             return {};
         }
-        if (c.kind != "clip")
+        if (c.kind != "clip" && c.kind != "stinger")
         {
-            return "unknown media kind '" + c.kind + "' (clip or still)";
+            return "unknown media kind '" + c.kind + "' (clip, still or stinger)";
         }
-        AVDictionary* options = nullptr;
-        av_dict_set(&options, "protocol_whitelist", "file", 0);
-        int rc = avformat_open_input(&m->format, c.path.c_str(), nullptr, &options);
-        av_dict_free(&options);
-        if (rc < 0)
+        if (auto const failed = openHevc(c.path, "clip", m->format, m->stream); !failed.empty())
         {
-            return "cannot open clip " + c.path + ": " + avError(rc);
-        }
-        if ((rc = avformat_find_stream_info(m->format, nullptr)) < 0)
-        {
-            return "cannot read clip " + c.path + ": " + avError(rc);
-        }
-        m->stream = av_find_best_stream(m->format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-        if (m->stream < 0)
-        {
-            return "clip " + c.path + " has no picture";
+            return failed;
         }
         AVStream const* stream = m->format->streams[m->stream];
         auto const* par = stream->codecpar;
@@ -286,6 +308,20 @@ struct ClipPlayer::Impl
         {
             return "clip " + c.path + " has no frames";
         }
+        if (!c.alpha.empty())
+        {
+            if (auto const failed = openHevc(c.alpha, "alpha", m->alphaFormat, m->alphaStream); !failed.empty())
+            {
+                return failed;
+            }
+            auto const* alpha = m->alphaFormat->streams[m->alphaStream]->codecpar;
+            if (alpha->codec_id != AV_CODEC_ID_HEVC || !alphaFormat(static_cast<AVPixelFormat>(alpha->format)) || alpha->width != setup.width ||
+                alpha->height != setup.height)
+            {
+                return "alpha " + c.alpha + " is not the library's HEVC 4:2:0 alpha at " + std::to_string(setup.width) + "x" +
+                       std::to_string(setup.height) + ": convert it again";
+            }
+        }
         if (!c.audio.empty())
         {
             m->audioFd = ::open(c.audio.c_str(), O_RDONLY | O_CLOEXEC);
@@ -312,9 +348,11 @@ struct ClipPlayer::Impl
         return nullptr;
     }
 
-    bool openDecoder(Media& m, Decoder& d, cudaStream_t stream)
+    bool openDecoder(Media& m, Decoder& d, AVFormatContext* format, int index, cudaStream_t stream)
     {
-        AVStream const* st = m.format->streams[m.stream];
+        d.format = format;
+        d.stream = index;
+        AVStream const* st = format->streams[index];
         AVCodec const* codec = avcodec_find_decoder(st->codecpar->codec_id);
         CUcontext const context = currentContext();
         if (codec == nullptr || context == nullptr)
@@ -350,19 +388,19 @@ struct ClipPlayer::Impl
         return true;
     }
 
-    void seek(Media& m, Decoder& d, long long frame)
+    void seek(Decoder& d, long long frame)
     {
-        AVStream const* st = m.format->streams[m.stream];
+        AVStream const* st = d.format->streams[d.stream];
         std::int64_t const start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
         std::int64_t const ts = start + av_rescale_q(frame, AVRational{static_cast<int>(setup.rate.den), static_cast<int>(setup.rate.num)}, st->time_base);
-        av_seek_frame(m.format, m.stream, ts, AVSEEK_FLAG_BACKWARD);
+        av_seek_frame(d.format, d.stream, ts, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(d.codec);
         d.flushing = false;
     }
 
     // The next decoded picture in d.frame (decode order = play order: the mezzanine has no
     // B-frames). Returns 0, AVERROR_EOF at the end, or an error.
-    int decodeNext(Media& m, Decoder& d)
+    int decodeNext(Decoder& d)
     {
         while (true)
         {
@@ -375,7 +413,7 @@ struct ClipPlayer::Impl
             {
                 return AVERROR_EOF;
             }
-            rc = av_read_frame(m.format, d.packet);
+            rc = av_read_frame(d.format, d.packet);
             if (rc == AVERROR_EOF)
             {
                 d.flushing = true;
@@ -386,7 +424,7 @@ struct ClipPlayer::Impl
             {
                 return rc;
             }
-            if (d.packet->stream_index == m.stream)
+            if (d.packet->stream_index == d.stream)
             {
                 rc = avcodec_send_packet(d.codec, d.packet);
             }
@@ -398,9 +436,10 @@ struct ClipPlayer::Impl
         }
     }
 
-    long long frameNumber(Media const& m, AVFrame const* frame) const
+    long long frameNumber(Decoder const& d) const
     {
-        AVStream const* st = m.format->streams[m.stream];
+        AVFrame const* frame = d.frame;
+        AVStream const* st = d.format->streams[d.stream];
         std::int64_t const start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
         std::int64_t const pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
         if (pts == AV_NOPTS_VALUE)
@@ -451,7 +490,7 @@ struct ClipPlayer::Impl
     {
         while (true)
         {
-            int const rc = decodeNext(m, d);
+            int const rc = decodeNext(d);
             if (rc == AVERROR_EOF)
             {
                 return -1;
@@ -461,7 +500,7 @@ struct ClipPlayer::Impl
                 fail(m, "decode: " + avError(rc));
                 return -2;
             }
-            long long const number = frameNumber(m, d.frame);
+            long long const number = frameNumber(d);
             if (number >= 0 && number < want)
             {
                 av_frame_unref(d.frame);
@@ -484,12 +523,57 @@ struct ClipPlayer::Impl
             }
             gpu::from444(stream, d.frame->data[0], d.frame->data[1], d.frame->data[2], d.frame->linesize[0], sw == AV_PIX_FMT_YUV444P16, setup.width,
                 setup.height, picture.v210, rowBytes);
-            cudaEventRecord(picture.ready, stream);
             // The surface goes back to FFmpeg's pool; its next copy is queued on the same stream,
             // after this conversion.
             av_frame_unref(d.frame);
             return number >= 0 ? number : want;
         }
+    }
+
+    // A stinger frame's key plane (after the picture): the luma of the alpha stream's frame
+    // `number`, or a full key without an alpha stream (or past its end). False on an error.
+    bool keyPlane(Media& m, Decoder* alpha, long long number, Picture& picture, cudaStream_t stream)
+    {
+        std::uint8_t* key = picture.v210 + setup.frameBytes;
+        while (alpha != nullptr)
+        {
+            int const rc = decodeNext(*alpha);
+            if (rc == AVERROR_EOF)
+            {
+                break;
+            }
+            if (rc < 0)
+            {
+                fail(m, "alpha decode: " + avError(rc));
+                return false;
+            }
+            long long const n = frameNumber(*alpha);
+            if (n >= 0 && n < number)
+            {
+                av_frame_unref(alpha->frame);
+                continue;
+            }
+            auto const* frames = alpha->frame->hw_frames_ctx != nullptr ? reinterpret_cast<AVHWFramesContext const*>(alpha->frame->hw_frames_ctx->data) : nullptr;
+            AVPixelFormat const sw = frames != nullptr ? frames->sw_format : AV_PIX_FMT_NONE;
+            bool const deep = sw == AV_PIX_FMT_P010LE || sw == AV_PIX_FMT_P016LE;
+            if (alpha->frame->format != AV_PIX_FMT_CUDA || (!deep && sw != AV_PIX_FMT_NV12) || alpha->frame->width != setup.width ||
+                alpha->frame->height != setup.height)
+            {
+                fail(m, "NVDEC gave no 4:2:0 alpha picture of the raster");
+                av_frame_unref(alpha->frame);
+                return false;
+            }
+            gpu::alphaToKey(stream, alpha->frame->data[0], alpha->frame->linesize[0], deep, setup.width, setup.height, key, setup.keyRowBytes);
+            av_frame_unref(alpha->frame);
+            return true;
+        }
+        gpu::alphaToKey(stream, nullptr, 0, false, setup.width, setup.height, key, setup.keyRowBytes);
+        return true;
+    }
+
+    [[nodiscard]] std::size_t pictureBytes() const
+    {
+        return setup.frameBytes + static_cast<std::size_t>(setup.keyRowBytes) * static_cast<std::size_t>(setup.height);
     }
 
     void allocPool()
@@ -504,7 +588,7 @@ struct ClipPlayer::Impl
                 }
                 delete p;
             });
-            if (cudaMalloc(reinterpret_cast<void**>(&picture->v210), setup.frameBytes) != cudaSuccess ||
+            if (cudaMalloc(reinterpret_cast<void**>(&picture->v210), pictureBytes()) != cudaSuccess ||
                 cudaEventCreateWithFlags(&picture->ready, cudaEventDisableTiming) != cudaSuccess)
             {
                 logError("player_pool", {{"player", setup.number}, {"error", "out of GPU memory"}});
@@ -516,13 +600,14 @@ struct ClipPlayer::Impl
 
     void decodeMain()
     {
-        pthread_setname_np(pthread_self(), ("fx-cp" + std::to_string(setup.number)).c_str());
+        pthread_setname_np(pthread_self(), ((setup.keyRowBytes > 0 ? "fx-st" : "fx-cp") + std::to_string(setup.number)).c_str());
         cudaSetDevice(setup.gpu);
         cudaStream_t stream = nullptr;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         allocPool();
         std::shared_ptr<Media> loaded;
         std::unique_ptr<Decoder> decoder;
+        std::unique_ptr<Decoder> alpha;
         std::uint64_t generation = 0;
         long long nextSeq = 0;
         long long nextFrame = 0;
@@ -549,6 +634,7 @@ struct ClipPlayer::Impl
             if (want != loaded)
             {
                 decoder.reset();
+                alpha.reset();
                 loaded = want;
                 generation = 0;
                 if (loaded != nullptr && loaded->kind == "still")
@@ -574,7 +660,7 @@ struct ClipPlayer::Impl
                     continue;
                 }
             }
-            if (loaded == nullptr || loaded->kind != "clip" || loaded->failed || cursor.empty)
+            if (loaded == nullptr || loaded->kind == "still" || loaded->failed || cursor.empty)
             {
                 continue;
             }
@@ -609,9 +695,15 @@ struct ClipPlayer::Impl
             if (decoder == nullptr)
             {
                 decoder = std::make_unique<Decoder>();
-                if (!openDecoder(*loaded, *decoder, stream))
+                if (loaded->alphaFormat != nullptr)
+                {
+                    alpha = std::make_unique<Decoder>();
+                }
+                if (!openDecoder(*loaded, *decoder, loaded->format, loaded->stream, stream) ||
+                    (alpha != nullptr && !openDecoder(*loaded, *alpha, loaded->alphaFormat, loaded->alphaStream, stream)))
                 {
                     decoder.reset();
+                    alpha.reset();
                     continue;
                 }
                 needSeek = true;
@@ -625,7 +717,11 @@ struct ClipPlayer::Impl
             }
             if (needSeek)
             {
-                seek(*loaded, *decoder, nextFrame);
+                seek(*decoder, nextFrame);
+                if (alpha != nullptr)
+                {
+                    seek(*alpha, nextFrame);
+                }
                 needSeek = false;
             }
             auto const t0 = Clock::now();
@@ -636,10 +732,11 @@ struct ClipPlayer::Impl
                 atEnd = true;
                 continue;
             }
-            if (made < 0)
+            if (made < 0 || (setup.keyRowBytes > 0 && !keyPlane(*loaded, alpha.get(), made, *picture, stream)))
             {
                 continue;
             }
+            cudaEventRecord(picture->ready, stream);
             auto out = std::make_shared<Decoded>();
             out->picture = std::move(picture);
             out->generation = generation;
@@ -659,6 +756,7 @@ struct ClipPlayer::Impl
             }
         }
         decoder.reset();
+        alpha.reset();
         loaded.reset();
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
@@ -705,6 +803,10 @@ void ClipPlayer::stop()
 std::shared_ptr<PlayerFrame> ClipPlayer::frameFor(std::uint64_t index, bool onAir)
 {
     auto& s = *impl_;
+    if (s.setup.keyRowBytes > 0 && !onAir && (s.playout.state() == Playout::State::Playing || s.playout.state() == Playout::State::Ended))
+    {
+        s.playout.cue(0);
+    }
     auto const step = s.playout.advance(index, onAir);
     auto out = std::make_shared<PlayerFrame>();
     out->index = index;
@@ -849,6 +951,22 @@ std::string ClipPlayer::command(PlayerCommand const& c)
     return {};
 }
 
+bool ClipPlayer::ready() const
+{
+    auto const& s = *impl_;
+    std::lock_guard lock{s.mu};
+    auto const cursor = s.playout.cursor();
+    return s.media != nullptr && !s.media->failed && s.playout.state() == Playout::State::Cued && cursor.start == 0 && !s.queue.empty() &&
+           s.queue.front()->generation == cursor.generation && s.queue.front()->seq == 0;
+}
+
+long long ClipPlayer::frames() const
+{
+    auto const& s = *impl_;
+    std::lock_guard lock{s.mu};
+    return s.media != nullptr && !s.media->failed ? s.playout.frames() : 0;
+}
+
 std::string ClipPlayer::statusJson() const
 {
     auto const& s = *impl_;
@@ -858,12 +976,16 @@ std::string ClipPlayer::statusJson() const
         {"late", s.late}, {"decoded", s.decoded}, {"decode_ms", s.decodeMs}};
     out["kind"] = s.media != nullptr ? s.media->kind : "";
     out["file"] = s.media != nullptr ? s.media->id.path : "";
+    if (s.setup.keyRowBytes > 0)
+    {
+        out["alpha"] = s.media != nullptr && s.media->alphaFormat != nullptr;
+    }
     out["error"] = s.error;
     return out.dump();
 }
 
 std::size_t ClipPlayer::deviceBytes() const
 {
-    return kPool * impl_->setup.frameBytes;
+    return kPool * impl_->pictureBytes();
 }
 } // namespace fxeng

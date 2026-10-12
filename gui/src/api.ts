@@ -18,6 +18,24 @@ export interface LogicalInput {
   audio?: { flow_id?: string | null; media_type: string; channels: number } | null;
 }
 
+export type TransitionKind = "mix" | "wipe" | "stinger";
+
+/** An ME's next transition: what Auto runs. soft and border are 0..1 of the pattern's travel. */
+export interface PanelTransition {
+  type: TransitionKind;
+  rate_frames: number;
+  wipe: {
+    pattern: number;
+    reverse: boolean;
+    /** Flip-flop: reverse toggles after each wipe. */
+    alternate: boolean;
+    soft: number;
+    border: number;
+    border_color: string;
+  };
+  stinger_slot_id: string | null;
+}
+
 export interface MixerPanel {
   id: string;
   label: string;
@@ -25,14 +43,26 @@ export interface MixerPanel {
   preview_input_id: string | null;
   wipe_armed?: boolean;
   last_transition?: string;
+  transition: PanelTransition;
+  /** Fade to Black: the whole output is black. */
+  ftb?: boolean;
 }
 
-export interface DownstreamKeyer {
+/** An upstream keyer or a DSK of one ME: linear (its v210a key input) or luma (a source). */
+export interface Keyer {
   id: string;
   label: string;
+  panel_id: string;
+  stage: "upstream" | "downstream";
   enabled: boolean;
   /** Duration of its Auto. */
   rate_ms: number;
+  mode: "linear" | "luma";
+  source_id: string | null;
+  clip: number;
+  soft: number;
+  gain: number;
+  invert: boolean;
 }
 
 /** What the engine reports for an input (GET /console `sources`); clip players add the transport. */
@@ -68,6 +98,7 @@ export interface LibraryItem {
   ready: boolean;
   playback: string;
   has_alpha: boolean;
+  has_sound: boolean;
   cut_frame?: number | null;
   cut_ms?: number | null;
   frame_count: number;
@@ -106,7 +137,9 @@ export interface WorkspaceConfig {
   mixer_panel_count: number;
   stinger_mode: string;
   stinger_count: number;
-  downstream_keyer_count: number;
+  keyers_per_me: number;
+  dsks_per_me: number;
+  stinger_players: number;
   source_tile_aspect?: "16:9" | "9:16";
 }
 
@@ -198,7 +231,7 @@ export interface ConsoleState {
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
   inputs: LogicalInput[];
   panels: MixerPanel[];
-  keyers: DownstreamKeyer[];
+  keyers: Keyer[];
   stinger_slots: StingerSlot[];
   mixer: MixerStatus;
   resources: ResourceInfo;
@@ -251,20 +284,28 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
-  fade: (panel_id: string) =>
-    fetch("/api/v1/mixer/fade", {
+  /** The ME's next transition (mix, wipe over its rate, or a stinger over its length). */
+  auto: (panel_id: string) =>
+    fetch("/api/v1/mixer/auto", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
+  /** The T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it. */
+  position: (panel_id: string, position: number) =>
+    fetch("/api/v1/mixer/position", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ panel_id, position }),
+    }).then((r) => parse(r)),
+  transition: (panel_id: string, patch: Record<string, unknown>) =>
+    fetch(`/api/v1/panels/${panel_id}/transition`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(patch),
+    }).then((r) => parse<PanelTransition>(r)),
   fadeToBlack: (panel_id: string) =>
     fetch("/api/v1/mixer/fade-to-black", {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({ panel_id }),
-    }).then((r) => parse(r)),
-  wipe: (panel_id: string) =>
-    fetch("/api/v1/mixer/wipe", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
@@ -283,7 +324,7 @@ export const api = {
     }).then((r) => parse<LogicalInput>(r)),
   keyerAuto: (id: string) =>
     fetch(`/api/v1/keyers/${id}/auto`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) =>
-      parse<DownstreamKeyer>(r),
+      parse<Keyer>(r),
     ),
   /** Clip player transport: cue (a frame, 0 = the first), play, pause, stop. */
   player: (inputId: string, action: "cue" | "play" | "pause" | "stop", frame = 0) =>
@@ -297,7 +338,7 @@ export const api = {
       method: "PATCH",
       headers: jsonHeaders,
       body: JSON.stringify(payload),
-    }).then((r) => parse<DownstreamKeyer>(r)),
+    }).then((r) => parse<Keyer>(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",

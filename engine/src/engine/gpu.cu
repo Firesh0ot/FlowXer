@@ -2,6 +2,7 @@
 
 #include "core/pixel.hpp"
 #include "core/v210.hpp"
+#include "core/wipe.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -418,50 +419,174 @@ __global__ void from444Kernel(std::uint8_t const* y, std::uint8_t const* cb, std
     writeGroup(v210, rowBytes, row, group, w);
 }
 
-// Linear key of a v210a fill + key over a work picture (straight fill): out = fill·α + out·(1 − α)
-// with α = key / 1023 · gain (pixel.hpp). One thread per 6-pixel group.
-__global__ void keyYuvKernel(std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, int width, int height, std::uint16_t* y,
-    std::uint16_t* cb, std::uint16_t* cr)
+// One thread per word of a v210a key line: three 10-bit keys from the alpha luma (full range).
+__global__ void alphaKeyKernel(std::uint8_t const* luma, int pitch, bool deep, int width, int height, std::uint8_t* key, int keyRowBytes)
 {
-    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const word = blockIdx.x * blockDim.x + threadIdx.x;
     int const row = blockIdx.y;
-    if (row >= height || group * 6 >= width)
+    if (row >= height || word * 4 >= keyRowBytes)
     {
         return;
     }
-    std::uint16_t fy[6];
-    std::uint16_t fcb[3];
-    std::uint16_t fcr[3];
-    readGroup(v210a, rowBytes, row, group, fy, fcb, fcr);
-    std::uint8_t const* keyLine = v210a + static_cast<std::size_t>(rowBytes) * static_cast<std::size_t>(height) +
-                                  static_cast<std::size_t>(row) * static_cast<std::size_t>(keyRowBytes);
-    float a[6];
-    for (int i = 0; i < 6; ++i)
-    {
-        int const x = min(group * 6 + i, width - 1);
-        a[i] = keyAlpha(keyAt(keyLine, x), gain);
-    }
-    int const cw = width / 2;
-    std::size_t const yRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
-    std::size_t const cRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(cw);
-    for (int i = 0; i < 6; ++i)
-    {
-        int const x = group * 6 + i;
-        if (x < width && a[i] > 0.f)
-        {
-            y[yRow + x] = mix10(y[yRow + x], fy[i], a[i]);
-        }
-    }
+    std::uint32_t packed = 0;
     for (int i = 0; i < 3; ++i)
     {
-        int const cx = group * 3 + i;
-        float const ca = 0.5f * (a[2 * i] + a[2 * i + 1]);
-        if (cx < cw && ca > 0.f)
+        int const x = word * 3 + i;
+        if (x >= width)
         {
-            cb[cRow + cx] = mix10(cb[cRow + cx], fcb[i], ca);
-            cr[cRow + cx] = mix10(cr[cRow + cx], fcr[i], ca);
+            break;
+        }
+        unsigned k = 1023u;
+        if (luma != nullptr)
+        {
+            std::uint8_t const* line = luma + static_cast<std::size_t>(row) * static_cast<std::size_t>(pitch);
+            unsigned const v = deep ? reinterpret_cast<std::uint16_t const*>(line)[x] : line[x];
+            k = deep ? v >> 6 : (v << 2) | (v >> 6);
+        }
+        packed |= k << (10 * i);
+    }
+    reinterpret_cast<std::uint32_t*>(key + static_cast<std::size_t>(row) * static_cast<std::size_t>(keyRowBytes))[word] = packed;
+}
+
+struct ComposeArgs
+{
+    // Y, Cb, Cr planes.
+    std::uint16_t const* a[3];
+    std::uint16_t const* b[3];
+    std::uint16_t* out[3];
+    // 0: A; 1: the dissolve of A to B at t; 2: the wipe of A to B.
+    int mode;
+    float t;
+    Wipe wipe;
+    std::uint8_t const* key[kMaxLayers];
+    float gain[kMaxLayers];
+    // Luma layers: the source's Y, Cb, Cr planes (null for a linear layer), clip, soft, invert.
+    std::uint16_t const* luma[kMaxLayers][3];
+    float clip[kMaxLayers];
+    float soft[kMaxLayers];
+    bool invert[kMaxLayers];
+    int layers;
+    int width;
+    int height;
+    int rowBytes;
+    int keyRowBytes;
+};
+
+// The fused compose of one ME (yuv16). One thread per 6-pixel group: the background in registers,
+// then each key layer, one write. Each layer rounds to 10 bits as a separate pass would (P2's
+// dissolve and DSK kernels), so the result is the same, with one read and one write.
+__global__ void composeYuvKernel(ComposeArgs args)
+{
+    int const group = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    int const width = args.width;
+    if (row >= args.height || group * 6 >= width)
+    {
+        return;
+    }
+    int const cw = width / 2;
+    // 3 pairs, fewer in the last group of a line that is not a multiple of 6 (1280).
+    int const pairs = min(3, cw - group * 3);
+    std::size_t const yRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(group) * 6u;
+    std::size_t const cRow = static_cast<std::size_t>(row) * static_cast<std::size_t>(cw) + static_cast<std::size_t>(group) * 3u;
+    std::uint16_t y[6] = {};
+    std::uint16_t cb[3] = {};
+    std::uint16_t cr[3] = {};
+    for (int p = 0; p < pairs; ++p)
+    {
+        std::uint16_t const ay[2] = {args.a[0][yRow + 2 * p], args.a[0][yRow + 2 * p + 1]};
+        std::uint16_t const acb = args.a[1][cRow + p];
+        std::uint16_t const acr = args.a[2][cRow + p];
+        if (args.mode == 0)
+        {
+            y[2 * p] = ay[0];
+            y[2 * p + 1] = ay[1];
+            cb[p] = acb;
+            cr[p] = acr;
+            continue;
+        }
+        std::uint16_t const by[2] = {args.b[0][yRow + 2 * p], args.b[0][yRow + 2 * p + 1]};
+        std::uint16_t const bcb = args.b[1][cRow + p];
+        std::uint16_t const bcr = args.b[2][cRow + p];
+        if (args.mode == 1)
+        {
+            y[2 * p] = mix10(ay[0], by[0], args.t);
+            y[2 * p + 1] = mix10(ay[1], by[1], args.t);
+            cb[p] = mix10(acb, bcb, args.t);
+            cr[p] = mix10(acr, bcr, args.t);
+        }
+        else
+        {
+            wipePair(args.wipe, group * 6 + 2 * p, row, ay, acb, acr, by, bcb, bcr, &y[2 * p], cb[p], cr[p]);
         }
     }
+    for (int l = 0; l < args.layers; ++l)
+    {
+        std::uint16_t fy[6] = {};
+        std::uint16_t fcb[3] = {};
+        std::uint16_t fcr[3] = {};
+        std::uint8_t const* keyLine = nullptr;
+        if (args.luma[l][0] != nullptr)
+        {
+            for (int p = 0; p < pairs; ++p)
+            {
+                fy[2 * p] = args.luma[l][0][yRow + 2 * p];
+                fy[2 * p + 1] = args.luma[l][0][yRow + 2 * p + 1];
+                fcb[p] = args.luma[l][1][cRow + p];
+                fcr[p] = args.luma[l][2][cRow + p];
+            }
+        }
+        else
+        {
+            readGroup(args.key[l], args.rowBytes, row, group, fy, fcb, fcr);
+            keyLine = args.key[l] + static_cast<std::size_t>(args.rowBytes) * static_cast<std::size_t>(args.height) +
+                      static_cast<std::size_t>(row) * static_cast<std::size_t>(args.keyRowBytes);
+        }
+        for (int p = 0; p < pairs; ++p)
+        {
+            float const a0 = keyLine != nullptr ? keyAlpha(keyAt(keyLine, group * 6 + 2 * p), args.gain[l])
+                                                : lumaAlpha(fy[2 * p], args.clip[l], args.soft[l], args.invert[l], args.gain[l]);
+            float const a1 = keyLine != nullptr ? keyAlpha(keyAt(keyLine, group * 6 + 2 * p + 1), args.gain[l])
+                                                : lumaAlpha(fy[2 * p + 1], args.clip[l], args.soft[l], args.invert[l], args.gain[l]);
+            y[2 * p] = mix10(y[2 * p], fy[2 * p], a0);
+            y[2 * p + 1] = mix10(y[2 * p + 1], fy[2 * p + 1], a1);
+            float const ca = 0.5f * (a0 + a1);
+            cb[p] = mix10(cb[p], fcb[p], ca);
+            cr[p] = mix10(cr[p], fcr[p], ca);
+        }
+    }
+    for (int p = 0; p < pairs; ++p)
+    {
+        args.out[0][yRow + 2 * p] = y[2 * p];
+        args.out[0][yRow + 2 * p + 1] = y[2 * p + 1];
+        args.out[1][cRow + p] = cb[p];
+        args.out[2][cRow + p] = cr[p];
+    }
+}
+
+// The wipe in rgba16f: per pixel lerp(a, lerp(border, b, mB), mA) in R'G'B'.
+__global__ void wipeRgbaKernel(Half4 const* a, Half4 const* b, Half4* out, int width, int height, Wipe w, Rgb border)
+{
+    int const x = blockIdx.x * blockDim.x + threadIdx.x;
+    int const row = blockIdx.y;
+    if (x >= width || row >= height)
+    {
+        return;
+    }
+    float mA = 0.f;
+    float mB = 0.f;
+    wipeMasks(w, x, row, mA, mB);
+    std::size_t const i = static_cast<std::size_t>(row) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x);
+    float2 const arg = __half22float2(a[i].rg);
+    float2 const aba = __half22float2(a[i].ba);
+    float2 const brg = __half22float2(b[i].rg);
+    float2 const bba = __half22float2(b[i].ba);
+    bool const hb = w.set.border > 0.f;
+    auto const blend = [&](float va, float vb, float vc) {
+        float const inner = hb ? vc + (vb - vc) * mB : vb;
+        return va + (inner - va) * mA;
+    };
+    out[i] = Half4{__floats2half2_rn(blend(arg.x, brg.x, border.r), blend(arg.y, brg.y, border.g)), __floats2half2_rn(blend(aba.x, bba.x, border.b), aba.y)};
 }
 
 __global__ void keyRgbaKernel(std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, int width, int height, Half4* rgba)
@@ -507,17 +632,72 @@ cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t con
     return cudaGetLastError();
 }
 
-cudaError_t keyV210a(cudaStream_t stream, std::uint8_t const* v210a, int rowBytes, int keyRowBytes, float gain, WorkBuffer& io)
+cudaError_t alphaToKey(cudaStream_t stream, std::uint8_t const* luma, int pitch, bool deep, int width, int height, std::uint8_t* key, int keyRowBytes)
 {
-    int const groups = (io.width + 5) / 6;
-    if (io.format == WorkFormat::Yuv16)
+    alphaKeyKernel<<<groupGrid(keyRowBytes / 4, height), 128, 0, stream>>>(luma, pitch, deep, width, height, key, keyRowBytes);
+    return cudaGetLastError();
+}
+
+cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int keyRowBytes, WorkBuffer& out)
+{
+    int const layers = std::min(job.layerCount, kMaxLayers);
+    int const groups = (out.width + 5) / 6;
+    if (out.format == WorkFormat::Yuv16)
     {
-        keyYuvKernel<<<groupGrid(groups, io.height), 128, 0, stream>>>(v210a, rowBytes, keyRowBytes, gain, io.width, io.height, planeY(io), planeCb(io),
-            planeCr(io));
+        ComposeArgs args{};
+        WorkBuffer const& b = job.b != nullptr ? *job.b : *job.a;
+        args.a[0] = planeY(*job.a);
+        args.a[1] = planeCb(*job.a);
+        args.a[2] = planeCr(*job.a);
+        args.b[0] = planeY(b);
+        args.b[1] = planeCb(b);
+        args.b[2] = planeCr(b);
+        args.out[0] = planeY(out);
+        args.out[1] = planeCb(out);
+        args.out[2] = planeCr(out);
+        args.mode = job.b == nullptr ? 0 : job.wiping ? 2 : job.t <= 0.f ? 0 : 1;
+        args.t = job.t;
+        args.wipe = job.wipe;
+        for (int l = 0; l < layers; ++l)
+        {
+            auto const& layer = job.layers[l];
+            args.key[l] = layer.v210a;
+            args.gain[l] = layer.gain;
+            args.luma[l][0] = layer.luma ? planeY(*layer.source) : nullptr;
+            args.luma[l][1] = layer.luma ? planeCb(*layer.source) : nullptr;
+            args.luma[l][2] = layer.luma ? planeCr(*layer.source) : nullptr;
+            args.clip[l] = layer.clip;
+            args.soft[l] = layer.soft;
+            args.invert[l] = layer.invert;
+        }
+        args.layers = layers;
+        args.width = out.width;
+        args.height = out.height;
+        args.rowBytes = rowBytes;
+        args.keyRowBytes = keyRowBytes;
+        composeYuvKernel<<<groupGrid(groups, out.height), 128, 0, stream>>>(args);
+        return cudaGetLastError();
+    }
+    if (job.b != nullptr && job.wiping)
+    {
+        auto const& w = job.wipe.set;
+        wipeRgbaKernel<<<dim3(static_cast<unsigned>((out.width + 127) / 128), static_cast<unsigned>(out.height)), 128, 0, stream>>>(
+            static_cast<Half4 const*>(job.a->data), static_cast<Half4 const*>(job.b->data), static_cast<Half4*>(out.data), out.width, out.height, job.wipe,
+            ycbcrToRgb(w.borderY, w.borderCb, w.borderCr));
     }
     else
     {
-        keyRgbaKernel<<<groupGrid(groups, io.height), 128, 0, stream>>>(v210a, rowBytes, keyRowBytes, gain, io.width, io.height, static_cast<Half4*>(io.data));
+        mix(stream, *job.a, job.b, job.t, out);
+    }
+    // rgba16f: linear layers only (a luma key needs yuv16).
+    for (int l = 0; l < layers; ++l)
+    {
+        if (job.layers[l].luma)
+        {
+            continue;
+        }
+        keyRgbaKernel<<<groupGrid(groups, out.height), 128, 0, stream>>>(job.layers[l].v210a, rowBytes, keyRowBytes, job.layers[l].gain, out.width,
+            out.height, static_cast<Half4*>(out.data));
     }
     return cudaGetLastError();
 }
@@ -810,64 +990,293 @@ bool selfTest(std::string& report)
         }
         done += "from444 exact; ";
     }
-    // DSK: a v210a fill (pb) with a key ramp 0..1023 across the picture and gain 0.8 over pa
-    // (yuv16): every sample as the CPU reference (keyAt, keyAlpha, mix10) within 1 code.
+    // Wipes (yuv16, the fused compose without layers): every code at 5 positions, 4 soft/border
+    // settings and both directions, bit for bit as the CPU reference (wipeFrame).
     {
-        int const keyRow = keyPlaneRowBytes(w);
-        std::vector<std::uint8_t> v210a(frameBytes + static_cast<std::size_t>(keyRow) * h, 0);
-        std::memcpy(v210a.data(), vb.data(), frameBytes);
-        std::uint8_t const* keys = v210a.data() + frameBytes;
-        for (int y = 0; y < h; ++y)
+        WorkBuffer wa;
+        WorkBuffer wb;
+        WorkBuffer wo;
+        if (allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wb, WorkFormat::Yuv16, w, h) != cudaSuccess ||
+            allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
         {
-            auto* words = reinterpret_cast<std::uint32_t*>(v210a.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
-            for (int x = 0; x < w; ++x)
-            {
-                words[x / 3] |= static_cast<std::uint32_t>(x * 1023 / (w - 1)) << ((x % 3) * 10);
-            }
-        }
-        float const gain = 0.8f;
-        DeviceBytes dkey(v210a.size());
-        cudaMemcpy(dkey.get(), v210a.data(), v210a.size(), cudaMemcpyHostToDevice);
-        WorkBuffer io;
-        if (allocWork(io, WorkFormat::Yuv16, w, h) != cudaSuccess)
-        {
-            report = "key: allocWork failed";
+            report = "wipe: allocWork failed";
             return false;
         }
-        unpack(nullptr, da.get(), rowBytes, io);
-        keyV210a(nullptr, dkey.get(), rowBytes, keyRow, gain, io);
-        pack(nullptr, io, dout.get(), rowBytes);
+        unpack(nullptr, da.get(), rowBytes, wa);
+        unpack(nullptr, db.get(), rowBytes, wb);
+        Planar422 got;
+        Planar422 want;
+        got.allocate(w, h);
+        int cases = 0;
+        std::string failed;
+        struct Edge
+        {
+            float soft;
+            float border;
+        };
+        for (int code : kWipeCodes)
+        {
+            for (float t : {0.f, 0.13f, 0.5f, 0.77f, 1.f})
+            {
+                for (Edge edge : {Edge{0.f, 0.f}, Edge{0.08f, 0.f}, Edge{0.f, 0.03f}, Edge{0.08f, 0.03f}})
+                {
+                    for (bool reverse : {false, true})
+                    {
+                        WipeSettings set;
+                        set.pattern = code;
+                        set.reverse = reverse;
+                        set.soft = edge.soft;
+                        set.border = edge.border;
+                        set.borderY = 700;
+                        set.borderCb = 300;
+                        set.borderCr = 800;
+                        Compose job;
+                        job.a = &wa;
+                        job.b = &wb;
+                        job.t = t;
+                        job.wiping = true;
+                        job.wipe = makeWipe(set, t, w, h);
+                        compose(nullptr, job, rowBytes, 0, wo);
+                        pack(nullptr, wo, dout.get(), rowBytes);
+                        cudaError_t const err = cudaDeviceSynchronize();
+                        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+                        unpackV210(back.data(), rowBytes, got);
+                        wipeFrame(pa, pb, job.wipe, want);
+                        int const diff = maxDiff(want, got);
+                        // The end points: all A at t = 0, all B at t = 1.
+                        int const end = t <= 0.f ? maxDiff(pa, got) : t >= 1.f ? maxDiff(pb, got) : 0;
+                        ++cases;
+                        if ((err != cudaSuccess || diff != 0 || end != 0) && failed.empty())
+                        {
+                            failed = "wipe " + std::to_string(code) + " t " + std::to_string(t) + (reverse ? " reverse" : "") + ": max error " +
+                                     std::to_string(diff) + ", end point " + std::to_string(end) + " (" + cudaGetErrorString(err) + ")";
+                        }
+                    }
+                }
+            }
+        }
+        freeWork(wa);
+        freeWork(wb);
+        freeWork(wo);
+        if (!failed.empty())
+        {
+            report = failed;
+            return false;
+        }
+        done += "wipes exact (" + std::to_string(cases) + " cases); ";
+    }
+    // The fused compose: a circle wipe with soft edge and border, then two linear key layers (pb
+    // with a key ramp 0..1023 across the picture at gain 0.8, pa with a key of 512 at gain 1) and a
+    // luma key of pb (clip 0.3, soft 0.2, gain 0.9), against the CPU reference (wipeFrame, then
+    // keyAt/keyAlpha or lumaAlpha and mix10 per layer): exact.
+    {
+        int const keyRow = keyPlaneRowBytes(w);
+        std::size_t const keyBytes = frameBytes + static_cast<std::size_t>(keyRow) * h;
+        std::vector<std::uint8_t> ramp(keyBytes, 0);
+        std::vector<std::uint8_t> flat(keyBytes, 0);
+        std::memcpy(ramp.data(), vb.data(), frameBytes);
+        std::memcpy(flat.data(), va.data(), frameBytes);
+        for (int y = 0; y < h; ++y)
+        {
+            auto* r = reinterpret_cast<std::uint32_t*>(ramp.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+            auto* f = reinterpret_cast<std::uint32_t*>(flat.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+            for (int x = 0; x < w; ++x)
+            {
+                r[x / 3] |= static_cast<std::uint32_t>(x * 1023 / (w - 1)) << ((x % 3) * 10);
+                f[x / 3] |= 512u << ((x % 3) * 10);
+            }
+        }
+        DeviceBytes dramp(keyBytes);
+        DeviceBytes dflat(keyBytes);
+        cudaMemcpy(dramp.get(), ramp.data(), keyBytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(dflat.get(), flat.data(), keyBytes, cudaMemcpyHostToDevice);
+        WorkBuffer wa;
+        WorkBuffer wb;
+        WorkBuffer wo;
+        if (allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wb, WorkFormat::Yuv16, w, h) != cudaSuccess ||
+            allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
+        {
+            report = "compose: allocWork failed";
+            return false;
+        }
+        unpack(nullptr, da.get(), rowBytes, wa);
+        unpack(nullptr, db.get(), rowBytes, wb);
+        WipeSettings set;
+        set.pattern = 119;
+        set.soft = 0.05f;
+        set.border = 0.02f;
+        Compose job;
+        job.a = &wa;
+        job.b = &wb;
+        job.t = 0.4f;
+        job.wiping = true;
+        job.wipe = makeWipe(set, job.t, w, h);
+        job.layers[0].v210a = dramp.get();
+        job.layers[0].gain = 0.8f;
+        job.layers[1].v210a = dflat.get();
+        job.layers[1].gain = 1.f;
+        job.layers[2].luma = true;
+        job.layers[2].source = &wb;
+        job.layers[2].clip = 0.3f;
+        job.layers[2].soft = 0.2f;
+        job.layers[2].gain = 0.9f;
+        job.layerCount = 3;
+        compose(nullptr, job, rowBytes, keyRow, wo);
+        pack(nullptr, wo, dout.get(), rowBytes);
         cudaError_t const err = cudaDeviceSynchronize();
-        freeWork(io);
+        freeWork(wa);
+        freeWork(wb);
+        freeWork(wo);
         cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
         Planar422 got;
         got.allocate(w, h);
         unpackV210(back.data(), rowBytes, got);
         Planar422 want;
-        want.allocate(w, h);
+        wipeFrame(pa, pb, job.wipe, want);
+        for (int l = 0; l < 2; ++l)
+        {
+            Planar422 const& fill = l == 0 ? pb : pa;
+            std::uint8_t const* keys = (l == 0 ? ramp.data() : flat.data()) + frameBytes;
+            float const gain = job.layers[l].gain;
+            for (int y = 0; y < h; ++y)
+            {
+                std::uint8_t const* line = keys + static_cast<std::size_t>(y) * keyRow;
+                for (int x = 0; x < w; ++x)
+                {
+                    std::size_t const i = static_cast<std::size_t>(y) * w + x;
+                    want.y[i] = mix10(want.y[i], fill.y[i], keyAlpha(keyAt(line, x), gain));
+                }
+                for (int x = 0; x < w / 2; ++x)
+                {
+                    std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x;
+                    float const a = 0.5f * (keyAlpha(keyAt(line, 2 * x), gain) + keyAlpha(keyAt(line, 2 * x + 1), gain));
+                    want.cb[c] = mix10(want.cb[c], fill.cb[c], a);
+                    want.cr[c] = mix10(want.cr[c], fill.cr[c], a);
+                }
+            }
+        }
+        for (std::size_t i = 0; i < want.y.size(); ++i)
+        {
+            want.y[i] = mix10(want.y[i], pb.y[i], lumaAlpha(pb.y[i], 0.3f, 0.2f, false, 0.9f));
+        }
+        for (std::size_t c = 0; c < want.cb.size(); ++c)
+        {
+            float const a = 0.5f * (lumaAlpha(pb.y[2 * c], 0.3f, 0.2f, false, 0.9f) + lumaAlpha(pb.y[2 * c + 1], 0.3f, 0.2f, false, 0.9f));
+            want.cb[c] = mix10(want.cb[c], pb.cb[c], a);
+            want.cr[c] = mix10(want.cr[c], pb.cr[c], a);
+        }
+        int const diff = maxDiff(want, got);
+        if (err != cudaSuccess || diff != 0)
+        {
+            report = "compose: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+            return false;
+        }
+        done += "compose (wipe + 2 linear + 1 luma key layers) exact; ";
+    }
+    // A stinger frame: its alpha (a decoder's 10-bit luma plane, P010) as the key plane after the
+    // fill pb, exact; then A with the stinger layer and a DSK above it (pa, key 512), against the
+    // CPU reference: exact. Without an alpha plane the key is full.
+    {
+        int const keyRow = keyPlaneRowBytes(w);
+        std::size_t const keyBytes = frameBytes + static_cast<std::size_t>(keyRow) * h;
+        std::size_t const pitch = static_cast<std::size_t>(w) * 2;
+        std::vector<std::uint16_t> luma(static_cast<std::size_t>(w) * h);
         for (int y = 0; y < h; ++y)
         {
-            std::uint8_t const* line = keys + static_cast<std::size_t>(y) * keyRow;
             for (int x = 0; x < w; ++x)
             {
-                std::size_t const i = static_cast<std::size_t>(y) * w + x;
-                want.y[i] = mix10(pa.y[i], pb.y[i], keyAlpha(keyAt(line, x), gain));
+                luma[static_cast<std::size_t>(y) * w + x] = static_cast<std::uint16_t>(((x * 7 + y * 3) % 1024) << 6);
             }
-            for (int x = 0; x < w / 2; ++x)
+        }
+        std::vector<std::uint8_t> dsk(keyBytes, 0);
+        std::memcpy(dsk.data(), va.data(), frameBytes);
+        for (int y = 0; y < h; ++y)
+        {
+            auto* d = reinterpret_cast<std::uint32_t*>(dsk.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+            for (int x = 0; x < w; ++x)
             {
-                std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x;
-                float const a = 0.5f * (keyAlpha(keyAt(line, 2 * x), gain) + keyAlpha(keyAt(line, 2 * x + 1), gain));
-                want.cb[c] = mix10(pa.cb[c], pb.cb[c], a);
-                want.cr[c] = mix10(pa.cr[c], pb.cr[c], a);
+                d[x / 3] |= 512u << ((x % 3) * 10);
+            }
+        }
+        DeviceBytes dluma(luma.size() * 2);
+        DeviceBytes dsting(keyBytes);
+        DeviceBytes ddsk(keyBytes);
+        cudaMemcpy(dluma.get(), luma.data(), luma.size() * 2, cudaMemcpyHostToDevice);
+        cudaMemcpy(dsting.get(), vb.data(), frameBytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(ddsk.get(), dsk.data(), keyBytes, cudaMemcpyHostToDevice);
+        std::vector<std::uint8_t> sting(keyBytes);
+        alphaToKey(nullptr, nullptr, 0, false, w, h, dsting.get() + frameBytes, keyRow);
+        cudaError_t err = cudaDeviceSynchronize();
+        cudaMemcpy(sting.data(), dsting.get(), keyBytes, cudaMemcpyDeviceToHost);
+        bool full = err == cudaSuccess;
+        for (int x = 0; x < w && full; ++x)
+        {
+            full = keyAt(sting.data() + frameBytes + static_cast<std::size_t>(h - 1) * keyRow, x) == 1023u;
+        }
+        alphaToKey(nullptr, dluma.get(), static_cast<int>(pitch), true, w, h, dsting.get() + frameBytes, keyRow);
+        WorkBuffer wa;
+        WorkBuffer wo;
+        if (allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
+        {
+            report = "stinger: allocWork failed";
+            return false;
+        }
+        unpack(nullptr, da.get(), rowBytes, wa);
+        Compose job;
+        job.a = &wa;
+        job.layers[0].v210a = dsting.get();
+        job.layers[0].gain = 1.f;
+        job.layers[1].v210a = ddsk.get();
+        job.layers[1].gain = 1.f;
+        job.layerCount = 2;
+        compose(nullptr, job, rowBytes, keyRow, wo);
+        pack(nullptr, wo, dout.get(), rowBytes);
+        err = cudaDeviceSynchronize();
+        freeWork(wa);
+        freeWork(wo);
+        cudaMemcpy(sting.data(), dsting.get(), keyBytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+        int keyErrors = 0;
+        for (int y = 0; y < h; ++y)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                keyErrors += keyAt(sting.data() + frameBytes + static_cast<std::size_t>(y) * keyRow, x) != static_cast<unsigned>((x * 7 + y * 3) % 1024);
+            }
+        }
+        Planar422 got;
+        got.allocate(w, h);
+        unpackV210(back.data(), rowBytes, got);
+        Planar422 want = pa;
+        for (int l = 0; l < 2; ++l)
+        {
+            Planar422 const& fill = l == 0 ? pb : pa;
+            std::uint8_t const* keys = (l == 0 ? sting.data() : dsk.data()) + frameBytes;
+            for (int y = 0; y < h; ++y)
+            {
+                std::uint8_t const* line = keys + static_cast<std::size_t>(y) * keyRow;
+                for (int x = 0; x < w; ++x)
+                {
+                    std::size_t const i = static_cast<std::size_t>(y) * w + x;
+                    want.y[i] = mix10(want.y[i], fill.y[i], keyAlpha(keyAt(line, x), 1.f));
+                }
+                for (int x = 0; x < w / 2; ++x)
+                {
+                    std::size_t const c = static_cast<std::size_t>(y) * (w / 2) + x;
+                    float const a = 0.5f * (keyAlpha(keyAt(line, 2 * x), 1.f) + keyAlpha(keyAt(line, 2 * x + 1), 1.f));
+                    want.cb[c] = mix10(want.cb[c], fill.cb[c], a);
+                    want.cr[c] = mix10(want.cr[c], fill.cr[c], a);
+                }
             }
         }
         int const diff = maxDiff(want, got);
-        if (err != cudaSuccess || diff > 1)
+        if (err != cudaSuccess || !full || keyErrors != 0 || diff != 0)
         {
-            report = "key: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+            report = "stinger: full key " + std::string(full ? "ok" : "wrong") + ", " + std::to_string(keyErrors) + " alpha samples off, compose max error " +
+                     std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
             return false;
         }
-        done += "key max " + std::to_string(diff) + "; ";
+        done += "stinger alpha key and layer (under a DSK) exact; ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;

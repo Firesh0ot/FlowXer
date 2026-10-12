@@ -5,6 +5,43 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: metrics of P3 (M4)
+
+- Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;
+  per player `flowxer_engine_stinger_player_state{player,state}`, `_stinger_frames_decoded_total`,
+  `_stinger_frames_late_total`, `_stinger_decode_ms`. The engine's `/status` gains `stingers.played`.
+  Control plane: `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`): takes it made a cut.
+- A stinger take that finds every stinger player busy waits up to 0.5 s for one, then plays (back-to-back
+  Autos both play); only then is it a cut.
+- Keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` and `flowxer_engine_keyer_key_running`.
+- `flowxer_engine_input_upload_ms{input,stat}` for every input and key flow.
+- `flowxer_transitions_total` counts `wipe` too.
+- Grafana (`deploy/grafana/flowxer.json`): download, upload and per-ME GPU time, GPU memory and
+  NVENC sessions, stingers, keyers on air and linear keys without a key signal.
+
+### Changed: stingers play on the GPU (P3 M3)
+
+- Stingers play again, on the GPU with alpha and sound, over the upstream keys and under the
+  DSKs: an auto-stinger, an armed Wipe with a Cut, Auto with the transition type STING,
+  `/stinger/play` and a take with `transition: "stinger"`. The background switches at the cut
+  frame, its sound crossfades over 4 frames there, and the stinger's sound goes into PGM. Both
+  sources are red on the tally. A stinger that still converts is a cut; with every stinger player busy
+  a take waits up to 0.5 s for one (M4). The armed Wipe stays armed when a Cut plays Preview's auto-stinger (as in
+  FlowXer 14).
+- `FLOWXER_STINGER_PLAYERS` (0–4, default 1, at most the rendering MEs): stingers that can play
+  at once; pinned like the panels (workspace `stinger_players`).
+- Library: TGA or PNG sequences with one optional WAV (the sound), and video with alpha (ProRes
+  4444, QuickTime Animation, PNG/RGBA in MOV, FFV1, VP9 with alpha). The stinger mezzanine is
+  the clip mezzanine (colour), a lossless HEVC 4:2:0 alpha stream and the sound; stingers
+  converted before (ProRes 4444) are converted again at the next start, their originals stay.
+  Library items gain `has_sound`.
+
+### Removed
+
+- `FLOWXER_RAM_CLIP_MAX_S` and `FLOWXER_RAM_BUDGET_MB`: only the P2 stinger conversion used
+  them (stingers now decode ahead on the GPU like clips). They are no longer read; a platform
+  that sets them can drop them.
+
 ### Changed: the engine replaces the GStreamer mixer (P2)
 
 FlowXer's media plane is its C++/CUDA engine (`engine/`), a child process of the

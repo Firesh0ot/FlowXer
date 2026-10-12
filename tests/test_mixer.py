@@ -114,12 +114,17 @@ def test_reentry_takes_the_program_of_a_higher_rendering_me(settings) -> None:
 def test_fade_to_black_and_back(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
     calls = _record_engine(mixer)
+    # The whole output fades (DSKs and sound too); the buses stay.
     mixer.fade_to_black("me-1", duration_ms=600)
-    assert mixer.program_input_id == "black" and mixer.preview_input_id == "cam-2"
-    assert calls[-1] == ("POST", "/me/1/take", {"source": "black", "frames": 30})
+    assert mixer.program_input_id == "cam-1" and mixer.preview_input_id == "cam-2" and mixer.panels[0].ftb
+    assert calls[-1] == ("POST", "/me/1/ftb/auto", {"frames": 30})
     mixer.fade_to_black("me-1", duration_ms=200)
-    assert mixer.program_input_id == "cam-2"
-    assert calls[-1] == ("POST", "/me/1/take", {"source": "in2", "frames": 10})
+    assert mixer.program_input_id == "cam-1" and not mixer.panels[0].ftb
+    assert calls[-1] == ("POST", "/me/1/ftb/auto", {"frames": 10})
+    # The engine gets the state when it starts.
+    mixer.fade_to_black("me-1")
+    mixer._on_engine_ready(None)
+    assert ("POST", "/me/1/ftb", {"on": True}) in calls
     mixer.stop()
 
 
@@ -144,21 +149,28 @@ def test_legacy_input_kinds_become_clip_players(mixer: VisionMixer) -> None:
         LogicalInputCreate(id="x", label="x", kind="hdmi")
 
 
-def test_one_downstream_keyer(mixer: VisionMixer) -> None:
-    assert [keyer.id for keyer in mixer.keyers] == ["dsk-1"]
-    with pytest.raises(MixerError, match="at most 1"):
-        mixer.apply_workspace(WorkspaceUpdate(downstream_keyer_count=2))
+def test_keyers_per_me(mixer: VisionMixer) -> None:
+    # Engine keyer numbers follow the list: ME 1 Key 1, Key 2, DSK 1.
+    assert [keyer.id for keyer in mixer.keyers] == ["me-1-key-1", "me-1-key-2", "dsk-1"]
     calls = _record_engine(mixer)
     mixer.update_keyer("dsk-1", enabled=True)
-    assert calls[-1] == ("PUT", "/dsk/1", {"on": True})
+    assert calls[-1] == ("POST", "/keyer/3", {"on": True})
     mixer.keyer_auto("dsk-1", duration_ms=500)
-    assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 25})
-    assert mixer.keyers[0].enabled is False
+    assert calls[-1] == ("POST", "/keyer/3/auto", {"frames": 25})
+    assert mixer.get_keyer("dsk-1").enabled is False
     # Auto without a duration takes the keyer's rate.
     mixer.update_keyer("dsk-1", rate_ms=1000)
     mixer.keyer_auto("dsk-1")
-    assert calls[-1] == ("POST", "/dsk/1/auto", {"frames": 50})
-    assert mixer.keyers[0].rate_ms == 1000 and mixer.keyers[0].enabled is True
+    assert calls[-1] == ("POST", "/keyer/3/auto", {"frames": 50})
+    assert mixer.get_keyer("dsk-1").rate_ms == 1000 and mixer.get_keyer("dsk-1").enabled is True
+    # A luma key of a camera on ME 1's upstream keyer 1.
+    mixer.update_keyer("me-1-key-1", mode="luma", source_id="cam-2", clip=0.4, soft=0.05, invert=True)
+    assert calls[-1] == ("POST", "/keyer/1/settings", {"mode": "luma", "clip": 0.4, "soft": 0.05, "gain": 1.0, "invert": True, "source": "in2"})
+    with pytest.raises(MixerError, match="needs a source"):
+        mixer.update_keyer("me-1-key-2", mode="luma")
+    assert mixer.get_keyer("me-1-key-2").mode.value == "linear"
+    with pytest.raises(MixerError, match="unknown keyer"):
+        mixer.update_keyer("dsk-9", enabled=True)
 
 
 def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:
@@ -227,3 +239,40 @@ def test_a_stop_ends_the_program_autostart_attempts(mixer: VisionMixer, monkeypa
     count = len(attempts)
     time.sleep(0.3)
     assert len(attempts) == count <= 2
+
+
+def _stinger_ready(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch, frames: int) -> None:
+    """ME 1's next transition is a stinger of `frames` frames whose mezzanine is ready."""
+    body = {"path": "/storage/library/st/mezz.mkv", "alpha": "", "audio": "", "channels": 2, "frames": frames}
+    monkeypatch.setattr(mixer, "_stinger_media", lambda slot, stinger_id=None: (body, 2))
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.get_panel("me-1").transition.type = TransitionType.stinger
+
+
+def test_back_to_back_stinger_autos_both_play(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One stinger player, holding the stinger: it is free 0.1 s after the stinger's end. An Auto
+    # sent before that waits for it and plays the stinger too.
+    _stinger_ready(mixer, monkeypatch, frames=5)
+    mixer._stinger_cued[1] = "/storage/library/st/mezz.mkv"
+    mixer.auto("me-1")
+    start = time.monotonic()
+    mixer.auto("me-1")
+    waited = time.monotonic() - start
+    assert mixer.transition_counts["stinger"] == 2 and mixer.transition_counts["cut"] == 0
+    assert mixer.stinger_fallbacks["busy"] == 0
+    assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
+    assert waited < 0.5
+
+
+def test_stinger_auto_with_no_player_free_in_time_is_a_cut(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A stinger loaded on demand keeps its player for its length + 1 s: a second Auto right after
+    # it does not wait (no player is free within 0.5 s) and is a cut, counted as busy.
+    _stinger_ready(mixer, monkeypatch, frames=50)
+    mixer.auto("me-1")
+    start = time.monotonic()
+    mixer.auto("me-1")
+    assert time.monotonic() - start < 0.1
+    assert mixer.transition_counts["stinger"] == 1 and mixer.transition_counts["cut"] == 1
+    assert mixer.stinger_fallbacks["busy"] == 1
+    assert 'flowxer_stinger_fallbacks_total{reason="busy"} 1' in render_prometheus(mixer)

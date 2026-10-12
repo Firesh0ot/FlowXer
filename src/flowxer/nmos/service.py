@@ -496,7 +496,7 @@ class NmosNode:
                 {
                     "id": rid,
                     "version": nmos_version(),
-                    "label": f"{keyer.label} Key",
+                    "label": keyer.receiver_label,
                     "description": f"{keyer.label} key input (v210a fill and key)",
                     "tags": {GROUPHINT: [f"{keyer.id}:Key"]},
                     "device_id": self.device_uuid,

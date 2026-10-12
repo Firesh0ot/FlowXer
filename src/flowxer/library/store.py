@@ -43,16 +43,18 @@ class LibraryStore:
         return self.item_dir(item_id) / "item.json"
 
     def mezz_path(self, item_id: str, format_id: str, kind: LibraryKind) -> Path:
-        """The derived file a format plays: a clip's HEVC 4:4:4 mezzanine, a still's v210
-        picture, a stinger's ProRes 4444. Originals are never named like this."""
-        if kind == LibraryKind.clip:
-            return self.item_dir(item_id) / f"mezz-{format_id}.mkv"
+        """The derived file a format plays: a clip's (or a stinger's colour) HEVC 4:4:4
+        mezzanine, a still's v210 picture. Originals are never named like this."""
         if kind == LibraryKind.still:
             return self.item_dir(item_id) / f"still-{format_id}.v210"
-        return self.item_dir(item_id) / f"mezz-{format_id}.mov"
+        return self.item_dir(item_id) / f"mezz-{format_id}.mkv"
+
+    def alpha_path(self, item_id: str, format_id: str) -> Path:
+        """A stinger's alpha for a format (the luma of lossless HEVC 4:2:0 10-bit)."""
+        return self.item_dir(item_id) / f"mezz-{format_id}-alpha.mkv"
 
     def audio_path(self, item_id: str, format_id: str) -> Path:
-        """A clip's sound for a format (raw float32, interleaved)."""
+        """A clip's or stinger's sound for a format (raw float32, interleaved)."""
         return self.item_dir(item_id) / f"mezz-{format_id}.f32"
 
     def thumb_path(self, item_id: str) -> Path:

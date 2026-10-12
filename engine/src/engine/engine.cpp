@@ -183,15 +183,23 @@ public:
         }
     }
 
-    void allocate(std::size_t bytes, int count)
+    // With a stream the allocation is stream-ordered (a key flow routed on air: the render stream
+    // does not wait for it).
+    void allocate(std::size_t bytes, int count, cudaStream_t stream = nullptr)
     {
         for (int i = 0; i < count; ++i)
         {
             auto* frame = new DevFrame;
             all_.push_back(frame);
-            check(cudaMalloc(reinterpret_cast<void**>(&frame->data), bytes), "cudaMalloc input frame");
+            check(stream != nullptr ? cudaMallocAsync(reinterpret_cast<void**>(&frame->data), bytes, stream)
+                                    : cudaMalloc(reinterpret_cast<void**>(&frame->data), bytes),
+                "cudaMalloc input frame");
             check(cudaEventCreateWithFlags(&frame->ready, cudaEventDisableTiming), "cudaEventCreate");
             free_.push_back(frame);
+        }
+        if (stream != nullptr)
+        {
+            check(cudaStreamSynchronize(stream), "input frames");
         }
     }
 
@@ -229,6 +237,8 @@ struct Input
     // Device bytes of one grain (v210, or v210 + key plane).
     std::size_t bytes = 0;
     FramePool pool;
+    // Its frames exist (a key flow gets them on its first route).
+    bool allocated = false;
     mutable std::mutex mu;
     std::condition_variable routed;
     Route video;
@@ -330,8 +340,10 @@ struct Slot
     std::vector<std::uint8_t*> out;
     // The input grains this output grain read; released after the downloads.
     std::vector<std::shared_ptr<DevFrame>> held;
-    // The clip player frames of this grain (their audio goes into the PGM audio).
+    // The clip player and stinger player frames of this grain (their audio goes into the PGM
+    // audio).
     std::vector<std::shared_ptr<PlayerFrame>> players;
+    std::vector<std::shared_ptr<PlayerFrame>> stingers;
     std::uint64_t index = 0;
     std::uint64_t inputIndex = 0;
     // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done.
@@ -433,8 +445,15 @@ struct Engine::Impl
     bool started = false;
 
     std::vector<std::unique_ptr<Input>> inputs;
+    // Key flows: one reader (and upload) per distinct routed flow, shared by the keyers routed to
+    // it; its frames are allocated when it is first routed. keySlot: keyer k's flow, or -1.
     std::vector<std::unique_ptr<Input>> keys;
+    mutable std::mutex keyMu;
+    std::vector<int> keySlot;
+    int keyPoolSize = 0;
     std::vector<std::unique_ptr<ClipPlayer>> players;
+    // Stinger players: clip players with v210a pictures (alpha) and sound.
+    std::vector<std::unique_ptr<ClipPlayer>> stingers;
     // Video outputs (PGM of every ME, PVW with pvwOutputs), audio outputs (ME m PGM at m-1).
     std::vector<std::unique_ptr<Output>> outputs;
     std::vector<std::unique_ptr<Output>> audioOutputs;
@@ -442,6 +461,8 @@ struct Engine::Impl
     std::vector<Output*> pvwOf;
     std::map<std::string, mxlInstance> outInstances;
     std::uint8_t* black = nullptr;
+    // Black with a full key (v210a): the Fade to Black layer, last over an ME's output.
+    std::uint8_t* blackKey = nullptr;
     // Work pictures of the sources (inputs, then players), and of each ME's buses.
     std::vector<gpu::WorkBuffer> srcWork;
     std::vector<gpu::WorkBuffer> pgmWork;
@@ -453,7 +474,7 @@ struct Engine::Impl
     std::vector<MosaicTile> tiles;
     cudaStream_t renderStream = nullptr;
     cudaStream_t downloadStream = nullptr;
-    std::size_t allocated = 0;
+    std::atomic<std::size_t> allocated{0};
     std::string gpuName;
     std::string pciBus;
     std::unique_ptr<MosaicEncoder> encoder;
@@ -509,18 +530,18 @@ struct Engine::Impl
 
     explicit Impl(Config c)
         : cfg(std::move(c))
-        , mixer(cfg.mes, static_cast<int>(cfg.inputs.size()), static_cast<int>(cfg.players.size()), dskMes(cfg))
+        , mixer(cfg.mes, static_cast<int>(cfg.inputs.size()), static_cast<int>(cfg.players.size()), keyerSpecs(cfg))
     {
     }
 
-    static std::vector<int> dskMes(Config const& cfg)
+    static std::vector<KeyerSpec> keyerSpecs(Config const& cfg)
     {
-        std::vector<int> mes;
+        std::vector<KeyerSpec> specs;
         for (auto const& key : cfg.keys)
         {
-            mes.push_back(key.me);
+            specs.push_back(KeyerSpec{key.me, key.upstream});
         }
-        return mes;
+        return specs;
     }
 
     [[nodiscard]] std::uint64_t currentIndex() const
@@ -564,6 +585,7 @@ struct Engine::Impl
         input->key = key;
         input->bytes = bytes;
         input->pool.allocate(bytes, poolSize);
+        input->allocated = poolSize > 0;
         allocated += bytes * static_cast<std::size_t>(poolSize);
         return input;
     }
@@ -591,6 +613,11 @@ struct Engine::Impl
 
         allocDevice(reinterpret_cast<void**>(&black), frameBytes, "black frame");
         check(gpu::fillBlack(renderStream, black, rowBytes, cfg.width, cfg.height), "fill black");
+        allocDevice(reinterpret_cast<void**>(&blackKey), keyBytes, "fade to black frame");
+        check(gpu::fillBlack(renderStream, blackKey, rowBytes, cfg.width, cfg.height), "fill black");
+        std::vector<std::uint32_t> const opaque((keyBytes - frameBytes) / 4, 0x3fffffffu);
+        check(cudaMemcpyAsync(blackKey + frameBytes, opaque.data(), keyBytes - frameBytes, cudaMemcpyHostToDevice, renderStream), "key plane");
+        check(cudaStreamSynchronize(renderStream), "key plane");
 
         // The ring keeps grains i-L .. newest (+1 for a source a grain ahead); in flight are at
         // most one grain per output slot and the one being uploaded.
@@ -605,14 +632,17 @@ struct Engine::Impl
             inputs.push_back(std::move(input));
             ++number;
         }
-        number = 1;
-        for (auto const& keyCfg : cfg.keys)
+        keyPoolSize = poolSize;
+        keySlot.assign(cfg.keys.size(), -1);
+        for (std::size_t s = 0; s < cfg.keys.size(); ++s)
         {
-            auto key = makeInput(number, "key" + std::to_string(number), keyCfg.label, true, keyBytes, poolSize);
-            key->video = keyCfg.route;
-            keys.push_back(std::move(key));
-            ++number;
+            keys.push_back(makeInput(static_cast<int>(s) + 1, "key" + std::to_string(s + 1), "", true, keyBytes, 0));
         }
+        for (std::size_t k = 0; k < cfg.keys.size(); ++k)
+        {
+            routeKeyer(static_cast<int>(k) + 1, cfg.keys[k].route);
+        }
+        number = 1;
         number = 1;
         for (auto const& playerCfg : cfg.players)
         {
@@ -627,6 +657,21 @@ struct Engine::Impl
             setup.channels = static_cast<std::size_t>(cfg.audioChannels);
             players.push_back(std::make_unique<ClipPlayer>(setup));
             allocated += players.back()->deviceBytes();
+        }
+        for (int s = 1; s <= cfg.stingerPlayers; ++s)
+        {
+            PlayerSetup setup;
+            setup.number = s;
+            setup.label = "Stinger " + std::to_string(s);
+            setup.width = cfg.width;
+            setup.height = cfg.height;
+            setup.rate = cfg.rate;
+            setup.gpu = cfg.gpu;
+            setup.frameBytes = frameBytes;
+            setup.keyRowBytes = keyRowBytes;
+            setup.channels = static_cast<std::size_t>(cfg.audioChannels);
+            stingers.push_back(std::make_unique<ClipPlayer>(setup));
+            allocated += stingers.back()->deviceBytes();
         }
         auto addWork = [&](std::vector<gpu::WorkBuffer>& list, std::size_t count) {
             list.resize(count);
@@ -1082,6 +1127,71 @@ struct Engine::Impl
         cudaStreamDestroy(stream);
     }
 
+    // Keyer k (1-based) to a key flow: a flow another keyer reads already is shared; else a free
+    // slot reads it (its frames allocated on its first route). A slot no keyer uses is closed.
+    bool routeKeyer(int k, Route const& video)
+    {
+        if (k < 1 || k > static_cast<int>(keySlot.size()))
+        {
+            return false;
+        }
+        std::lock_guard lock{keyMu};
+        auto const users = [&](int s) { return std::count(keySlot.begin(), keySlot.end(), s); };
+        int const old = keySlot[static_cast<std::size_t>(k - 1)];
+        if (old >= 0 && !video.flow.empty() && keys[static_cast<std::size_t>(old)]->videoRoute() == video)
+        {
+            // The same flow again: the reader keeps reading.
+            return true;
+        }
+        keySlot[static_cast<std::size_t>(k - 1)] = -1;
+        int shared = -1;
+        for (int s = 0; s < static_cast<int>(keys.size()) && !video.flow.empty(); ++s)
+        {
+            if (users(s) > 0 && keys[static_cast<std::size_t>(s)]->videoRoute() == video)
+            {
+                shared = s;
+            }
+        }
+        if (old >= 0 && old != shared && users(old) == 0)
+        {
+            route(*keys[static_cast<std::size_t>(old)], Route{}, nullptr);
+        }
+        if (video.flow.empty())
+        {
+            return true;
+        }
+        int slot = shared;
+        for (int s = 0; s < static_cast<int>(keys.size()) && slot < 0; ++s)
+        {
+            // A free slot, one with frames first.
+            if (users(s) == 0 && keys[static_cast<std::size_t>(s)]->allocated)
+            {
+                slot = s;
+            }
+        }
+        for (int s = 0; s < static_cast<int>(keys.size()) && slot < 0; ++s)
+        {
+            if (users(s) == 0)
+            {
+                slot = s;
+            }
+        }
+        auto& in = *keys[static_cast<std::size_t>(slot)];
+        if (!in.allocated)
+        {
+            in.pool.allocate(keyBytes, keyPoolSize, downloadStream);
+            in.allocated = true;
+            allocated += keyBytes * static_cast<std::size_t>(keyPoolSize);
+        }
+        keySlot[static_cast<std::size_t>(k - 1)] = slot;
+        if (shared < 0)
+        {
+            in.label = cfg.keys[static_cast<std::size_t>(k - 1)].label;
+            route(in, video, nullptr);
+        }
+        return true;
+    }
+
     bool route(Input& in, Route const& video, Route const* audio)
     {
         {
@@ -1207,7 +1317,12 @@ struct Engine::Impl
     // Queues all GPU work of output grain `index` on the render stream (returns at once).
     void render(std::uint64_t index, Slot& slot)
     {
-        auto const plan = mixer.frame(index);
+        std::vector<bool> stingerReady(stingers.size());
+        for (std::size_t k = 0; k < stingers.size(); ++k)
+        {
+            stingerReady[k] = stingers[k]->ready();
+        }
+        auto const plan = mixer.frame(index, stingerReady);
         auto const& plans = plan.mes;
         std::uint64_t const j = inputIndexFor(index, cfg.latency);
         std::size_t const nIn = inputs.size();
@@ -1225,16 +1340,30 @@ struct Engine::Impl
                 ready[k] = frames[k]->ready;
             }
         }
-        // A clip player is on air when it is in an ME's Program (or the incoming source of a Mix).
+        // A clip player is on air when it is in an ME's Program (or the incoming source of a Mix),
+        // or the source of a luma key on air.
         std::vector<bool> onAir(players.size(), false);
+        for (auto const& key : plan.keys)
+        {
+            if (key.gain > 0.f && key.settings.luma && key.settings.source.kind == Source::Kind::Player)
+            {
+                onAir[static_cast<std::size_t>(key.settings.source.index - 1)] = true;
+            }
+        }
+        // A stinger player is on air while a stinger of it runs.
+        std::vector<bool> stingOnAir(stingers.size(), false);
         for (auto const& p : plans)
         {
             for (auto const& source : {p.a, p.b})
             {
-                if (source.kind == Source::Kind::Player && (source == p.a || p.mixing))
+                if (source.kind == Source::Kind::Player && (source == p.background() || p.mixing))
                 {
                     onAir[static_cast<std::size_t>(source.index - 1)] = true;
                 }
+            }
+            if (p.stinger > 0)
+            {
+                stingOnAir[static_cast<std::size_t>(p.stinger - 1)] = true;
             }
         }
         for (std::size_t k = 0; k < players.size(); ++k)
@@ -1246,6 +1375,11 @@ struct Engine::Impl
                 ready[nIn + k] = playerFrames[k]->ready;
             }
         }
+        std::vector<std::shared_ptr<PlayerFrame>> stingFrames(stingers.size());
+        for (std::size_t k = 0; k < stingers.size(); ++k)
+        {
+            stingFrames[k] = stingers[k]->frameFor(index, stingOnAir[k]);
+        }
         std::vector<bool> needed(nSrc, false);
         auto const need = [&](Source source) {
             int const s = sourceSlot(source);
@@ -1256,12 +1390,19 @@ struct Engine::Impl
         };
         for (auto const& p : plans)
         {
-            need(p.a);
+            need(p.background());
             if (p.mixing)
             {
                 need(p.b);
             }
             need(p.preview);
+        }
+        for (auto const& key : plan.keys)
+        {
+            if (key.gain > 0.f && key.settings.luma)
+            {
+                need(key.settings.source);
+            }
         }
         cudaStream_t const st = renderStream;
         auto mark = slot.mark.begin();
@@ -1288,17 +1429,24 @@ struct Engine::Impl
             int const s = sourceSlot(source);
             return s >= 0 ? srcWork[static_cast<std::size_t>(s)] : blackWork;
         };
-        // The key inputs the downstream keyers need now (grain i - L, like the inputs).
-        std::vector<std::shared_ptr<DevFrame>> keyFrames(keys.size());
-        for (auto const& dsk : plan.dsks)
+        // The key flows the linear keyers on air need now (grain i - L, like the inputs), each
+        // once.
+        std::vector<int> slots;
         {
-            auto const k = static_cast<std::size_t>(dsk.key - 1);
-            if (dsk.gain > 0.f && k < keys.size() && !keyFrames[k])
+            std::lock_guard lock{keyMu};
+            slots = keySlot;
+        }
+        std::vector<std::shared_ptr<DevFrame>> keyFrames(keys.size());
+        for (auto const& key : plan.keys)
+        {
+            int const s = slots[static_cast<std::size_t>(key.key - 1)];
+            if (key.gain > 0.f && !key.settings.luma && s >= 0 && !keyFrames[static_cast<std::size_t>(s)])
             {
-                keyFrames[k] = pick(*keys[k], j, index);
-                if (keyFrames[k])
+                auto& frame = keyFrames[static_cast<std::size_t>(s)];
+                frame = pick(*keys[static_cast<std::size_t>(s)], j, index);
+                if (frame)
                 {
-                    cudaStreamWaitEvent(st, keyFrames[k]->ready, 0);
+                    cudaStreamWaitEvent(st, frame->ready, 0);
                 }
             }
         }
@@ -1306,18 +1454,75 @@ struct Engine::Impl
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
-            gpu::mix(st, workOf(p.a), p.mixing ? &workOf(p.b) : nullptr, p.mixing ? p.t : 0.f, pgmWork[me]);
-            gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
-            // Downstream keyers over the ME's Program only: keys have no preview (Preview shows
-            // only its source).
-            for (auto const& dsk : plan.dsks)
+            // Program in one pass: the background (A, a Mix or a Wipe to B, or a stinger's A or B),
+            // the upstream keyers, the stinger, the DSKs, Fade to Black. Keys have no preview
+            // (Preview shows only its source).
+            gpu::Compose job;
+            job.a = &workOf(p.background());
+            job.b = p.mixing ? &workOf(p.b) : nullptr;
+            job.t = p.mixing ? p.t : 0.f;
+            job.wiping = p.wiping;
+            if (p.wiping)
             {
-                auto const& frame = dsk.me == p.me && dsk.gain > 0.f ? keyFrames[static_cast<std::size_t>(dsk.key - 1)] : nullptr;
-                if (frame)
+                job.wipe = makeWipe(p.wipe, p.t, cfg.width, cfg.height);
+            }
+            for (int stage = 0; stage < 3; ++stage)
+            {
+                if (stage == 1)
                 {
-                    gpu::keyV210a(st, frame->data, rowBytes, keyRowBytes, dsk.gain, pgmWork[me]);
+                    // The stinger: over the upstream keys, under the DSKs.
+                    auto const& frame = p.stinger > 0 ? stingFrames[static_cast<std::size_t>(p.stinger - 1)] : nullptr;
+                    if (frame && frame->v210 != nullptr && job.layerCount < gpu::kMaxLayers)
+                    {
+                        cudaStreamWaitEvent(st, frame->ready, 0);
+                        gpu::KeyLayer layer;
+                        layer.v210a = frame->v210;
+                        layer.gain = 1.f;
+                        job.layers[job.layerCount++] = layer;
+                    }
+                    continue;
+                }
+                bool const upstream = stage == 0;
+                for (auto const& key : plan.keys)
+                {
+                    if (key.me != p.me || key.upstream != upstream || key.gain <= 0.f || job.layerCount >= gpu::kMaxLayers)
+                    {
+                        continue;
+                    }
+                    auto const& set = key.settings;
+                    gpu::KeyLayer layer;
+                    layer.gain = key.gain * set.gain;
+                    if (set.luma)
+                    {
+                        layer.luma = true;
+                        layer.source = &workOf(set.source);
+                        layer.clip = set.clip;
+                        layer.soft = set.soft;
+                        layer.invert = set.invert;
+                    }
+                    else
+                    {
+                        int const s = slots[static_cast<std::size_t>(key.key - 1)];
+                        auto const& frame = s >= 0 ? keyFrames[static_cast<std::size_t>(s)] : nullptr;
+                        if (!frame)
+                        {
+                            continue;
+                        }
+                        layer.v210a = frame->data;
+                    }
+                    job.layers[job.layerCount++] = layer;
                 }
             }
+            // Fade to Black: last, over everything (the DSKs too).
+            if (p.ftb > 0.f && job.layerCount < gpu::kMaxLayers)
+            {
+                gpu::KeyLayer layer;
+                layer.v210a = blackKey;
+                layer.gain = p.ftb;
+                job.layers[job.layerCount++] = layer;
+            }
+            gpu::compose(st, job, rowBytes, keyRowBytes, pgmWork[me]);
+            gpu::mix(st, workOf(p.preview), nullptr, 0.f, pvwWork[me]);
             cudaEventRecord(*mark++, st);
         }
         for (std::size_t me = 0; me < pgmWork.size(); ++me)
@@ -1343,6 +1548,7 @@ struct Engine::Impl
             }
         }
         slot.players = std::move(playerFrames);
+        slot.stingers = std::move(stingFrames);
         slot.index = index;
         slot.inputIndex = j;
         slot.plans = plans;
@@ -1471,6 +1677,7 @@ struct Engine::Impl
         slot.held.clear();
         writeAudio(slot, audio);
         slot.players.clear();
+        slot.stingers.clear();
         slot.busy.store(false);
     }
 
@@ -1617,7 +1824,7 @@ struct Engine::Impl
 
     // PGM audio of output grain `index`: the audio of the PGM source, read L grains back on the
     // same TAI grid as the video (a clip player's own audio of the grain), crossfaded (equal
-    // power) while a Mix runs.
+    // power) while a Mix runs and around a stinger's cut point; a stinger's sound is added.
     void audioGrain(std::uint64_t index, Slot const& slot, AudioRun& audio)
     {
         auto const& plans = slot.plans;
@@ -1635,7 +1842,7 @@ struct Engine::Impl
             for (auto const& source : {plan.a, plan.b})
             {
                 int const s = sourceSlot(source);
-                if (s >= 0 && (source == plan.a || plan.mixing))
+                if (s >= 0 && (source == plan.a || plan.mixing || plan.stinger > 0))
                 {
                     needed[static_cast<std::size_t>(s)] = true;
                 }
@@ -1683,13 +1890,14 @@ struct Engine::Impl
             return s >= 0 ? &audio.in[static_cast<std::size_t>(s)] : nullptr;
         };
         std::vector<float> const silence(ch * n, 0.f);
+        std::vector<float> sting;
         // Render order (ME n before ME m): a re-entered Program's audio is ready.
         for (auto const& plan : plans)
         {
             auto& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
             auto const* a = sourceOf(plan.a);
             a = a != nullptr && a->size() == ch * n ? a : &silence;
-            if (plan.mixing)
+            if (plan.mixing || plan.stinger > 0)
             {
                 auto const* b = sourceOf(plan.b);
                 b = b != nullptr && b->size() == ch * n ? b : &silence;
@@ -1702,6 +1910,28 @@ struct Engine::Impl
             else
             {
                 dst = *a;
+            }
+            auto const& stingFrame =
+                plan.stinger > 0 && static_cast<std::size_t>(plan.stinger) <= slot.stingers.size() ? slot.stingers[static_cast<std::size_t>(plan.stinger - 1)] : nullptr;
+            if (stingFrame && stingFrame->index == index && stingFrame->samples > 0)
+            {
+                copyPlayerAudio(*stingFrame, sting, n, ch);
+                for (std::size_t s = 0; s < dst.size(); ++s)
+                {
+                    dst[s] += sting[s];
+                }
+            }
+            // Fade to Black takes the sound with it, ramping within the grain.
+            if (plan.ftb > 0.f || plan.ftbPrev > 0.f)
+            {
+                for (std::size_t c = 0; c < ch; ++c)
+                {
+                    for (std::size_t s = 0; s < n; ++s)
+                    {
+                        float const g = plan.ftbPrev + (plan.ftb - plan.ftbPrev) * static_cast<float>(s + 1) / static_cast<float>(n);
+                        dst[c * n + s] *= 1.f - g;
+                    }
+                }
             }
             auto& output = *audioOutputs[static_cast<std::size_t>(plan.me - 1)];
             mxlMutableWrappedMultiBufferSlice slice{};
@@ -1938,9 +2168,12 @@ struct Engine::Impl
                 in->thread = std::thread([this, in] { inputMain(*in); });
             }
         }
-        for (auto& player : players)
+        for (auto* list : {&players, &stingers})
         {
-            player->start();
+            for (auto& player : *list)
+            {
+                player->start();
+            }
         }
         // The render thread starts once the writer has page-locked its grains.
         auto warm = writerWarm.get_future();
@@ -1952,7 +2185,8 @@ struct Engine::Impl
         }
         statsThread = std::thread([this] { statsMain(); });
         renderThread = std::thread([this] { renderMain(); });
-        logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"players", players.size()}, {"keys", keys.size()}, {"mes", cfg.mes},
+        logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"players", players.size()}, {"stinger_players", stingers.size()},
+                                      {"keys", keys.size()}, {"mes", cfg.mes},
                                       {"latency", cfg.latency}, {"pvw_outputs", cfg.pvwOutputs}, {"work_format", cfg.workFormat},
                                       {"device_mb", allocated / 1048576}});
     }
@@ -1992,10 +2226,14 @@ struct Engine::Impl
         {
             slot.held.clear();
             slot.players.clear();
+            slot.stingers.clear();
         }
-        for (auto& player : players)
+        for (auto* list : {&players, &stingers})
         {
-            player->stop();
+            for (auto& player : *list)
+            {
+                player->stop();
+            }
         }
         // The last writer's release deletes a flow (MXL): its readers see it again when the
         // next writer (this engine or the mixer it replaced) creates it.
@@ -2058,6 +2296,7 @@ struct Engine::Impl
         inputs.clear();
         keys.clear();
         players.clear();
+        stingers.clear();
         cudaStreamDestroy(renderStream);
         cudaStreamDestroy(downloadStream);
         logInfo("engine_stopped", {{"rendered", rendered.load()}, {"committed", committed.load()}, {"skipped", skipped.load()}});
@@ -2141,6 +2380,7 @@ struct Engine::Impl
             {"mes", cfg.mes},
             {"inputs", inputs.size()},
             {"players", players.size()},
+            {"stinger_players", stingers.size()},
             {"keys", keys.size()},
             {"pvw_outputs", cfg.pvwOutputs},
             {"work_format", cfg.workFormat},
@@ -2198,18 +2438,48 @@ struct Engine::Impl
             list.push_back(inputJson(*input, now));
         }
         out["inputs"] = list;
-        json keyList = json::array();
-        for (auto const& key : keys)
+        // Per keyer its key flow's state (FlowXer's view), and per key flow in use its reader.
+        std::vector<int> slots;
         {
-            keyList.push_back(inputJson(*key, now));
+            std::lock_guard lock{keyMu};
+            slots = keySlot;
+        }
+        json keyList = json::array();
+        json flowList = json::array();
+        for (std::size_t k = 0; k < slots.size(); ++k)
+        {
+            json item{{"key", k + 1}, {"label", cfg.keys[k].label}, {"state", "not_routed"}, {"flow_slot", nullptr}};
+            if (slots[k] >= 0)
+            {
+                auto const flow = inputJson(*keys[static_cast<std::size_t>(slots[k])], now);
+                item["state"] = flow["state"];
+                item["arrival_ms"] = flow["arrival_ms"];
+                item["route"] = flow["route"];
+                item["flow_slot"] = slots[k] + 1;
+            }
+            keyList.push_back(item);
+        }
+        for (std::size_t s = 0; s < keys.size(); ++s)
+        {
+            if (std::find(slots.begin(), slots.end(), static_cast<int>(s)) != slots.end())
+            {
+                flowList.push_back(inputJson(*keys[s], now));
+            }
         }
         out["keys"] = keyList;
+        out["key_flows"] = flowList;
         json playerList = json::array();
         for (auto const& player : players)
         {
             playerList.push_back(json::parse(player->statusJson()));
         }
         out["players"] = playerList;
+        json stingerList = json::array();
+        for (auto const& player : stingers)
+        {
+            stingerList.push_back(json::parse(player->statusJson()));
+        }
+        out["stingers"] = {{"players", stingerList}, {"played", mixer.stingersPlayed()}, {"waits", mixer.stingerWaits()}, {"cuts", mixer.stingerCuts()}};
         json mes = json::array();
         auto const flow = [](Output const& o) {
             return json{{"flow", o.id}, {"domain", o.domain}, {"label", o.label}, {"existing", o.existing}, {"committed", o.committed.load()},
@@ -2233,6 +2503,12 @@ struct Engine::Impl
                 {"program", sourceName(view.program)},
                 {"preview", sourceName(view.preview)},
                 {"mixing", view.mixing},
+                {"wiping", view.wiping},
+                {"ftb", round3(mixer.ftbGain(view.me))},
+                {"manual", view.manual},
+                {"t", round3(view.t)},
+                {"stinger", view.stinger},
+                {"next_transition", transitionName(view.next.type)},
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},
                 {"position", view.position},
@@ -2241,12 +2517,13 @@ struct Engine::Impl
                 {"pgm_audio", pgmAudio}});
         }
         out["mes"] = mes;
-        json dsks = json::array();
-        for (auto const& dsk : mixer.dskView())
+        json keyers = json::array();
+        for (auto const& key : mixer.keyView())
         {
-            dsks.push_back({{"dsk", dsk.key}, {"key", dsk.key}, {"me", dsk.me}, {"on", dsk.on}, {"transition", dsk.transition}, {"gain", round3(dsk.gain)}});
+            keyers.push_back({{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on},
+                {"transition", key.transition}, {"gain", round3(key.gain)}, {"mode", key.settings.luma ? "luma" : "linear"}});
         }
-        out["dsks"] = dsks;
+        out["keyers"] = keyers;
         json mosaic = {{"enabled", cfg.mosaic}, {"fps", cfg.mosaicFps}, {"frames", mosaicFrames.load()}, {"dropped", mosaicDropped.load()}, {"encode_ms", encodeMs.toJson()}};
         // The preview contract: where each stream goes and whether it is being published.
         json streams = json::array();
@@ -2319,11 +2596,7 @@ bool Engine::routeInput(int k, Route const& video, Route const& audio)
 
 bool Engine::routeKey(int k, Route const& route)
 {
-    if (k < 1 || k > static_cast<int>(impl_->keys.size()))
-    {
-        return false;
-    }
-    return impl_->route(*impl_->keys[static_cast<std::size_t>(k - 1)], route, nullptr);
+    return impl_->routeKeyer(k, route);
 }
 
 std::string Engine::playerCommand(int k, PlayerCommand const& command)
@@ -2333,6 +2606,24 @@ std::string Engine::playerCommand(int k, PlayerCommand const& command)
         return "no clip player " + std::to_string(k);
     }
     return impl_->players[static_cast<std::size_t>(k - 1)]->command(command);
+}
+
+std::string Engine::stingerCommand(int k, PlayerCommand const& command)
+{
+    if (k < 1 || k > static_cast<int>(impl_->stingers.size()))
+    {
+        return "no stinger player " + std::to_string(k);
+    }
+    return impl_->stingers[static_cast<std::size_t>(k - 1)]->command(command);
+}
+
+long long Engine::stingerFrames(int k) const
+{
+    if (k < 1 || k > static_cast<int>(impl_->stingers.size()))
+    {
+        return -1;
+    }
+    return impl_->stingers[static_cast<std::size_t>(k - 1)]->frames();
 }
 
 std::string Engine::statusJson() const
@@ -2381,7 +2672,7 @@ std::string Engine::metricsText() const
             metric("gpu_stage_ms", value["max"].get<double>(), "stage=\"" + stage + "\",stat=\"max\"");
         }
     }
-    for (auto const* list : {&s["inputs"], &s["keys"]})
+    for (auto const* list : {&s["inputs"], &s["key_flows"]})
     {
         for (auto const& input : *list)
         {
@@ -2394,6 +2685,8 @@ std::string Engine::metricsText() const
             metric("input_running", input["state"] == "running" ? 1.0 : 0.0, l);
             metric("input_arrival_ms", input["arrival_ms"]["avg"].get<double>(), l + ",essence=\"video\",stat=\"avg\"");
             metric("input_arrival_ms", input["arrival_ms"]["max"].get<double>(), l + ",essence=\"video\",stat=\"max\"");
+            metric("input_upload_ms", input["upload_ms"]["avg"].get<double>(), l + ",stat=\"avg\"");
+            metric("input_upload_ms", input["upload_ms"]["max"].get<double>(), l + ",stat=\"max\"");
             if (input.contains("audio"))
             {
                 auto const& a = input["audio"];
@@ -2412,6 +2705,33 @@ std::string Engine::metricsText() const
         metric("player_frames_late_total", player.value("late", 0.0), l);
         metric("player_frames_decoded_total", player.value("decoded", 0.0), l);
         metric("player_decode_ms", player.value("decode_ms", 0.0), l + ",stat=\"avg\"");
+    }
+    // Stingers (P3): played, grains waited for a first frame, fallbacks to a cut; per player.
+    auto const& stingers = s["stingers"];
+    metric("stingers_played_total", stingers["played"].get<double>());
+    metric("stinger_wait_grains_total", stingers["waits"].get<double>());
+    metric("stinger_cuts_total", stingers["cuts"].get<double>());
+    for (auto const& player : stingers["players"])
+    {
+        std::string const l = "player=\"" + std::to_string(player["player"].get<int>()) + "\"";
+        for (char const* state : {"empty", "cued", "playing", "paused", "ended"})
+        {
+            metric("stinger_player_state", player["state"] == state ? 1.0 : 0.0, l + ",state=\"" + state + "\"");
+        }
+        metric("stinger_frames_late_total", player.value("late", 0.0), l);
+        metric("stinger_frames_decoded_total", player.value("decoded", 0.0), l);
+        metric("stinger_decode_ms", player.value("decode_ms", 0.0), l + ",stat=\"avg\"");
+    }
+    // Keyers (P3): on air, and whether the key flow of a linear key runs (else NO KEY).
+    auto const& keyList = s["keys"];
+    for (auto const& key : s["keyers"])
+    {
+        auto const k = key["key"].get<std::size_t>();
+        std::string const label = k >= 1 && k <= keyList.size() ? keyList[k - 1]["label"].get<std::string>() : std::to_string(k);
+        std::string const l = "keyer=\"" + label + "\",me=\"" + std::to_string(key["me"].get<int>()) + "\",stage=\"" +
+            key["stage"].get<std::string>() + "\",mode=\"" + key["mode"].get<std::string>() + "\"";
+        metric("keyer_on_air", key["on"].get<bool>() ? 1.0 : 0.0, l);
+        metric("keyer_key_running", k >= 1 && k <= keyList.size() && keyList[k - 1]["state"] == "running" ? 1.0 : 0.0, l);
     }
     auto const& mosaic = s["mosaic"];
     metric("mosaic_frames_total", mosaic["frames"].get<double>());

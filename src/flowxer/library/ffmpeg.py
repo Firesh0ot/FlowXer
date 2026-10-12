@@ -209,17 +209,25 @@ def parse_frame_rate(value: str | None, default: float = 50.0) -> float:
 
 
 def has_alpha_pix_fmt(pix_fmt: str) -> bool:
+    """A pixel format with an alpha channel (yuva*, rgba*, argb, gbrap*, ya*, ...)."""
     name = (pix_fmt or "").lower()
-    return any(token in name for token in ("a", "rgba", "argb", "bgra", "abgr", "yuva", "gbra"))
+    return name.startswith(("yuva", "rgba", "bgra", "argb", "abgr", "gbrap", "ya"))
 
 
-def _fit_filter(width: int, height: int, fit: str) -> str:
-    """Scale (and pad or crop) to the raster: fit (letterbox), fill (crop) or center (1:1)."""
+def is_rgb_pix_fmt(pix_fmt: str) -> bool:
+    """An R'G'B' pixel format (it needs the BT.709 matrix on the way to Y'CbCr)."""
+    name = (pix_fmt or "").lower()
+    return name.startswith(("rgb", "bgr", "argb", "abgr", "gbr", "0rgb", "0bgr", "pal8"))
+
+
+def _fit_filter(width: int, height: int, fit: str, pad: str = "black") -> str:
+    """Scale (and pad or crop) to the raster: fit (letterbox), fill (crop) or center (1:1).
+    `pad` is the colour of the bars (a stinger's are transparent: black@0)."""
     if fit == "fill":
         return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
     if fit in {"center", "1:1"}:
-        return f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,crop={width}:{height}"
-    return f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+        return f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:{pad},crop={width}:{height}"
+    return f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:{pad}"
 
 
 def build_still_filter(*, width: int, height: int, fit: str = "fit") -> str:
@@ -239,20 +247,25 @@ def build_video_filter(
     src_interlaced: bool = False,
     color_space: str = "",
     dst_pix_fmt: str = "yuv422p10le",
+    rgb: bool = False,
+    pad: str = "black",
 ) -> str:
-    """Build an ffmpeg -vf chain matching mxl-test-player conversion semantics."""
+    """Build an ffmpeg -vf chain matching mxl-test-player conversion semantics. An R'G'B' source
+    (`rgb`: TGA, PNG, QuickTime Animation) is converted with the BT.709 matrix to limited range."""
     parts: list[str] = []
     if src_interlaced:
         parts.append("bwdif=mode=send_frame")
     cs = (color_space or "").lower()
     if cs in {"smpte170m", "bt470bg", "smpte240m"}:
         parts.append("colorspace=all=bt709:iall=bt601")
-    parts.append(_fit_filter(width, height, fit))
+    parts.append(_fit_filter(width, height, fit, pad))
     fps = f"{fps_num}/{fps_den}"
     if fps_mode == "motion":
         parts.append(f"minterpolate=fps={fps}:mi_mode=mci")
     else:
         parts.append(f"fps={fps}")
+    if rgb:
+        parts.append("scale=out_color_matrix=bt709:out_range=tv")
     parts.append(f"format={dst_pix_fmt}")
     return ",".join(parts)
 
@@ -300,12 +313,14 @@ _NVENC_PROBE = [
 ]
 
 
-def build_clip_video_command(*, original: Path, video_tmp: Path, vf: str, keyint: int, threads: int, nvenc: bool) -> list[str]:
+def build_clip_video_command(
+    *, original: Path | None, video_tmp: Path, vf: str, keyint: int, threads: int, nvenc: bool, input_args: list[str] | None = None
+) -> list[str]:
     """Clip picture to the HEVC 4:4:4 10-bit mezzanine (Matroska); the sound is conformed by its
     own command into a raw file next to it. `threads` is the conversion's CPU budget
     (conversion_threads). NVENC encodes on the GPU, so decoding and scaling get the budget
     (half each). x265 gets it for its workers; decoding and scaling, on one thread each, keep up
-    with it."""
+    with it. `input_args` replace "-i original" (a stinger's image sequence)."""
     if nvenc:
         helpers = str(max(1, threads // 2))
         # After _INPUT: these override its one-thread defaults.
@@ -322,8 +337,7 @@ def build_clip_video_command(*, original: Path, video_tmp: Path, vf: str, keyint
         *_FFMPEG,
         *_INPUT,
         *threading_args,
-        "-i",
-        str(original),
+        *(input_args or ["-i", str(original)]),
         "-an",
         "-sn",
         "-dn",
@@ -430,26 +444,36 @@ def build_thumb_command(*, mezz: Path, thumb: Path) -> list[str]:
     ]
 
 
-def build_stinger_mezz_command(*, input_args: list[str], mezz: Path, vf: str, threads: int) -> list[str]:
-    """ProRes 4444 mezzanine for stingers (preserves alpha when present). No sound: the
-    mixer plays only a stinger's picture. The encoder gets `threads` threads
-    (conversion_threads)."""
+def build_stinger_alpha_command(
+    *, input_args: list[str], alpha_tmp: Path, vf: str, width: int, height: int, fps: str, keyint: int, threads: int, nvenc: bool
+) -> list[str]:
+    """A stinger's alpha as the luma of HEVC 4:2:0 10-bit (Matroska; chroma 512, no range
+    conversion), lossless, since NVDEC decodes no alpha and no 4:0:0 (docs/engine-p3.md §6). `vf`
+    ends in yuva444p10le; `fps` is the format's rate (n/d). NVENC lossless, else x265 lossless."""
+    if nvenc:
+        encoder = ["-c:v", "hevc_nvenc", "-profile:v", "main10", "-preset", "p5", "-tune", "lossless", "-bf", "0", "-g", str(keyint)]
+    else:
+        params = f"lossless=1:keyint={keyint}:min-keyint={keyint}:bframes=0:scenecut=0:pools={threads}:log-level=error"
+        encoder = ["-c:v", "libx265", "-profile:v", "main10", "-preset", "medium", "-x265-params", params]
+    grey = f"color=c=0x808080:s={width // 2}x{height // 2}:r={fps},format=gray10le,setsar=1"
     return [
         *_FFMPEG,
         *_INPUT,
         *input_args,
-        "-vf",
-        vf,
-        "-threads",
-        str(threads),
-        "-c:v",
-        "prores_ks",
-        "-profile:v",
-        "4",
-        "-pix_fmt",
-        "yuva444p10le",
-        "-an",
         "-f",
-        "mov",
-        str(mezz),
+        "lavfi",
+        "-i",
+        grey,
+        "-filter_complex",
+        f"[0:v]{vf},extractplanes=a,setsar=1[a];[a][1:v][1:v]mergeplanes=0x001020:yuv420p10le[alpha]",
+        "-map",
+        "[alpha]",
+        "-shortest",
+        "-an",
+        "-sn",
+        "-dn",
+        *encoder,
+        "-f",
+        "matroska",
+        str(alpha_tmp),
     ]

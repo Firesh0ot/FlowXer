@@ -28,6 +28,19 @@ void crossfadeBlock(float const* a, float const* b, float* out, std::size_t samp
     }
 }
 
+float stingerFadeT(int f, int cut, int frames)
+{
+    if (f < 0)
+    {
+        return 0.f;
+    }
+    if (f >= frames - 1)
+    {
+        return 1.f;
+    }
+    return std::fmin(1.f, std::fmax(0.f, static_cast<float>(f - cut + 3) / 4.f));
+}
+
 SampleRange grainSamples(Rate rate, std::uint64_t index)
 {
     Rate const audio{kAudioRate, 1};

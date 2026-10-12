@@ -87,8 +87,6 @@ class LibraryService:
         self.queue = ConversionQueue(
             self.store,
             concurrency=settings.convert_concurrency,
-            ram_clip_max_s=settings.ram_clip_max_s,
-            ram_budget_mb=settings.ram_budget_mb,
             on_update=self._job_update,
         )
         # Set by the mixer: the inputs/slots that use an item (derived from the mixer state,
@@ -258,12 +256,22 @@ class LibraryService:
         return path if path.is_file() else None
 
     def audio_path(self, item_id: str, format_id: str | None = None) -> Path | None:
-        """A ready clip's sound file (raw float32, interleaved)."""
+        """A ready clip's or stinger's sound file (raw float32, interleaved); None for a silent
+        stinger."""
         fmt = format_id or self._format_id
         item = self.get(item_id)
-        if item is None or item.kind != LibraryKind.clip or not item.is_ready(fmt):
+        if item is None or item.kind == LibraryKind.still or not item.is_ready(fmt):
             return None
         path = self.store.audio_path(item_id, fmt)
+        return path if path.is_file() else None
+
+    def alpha_path(self, item_id: str, format_id: str | None = None) -> Path | None:
+        """A ready stinger's alpha stream; None for an opaque stinger."""
+        fmt = format_id or self._format_id
+        item = self.get(item_id)
+        if item is None or item.kind != LibraryKind.stinger or not item.is_ready(fmt) or not item.conversion_for(fmt).has_alpha:
+            return None
+        path = self.store.alpha_path(item_id, fmt)
         return path if path.is_file() else None
 
     def playback_mode(self, item_id: str, format_id: str | None = None) -> str:
@@ -336,8 +344,9 @@ class LibraryService:
         options: ConvertOptions | None = None,
         move: bool = False,
     ) -> LibraryItem:
-        """Make a library item from a file or TGA folder. Only quick checks run here (a ZIP
-        is unpacked by its conversion job). On any error no item directory is left."""
+        """Make a library item from a file or an image sequence folder (TGA or PNG, a WAV). Only
+        quick checks run here (a ZIP is unpacked by its conversion job). On any error no item
+        directory is left."""
         options = options or ConvertOptions()
         display_name = name or path.name
         zipped = path.is_file() and (
@@ -345,7 +354,7 @@ class LibraryService:
             or (path.suffix.lower() == ".zip" and (kind == LibraryKind.stinger or mode == UploadMode.image_sequence))
         )
         if (zipped or mode != UploadMode.video) and kind != LibraryKind.stinger:
-            raise ValueError("TGA sequences and ZIPs are stingers")
+            raise ValueError("image sequences and ZIPs are stingers")
         item_id = new_item_id()
         directory = self.store.item_dir(item_id)
         directory.mkdir(parents=True)
@@ -392,7 +401,8 @@ class LibraryService:
         return item
 
     def ingest_sequence_dir(self, stage: Path, *, name: str, options: ConvertOptions | None = None) -> LibraryItem:
-        """A TGA folder written by POST /uploads/sequence (moved, not copied)."""
+        """A sequence folder (TGA or PNG frames, a WAV) written by POST /uploads/sequence (moved,
+        not copied)."""
         return self.ingest_path(
             stage,
             kind=LibraryKind.stinger,

@@ -8,6 +8,7 @@
 //   recycled device frame and publishes it to the input's short ring; re-opens on a new route;
 // - fx-key<n>: the same for a key input (v210a fill + key);
 // - fx-cp<n>: a clip player's decoder (GPU decode of clips, stills uploaded once);
+// - fx-st<n>: a stinger player's decoder (colour and alpha in lockstep, sound);
 // - fx-render: one per process, on the TAI grid: picks input grain i - L, renders the MEs
 //   (descending, so re-entry is same-grain), keys the DSKs, packs, draws the mosaic, hands the
 //   grain slot to the writer;
@@ -45,6 +46,10 @@ public:
     bool routeKey(int k, Route const& route);
     // Clip player k (1-based). Returns an error message, empty when done.
     std::string playerCommand(int k, PlayerCommand const& command);
+    // Stinger player k (1-based), and the frames of its loaded stinger (0: none; -1: no such
+    // player).
+    std::string stingerCommand(int k, PlayerCommand const& command);
+    [[nodiscard]] long long stingerFrames(int k) const;
 
     [[nodiscard]] std::string statusJson() const;
     [[nodiscard]] std::string metricsText() const;

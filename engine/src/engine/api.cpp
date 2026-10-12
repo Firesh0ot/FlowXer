@@ -2,8 +2,11 @@
 
 #include "engine/engine.hpp"
 
+#include "core/pixel.hpp"
+
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
 #include <optional>
 
 namespace fxeng
@@ -51,6 +54,29 @@ Route routeOf(json const& body)
     return Route{text(body, "domain"), text(body, "flow")};
 }
 
+// "#RRGGBB" as 10-bit BT.709 limited-range Y'CbCr.
+bool parseColour(std::string const& text, WipeSettings& wipe)
+{
+    unsigned r = 0;
+    unsigned g = 0;
+    unsigned b = 0;
+    if (text.size() != 7 || text[0] != '#' || text.find_first_not_of("0123456789abcdefABCDEF", 1) != std::string::npos ||
+        std::sscanf(text.c_str() + 1, "%2x%2x%2x", &r, &g, &b) != 3)
+    {
+        return false;
+    }
+    rgbToYcbcr(Rgb{static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f, static_cast<float>(b) / 255.f}, wipe.borderY, wipe.borderCb,
+        wipe.borderCr);
+    return true;
+}
+
+json transitionJson(TransitionSettings const& next)
+{
+    auto const& w = next.wipe;
+    return json{{"type", transitionName(next.type)}, {"frames", next.frames}, {"pattern", w.pattern}, {"reverse", w.reverse}, {"soft", w.soft},
+        {"border", w.border}, {"border_ycbcr", {w.borderY, w.borderCb, w.borderCr}}};
+}
+
 json meView(Engine& engine, int me)
 {
     for (auto const& view : engine.mixer().view())
@@ -58,7 +84,9 @@ json meView(Engine& engine, int me)
         if (view.me == me)
         {
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
-                {"target", sourceName(view.target)}, {"frames", view.frames}};
+                {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
+                {"stinger", view.stinger},
+                {"transition", transitionJson(view.next)}};
         }
     }
     return json::object();
@@ -76,8 +104,14 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "ME " + std::to_string(me) + " takes the inputs, the clip players, black and the Program of a higher ME (re-entry n > m)");
     case MixResult::BadFrames:
         return error(400, "frames must be 1.." + std::to_string(Mixer::kMaxFrames));
+    case MixResult::BadPattern:
+        return error(400, "pattern must be a wipe code of P3, soft and border 0..1");
+    case MixResult::BadPosition:
+        return error(400, "t must be 0..1");
+    case MixResult::BadKey:
+        return error(400, "clip, soft and gain must be 0..1");
     case MixResult::Busy:
-        return error(409, "a Mix is running on ME " + std::to_string(me));
+        return error(409, "a transition is running on ME " + std::to_string(me));
     }
     return error(500, "unexpected");
 }
@@ -108,10 +142,52 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         }
         return mixResult(engine, action == "preview" ? mixer.setPreview(me, *s) : mixer.setProgram(me, *s), me, "ME");
     }
+    if (action == "transition")
+    {
+        TransitionSettings next;
+        for (auto const& view : mixer.view())
+        {
+            if (view.me == me)
+            {
+                next = view.next;
+            }
+        }
+        auto const type = body.contains("type") ? parseTransition(text(body, "type")) : next.type;
+        auto const n = frames(body, next.frames);
+        if (!type || *type == Transition::Cut || !n)
+        {
+            return error(400, "type must be mix, wipe or stinger and frames an integer");
+        }
+        next.type = *type;
+        next.frames = *n;
+        auto& wipe = next.wipe;
+        try
+        {
+            wipe.pattern = body.value("pattern", wipe.pattern);
+            wipe.reverse = body.value("reverse", wipe.reverse);
+            wipe.soft = body.value("soft", wipe.soft);
+            wipe.border = body.value("border", wipe.border);
+        }
+        catch (json::exception const&)
+        {
+            return error(400, "pattern must be an integer, reverse a boolean, soft and border numbers");
+        }
+        if (body.contains("border_color") && !parseColour(text(body, "border_color"), wipe))
+        {
+            return error(400, "border_color must be #RRGGBB");
+        }
+        return mixResult(engine, mixer.setTransition(me, next), me, "ME");
+    }
     if (action == "take")
     {
         auto const s = source("source");
         auto const n = frames(body, 0);
+        // P2's take with frames > 0 is a mix.
+        auto const type = body.contains("type") ? parseTransition(text(body, "type")) : Transition::Mix;
+        if (!type)
+        {
+            return error(400, "type must be cut, mix, wipe or stinger");
+        }
         std::optional<Source> preview;
         if (body.contains("preview") && !body["preview"].is_null())
         {
@@ -125,7 +201,23 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "take needs a source (in<n>, cp<n>, black, me<n>) and integer frames");
         }
-        return mixResult(engine, mixer.take(me, *s, *n, preview), me, "ME");
+        // A stinger: its player's loaded stinger and cut frame (a player without one cuts).
+        Sting sting;
+        if (*type == Transition::Stinger && body.contains("stinger"))
+        {
+            if (!body["stinger"].is_number_integer() || (body.contains("cut") && !body["cut"].is_number_integer()))
+            {
+                return error(400, "stinger (the player) and cut must be integers");
+            }
+            sting.player = body["stinger"].get<int>();
+            sting.cut = body.value("cut", 0);
+            sting.frames = static_cast<int>(engine.stingerFrames(sting.player));
+            if (sting.frames < 0)
+            {
+                return error(404, "no stinger player " + std::to_string(sting.player));
+            }
+        }
+        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting), me, "ME");
     }
     if (action == "cut")
     {
@@ -133,12 +225,42 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
     }
     if (action == "auto")
     {
-        auto const n = frames(body, 25);
-        if (!n)
+        if (body.contains("frames") && !body["frames"].is_number_integer())
         {
             return error(400, "frames must be an integer");
         }
-        return mixResult(engine, mixer.autoMix(me, *n), me, "ME");
+        auto const n = body.contains("frames") ? std::optional<int>(body["frames"].get<int>()) : std::nullopt;
+        return mixResult(engine, mixer.autoTransition(me, n), me, "ME");
+    }
+    if (action == "ftb" || action == "ftb/auto")
+    {
+        MixResult result = MixResult::Ok;
+        if (action == "ftb")
+        {
+            if (!body.contains("on") || !body["on"].is_boolean())
+            {
+                return error(400, "on must be true or false");
+            }
+            result = mixer.ftbSet(me, body["on"].get<bool>());
+        }
+        else
+        {
+            auto const n = frames(body, 25);
+            if (!n)
+            {
+                return error(400, "frames must be an integer");
+            }
+            result = mixer.ftbAuto(me, *n);
+        }
+        return result == MixResult::Ok ? reply(200, json{{"me", me}, {"ftb", mixer.ftbGain(me)}}) : mixResult(engine, result, me, "ME");
+    }
+    if (action == "position")
+    {
+        if (!body.contains("t") || !body["t"].is_number())
+        {
+            return error(400, "t must be a number 0..1");
+        }
+        return mixResult(engine, mixer.position(me, body["t"].get<float>()), me, "ME");
     }
     return error(404, "unknown action " + action);
 }
@@ -246,7 +368,27 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     {
         return playerCommand(engine, k, rest, body);
     }
-    if (int const k = pathNumber(request.path, "/dsk/", rest); k > 0)
+    if (int const k = pathNumber(request.path, "/stinger/", rest); k > 0 && rest == "load")
+    {
+        // A stinger onto stinger player k (path "" unloads): cued on its first frame, played by
+        // a take with type stinger.
+        PlayerCommand command;
+        command.action = PlayerCommand::Action::Load;
+        command.kind = "stinger";
+        command.path = text(body, "path");
+        command.alpha = text(body, "alpha");
+        command.audio = text(body, "audio");
+        command.channels = body.contains("channels") && body["channels"].is_number_integer() ? body["channels"].get<int>() : 0;
+        command.frames = body.contains("frames") && body["frames"].is_number_integer() ? body["frames"].get<long long>() : 0;
+        command.playOnCut = true;
+        auto const failed = engine.stingerCommand(k, command);
+        if (!failed.empty())
+        {
+            return error(failed.rfind("no stinger player", 0) == 0 ? 404 : 409, failed);
+        }
+        return reply(200, json{{"stinger", k}, {"frames", engine.stingerFrames(k)}});
+    }
+    if (int const k = pathNumber(request.path, "/keyer/", rest); k > 0)
     {
         auto& mixer = engine.mixer();
         MixResult result = MixResult::Ok;
@@ -256,7 +398,7 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
             {
                 return error(400, "on must be true or false");
             }
-            result = mixer.dskSet(k, body["on"].get<bool>());
+            result = mixer.keySet(k, body["on"].get<bool>());
         }
         else if (rest == "auto")
         {
@@ -265,24 +407,55 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
             {
                 return error(400, "frames must be an integer");
             }
-            result = mixer.dskAuto(k, *n);
+            result = mixer.keyAuto(k, *n);
+        }
+        else if (rest == "settings")
+        {
+            KeySettings set;
+            auto const mode = text(body, "mode");
+            if (mode != "linear" && mode != "luma")
+            {
+                return error(400, "mode must be linear or luma");
+            }
+            set.luma = mode == "luma";
+            if (set.luma)
+            {
+                auto const source = parseSource(text(body, "source"));
+                if (!source)
+                {
+                    return error(400, "a luma key needs a source (in<n>, cp<n>, black, me<n>)");
+                }
+                set.source = *source;
+            }
+            try
+            {
+                set.clip = body.value("clip", set.clip);
+                set.soft = body.value("soft", set.soft);
+                set.gain = body.value("gain", set.gain);
+                set.invert = body.value("invert", set.invert);
+            }
+            catch (json::exception const&)
+            {
+                return error(400, "clip, soft and gain must be numbers, invert a boolean");
+            }
+            result = mixer.keySettings(k, set);
         }
         else
         {
-            return error(404, "unknown DSK action " + rest);
+            return error(404, "unknown keyer action " + rest);
         }
         if (result != MixResult::Ok)
         {
-            return mixResult(engine, result, k, "DSK");
+            return mixResult(engine, result, k, "keyer");
         }
-        for (auto const& dsk : mixer.dskView())
+        for (auto const& key : mixer.keyView())
         {
-            if (dsk.key == k)
+            if (key.key == k)
             {
-                return reply(200, json{{"dsk", k}, {"on", dsk.on}, {"transition", dsk.transition}, {"gain", dsk.gain}});
+                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}});
             }
         }
-        return reply(200, json{{"dsk", k}});
+        return reply(200, json{{"key", k}});
     }
     return error(404, "not found");
 }

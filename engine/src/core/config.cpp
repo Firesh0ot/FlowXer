@@ -163,7 +163,8 @@ std::vector<PlayerConfig> parsePlayers(std::string const& text)
     return players;
 }
 
-// FLOWXER_ENGINE_KEYS: [{"label", "domain", "flow", "me"}], one DSK per key input.
+// FLOWXER_ENGINE_KEYS: [{"label", "domain", "flow", "me", "stage": "upstream" | "downstream"}], one
+// keyer per entry (default a DSK of ME 1).
 std::vector<KeyConfig> parseKeys(std::string const& text, int mes)
 {
     std::vector<KeyConfig> keys;
@@ -185,6 +186,12 @@ std::vector<KeyConfig> parseKeys(std::string const& text, int mes)
             }
             key.me = item["me"].get<int>();
         }
+        auto const stage = field(item, "stage");
+        if (!stage.empty() && stage != "upstream" && stage != "downstream")
+        {
+            throw ConfigError("FLOWXER_ENGINE_KEYS: \"stage\" must be upstream or downstream");
+        }
+        key.upstream = stage == "upstream";
         if (!key.route.flow.empty() && key.route.domain.empty())
         {
             throw ConfigError("FLOWXER_ENGINE_KEYS: key " + std::to_string(keys.size() + 1) + " has a flow but no \"domain\"");
@@ -193,7 +200,7 @@ std::vector<KeyConfig> parseKeys(std::string const& text, int mes)
     }
     if (keys.size() > static_cast<std::size_t>(kMaxKeys))
     {
-        throw ConfigError("FLOWXER_ENGINE_KEYS: at most " + std::to_string(kMaxKeys) + " key inputs");
+        throw ConfigError("FLOWXER_ENGINE_KEYS: at most " + std::to_string(kMaxKeys) + " keyers");
     }
     return keys;
 }
@@ -305,6 +312,7 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     }
     cfg.mes = getInt(values, "FLOWXER_ENGINE_MES", cfg.mes, 1, kMaxMes);
     cfg.keys = parseKeys(get(values, "FLOWXER_ENGINE_KEYS", ""), cfg.mes);
+    cfg.stingerPlayers = getInt(values, "FLOWXER_ENGINE_STINGER_PLAYERS", cfg.stingerPlayers, 0, kMaxStingerPlayers);
     cfg.latency = getInt(values, "FLOWXER_ENGINE_LATENCY", cfg.latency, 1, kMaxLatency);
     cfg.format = get(values, "FLOWXER_ENGINE_FORMAT", cfg.format);
     if (!parseFormat(cfg.format, cfg.width, cfg.height, cfg.rate))

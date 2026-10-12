@@ -60,9 +60,10 @@ export function LibraryModal({
     setProgress(0);
     try {
       if (kind === "stinger" && mode === "folder") {
-        const tga = files.filter((file) => file.name.toLowerCase().endsWith(".tga"));
-        if (!tga.length) throw new Error("Drop a folder of .tga frames");
-        await api.uploadSequence(tga[0].webkitRelativePath?.split("/")[0] || "sequence", tga, {
+        // TGA or PNG frames and one optional WAV (the stinger's sound).
+        const sequence = files.filter((file) => /\.(tga|png|wav)$/i.test(file.name));
+        if (!sequence.some((file) => /\.(tga|png)$/i.test(file.name))) throw new Error("Drop a folder of .tga or .png frames");
+        await api.uploadSequence(sequence[0].webkitRelativePath?.split("/")[0] || "sequence", sequence, {
           sequence_fps: sequenceFps,
           cut_frame: cutFrame,
           fit,
@@ -116,9 +117,9 @@ export function LibraryModal({
           />
           {kind === "stinger" ? (
             <select value={mode} onChange={(e) => setMode(e.target.value as UploadMode)}>
-              <option value="video">Video file</option>
-              <option value="folder">TGA folder</option>
-              <option value="zip">TGA zip</option>
+              <option value="video">Video file (with alpha)</option>
+              <option value="folder">TGA/PNG folder (+ WAV)</option>
+              <option value="zip">TGA/PNG zip (+ WAV)</option>
             </select>
           ) : null}
           <select value={fit} onChange={(e) => setFit(e.target.value)}>
@@ -160,7 +161,7 @@ export function LibraryModal({
                 mode === "zip"
                   ? ".zip"
                   : mode === "folder"
-                    ? ".tga"
+                    ? ".tga,.png,.wav"
                     : kind === "clip"
                       ? "video/*,image/*,.mov,.mxf,.mkv,.ts,.dpx,.exr"
                       : "video/*,.mov,.mxf,.mkv,.ts"
@@ -214,6 +215,9 @@ export function LibraryModal({
                   {item.ready ? "ready" : item.status}
                   {item.playback !== "unknown" ? ` · ${item.playback}` : ""}
                   {item.frame_count ? ` · ${item.frame_count}f` : ""}
+                  {item.kind === "stinger"
+                    ? ` · ${item.has_alpha ? "alpha" : "opaque"}${item.has_sound ? " · sound" : ""} · cut ${item.cut_frame ?? 0}`
+                    : ""}
                   {item.in_use ? " · in use" : ""}
                 </p>
                 {item.error ? <p className="error">{item.error}</p> : null}

@@ -72,8 +72,8 @@ OPENAPI_TAGS = [
     {
         "name": "stinger",
         "description": (
-            "Stinger slots and their media (TGA sequence or video). Stinger playback comes back "
-            "in P3; until then a stinger take is a cut."
+            "Stinger slots and their media (library stingers: TGA or PNG sequences with a WAV, or "
+            "video with alpha). Stingers play on the GPU with alpha and sound."
         ),
     },
     {

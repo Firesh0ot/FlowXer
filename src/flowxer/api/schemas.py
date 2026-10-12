@@ -38,7 +38,64 @@ class ProgramBus(str, Enum):
 class TransitionType(str, Enum):
     cut = "cut"
     mix = "mix"
+    wipe = "wipe"
     stinger = "stinger"
+
+
+# SMPTE ST 258 wipe codes (docs/engine-p3.md §4): bars 1, 2; corner boxes 3-6; barn doors 21, 22;
+# edge boxes 23-26; diagonals 41, 42; diagonal barn doors 45, 46; box 101; diamond 102; circle 119;
+# clock 201-204.
+WIPE_CODES = (1, 2, 3, 4, 5, 6, 21, 22, 23, 24, 25, 26, 41, 42, 45, 46, 101, 102, 119, 201, 202, 203, 204)
+
+
+class WipeSettings(BaseModel):
+    pattern: int = Field(default=1, description="SMPTE wipe code: " + ", ".join(map(str, WIPE_CODES)))
+    reverse: bool = Field(default=False, description="Run the pattern backwards")
+    alternate: bool = Field(
+        default=False, description="Flip-flop: reverse toggles after each wipe, so the next one goes back"
+    )
+    soft: float = Field(default=0.0, ge=0.0, le=1.0, description="Soft edge, a fraction of the pattern's travel")
+    border: float = Field(default=0.0, ge=0.0, le=1.0, description="Border width, a fraction of the pattern's travel")
+    border_color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+
+    @field_validator("pattern")
+    @classmethod
+    def _known_code(cls, value: int) -> int:
+        if value not in WIPE_CODES:
+            raise ValueError(f"pattern must be one of {', '.join(map(str, WIPE_CODES))}")
+        return value
+
+
+class WipeSettingsUpdate(BaseModel):
+    pattern: int | None = None
+    reverse: bool | None = None
+    alternate: bool | None = None
+    soft: float | None = None
+    border: float | None = None
+    border_color: str | None = None
+
+
+class PanelTransition(BaseModel):
+    """An ME's next transition: what Auto runs."""
+
+    type: TransitionType = Field(default=TransitionType.mix, description="mix, wipe or stinger")
+    rate_frames: int = Field(default=25, ge=1, le=1000, description="Duration of Auto in frames")
+    wipe: WipeSettings = Field(default_factory=WipeSettings)
+    stinger_slot_id: str | None = Field(default=None, description="The stinger slot of type stinger")
+
+    @field_validator("type")
+    @classmethod
+    def _not_cut(cls, value: TransitionType) -> TransitionType:
+        if value == TransitionType.cut:
+            raise ValueError("type must be mix, wipe or stinger")
+        return value
+
+
+class PanelTransitionUpdate(BaseModel):
+    type: TransitionType | None = None
+    rate_frames: int | None = None
+    wipe: WipeSettingsUpdate | None = None
+    stinger_slot_id: str | None = None
 
 
 class StingerPhase(str, Enum):
@@ -168,7 +225,7 @@ class LogicalInputUpdate(BaseModel):
         default=None,
         description=(
             "Stinger slot played when this source is taken to Program or Cut from Preview. "
-            "Null disables auto-stinger. Stingers come back in P3; until then such a take is a cut."
+            "Null disables auto-stinger."
         ),
     )
 
@@ -194,6 +251,12 @@ class TakeRequest(BaseModel):
     )
     transition: TransitionType = TransitionType.cut
     duration_ms: int = Field(default=0, ge=0, le=10000)
+    frames: int | None = Field(
+        default=None,
+        ge=0,
+        le=1000,
+        description="Duration in frames (instead of duration_ms); a wipe without either takes the ME's rate",
+    )
     stinger_id: str | None = None
     panel_id: str = Field(default="me-1", description="Mixer panel (ME) to cut to program")
 
@@ -216,6 +279,18 @@ class PanelTransitionRequest(BaseModel):
     armed: bool | None = Field(
         default=None,
         description="For Wipe: true arms, false disarms. Omit to toggle.",
+    )
+
+
+class AutoRequest(BaseModel):
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME)")
+    frames: int | None = Field(default=None, ge=1, le=1000, description="Duration in frames (default: the ME's rate)")
+
+
+class PositionRequest(BaseModel):
+    panel_id: str = Field(default="me-1", description="Mixer panel (ME)")
+    position: float = Field(
+        ..., ge=0.0, le=1.0, description="T-bar: off 0 starts the ME's transition, 1 completes it, 0 ends it without the swap"
     )
 
 
@@ -369,16 +444,46 @@ class MixerPanel(BaseModel):
     preview_input_id: str | None = None
     wipe_armed: bool = False
     last_transition: str = "cut"
+    transition: PanelTransition = Field(default_factory=PanelTransition)
+    ftb: bool = Field(default=False, description="Fade to Black: the ME's whole output (DSKs and sound too) is black")
 
 
-class DownstreamKeyer(BaseModel):
-    """A downstream keyer on ME 1: keys its key input (a v210a fill + key MXL flow, NMOS
-    receiver "<label> Key") over ME 1 Program only (keys have no preview)."""
+class KeyerStage(str, Enum):
+    upstream = "upstream"
+    downstream = "downstream"
+
+
+class KeyMode(str, Enum):
+    linear = "linear"
+    luma = "luma"
+
+
+class Keyer(BaseModel):
+    """An upstream keyer (before the transition) or a DSK (after it) of one ME. Keys show on the
+    ME's Program only (keys have no preview). Linear: its key input, a v210a fill + key MXL flow
+    (NMOS receiver `receiver_label`). Luma: a self key of a source the ME may take."""
 
     id: str
     label: str
+    panel_id: str = Field(default="me-1", description="The ME it keys")
+    stage: KeyerStage = Field(default=KeyerStage.downstream)
     enabled: bool = Field(default=False, description="On air")
     rate_ms: int = Field(default=500, ge=1, le=10000, description="Duration of its Auto (fade on or off)")
+    mode: KeyMode = Field(default=KeyMode.linear)
+    source_id: str | None = Field(default=None, description="Luma: the keyed source (an input or me-<n>)")
+    clip: float = Field(default=0.5, ge=0.0, le=1.0, description="Luma: the level that keys (0 black .. 1 white)")
+    soft: float = Field(default=0.1, ge=0.0, le=1.0, description="Luma: the softness above the clip")
+    gain: float = Field(default=1.0, ge=0.0, le=1.0, description="Scales the key")
+    invert: bool = Field(default=False, description="Luma: key the dark parts")
+
+    @property
+    def receiver_label(self) -> str:
+        """Its key input's NMOS receiver: `ME n Key k` (upstream) or `<label> Key` (DSK)."""
+        return self.label if self.stage == KeyerStage.upstream else f"{self.label} Key"
+
+
+# P2 name of the keyer model.
+DownstreamKeyer = Keyer
 
 
 class StingerSlot(BaseModel):
@@ -417,13 +522,25 @@ class WorkspaceConfig(BaseModel):
         description="shared = one TGA sequence for in and out; separate = dedicated in/out stingers",
     )
     stinger_count: int = Field(default=1, ge=1, le=8)
-    downstream_keyer_count: int = Field(
-        default=1, ge=0, le=8, description="Downstream keyers on ME 1 (this version has at most one)"
+    keyers_per_me: int = Field(default=2, ge=0, le=8, description="Upstream keyers of every rendering ME")
+    dsks_per_me: int = Field(default=1, ge=0, le=4, description="DSKs of every rendering ME")
+    stinger_players: int = Field(
+        default=1, ge=0, le=4, description="Stinger players (at most the rendering MEs; each plays one stinger at a time)"
     )
     source_tile_aspect: str = Field(
         default="16:9",
         description="Operator source-tile picture ratio: 16:9 (landscape) or 9:16 (portrait).",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _p2_keyers(cls, data):
+        # P2: downstream_keyer_count (0 or 1, DSK 1 on ME 1) is the DSKs per ME now.
+        if isinstance(data, dict) and "downstream_keyer_count" in data:
+            data = dict(data)
+            count = data.pop("downstream_keyer_count")
+            data.setdefault("dsks_per_me", min(int(count or 0), 4))
+        return data
 
 
 class WorkspaceUpdate(BaseModel):
@@ -432,17 +549,34 @@ class WorkspaceUpdate(BaseModel):
     mixer_panel_count: int | None = Field(default=None, ge=1, le=4)
     stinger_mode: str | None = None
     stinger_count: int | None = Field(default=None, ge=1, le=8)
-    downstream_keyer_count: int | None = Field(default=None, ge=0, le=8)
+    keyers_per_me: int | None = Field(default=None, ge=0, le=8)
+    dsks_per_me: int | None = Field(default=None, ge=0, le=4)
+    stinger_players: int | None = Field(default=None, ge=0, le=4)
     source_tile_aspect: str | None = Field(
         default=None,
         description="16:9 or 9:16 source tiles on the operator deck",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _p2_keyers(cls, data):
+        if isinstance(data, dict) and "downstream_keyer_count" in data:
+            data = dict(data)
+            count = data.pop("downstream_keyer_count")
+            data.setdefault("dsks_per_me", min(int(count or 0), 4) if count is not None else None)
+        return data
 
 
 class KeyerUpdate(BaseModel):
     enabled: bool | None = Field(default=None, description="On or off at the next frame")
     label: str | None = None
     rate_ms: int | None = Field(default=None, ge=1, le=10000, description="Duration of its Auto")
+    mode: KeyMode | None = None
+    source_id: str | None = None
+    clip: float | None = Field(default=None, ge=0.0, le=1.0)
+    soft: float | None = Field(default=None, ge=0.0, le=1.0)
+    gain: float | None = Field(default=None, ge=0.0, le=1.0)
+    invert: bool | None = None
 
 
 class StingerSlotUpdate(BaseModel):
@@ -549,7 +683,7 @@ class ConsoleState(BaseModel):
     formats: list[dict]
     inputs: list[LogicalInput]
     panels: list[MixerPanel]
-    keyers: list[DownstreamKeyer]
+    keyers: list[Keyer]
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
     resources: ResourceInfo
@@ -592,6 +726,8 @@ class LibraryItemOut(BaseModel):
     ready: bool = False
     playback: str = "unknown"
     has_alpha: bool = False
+    # A clip or stinger with sound (a stinger's sound goes into PGM).
+    has_sound: bool = False
     cut_frame: int | None = None
     cut_ms: int | None = None
     frame_count: int = 0

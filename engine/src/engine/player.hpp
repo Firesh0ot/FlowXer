@@ -6,6 +6,10 @@
 // Clips are the library's mezzanine: HEVC 4:4:4 (10-bit) at the engine's raster and rate,
 // decoded by NVDEC, plus a raw sound file (float32, interleaved, 48 kHz) of exactly the clip's
 // length. Stills are one raw v210 picture at the engine's raster.
+//
+// A stinger player is a clip player whose pictures are v210a: the stinger's colour (the clip
+// mezzanine) and its alpha (the luma of a lossless HEVC 4:2:0 10-bit stream, decoded in lockstep)
+// as the key plane; an opaque stinger has no alpha stream and a full key.
 #pragma once
 
 #include "core/tai.hpp"
@@ -41,6 +45,8 @@ struct PlayerCommand
     std::string audio;
     int channels = 0;
     long long frames = 0;
+    // Load of a stinger: its alpha stream ("" : opaque).
+    std::string alpha;
     bool loop = false;
     // Play when the player goes to an ME's Program.
     bool playOnCut = false;
@@ -58,6 +64,9 @@ struct PlayerSetup
     int gpu = 0;
     // Bytes of a packed v210 picture.
     std::size_t frameBytes = 0;
+    // A stinger player: the bytes per line of the v210a key plane after the picture; 0 for a clip
+    // player.
+    int keyRowBytes = 0;
     // Channels of the PGM audio.
     std::size_t channels = 2;
 };
@@ -67,7 +76,7 @@ struct PlayerFrame
 {
     // The output grain.
     std::uint64_t index = 0;
-    // Packed v210 on the device; nullptr: black.
+    // Packed v210 on the device (a stinger player's: v210a); nullptr: black.
     std::uint8_t const* v210 = nullptr;
     // Recorded after the picture was made; the render stream waits on it.
     cudaEvent_t ready = nullptr;
@@ -99,10 +108,15 @@ public:
     void start();
     void stop();
     // Render thread: the frame of output grain `index`. `onAir` is true while the player is in an
-    // ME's Program (play on cut starts it then).
+    // ME's Program (play on cut starts it then). A stinger player is on air while a stinger of it
+    // runs; off air it cues its first frame again.
     std::shared_ptr<PlayerFrame> frameFor(std::uint64_t index, bool onAir);
     // An error message, empty when done.
     std::string command(PlayerCommand const& command);
+    // Cued on the first frame with that frame decoded: a play shows it at once.
+    [[nodiscard]] bool ready() const;
+    // Frames of the loaded media (0: none, or it failed).
+    [[nodiscard]] long long frames() const;
     [[nodiscard]] std::string statusJson() const;
     [[nodiscard]] std::size_t deviceBytes() const;
 

@@ -5,10 +5,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from flowxer.api.schemas import (
+    AutoRequest,
     ConsoleState,
     ConvertJobOut,
     DomainInfo,
-    DownstreamKeyer,
+    Keyer,
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
@@ -21,8 +22,11 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
+    PanelTransition,
     PanelTransitionRequest,
+    PanelTransitionUpdate,
     PlayerCueRequest,
+    PositionRequest,
     PreviewRequest,
     ResourceInfo,
     StingerInfo,
@@ -171,20 +175,29 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
     description=(
         "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
         "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
-        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows "
-        "and Cut/Auto of one ME."
+        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
+        "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
+        "upstream keyers and DSKs with On/Off and Auto."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
+    transition = {"type": "boolean", "default": True, "title": "Transition type"}
     return [
         {
             "id": "bus",
             "title": "FlowXer bus",
-            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "params": {"type": "object", "properties": {"me": me, "transition": transition}, "required": ["me"]},
             "min_size": {"w": 480, "h": 150},
             "version": __version__,
-        }
+        },
+        {
+            "id": "keys",
+            "title": "FlowXer keys",
+            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "min_size": {"w": 240, "h": 150},
+            "version": __version__,
+        },
     ]
 
 
@@ -342,14 +355,19 @@ def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     "/mixer/take",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Take a logical input (or me-<n>, re-entry) to Program: cut or mix (a stinger is a cut in this version)",
+    summary="Take a logical input (or me-<n>, re-entry) to Program: cut (the input's auto-stinger plays), mix, wipe or stinger",
 )
 def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
         body = mixer.take(
-            payload.input_id, payload.transition, payload.stinger_id, payload.panel_id, payload.duration_ms
+            payload.input_id,
+            payload.transition,
+            payload.stinger_id,
+            payload.panel_id,
+            payload.duration_ms,
+            payload.frames,
         )
     except MixerError as exc:
         raise _http(exc)
@@ -376,7 +394,7 @@ def mixer_preview(
     "/mixer/cut",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Cut Preview to Program (auto-stingers and Wipe come back in P3)",
+    summary="Cut Preview to Program: Preview's auto-stinger plays, else an armed Wipe plays the stinger slot by direction",
 )
 def mixer_cut(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -387,6 +405,52 @@ def mixer_cut(
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="cut", mixer=body)
+
+
+@router.post(
+    "/mixer/auto",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Run the ME's next transition (mix, wipe or stinger) from Preview to Program",
+)
+def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    payload = payload or AutoRequest()
+    try:
+        body = mixer.auto(payload.panel_id, payload.frames)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="auto", mixer=body)
+
+
+@router.post(
+    "/mixer/position",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it without the swap",
+)
+def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    try:
+        body = mixer.set_position(payload.panel_id, payload.position)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="position", mixer=body)
+
+
+@router.patch(
+    "/panels/{panel_id}/transition",
+    response_model=PanelTransition,
+    tags=["mixer"],
+    summary="The ME's next transition: type (mix, wipe, stinger), rate in frames, wipe pattern and edge, stinger slot",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_panel_transition(
+    panel_id: str, payload: PanelTransitionUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> PanelTransition:
+    try:
+        return mixer.update_transition(panel_id, payload)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise _http(exc, code)
 
 
 @router.post(
@@ -427,7 +491,7 @@ def mixer_fade_to_black(
     "/mixer/wipe",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Arm Wipe (toggle if armed is omitted); wipes come in P3, the next Cut is a cut",
+    summary="Arm Wipe (toggle if armed is omitted): the next Cut plays the stinger slot by direction (FlowXer 14)",
 )
 def mixer_wipe(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -464,7 +528,7 @@ def storage_stingers(mixer: VisionMixer = Depends(get_mixer)) -> list[StingerInf
     "/stinger/play",
     response_model=MixerCommandResponse,
     tags=["stinger"],
-    summary="Stinger take (a cut in this version; stingers come back in P3); flip_flop swaps Preview/Program",
+    summary="Stinger take on the GPU (a cut while the stinger converts); flip_flop swaps Preview/Program",
 )
 def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)
@@ -646,15 +710,25 @@ def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
     return ResourceInfo.model_validate(collect_resources(mixer))
 
 
+@router.get(
+    "/keyers",
+    response_model=list[Keyer],
+    tags=["keyers"],
+    summary="The upstream keyers and DSKs of every rendering ME, in order",
+)
+def list_keyers(mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
+    return mixer.keyers
+
+
 @router.patch(
     "/keyers/{keyer_id}",
-    response_model=DownstreamKeyer,
+    response_model=Keyer,
     tags=["keyers"],
-    summary="Downstream keyer on or off (at the next frame), or its label",
+    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma), luma source, clip, soft, gain, invert",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)
-) -> DownstreamKeyer:
+) -> Keyer:
     try:
         return mixer.update_keyer(keyer_id, **payload.model_dump(exclude_unset=True))
     except MixerError as exc:
@@ -668,13 +742,13 @@ def patch_keyer(
 
 @router.post(
     "/keyers/{keyer_id}/auto",
-    response_model=DownstreamKeyer,
+    response_model=Keyer,
     tags=["keyers"],
-    summary="Fade the downstream keyer on (or off when it is on)",
+    summary="Fade the keyer on (or off when it is on)",
 )
 def keyer_auto(
     keyer_id: str, payload: KeyerAutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
-) -> DownstreamKeyer:
+) -> Keyer:
     try:
         return mixer.keyer_auto(keyer_id, (payload or KeyerAutoRequest()).duration_ms)
     except MixerError as exc:
