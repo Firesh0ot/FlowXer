@@ -704,8 +704,8 @@ The tables are in `docs/engine-p3.md` ("M4 as built"). In short, on A16 GPU 0 (P
   on every ME renders in 5.52 ms (render + download 12.41 ms, max 14.0), as estimated. Stingers on
   all 4 MEs at once: 7.03 ms (14.09 ms, max 17.6), 0 skipped, 0 late.
 - **Upload:** 1.34 ms per key flow per grain. 8 distinct key flows next to 8 inputs keep the link
-  busy about 20 ms per grain: with stingers on top, 2 late grains in 2 min. Plan at most 6 distinct
-  key flows on Gen4 x4 / Gen3 x8.
+  busy about 20 ms per grain: with stingers on top, 2 late grains in 2 min. 8 is the edge on
+  Gen4 x4 / Gen3 x8 (occasional late grains under full load); FlowXer sets no limit.
 - **GPU memory:** 80 MiB per key flow, 347 MiB per stinger player with a stinger loaded.
 - **2 h soak** (keys, mixes, wipes, stingers, T-bar, FTB, imports, 5 viewers): 0 skipped, 3 single
   late grains, lag 4, render + download 10.81 ms (max 12.74), GPU memory flat at 1993 MiB, 0 API

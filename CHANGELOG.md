@@ -11,6 +11,8 @@ in `docs/platform-integration-plan.md` §8.
   per player `flowxer_engine_stinger_player_state{player,state}`, `_stinger_frames_decoded_total`,
   `_stinger_frames_late_total`, `_stinger_decode_ms`. The engine's `/status` gains `stingers.played`.
   Control plane: `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`): takes it made a cut.
+- A stinger take that finds every stinger player busy waits up to 0.5 s for one, then plays (back-to-back
+  Autos both play); only then is it a cut.
 - Keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` and `flowxer_engine_keyer_key_running`.
 - `flowxer_engine_input_upload_ms{input,stat}` for every input and key flow.
 - `flowxer_transitions_total` counts `wipe` too.
@@ -23,8 +25,8 @@ in `docs/platform-integration-plan.md` §8.
   DSKs: an auto-stinger, an armed Wipe with a Cut, Auto with the transition type STING,
   `/stinger/play` and a take with `transition: "stinger"`. The background switches at the cut
   frame, its sound crossfades over 4 frames there, and the stinger's sound goes into PGM. Both
-  sources are red on the tally. A stinger that still converts, or one with every stinger player
-  busy, is a cut. The armed Wipe stays armed when a Cut plays Preview's auto-stinger (as in
+  sources are red on the tally. A stinger that still converts is a cut; with every stinger player busy
+  a take waits up to 0.5 s for one (M4). The armed Wipe stays armed when a Cut plays Preview's auto-stinger (as in
   FlowXer 14).
 - `FLOWXER_STINGER_PLAYERS` (0–4, default 1, at most the rendering MEs): stingers that can play
   at once; pinned like the panels (workspace `stinger_players`).

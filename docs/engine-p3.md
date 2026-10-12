@@ -355,7 +355,8 @@ One stinger playing at 50 frames/s uses 5 % of the decoders.
   (`stingers.cuts`); the wait is counted (`stingers.waits`).
 - **Which stinger player k holds:** the stinger ME k's next Cut or Auto plays, in this order:
   Preview's auto-stinger, an armed Wipe's slot, the slot of the type stinger. A player is free
-  again 0.1 s after its stinger (1 s for one loaded on demand).
+  again 0.1 s after its stinger (1 s for one loaded on demand). A take that finds every player
+  busy waits up to 0.5 s for one (M4, the user's decision), then plays; else it is a cut.
 - **Armed Wipe:** as in FlowXer 14, a Cut that plays Preview's auto-stinger leaves Wipe armed;
   the Cut that plays the armed Wipe's stinger uses it up.
 - **Alpha of 8-bit sources:** FFmpeg widens it to 10 bits (255 → 1023); the mezzanine stores the
@@ -478,7 +479,8 @@ One receiver per keyer of each rendering ME: BCP-007-03 `urn:x-nmos:transport:mx
 - **Keyers:** at most 4 × (8 + 4) = 48 receivers.
 - **Distinct routed key flows** at 1080p50, next to 8 live inputs:
   - at most 8 on a link like the lab's (PCIe Gen4 x4 or Gen3 x8, 6.3 GB/s). Measured in M4: 8 is
-    the edge (the link busy about 20 ms per grain), so plan at most 6
+    the edge (the link busy about 20 ms per grain; under full load a grain can come late now and
+    then). The user's decision: 8 stays, with no hard limit and no warning
     ([M4 as built](#m4-as-built));
   - at most 16 on Gen3 x16 ([§10](#10-gpu-budget)).
   
@@ -573,7 +575,8 @@ ME, plus the mosaic, at 1080p50 in yuv16.
 - stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`,
   `_stinger_cuts_total` (the engine waited 50 grains), per player `_stinger_player_state{player,state}`,
   `_stinger_frames_decoded_total`, `_stinger_frames_late_total`, `_stinger_decode_ms`; and
-  `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`: takes the control plane made a cut);
+  `flowxer_stinger_fallbacks_total{reason}` (`not_ready`; `busy`: no player free within 0.5 s): takes
+  the control plane made a cut;
 - keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}`, `_keyer_key_running`;
 - the upload ms of each input and key flow: `flowxer_engine_input_upload_ms{input,stat}`;
 - `flowxer_transitions_total{type="wipe"}`.
@@ -611,8 +614,9 @@ Against the estimate of this section:
   - With the wipes it still held (0 late).
   - With the 4 stingers on top, the render waited for uploads (unpack max 14.6 ms): 2 late grains
     in 2 min and a lag of 5 grains once.
-  - **8 distinct key flows next to 8 inputs is the edge of a Gen4 x4 / Gen3 x8 link, not a safe
-    operating point.**
+  - **8 distinct key flows next to 8 inputs are the edge of a Gen4 x4 / Gen3 x8 link:** under full
+    load (wipes and stingers on every ME) a grain can come late now and then. The user's decision:
+    8 stays the documented maximum, with no hard limit and no warning.
 - **GPU memory:**
   - a key flow 80 MiB (engine count 79 MB; estimate 85 MB), the first one 96 MiB;
   - a stinger player 347 MiB with a stinger loaded (pool 71 + decoders 276, as in M3);
@@ -625,10 +629,9 @@ Against the estimate of this section:
   - download 6.9–7.9 ms on Gen3 x8 (3.5–4 ms on Gen3 x16);
   - render + download ≈ 9.4–10.2 ms on average, max ≈ 12.4 ms with 1 key flow: inside the 15 ms
     target, which leaves 5 ms for the node's other GPU functions;
-  - the upload does not get faster with the GPU: on Gen3 x8 the 8-flow case stays at the edge.
-    Plan **at most 6 distinct key flows** at 1080p50 next to 8 inputs on Gen3 x8 (about
-    7.5 + 6 × 1.5 = 16.5 ms of link time per grain); keyers that share a flow count once. On Gen3
-    x16 the estimate of 16 stays (not measured).
+  - the upload does not get faster with the GPU: on Gen3 x8, 8 distinct key flows next to 8
+    inputs stay at the edge (occasional late grains under full load); keyers that share a flow
+    count once. On Gen3 x16 the estimate of 16 stays (not measured).
 
 **2 h soak** (`fxp3-soak.py`, image from this branch, A16 GPU 0, `docker --cpus 6`, L = 4;
 2026-10-12, 08:24 to 10:27):
@@ -671,10 +674,11 @@ Against the estimate of this section:
   test-script error ended it.
 - **Back-to-back Autos with stingers:** in the worst case the test sent the next Auto as soon as
   the engine reported an ME's stinger done. The control plane counted 365 cuts next to 734
-  stingers: it frees a stinger player 0.1 s after its stinger's expected end, so an Auto sent
-  before that found every player busy and became a cut (now counted as
-  `flowxer_stinger_fallbacks_total{reason="busy"}`). An operator who presses Auto again in that
-  moment, with no other player free, gets a cut.
+  stingers: it frees a stinger player 0.1 s after its stinger's expected end, and an Auto sent
+  before that found every player busy and became a cut. Changed after M4 (the user's decision): a
+  take that finds every player busy waits up to 0.5 s for one, then plays; only if none is free by
+  then is it a cut, counted as `flowxer_stinger_fallbacks_total{reason="busy"}`. Lab check: see
+  below.
 
 ## 11. Milestones
 
