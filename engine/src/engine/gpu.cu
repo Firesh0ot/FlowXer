@@ -638,8 +638,8 @@ __global__ void dmeTableKernel(DmeBox b, int* start, float* weights)
 // source indices in registers, over kDmeRows source rows.
 constexpr int kDmeRows = 16;
 
-template <int N>
-__global__ void dmeHPassKernel(DmeBox b, DmeSource src, DmeTable t, std::int16_t* mid)
+template <int N, bool Linear>
+__global__ void __launch_bounds__(128) dmeHPassKernel(DmeBox b, DmeSource src, DmeTable t, std::int16_t* mid)
 {
     int const e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= b.cols)
@@ -657,21 +657,46 @@ __global__ void dmeHPassKernel(DmeBox b, DmeSource src, DmeTable t, std::int16_t
     int const r1 = min(r0 + kDmeRows, b.rows);
     for (int r = r0; r < r1; ++r)
     {
-        mid[static_cast<std::size_t>(r) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeHSample<N>(src, plane, b.r0 + r, w, j);
+        int const row = b.r0 + r;
+        std::int16_t v;
+        if constexpr (Linear)
+        {
+            v = dmeHSampleLinear<N>(dmeWords(src, row), dmeKeyLine(src, row), plane, w, j);
+        }
+        else
+        {
+            v = dmeHSampleOpaque<N>(dmeLine(src, plane, row), w, j);
+        }
+        mid[static_cast<std::size_t>(r) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = v;
     }
 }
 
-// The vertical pass: one thread per box buffer sample.
+// The vertical pass: one block per box row (its taps in shared memory), one thread per buffer
+// sample.
 template <int N>
-__global__ void dmeVPassKernel(DmeBox b, DmeTable t, std::int16_t const* mid, std::int16_t* out)
+__global__ void __launch_bounds__(128) dmeVPassKernel(DmeBox b, DmeTable t, std::int16_t const* mid, std::int16_t* out)
 {
-    int const e = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float w[N];
+    __shared__ int r[N];
     int const oy = blockIdx.y;
-    if (e >= b.cols || oy >= b.bh)
+    if (threadIdx.x == 0)
+    {
+        float tw[N];
+        int tr[N];
+        dmeRowTaps<N>(b, t, oy, tw, tr);
+        for (int i = 0; i < N; ++i)
+        {
+            w[i] = tw[i];
+            r[i] = tr[i];
+        }
+    }
+    __syncthreads();
+    int const e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= b.cols)
     {
         return;
     }
-    out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeVSample<N>(b, t, mid, e, oy);
+    out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeVSampleTaps<N>(b, mid, e, w, r);
 }
 } // namespace
 
@@ -723,7 +748,14 @@ cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const&
     dim3 const vGrid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>(box.bh));
     dmeDispatch(box.taps, [&](auto n) {
         constexpr int N = decltype(n)::value;
-        dmeHPassKernel<N><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+        if (source.v210a != nullptr)
+        {
+            dmeHPassKernel<N, true><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+        }
+        else
+        {
+            dmeHPassKernel<N, false><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+        }
         dmeVPassKernel<N><<<vGrid, 128, 0, stream>>>(box, table, scratch.mid, buffer);
     });
     return cudaGetLastError();

@@ -269,18 +269,10 @@ struct DmeSource
     int height = 0;
 };
 
-// Source sample j of `plane` on source row `row`. A linear box's fill is premultiplied: (Y − 64)
-// · k / 1023, (C − 512) · the pair's mean k / 1023; plane 3 is the key itself.
-FXENG_HD inline float dmeFetch(DmeSource const& src, int plane, int row, int j)
+// Sample j of a linear box's v210a line (`words`, its key line `keyLine`), premultiplied:
+// (Y − 64) · k / 1023, (C − 512) · the pair's mean k / 1023; plane 3 is the key itself.
+FXENG_HD inline float dmeFetchLinear(std::uint32_t const* words, std::uint8_t const* keyLine, int plane, int j)
 {
-    if (src.v210a == nullptr)
-    {
-        int const w = plane == 0 ? src.width : src.width / 2;
-        return static_cast<float>(src.plane[plane][static_cast<std::size_t>(row) * static_cast<std::size_t>(w) + static_cast<std::size_t>(j)]);
-    }
-    auto const* words = reinterpret_cast<std::uint32_t const*>(src.v210a + static_cast<std::size_t>(row) * static_cast<std::size_t>(src.rowBytes));
-    std::uint8_t const* keyLine = src.v210a + static_cast<std::size_t>(src.rowBytes) * static_cast<std::size_t>(src.height) +
-                                  static_cast<std::size_t>(row) * static_cast<std::size_t>(src.keyRowBytes);
     if (plane == 3)
     {
         return static_cast<float>(keyAt(keyLine, j));
@@ -328,36 +320,100 @@ FXENG_HD inline void dmeTaps(DmeTable const& t, int entry, int lo, int hi, float
     }
 }
 
-// One horizontal-pass sample: column `plane` taps over source row `row`.
+// A source line of `plane` on source row `row`: an opaque source's samples, or a linear
+// source's v210a words and key line.
+FXENG_HD inline std::uint16_t const* dmeLine(DmeSource const& src, int plane, int row)
+{
+    std::uint16_t const* base = plane == 0 ? src.plane[0] : (plane == 1 ? src.plane[1] : src.plane[2]);
+    int const width = plane == 0 ? src.width : src.width / 2;
+    return base + static_cast<std::size_t>(row) * static_cast<std::size_t>(width);
+}
+
+FXENG_HD inline std::uint32_t const* dmeWords(DmeSource const& src, int row)
+{
+    return reinterpret_cast<std::uint32_t const*>(src.v210a + static_cast<std::size_t>(row) * static_cast<std::size_t>(src.rowBytes));
+}
+
+FXENG_HD inline std::uint8_t const* dmeKeyLine(DmeSource const& src, int row)
+{
+    return src.v210a + static_cast<std::size_t>(src.rowBytes) * static_cast<std::size_t>(src.height) +
+           static_cast<std::size_t>(row) * static_cast<std::size_t>(src.keyRowBytes);
+}
+
+// One horizontal-pass sample of an opaque source line.
 template <int N>
-FXENG_HD inline std::int16_t dmeHSample(DmeSource const& src, int plane, int row, float const (&w)[N], int const (&j)[N])
+FXENG_HD inline std::int16_t dmeHSampleOpaque(std::uint16_t const* line, float const (&w)[N], int const (&j)[N])
 {
     float acc = 0.f;
     FXENG_UNROLL
     for (int i = 0; i < N; ++i)
     {
-        acc += w[i] * dmeFetch(src, plane, row, j[i]);
+        acc += w[i] * static_cast<float>(line[j[i]]);
     }
     return dmeToMid(acc);
 }
 
-// One vertical-pass sample of buffer column e, box row oy, from the horizontal pass's rows
-// (`mid`: b.rows lines of b.cols, source rows r0 …).
+// One horizontal-pass sample of a linear source line (premultiplied, or the key).
 template <int N>
-FXENG_HD inline std::int16_t dmeVSample(DmeBox const& b, DmeTable const& t, std::int16_t const* mid, int e, int oy)
+FXENG_HD inline std::int16_t dmeHSampleLinear(std::uint32_t const* words, std::uint8_t const* keyLine, int plane, float const (&w)[N], int const (&j)[N])
 {
-    int const entry = b.bw + b.bw / 2 + oy;
-    int const i0 = t.start[entry];
     float acc = 0.f;
     FXENG_UNROLL
     for (int i = 0; i < N; ++i)
     {
-        int const r = dmeClampI(dmeClampI(i0 + i, b.ct, b.cb - 1) - b.r0, 0, b.rows - 1);
-        float const w = t.w[static_cast<std::size_t>(i) * static_cast<std::size_t>(t.entries) + static_cast<std::size_t>(entry)];
-        acc += w * static_cast<float>(mid[static_cast<std::size_t>(r) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)]);
+        acc += w[i] * dmeFetchLinear(words, keyLine, plane, j[i]);
+    }
+    return dmeToMid(acc);
+}
+
+// One horizontal-pass sample: column `plane` taps over source row `row`.
+template <int N>
+FXENG_HD inline std::int16_t dmeHSample(DmeSource const& src, int plane, int row, float const (&w)[N], int const (&j)[N])
+{
+    if (src.v210a == nullptr)
+    {
+        return dmeHSampleOpaque<N>(dmeLine(src, plane, row), w, j);
+    }
+    return dmeHSampleLinear<N>(dmeWords(src, row), dmeKeyLine(src, row), plane, w, j);
+}
+
+// The taps of box row oy for the vertical pass: weights and lines of the horizontal pass's rows
+// (`mid`: b.rows lines of b.cols, source rows r0 …; the crop's edge rows repeat).
+template <int N>
+FXENG_HD inline void dmeRowTaps(DmeBox const& b, DmeTable const& t, int oy, float (&w)[N], int (&r)[N])
+{
+    int const entry = b.bw + b.bw / 2 + oy;
+    int const i0 = t.start[entry];
+    FXENG_UNROLL
+    for (int i = 0; i < N; ++i)
+    {
+        w[i] = t.w[static_cast<std::size_t>(i) * static_cast<std::size_t>(t.entries) + static_cast<std::size_t>(entry)];
+        r[i] = dmeClampI(dmeClampI(i0 + i, b.ct, b.cb - 1) - b.r0, 0, b.rows - 1);
+    }
+}
+
+// One vertical-pass sample of buffer column e from its row taps.
+template <int N>
+FXENG_HD inline std::int16_t dmeVSampleTaps(DmeBox const& b, std::int16_t const* mid, int e, float const* w, int const* r)
+{
+    float acc = 0.f;
+    FXENG_UNROLL
+    for (int i = 0; i < N; ++i)
+    {
+        acc += w[i] * static_cast<float>(mid[static_cast<std::size_t>(r[i]) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)]);
     }
     bool const premultiplied = b.kind == DmeKind::Linear && e < 2 * b.bw;
     return dmeToBox(acc, premultiplied);
+}
+
+// One vertical-pass sample of buffer column e, box row oy.
+template <int N>
+FXENG_HD inline std::int16_t dmeVSample(DmeBox const& b, DmeTable const& t, std::int16_t const* mid, int e, int oy)
+{
+    float w[N];
+    int r[N];
+    dmeRowTaps<N>(b, t, oy, w, r);
+    return dmeVSampleTaps<N>(b, mid, e, w, r);
 }
 
 // Calls f(std::integral_constant<int, taps>) for the box's tap count.
