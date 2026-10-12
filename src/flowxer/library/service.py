@@ -87,8 +87,6 @@ class LibraryService:
         self.queue = ConversionQueue(
             self.store,
             concurrency=settings.convert_concurrency,
-            ram_clip_max_s=settings.ram_clip_max_s,
-            ram_budget_mb=settings.ram_budget_mb,
             on_update=self._job_update,
         )
         # Set by the mixer: the inputs/slots that use an item (derived from the mixer state,

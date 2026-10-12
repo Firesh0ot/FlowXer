@@ -46,7 +46,6 @@ from flowxer.library.ffmpeg import (
     default_runner,
 )
 from flowxer.library.models import ConversionInfo, ConversionStatus, LibraryItem, LibraryKind
-from flowxer.library.ram import decide_ram_playback, estimate_frame_bytes
 from flowxer.library.sequence import safe_extract_tga_zip, validate_sequence
 from flowxer.library.uploads import UploadManager
 from flowxer.nmos import ids
@@ -341,30 +340,6 @@ def test_cut_frame_after_fps_change_keeps_ms():
     assert ms == 500
     frame2, _ = cut_frame_after_fps_change(cut_ms=None, cut_frame=10, old_fps=25, new_fps=50, new_frame_count=100)
     assert frame2 == 20
-
-
-def test_ram_budget_fallback():
-    ok = decide_ram_playback(
-        frames=100,
-        fps=50,
-        width=1920,
-        height=1080,
-        has_alpha=True,
-        ram_clip_max_s=20,
-        ram_budget_bytes=4096 << 20,
-    )
-    assert ok.use_ram
-    big = decide_ram_playback(
-        frames=50 * 60,
-        fps=50,
-        width=1920,
-        height=1080,
-        has_alpha=True,
-        ram_clip_max_s=20,
-        ram_budget_bytes=64 << 20,
-    )
-    assert not big.use_ram
-    assert estimate_frame_bytes(1920, 1080, has_alpha=True) == 1920 * 1080 * 4
 
 
 def _write_tga(path: Path, color=(255, 0, 0, 128), size=(16, 9)) -> None:

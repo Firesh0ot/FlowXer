@@ -90,8 +90,6 @@ class Settings(BaseSettings):
     # Optional watched drop folder for auto-ingest (empty disables).
     import_dir: Path | None = None
     convert_concurrency: int = Field(default=1, ge=1, le=8)
-    ram_clip_max_s: float = Field(default=20.0, ge=0.0, le=600.0)
-    ram_budget_mb: int = Field(default=4096, ge=64, le=262144)
     upload_limit_gb: float = Field(default=20.0, ge=0.1, le=500.0)
     # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
     mxl_revision: str = ""

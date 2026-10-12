@@ -184,7 +184,7 @@ export function TransitionSection({
       ) : null}
       {transition.type === "stinger" ? (
         <label className="sting-slot">
-          Stinger slot (a cut until stingers play)
+          Stinger slot
           <select
             value={transition.stinger_slot_id ?? ""}
             onChange={(event) => onChange({ stinger_slot_id: event.target.value || null })}
@@ -193,6 +193,8 @@ export function TransitionSection({
             {stingerSlots.map((slot) => (
               <option key={slot.id} value={slot.id}>
                 {slot.label}
+                {slot.cut_frame != null ? ` · cut ${slot.cut_frame}` : ""}
+                {slot.ready === false ? " · converting" : ""}
               </option>
             ))}
           </select>

@@ -284,7 +284,7 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
-  /** The ME's next transition (mix, wipe; a stinger is a cut for now) over its rate. */
+  /** The ME's next transition (mix, wipe over its rate, or a stinger over its length). */
   auto: (panel_id: string) =>
     fetch("/api/v1/mixer/auto", {
       method: "POST",

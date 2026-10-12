@@ -78,7 +78,7 @@ class WipeSettingsUpdate(BaseModel):
 class PanelTransition(BaseModel):
     """An ME's next transition: what Auto runs."""
 
-    type: TransitionType = Field(default=TransitionType.mix, description="mix, wipe or stinger (a cut until stingers play)")
+    type: TransitionType = Field(default=TransitionType.mix, description="mix, wipe or stinger")
     rate_frames: int = Field(default=25, ge=1, le=1000, description="Duration of Auto in frames")
     wipe: WipeSettings = Field(default_factory=WipeSettings)
     stinger_slot_id: str | None = Field(default=None, description="The stinger slot of type stinger")
@@ -225,7 +225,7 @@ class LogicalInputUpdate(BaseModel):
         default=None,
         description=(
             "Stinger slot played when this source is taken to Program or Cut from Preview. "
-            "Null disables auto-stinger. Stingers come back in P3; until then such a take is a cut."
+            "Null disables auto-stinger."
         ),
     )
 

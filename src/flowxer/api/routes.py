@@ -355,7 +355,7 @@ def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     "/mixer/take",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Take a logical input (or me-<n>, re-entry) to Program: cut, mix or wipe (a stinger is a cut in this version)",
+    summary="Take a logical input (or me-<n>, re-entry) to Program: cut (the input's auto-stinger plays), mix, wipe or stinger",
 )
 def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
@@ -394,7 +394,7 @@ def mixer_preview(
     "/mixer/cut",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Cut Preview to Program (auto-stingers and Wipe come back in P3)",
+    summary="Cut Preview to Program: Preview's auto-stinger plays, else an armed Wipe plays the stinger slot by direction",
 )
 def mixer_cut(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -411,7 +411,7 @@ def mixer_cut(
     "/mixer/auto",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Run the ME's next transition (mix or wipe; a stinger is a cut in this version) from Preview to Program",
+    summary="Run the ME's next transition (mix, wipe or stinger) from Preview to Program",
 )
 def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     payload = payload or AutoRequest()
@@ -491,7 +491,7 @@ def mixer_fade_to_black(
     "/mixer/wipe",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Arm Wipe (toggle if armed is omitted); wipes come in P3, the next Cut is a cut",
+    summary="Arm Wipe (toggle if armed is omitted): the next Cut plays the stinger slot by direction (FlowXer 14)",
 )
 def mixer_wipe(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -528,7 +528,7 @@ def storage_stingers(mixer: VisionMixer = Depends(get_mixer)) -> list[StingerInf
     "/stinger/play",
     response_model=MixerCommandResponse,
     tags=["stinger"],
-    summary="Stinger take (a cut in this version; stingers come back in P3); flip_flop swaps Preview/Program",
+    summary="Stinger take on the GPU (a cut while the stinger converts); flip_flop swaps Preview/Program",
 )
 def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)

@@ -66,16 +66,12 @@ class ConversionQueue:
         *,
         concurrency: int = 1,
         ffmpeg: FFmpeg | None = None,
-        ram_clip_max_s: float = 20.0,
-        ram_budget_mb: int = 4096,
         on_update: JobListener | None = None,
     ) -> None:
         self.store = store
         self.concurrency = max(1, min(8, concurrency))
         self.threads = conversion_threads(self.concurrency)
         self.ffmpeg = ffmpeg or FFmpeg()
-        self.ram_clip_max_s = ram_clip_max_s
-        self.ram_budget_bytes = ram_budget_mb << 20
         self.on_update = on_update
         self._jobs: dict[str, ConvertJob] = {}
         self._queue: deque[str] = deque()
