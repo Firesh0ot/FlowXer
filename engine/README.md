@@ -165,12 +165,26 @@ fused compose: the background, the upstream keyers, the DSKs, Fade to Black.
   premultiplied) in a box: one weight-table kernel and one resample kernel per box (Catmull-Rom,
   widened by 1 / size when shrinking, at most 32 taps; the horizontal pass into shared memory per
   tile of box rows, then the vertical pass), into the keyer's box buffer (12.4 MB at 1080p,
-  allocated when the box is first drawn). The fused compose draws it as a `box` layer: a black
+  allocated by the control thread when the box is first enabled, so the render thread never
+  allocates). The fused compose draws it as a `box` layer: a black
   rectangular shadow (smoothstep edges), the outer border, then the picture (anti-aliased or soft
   edges), each rounded to 10 bits; the keyer's gain scales all three. A linear box limits its
   premultiplied fill to what its key allows, so the cubic's ringing at a hard key edge leaves no
   fringe. yuv16 only. The CPU reference (`dmeResampleCpu`, `dmeLayerCpu`) and the kernels share
   the code and agree bit for bit.
+- **Keyframes** (P4 M2, `docs/engine-p4.md` §5, `core/keyframes.hpp`): up to 8 box states per
+  upstream keyer, each reached from the one before over its `frames` with an ease (linear, ease,
+  ease-in, ease-out, hold); size in log space (0 as 0.01), the rest linear. The box of every grain
+  is computed on the CPU from the grain index (a run started at grain s shows step f in grain
+  s + f − 1, skipped grains do not stretch it) and handed to the GPU with the plan; only + − × ÷
+  and exact scaling (own ln and exp), so the CPU reference of the tests computes the same bits.
+  A run goes from where the box is to a keyframe through the ones in between (a box off the
+  keyframes' path, e.g. edited by hand, first goes straight to the run's first keyframe over that
+  keyframe's frames and ease); loops: wrap (to the last keyframe, then keyframe 0 the next grain)
+  and pingpong; stop holds. A change of the box's animated fields stops a run there. **Fly**
+  (`fly`, 2 keyframes): the keyer's Auto on turns it on and runs keyframe 0 → last, Auto off runs
+  back and turns it off after the grain at keyframe 0, an Auto during a fly turns back, cut on and
+  off jump to the last keyframe and to 0. `/status` shows each keyer's box and run.
 - **Key flows:** keyers routed to the same flow share one reader and upload; a flow's frames
   are allocated when it is first routed (stream-ordered), not at start.
 - `POST /keyer/<k>` `{"on": bool}` cuts it, `/keyer/<k>/auto` `{"frames": n}` fades the gain over
@@ -305,12 +319,15 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `PUT /key/{k}` | `{"domain", "flow"}` | routes keyer k's key input (v210a); a flow another keyer reads is shared |
 | `POST /keyer/{k}` | `{"on": true}` | the keyer on or off at the next grain |
 | `POST /keyer/{k}/auto` | `{"frames": 25}` | fades the keyer on (or off when it is on) |
-| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma"\|"pip", "source", "clip", "soft", "gain", "invert", "dme"}` | the key; a luma or pip source must be one the keyer's ME may take; `dme` `{enabled, x, y, size, soft, crop {left, right, top, bottom}, border {width, soft, color "#RRGGBB", opacity}, shadow {dx, dy, blur, opacity}}`; pip and dme on upstream keyers only |
+| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma"\|"pip", "source", "clip", "soft", "gain", "invert", "fly", "dme"}` | the key; a luma or pip source must be one the keyer's ME may take; `dme` changes the given fields of the keyer's live box `{enabled, x, y, size, soft, crop {left, right, top, bottom}, border {width, soft, color "#RRGGBB", opacity}, shadow {dx, dy, blur, opacity}}` (without `dme` the box stays; a change of position, size, crop, soft, border width, soft or opacity or shadow stops a run there); pip and dme on upstream keyers only |
+| `PUT /keyer/{k}/keyframes` | `{"keyframes": [{box fields, "frames": 25, "ease": "linear"\|"ease"\|"ease-in"\|"ease-out"\|"hold"}]}` | up to 8 (upstream keyers; missing box fields: the keyer's box); a run stops where the box is |
+| `POST /keyer/{k}/run` | `{"to", "reverse", "loop": "off"\|"wrap"\|"pingpong", "frames": 0}` | a run of the box from the next grain: to keyframe `to` (the last; 0 with `reverse`), a loop, or (`frames` 0) a jump; needs a box and the keyframe |
+| `POST /keyer/{k}/stop` | – | stops a run: the box holds (a keyer flying off stays on) |
 | `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
 | `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |
@@ -402,6 +419,11 @@ DME cost on the lab (A16 GPU 3, 1080p, border + shadow, resample + box layer, CU
 300 runs): corner PiP 1/3 0.26 ms, half-size PiP 0.29 ms, split 2 × 1/2 0.31 ms per box, quad
 0.29 ms per box, 8 × 1/4 0.24 ms per box, full size 0.48 ms, upscale 1.5 0.42 ms. In the running
 engine a half-size pip adds 0.27 ms to its ME (2 boxes: 0.23 ms per box).
+
+P4 M2 on the lab (`fxp4-functional-m2.py`, GPU 3): every grain of a fly read back from MXL equals
+the CPU reference of its step (fly in and off with the keyer's Auto over 3 keyframes, a turn-back,
+presets flying on air, pingpong and wrap loops over 61 grains each); no output grain skipped; a
+moving half-size box costs what a static one does (0.51 against 0.50 ms on ME 1).
 
 ### Against the success criteria
 

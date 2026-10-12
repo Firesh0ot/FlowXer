@@ -2,7 +2,9 @@
 
 Status: M1 (the box) implemented in #91: `core/dme.hpp`, the resample and box layer, `pip` and
 DME on linear and luma keyers, API, GUI fields, tally; M1 gate met (0.29 ms per half-size box
-with border and shadow on the A16). M2–M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
+with border and shadow on the A16). M2 (keyframes, fly with the keyer's Auto, presets, the box
+editor, the `dme` widget) implemented in #91, with the details in
+[Implementation notes (M2)](#implementation-notes-m2). M3–M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
 the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
@@ -240,6 +242,31 @@ Written by the control plane as box state plus keyframes (0 = off screen on the 
 | `split` | keyers 1 and 2: each source cropped to its centre half, full size, side by side |
 | `quad` | keyers 1–4 at 1/2 size, 2 × 2 (needs 4 upstream keyers) |
 | `full` | size 1, centred (a fly to and from full screen) |
+
+### Implementation notes (M2)
+
+Where M2 fills in or differs from the text above:
+- **Engine API paths:** `PUT /keyer/{k}/keyframes`, `POST /keyer/{k}/run`, `/keyer/{k}/stop` with
+  the engine's keyer number k (as M1's `/keyer/{k}/settings`), not `/me/{m}/key/{k}/…`.
+- **Timing:** as P3's mix, the first grain after a run's command shows its step 1; the last
+  step shows the target keyframe exactly.
+- **Off the path:** a box edited by hand (or with new keyframes it is on none of) is off the
+  keyframes' path; a run from there first goes straight to its first keyframe over that
+  keyframe's `frames` and `ease` (so keyframe 0's frames and ease matter when a run goes to 0).
+- **Log size:** a size of 0 interpolates as 0.01 (a 19 px box at 1080p), so a fly from size 0
+  starts as a dot; ln and exp are the engine's own (no libm), the same bits on every machine.
+- **Box changes:** `PATCH /keyers/{id}` with `dme` changes the given fields of the box where it
+  is; a change of an animated field stops a run there (the colour and `enabled` do not).
+  `PUT /keyers/{id}/dme` replaces the box. A `pip` keyer is always a box.
+- **Presets:** each keyer gets keyframe 0 (off screen on the near side, 5 % beyond the edge) and
+  1 (on), both with the keyer's rate and `ease`. On air the box flies to keyframe 1 from where it
+  is; off air it is there at once. `full`'s keyframe 0 is the box as it was. Corner PiPs: 1/3
+  size, the picture and its 4 px white border inside the 5 % margin, shadow 8/8 px, blur 16,
+  opacity 0.5. `fly` is not changed.
+- **Tally:** the raw tally keeps a keyer on air while it fades or flies off (P3's fade off ended
+  it at the Auto).
+- **Box editor:** move and scale (corner handles); the Alt + edge crop handles are not in M2 (the
+  crop is in the keyer panel's fields).
 
 ## 6. Frame grab
 

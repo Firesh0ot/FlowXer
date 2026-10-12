@@ -19,6 +19,23 @@ in `docs/platform-integration-plan.md` §8.
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 
+### Added: DME keyframes, presets, box editor and the dme widget (P4 M2)
+
+- Keyframes: up to 8 per upstream keyer (`PUT /keyers/{id}/keyframes`): position, size (in log
+  space), crop, border and shadow, each with its time in frames and an ease (linear, ease,
+  ease-in, ease-out, hold). `POST /keyers/{id}/run` runs the box from where it is to a keyframe,
+  back (`reverse`), in a loop (`wrap`, `pingpong`) or jumps (`frames: 0`); `/stop` holds it. The
+  engine computes the box of every grain from the grain index: exact and reproducible.
+- `fly`: the keyer's Auto flies the box on (keyframe 0 to the last) and off; an Auto during a fly
+  turns back; cut on and off jump. The raw tally keeps a keyer on air while it fades or flies off.
+- Presets (`POST /keyers/{id}/preset`, `GET /dme/presets`): four corner PiPs, split (keyers 1
+  and 2), quad (keyers 1 to 4), full; on air the box flies there.
+- `PUT /keyers/{id}/dme` replaces a box (PATCH merges); a pip keyer is always a box.
+- GUI: the box editor over the active ME's Program (drag to move, corner handles to scale, ON AIR
+  while on air), the keyframe list with RUN, STOP, loops and the presets in the keyer panel.
+- Widget `dme` (`/widget/dme?me=<n>&keyer=<k>`): On/Off, Auto, Run back and forth, Stop, presets.
+- Box buffers are allocated when a box is first enabled, not by the render thread.
+
 ### Added: DME boxes (P4 M1)
 
 - An upstream keyer can put its key in a box: `dme` with position, size, crop, soft edge, an
