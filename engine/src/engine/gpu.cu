@@ -456,7 +456,9 @@ struct ComposeArgs
 // The fused compose of one ME (yuv16). One thread per 6-pixel group: the background in registers,
 // then each key layer, one write. Each layer rounds to 10 bits as a separate pass would (P2's
 // dissolve and DSK kernels), so the result is the same, with one read and one write.
-__global__ void composeYuvKernel(ComposeArgs args)
+// At most 80 registers (6 blocks of 128 per SM): the box layer's maths would otherwise take 118 and
+// a third of the occupancy.
+__global__ void __launch_bounds__(128, 6) composeYuvKernel(ComposeArgs args)
 {
     int const group = blockIdx.x * blockDim.x + threadIdx.x;
     int const row = blockIdx.y;
