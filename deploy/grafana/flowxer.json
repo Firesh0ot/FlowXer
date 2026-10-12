@@ -102,7 +102,8 @@
       "targets": [
         { "expr": "flowxer_engine_gpu_stage_ms{stage=\"download\",stat=\"max\"}", "legendFormat": "download max", "refId": "A" },
         { "expr": "sum(flowxer_engine_input_upload_ms{stat=\"avg\"})", "legendFormat": "upload, inputs and key flows", "refId": "B" },
-        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"me\",stat=\"max\"}", "legendFormat": "ME {{me}} max", "refId": "C" }
+        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"me\",stat=\"max\"}", "legendFormat": "ME {{me}} max", "refId": "C" },
+        { "expr": "flowxer_engine_dme_ms{stat=\"max\"}", "legendFormat": "ME {{me}} boxes max", "refId": "D" }
       ]
     },
     {

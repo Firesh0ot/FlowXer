@@ -394,8 +394,10 @@ struct Slot
     std::vector<std::shared_ptr<PlayerFrame>> stingers;
     std::uint64_t index = 0;
     std::uint64_t inputIndex = 0;
-    // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done.
+    // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done; per ME
+    // (render order) the end of its boxes' resample (it starts with the ME).
     std::vector<cudaEvent_t> mark;
+    std::vector<cudaEvent_t> boxed;
     cudaEvent_t downloadStart = nullptr;
     std::vector<cudaEvent_t> downloaded;
     // The ME plans of this grain (render order), for the audio.
@@ -583,6 +585,8 @@ struct Engine::Impl
     std::atomic<std::uint64_t> startIndex{0};
     Window unpackMs;
     std::vector<std::unique_ptr<Window>> meMs;
+    // Per ME: the resample of its boxes (the box layers are part of its compose).
+    std::vector<std::unique_ptr<Window>> dmeMs;
     Window packMs;
     Window mosaicMs;
     Window downloadMs;
@@ -892,9 +896,13 @@ struct Engine::Impl
                 allocDevice(reinterpret_cast<void**>(&out), frameBytes, "output frame");
             }
             slot.mark.resize(static_cast<std::size_t>(4 + cfg.mes));
-            for (auto& event : slot.mark)
+            slot.boxed.resize(static_cast<std::size_t>(cfg.mes));
+            for (auto* list : {&slot.mark, &slot.boxed})
             {
-                check(cudaEventCreate(&event), "cudaEventCreate");
+                for (auto& event : *list)
+                {
+                    check(cudaEventCreate(&event), "cudaEventCreate");
+                }
             }
             check(cudaEventCreateWithFlags(&slot.downloadStart, cudaEventDefault), "cudaEventCreate");
             check(cudaEventCreateWithFlags(&slot.grabbed, cudaEventBlockingSync | cudaEventDisableTiming), "cudaEventCreate");
@@ -907,6 +915,7 @@ struct Engine::Impl
         for (int m = 0; m < cfg.mes; ++m)
         {
             meMs.push_back(std::make_unique<Window>());
+            dmeMs.push_back(std::make_unique<Window>());
         }
 
         tiles = mosaicTiles(cfg.width, cfg.height, static_cast<int>(inputs.size()), static_cast<int>(players.size()), cfg.mes);
@@ -1653,6 +1662,7 @@ struct Engine::Impl
             }
         }
         // ME n before ME m (n > m): a re-entered Program is the same output grain (with its keys).
+        auto boxed = slot.boxed.begin();
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
@@ -1675,6 +1685,8 @@ struct Engine::Impl
             {
                 if (stage == 1)
                 {
+                    // The upstream keyers' boxes are resampled (dme_ms; before a stinger's wait).
+                    cudaEventRecord(*boxed++, st);
                     // The stinger: over the upstream keys, under the DSKs.
                     auto const& frame = p.stinger > 0 ? stingFrames[static_cast<std::size_t>(p.stinger - 1)] : nullptr;
                     if (frame && frame->v210 != nullptr && job.layerCount < gpu::kMaxLayers)
@@ -1950,8 +1962,9 @@ struct Engine::Impl
         unpackMs.add(elapsed(mark[0], mark[1]));
         for (std::size_t i = 0; i < mes; ++i)
         {
-            // mark[2 + i] ends the i-th ME in render order (ME mes .. 1).
+            // mark[2 + i] ends the i-th ME in render order (ME mes .. 1), boxed[i] its boxes.
             meMs[mes - 1 - i]->add(elapsed(mark[1 + i], mark[2 + i]));
+            dmeMs[mes - 1 - i]->add(elapsed(mark[1 + i], slot.boxed[i]));
         }
         packMs.add(elapsed(mark[1 + mes], mark[2 + mes]));
         mosaicMs.add(elapsed(mark[2 + mes], mark[3 + mes]));
@@ -2680,9 +2693,12 @@ struct Engine::Impl
             {
                 cudaFree(out);
             }
-            for (auto event : slot.mark)
+            for (auto* list : {&slot.mark, &slot.boxed})
             {
-                cudaEventDestroy(event);
+                for (auto event : *list)
+                {
+                    cudaEventDestroy(event);
+                }
             }
             for (auto event : slot.downloaded)
             {
@@ -2827,9 +2843,11 @@ struct Engine::Impl
             {"lag_grains", lagGrains.toJson()},
             {"commit_ms", commitMs.toJson()}};
         json me = json::object();
+        json dme = json::object();
         for (std::size_t m = 0; m < meMs.size(); ++m)
         {
             me[std::to_string(m + 1)] = meMs[m]->toJson();
+            dme[std::to_string(m + 1)] = dmeMs[m]->toJson();
         }
         Window::Value uploadSum;
         for (auto const& input : inputs)
@@ -2842,6 +2860,7 @@ struct Engine::Impl
             {"upload_all_inputs", round3(uploadSum.avg)},
             {"unpack", unpackMs.toJson()},
             {"me", me},
+            {"dme", dme},
             {"pack", packMs.toJson()},
             {"mosaic", mosaicMs.toJson()},
             {"download", downloadMs.toJson()},
@@ -3105,6 +3124,15 @@ std::string Engine::metricsText() const
             {
                 metric("gpu_stage_ms", v["avg"].get<double>(), "stage=\"me\",me=\"" + me + "\",stat=\"avg\"");
                 metric("gpu_stage_ms", v["max"].get<double>(), "stage=\"me\",me=\"" + me + "\",stat=\"max\"");
+            }
+        }
+        else if (stage == "dme")
+        {
+            // The resample of each ME's boxes (P4).
+            for (auto const& [me, v] : value.items())
+            {
+                metric("dme_ms", v["avg"].get<double>(), "me=\"" + me + "\",stat=\"avg\"");
+                metric("dme_ms", v["max"].get<double>(), "me=\"" + me + "\",stat=\"max\"");
             }
         }
         else if (value.is_object())
