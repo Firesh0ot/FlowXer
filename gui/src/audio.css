@@ -1,0 +1,49 @@
+/* The AUDIO strip (components/AudioStrip.tsx), in the console and in the `audio` widget. */
+.audio-strip {
+  display: flex; gap: 4px; align-items: stretch; overflow-x: auto; padding: 6px; min-height: 0;
+  font-size: 11px;
+}
+.audio-strip.empty { color: var(--muted); padding: 12px; }
+.audio-column {
+  flex: 0 0 56px; width: 56px; display: grid; grid-template-rows: auto 14px minmax(110px, 1fr) auto auto;
+  gap: 3px; padding: 4px 3px; border: 1px solid var(--line); border-radius: 4px; background: #0e131c;
+}
+.audio-column.heard { border-color: #4a3030; }
+.audio-column.master { flex-basis: 112px; width: 112px; border-color: #2a4a6a; grid-template-rows: auto 14px minmax(110px, 1fr) auto auto auto; }
+.audio-label {
+  display: flex; align-items: center; gap: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-weight: 600; font-size: 10px; letter-spacing: 0.02em;
+}
+.on-air-dot { flex: 0 0 7px; width: 7px; height: 7px; border-radius: 50%; background: #2a3242; }
+.on-air-dot.on { background: var(--pgm); box-shadow: 0 0 4px var(--pgm); }
+.audio-delay { font-size: 9px; color: var(--muted); text-align: center; white-space: nowrap; }
+.audio-delay .overs { color: #fff; background: var(--pgm); border-radius: 3px; padding: 0 3px; }
+.audio-body { display: flex; gap: 3px; min-height: 0; justify-content: center; }
+.meter { display: flex; gap: 2px; height: 100%; }
+.meter-bar { position: relative; width: 6px; height: 100%; background: #05070b; border: 1px solid #1c2433; overflow: hidden; }
+.meter-bar.over { border-top: 3px solid var(--pgm); }
+.meter-fill {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(to top, #2ecf6a 0%, #2ecf6a 62%, #e0c025 80%, #e0602a 94%, #e23b3b 100%);
+  background-size: 100% 100%;
+}
+.meter-hold { position: absolute; left: 0; right: 0; height: 2px; background: #e8eef8; }
+.meter-mark { position: absolute; left: 0; right: 0; height: 1px; background: #2ec4ff; }
+.fader-box { position: relative; display: grid; grid-template-rows: 1fr auto; justify-items: center; min-height: 0; }
+.fader-scale { position: absolute; left: -2px; top: 8px; bottom: 26px; width: 14px; pointer-events: none; }
+.fader-scale span { position: absolute; left: 0; transform: translateY(50%); font-size: 7px; color: var(--muted); }
+.fader {
+  writing-mode: vertical-lr; direction: rtl; width: 22px; height: 100%; min-height: 90px; margin: 0 0 0 10px;
+  accent-color: #8ea0b8; cursor: ns-resize;
+}
+.fader-value { font-size: 10px; text-align: center; font-variant-numeric: tabular-nums; }
+.audio-buttons { display: grid; grid-template-columns: 1fr; gap: 2px; }
+.audio-buttons button {
+  font: inherit; font-size: 9px; font-weight: 700; letter-spacing: 0.04em; padding: 3px 0; cursor: pointer;
+  color: var(--text); background: var(--button, #151b26); border: 1px solid var(--line); border-radius: 3px;
+}
+.audio-buttons button.mute.on { background: #e0b025; border-color: #e0b025; color: #041018; }
+.audio-buttons button.afv.on { background: #2a4a6a; border-color: #4a7ab0; color: #fff; }
+.audio-buttons button:hover { filter: brightness(1.15); }
+.afv-none { height: 19px; }
+.loudness { display: grid; gap: 1px; font-size: 10px; font-variant-numeric: tabular-nums; }

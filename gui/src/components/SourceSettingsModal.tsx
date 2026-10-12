@@ -1,10 +1,13 @@
 import { useState } from "react";
-import type { LibraryItem, LogicalInput, StingerSlot } from "../api";
+import type { AudioState, LibraryItem, LogicalInput, StingerSlot } from "../api";
 
 const KINDS = ["mxl_live", "clip_player", "black"] as const;
 
 export function SourceSettingsModal({
   input,
+  audio,
+  fps,
+  onAudio,
   libraryItems,
   stingerSlots,
   pinnedBy,
@@ -13,6 +16,10 @@ export function SourceSettingsModal({
   onOpenLibrary,
 }: {
   input: LogicalInput;
+  /** The audio settings (P5): a live input's delay and channel map are in its Audio section. */
+  audio?: AudioState;
+  fps: number;
+  onAudio: (payload: { delay_ms?: number; channel_map?: number[] }) => Promise<void>;
   /** Ready clips and stills of the library. */
   libraryItems: LibraryItem[];
   stingerSlots: StingerSlot[];
@@ -32,7 +39,16 @@ export function SourceSettingsModal({
   const [playOnCut, setPlayOnCut] = useState(Boolean(input.play_on_cut));
   const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
-
+  const inputAudio = audio?.inputs[input.id];
+  const pgmChannels = audio?.channels ?? 2;
+  const flowChannels = inputAudio?.channels ?? input.audio?.channels ?? 2;
+  const [delayMs, setDelayMs] = useState(inputAudio?.delay_ms ?? 0);
+  // Per PGM channel the input channel (1-based, 0 silent); the default is 1:1.
+  const identity = Array.from({ length: pgmChannels }, (_, c) => (flowChannels === 1 ? 1 : c < flowChannels ? c + 1 : 0));
+  const [channelMap, setChannelMap] = useState<number[]>(inputAudio?.channel_map?.length ? inputAudio.channel_map : identity);
+  const frameMs = 1000 / fps;
+  const maxDelay = audio?.max_delay_ms ?? 1000;
+  const stepDelay = (ms: number) => setDelayMs((d) => Math.min(maxDelay, Math.max(0, Math.round((d + ms) * 48) / 48)));
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -77,6 +93,61 @@ export function SourceSettingsModal({
               Audio flow UUID
               <input value={audioFlow} onChange={(e) => setAudioFlow(e.target.value)} />
             </label>
+            {audio ? (
+              <fieldset className="audio-settings">
+                <legend>Audio</legend>
+                <label>
+                  Delay (ms; audio later than its video, 0–{maxDelay})
+                  <span className="delay-row">
+                    <button type="button" title="One frame less" onClick={() => stepDelay(-frameMs)}>
+                      −1 fr
+                    </button>
+                    <button type="button" title="1 ms less" onClick={() => stepDelay(-1)}>
+                      −1
+                    </button>
+                    <input
+                      type="number"
+                      min={0}
+                      max={maxDelay}
+                      step={0.1}
+                      value={Math.round(delayMs * 100) / 100}
+                      onChange={(e) => setDelayMs(Math.min(maxDelay, Math.max(0, Number(e.target.value) || 0)))}
+                    />
+                    <button type="button" title="1 ms more" onClick={() => stepDelay(1)}>
+                      +1
+                    </button>
+                    <button type="button" title="One frame more" onClick={() => stepDelay(frameMs)}>
+                      +1 fr
+                    </button>
+                  </span>
+                </label>
+                <div className="map-row">
+                  <span>Channels (PGM ← input; the flow has {flowChannels})</span>
+                  {channelMap.map((value, c) => (
+                    <label key={c}>
+                      {c + 1}
+                      <select
+                        value={value}
+                        onChange={(e) => setChannelMap((map) => map.map((v, k) => (k === c ? Number(e.target.value) : v)))}
+                      >
+                        <option value={0}>silent</option>
+                        {Array.from({ length: Math.max(flowChannels, 2) }, (_, k) => (
+                          <option key={k + 1} value={k + 1}>
+                            {k + 1}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ))}
+                  <button type="button" onClick={() => setChannelMap(identity)}>
+                    1:1
+                  </button>
+                  <button type="button" onClick={() => setChannelMap(channelMap.map(() => 1))}>
+                    Mono
+                  </button>
+                </div>
+              </fieldset>
+            ) : null}
           </>
         ) : null}
         {kind === "clip_player" ? (
@@ -151,6 +222,14 @@ export function SourceSettingsModal({
                   payload.play_on_cut = playOnCut;
                 }
                 await onSave(payload);
+                if (kind === "mxl_live" && audio) {
+                  const isIdentity = channelMap.every((v, c) => v === identity[c]);
+                  const map = isIdentity ? [] : channelMap;
+                  const before = inputAudio?.channel_map ?? [];
+                  if (delayMs !== (inputAudio?.delay_ms ?? 0) || map.join(",") !== before.join(",")) {
+                    await onAudio({ delay_ms: delayMs, channel_map: map });
+                  }
+                }
                 onClose();
               } catch (err) {
                 setError(err instanceof Error ? err.message : "Save failed");

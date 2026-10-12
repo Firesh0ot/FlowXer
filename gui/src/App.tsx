@@ -1,5 +1,6 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
+import { AudioStrip, useAudioMeters } from "./components/AudioStrip";
 import { LibraryModal } from "./components/LibraryModal";
 import { BoxEditor } from "./components/BoxEditor";
 import { Monitor } from "./components/Monitor";
@@ -41,6 +42,24 @@ export default function App() {
   // A picture's context menu (GRAB) at the mouse, and the toast that names a new still.
   const [grabMenu, setGrabMenu] = useState<{ source: string; label: string; x: number; y: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The AUDIO strip of the active ME, open or closed (remembered in the browser).
+  const [audioOpen, setAudioOpen] = useState(() => {
+    try {
+      return localStorage.getItem("flowxer.audioOpen") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const meters = useAudioMeters(audioOpen);
+  const toggleAudio = () =>
+    setAudioOpen((open) => {
+      try {
+        localStorage.setItem("flowxer.audioOpen", open ? "0" : "1");
+      } catch {
+        // Not remembered.
+      }
+      return !open;
+    });
 
   const refresh = async () => {
     try {
@@ -110,7 +129,7 @@ export default function App() {
   };
 
   return (
-    <div className="console">
+    <div className={`console ${audioOpen && snapshot.audio ? "with-audio" : ""}`}>
       <header className="menu-bar">
         <div className="brand">
           <span className="mark">FX</span>
@@ -276,6 +295,11 @@ export default function App() {
               </button>
             </div>
           ))}
+          {snapshot.audio ? (
+            <button className={`audio-toggle ${audioOpen ? "on" : ""}`} title="The active ME's audio strip" onClick={toggleAudio}>
+              AUDIO
+            </button>
+          ) : null}
         </div>
       </section>
 
@@ -319,6 +343,12 @@ export default function App() {
           onGrab={() => grab(panel.id)}
         />
       </section>
+
+      {audioOpen && snapshot.audio ? (
+        <section className="audio-section">
+          <AudioStrip panelId={panel.id} audio={snapshot.audio} meters={meters} onChanged={() => void refresh()} onError={setError} />
+        </section>
+      ) : null}
 
       {grabMenu ? (
         <>
@@ -377,6 +407,11 @@ export default function App() {
       {sourceEdit ? (
         <SourceSettingsModal
           input={sourceEdit}
+          audio={snapshot.audio}
+          fps={fps}
+          onAudio={async (payload) => {
+            await api.patchAudioInput(sourceEdit.id, payload);
+          }}
           libraryItems={playable}
           stingerSlots={snapshot.stinger_slots}
           pinnedBy={snapshot.pinned?.logical_source_count}

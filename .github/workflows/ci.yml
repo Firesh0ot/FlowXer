@@ -32,6 +32,7 @@ jobs:
           npx tsc --noEmit
           node --experimental-strip-types scripts/check-wipe.ts
           node --experimental-strip-types scripts/check-dme.ts
+          node --experimental-strip-types scripts/check-fader.ts
 
   engine:
     name: Engine unit tests

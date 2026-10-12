@@ -187,12 +187,14 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
         "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
         "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
         "upstream keyers and DSKs with On/Off and Auto. `dme`: one upstream keyer's box: On/Off, "
-        "Auto, Run back and forth, and the presets."
+        "Auto, Run back and forth, and the presets. `audio`: one ME's audio strips (meter, MUTE, AFV, and the "
+        "fader unless `faders=false`) and its master meter with the loudness."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
     transition = {"type": "boolean", "default": True, "title": "Transition type"}
+    faders = {"type": "boolean", "default": True, "title": "Faders"}
     keyer = {"type": "integer", "minimum": 1, "maximum": max(1, mixer.workspace.keyers_per_me), "title": "Upstream keyer"}
     return [
         {
@@ -214,6 +216,13 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "title": "FlowXer DME",
             "params": {"type": "object", "properties": {"me": me, "keyer": keyer}, "required": ["me", "keyer"]},
             "min_size": {"w": 320, "h": 120},
+            "version": __version__,
+        },
+        {
+            "id": "audio",
+            "title": "FlowXer audio",
+            "params": {"type": "object", "properties": {"me": me, "faders": faders}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 240},
             "version": __version__,
         },
     ]

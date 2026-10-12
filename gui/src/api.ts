@@ -283,6 +283,47 @@ export interface TallyConfig {
   presets: TallyPreset[];
 }
 
+/** P5 audio settings (GET /audio, GET /console `audio`). */
+export interface AudioStripSettings {
+  label: string;
+  kind: "input" | "clip_player" | "panel" | "stinger";
+  fader_db: number;
+  mute: boolean;
+  /** Audio follows video; null on the stinger strip. */
+  afv: boolean | null;
+}
+
+export interface AudioState {
+  /** The PGM's channels. */
+  channels: number;
+  max_delay_ms: number;
+  /** Per live input id: its delay, channel map (empty: 1:1) and its flow's channels. */
+  inputs: Record<string, { label: string; delay_ms: number; channel_map: number[]; channels: number | null }>;
+  /** Per rendering panel id: its master and its strips in slot order. */
+  panels: Record<string, { label: string; master_db: number; strips: Record<string, AudioStripSettings> }>;
+}
+
+export interface SourceMeter {
+  peak_dbfs: number[];
+  rms_dbfs: number[];
+}
+
+/** GET /audio/meters: the last 100 ms block (values below −120 dB are −120). */
+export interface AudioMeters {
+  block: number | null;
+  channels: number;
+  sources: Record<string, SourceMeter>;
+  panels: Record<
+    string,
+    SourceMeter & {
+      true_peak_dbtp: number[];
+      loudness: { pair: number; momentary: number; short_term: number; integrated: number }[];
+      overs: number;
+      strips: Record<string, { gain_db: number; heard: boolean }>;
+    }
+  >;
+}
+
 export interface ConsoleState {
   workspace: WorkspaceConfig;
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
@@ -304,6 +345,8 @@ export interface ConsoleState {
   nmos?: NmosStatus;
   /** Workspace fields set by the environment, with the variables that set them. */
   pinned?: Partial<Record<keyof WorkspaceConfig, string>>;
+  /** The audio settings (P5). */
+  audio?: AudioState;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -423,6 +466,28 @@ export const api = {
       parse<Keyer[]>(r),
     ),
   dmePresets: () => fetch("/api/v1/dme/presets").then((r) => parse<DmePresetInfo[]>(r)),
+  audio: () => fetch("/api/v1/audio").then((r) => parse<AudioState>(r)),
+  audioMeters: () => fetch("/api/v1/audio/meters").then((r) => parse<AudioMeters>(r)),
+  patchAudioInput: (id: string, payload: { delay_ms?: number; channel_map?: number[] }) =>
+    fetch(`/api/v1/audio/inputs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  patchAudioPanel: (id: string, payload: { master_db: number }) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  patchAudioStrip: (panel: string, strip: string, payload: { fader_db?: number; mute?: boolean; afv?: boolean }) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(panel)}/strips/${encodeURIComponent(strip)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  resetLoudness: (panel: string) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(panel)}/loudness/reset`, { method: "POST" }).then((r) => parse(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",

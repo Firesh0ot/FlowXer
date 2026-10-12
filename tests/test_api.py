@@ -108,7 +108,10 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus", "keys", "dme"]
+    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio"]
+    audio = widgets[3]
+    assert audio["params"]["required"] == ["me"] and audio["params"]["properties"]["faders"]["default"] is True
+    assert audio["min_size"] == {"w": 480, "h": 240}
     assert widgets[1]["params"]["required"] == ["me"] and widgets[1]["min_size"] == {"w": 240, "h": 150}
     bus = widgets[0]
     assert bus["params"]["required"] == ["me"]
