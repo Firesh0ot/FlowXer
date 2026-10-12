@@ -159,6 +159,18 @@ fused compose: the background, the upstream keyers, the DSKs, Fade to Black.
 - **Luma:** a self key of a source the ME may take (an input, a clip player, `me<n>` with n > m):
   α = clamp(((Y − 64) / 876 − clip) / soft) (hard with no softness), inverted, times the gain;
   the fill is the source. A clip player keyed on air counts as on air.
+- **Pip** (upstream keyers): a source the ME may take, opaque, in a box.
+- **DME boxes** (P4 M1, `docs/engine-p4.md` §3, `core/dme.hpp`): an upstream keyer with
+  `dme.enabled` (always for a pip) crops, scales and places its fill (and a linear key's key,
+  premultiplied) in a box: one weight-table kernel and one resample kernel per box (Catmull-Rom,
+  widened by 1 / size when shrinking, at most 32 taps; the horizontal pass into shared memory per
+  tile of box rows, then the vertical pass), into the keyer's box buffer (12.4 MB at 1080p,
+  allocated when the box is first drawn). The fused compose draws it as a `box` layer: a black
+  rectangular shadow (smoothstep edges), the outer border, then the picture (anti-aliased or soft
+  edges), each rounded to 10 bits; the keyer's gain scales all three. A linear box limits its
+  premultiplied fill to what its key allows, so the cubic's ringing at a hard key edge leaves no
+  fringe. yuv16 only. The CPU reference (`dmeResampleCpu`, `dmeLayerCpu`) and the kernels share
+  the code and agree bit for bit.
 - **Key flows:** keyers routed to the same flow share one reader and upload; a flow's frames
   are allocated when it is first routed (stream-ordered), not at start.
 - `POST /keyer/<k>` `{"on": bool}` cuts it, `/keyer/<k>/auto` `{"frames": n}` fades the gain over
@@ -293,7 +305,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `PUT /key/{k}` | `{"domain", "flow"}` | routes keyer k's key input (v210a); a flow another keyer reads is shared |
 | `POST /keyer/{k}` | `{"on": true}` | the keyer on or off at the next grain |
 | `POST /keyer/{k}/auto` | `{"frames": 25}` | fades the keyer on (or off when it is on) |
-| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma", "source", "clip", "soft", "gain", "invert"}` | the key; a luma source must be one the keyer's ME may take |
+| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma"\|"pip", "source", "clip", "soft", "gain", "invert", "dme"}` | the key; a luma or pip source must be one the keyer's ME may take; `dme` `{enabled, x, y, size, soft, crop {left, right, top, bottom}, border {width, soft, color "#RRGGBB", opacity}, shadow {dx, dy, blur, opacity}}`; pip and dme on upstream keyers only |
 | `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
@@ -382,7 +394,14 @@ ME 2 → ME 1 gives the same picture in the same output grain; ME 2 may not take
 GPU self-test: yuv16 round trip and dissolve exact, rgba16f round trip exact on the test
 picture, dissolve within 1 code. P3 adds every wipe code (5 positions, 4 soft/border settings, both
 directions: 920 cases) bit for bit against the CPU reference, and the fused compose (a wipe and two
-key layers) exact.
+key layers) exact. P4 adds 9 DME boxes (pip, luma and linear; sizes 0.1–1.5, crops, sub-pixel
+positions, soft edges, borders, shadows, partly off the raster): box buffers and composed pictures
+bit for bit.
+
+DME cost on the lab (A16 GPU 3, 1080p, border + shadow, resample + box layer, CUDA events over
+300 runs): corner PiP 1/3 0.26 ms, half-size PiP 0.29 ms, split 2 × 1/2 0.31 ms per box, quad
+0.29 ms per box, 8 × 1/4 0.24 ms per box, full size 0.48 ms, upscale 1.5 0.42 ms. In the running
+engine a half-size pip adds 0.27 ms to its ME (2 boxes: 0.23 ms per box).
 
 ### Against the success criteria
 

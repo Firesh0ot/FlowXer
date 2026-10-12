@@ -19,6 +19,18 @@ in `docs/platform-integration-plan.md` §8.
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 
+### Added: DME boxes (P4 M1)
+
+- An upstream keyer can put its key in a box: `dme` with position, size, crop, soft edge, an
+  outer border (width, soft, colour, opacity) and a black rectangular shadow (offset, blur,
+  opacity). The keyer mode `pip` shows any source the ME may take (an input, a clip player, a
+  higher ME) opaque in a box. `PATCH /keyers/{id}` takes `mode: "pip"` and a partial `dme`;
+  the GUI's keyer panel has the box fields. DSKs have no DME.
+- Scaling is Catmull-Rom (anti-aliased when shrinking) with sub-pixel positions; chroma on its
+  own 4:2:2 grid; a linear box is scaled premultiplied. GPU and CPU reference agree bit for bit.
+- Tally: a pip's source lights LH while the keyer is on air, like a luma key's.
+- Cost on the lab A16: about 0.29 ms per half-size 1080p box (resample and box layer).
+
 ### Added: metrics of P3 (M4)
 
 - Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;

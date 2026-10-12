@@ -1,6 +1,8 @@
 # FlowXer engine P4: DME boxes and frame grab
 
-Status: the design, not implemented. P4 builds on P3 (transitions and keying, #89) and on P2
+Status: M1 (the box) implemented in #91: `core/dme.hpp`, the resample and box layer, `pip` and
+DME on linear and luma keyers, API, GUI fields, tally; M1 gate met (0.29 ms per half-size box
+with border and shadow on the A16). M2–M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
 the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
