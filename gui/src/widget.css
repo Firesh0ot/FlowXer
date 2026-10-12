@@ -88,7 +88,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   position: relative; min-width: 480px; min-height: 240px; height: 100%;
   display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 4px; padding: 8px; background: var(--panel);
 }
-.audio-widget .audio-strip { padding: 0; }
+.audio-widget .audio-strip { padding: 0; min-height: 200px; }
 .empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 .widget-error {
   position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;

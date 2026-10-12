@@ -18,7 +18,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 /* The AUDIO strip of the active ME, a row under the deck (P5). */
 .console.with-audio { grid-template-rows: auto auto minmax(0, 1fr) auto; }
-.audio-section { border-top: 1px solid var(--line); background: #0b0e14; max-height: 260px; overflow: auto; }
+.audio-section { border-top: 1px solid var(--line); background: #0b0e14; height: 240px; min-height: 0; }
 .aux-row button.audio-toggle { margin-left: auto; font-weight: 700; letter-spacing: 0.08em; }
 .aux-row button.audio-toggle.on { outline: 2px solid var(--accent); }
 .audio-settings { border: 1px solid var(--line); border-radius: 6px; display: grid; gap: 8px; padding: 8px; }
