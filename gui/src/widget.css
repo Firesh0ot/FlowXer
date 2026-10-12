@@ -60,6 +60,9 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   background: var(--button); border: 1px solid var(--line); border-radius: 4px;
 }
 .key-row button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+/* A linear keyer without a key signal (NO KEY): amber, so On does not look like a key on air. */
+.key-label.nokey { color: #e0b025; }
+.key-row button.on.nokey { background: #e0b025; border-color: #e0b025; color: #041018; }
 .keys-widget button:hover { filter: brightness(1.15); }
 .empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 .widget-error {

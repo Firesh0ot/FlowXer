@@ -45,7 +45,7 @@ export function KeyerControl({
   return (
     <div className={`dsk-control ${keyer.enabled ? "on" : ""}`} title={noKey ? `Key input: ${keyState}` : undefined}>
       <button
-        className={keyer.enabled ? "on" : ""}
+        className={`${keyer.enabled ? "on" : ""} ${noKey ? "nokey" : ""}`}
         title="Cut the keyer on or off"
         onClick={() => patch({ enabled: !keyer.enabled })}
       >

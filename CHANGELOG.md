@@ -5,6 +5,16 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Fixed: P3 trial on small
+
+- `recommended_latency_grains` counts only what delivers: each input's video and audio while
+  they run and the key flows in use while they run. Unrouted inputs and keys, key flows without
+  grains, clip players and stinger players never count. An input's audio whose head stood still
+  for a second is `no_signal` (like video) and adds no lag (a left flow's growing distance held
+  the peak).
+- GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
+  ON does not look like a key on air.
+
 ### Added: metrics of P3 (M4)
 
 - Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;

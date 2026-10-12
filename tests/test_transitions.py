@@ -214,6 +214,33 @@ def test_a_p2_state_keeps_dsk_1(settings) -> None:
     assert [keyer.id for keyer in again.keyers] == ["me-1-key-1", "me-1-key-2", "dsk-1"]
 
 
+@pytest.mark.parametrize("on", [False, True])
+def test_the_saved_p2_state_keeps_dsk_1_on_or_off(settings, on: bool) -> None:
+    # small's test-all: the state.json P2 (14.21.49) wrote, DSK 1 not routed; P3 starts on it with
+    # FLOWXER_KEYERS_PER_ME=2, FLOWXER_DSKS_PER_ME=1. DSK 1 stays as it was, in FlowXer and on the
+    # engine; the keyers P2 did not have start off.
+    settings.keyers_per_me, settings.dsks_per_me, settings.stinger_players = 2, 1, 1
+    p2 = VisionMixer(settings)
+    state = p2.export_state()
+    state["flowxer_version"] = "14.21.49"
+    state["workspace"] = {
+        "downstream_keyer_count": 1, "format_id": "1080p50", "logical_source_count": 7, "mixer_panel_count": 1,
+        "source_tile_aspect": "16:9", "stinger_count": 1, "stinger_mode": "shared",
+    }
+    state["panels"] = [
+        {"id": "me-1", "label": "ME 1", "last_transition": "cut", "preview_input_id": "cam-2", "program_input_id": "cam-1", "wipe_armed": False}
+    ]
+    state["keyers"] = [{"enabled": on, "id": "dsk-1", "label": "DSK 1", "rate_ms": 500}]
+    p2._store.save(state)
+    p3 = VisionMixer(settings)
+    assert [(keyer.id, keyer.enabled) for keyer in p3.keyers] == [("me-1-key-1", False), ("me-1-key-2", False), ("dsk-1", on)]
+    calls = _record_engine(p3)
+    p3._on_engine_ready(None)
+    assert [(path, body) for _, path, body in calls if path.startswith("/keyer/") and "on" in body] == [
+        ("/keyer/1", {"on": False}), ("/keyer/2", {"on": False}), ("/keyer/3", {"on": on}),
+    ]
+
+
 def test_keyer_counts_from_the_environment(settings) -> None:
     settings.panels = 2
     settings.keyers_per_me = 1

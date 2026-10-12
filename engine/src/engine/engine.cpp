@@ -276,8 +276,10 @@ struct Input
     std::atomic<std::uint64_t> audioStartup{0};
     std::atomic<std::uint64_t> audioWaits{0};
     std::atomic<std::uint64_t> audioReopens{0};
-    // How far the audio head is behind TAI (ms), sampled once per grain.
+    // How far the audio head is behind TAI (ms), sampled once per grain while the head moves.
     Window audioLag;
+    // When the audio head last moved (TAI ns; 0: not yet): still for a second is no_signal.
+    std::atomic<std::uint64_t> audioMovedAt{0};
 
     [[nodiscard]] Route videoRoute() const
     {
@@ -323,6 +325,7 @@ struct AudioRun
         std::uint64_t gen = ~0ull;
         Route route;
         std::chrono::steady_clock::time_point retryAt{};
+        std::uint64_t head = MXL_UNDEFINED_INDEX;
     };
     std::vector<Reader> readers;
     // Channel-major buffers of one grain: per source (inputs, then players), per ME Program.
@@ -1715,6 +1718,8 @@ struct Engine::Impl
             r.retryAt = {};
             in.audioGraceUntil.store(graceFromNow());
             in.audioLag.reset();
+            r.head = MXL_UNDEFINED_INDEX;
+            in.audioMovedAt.store(0);
             setAudioState(in, r.route.flow.empty() ? "not_routed" : "starting");
         }
         if (r.reader != nullptr)
@@ -1760,7 +1765,9 @@ struct Engine::Impl
         return true;
     }
 
-    // How far the audio head is behind TAI, once per grain for every routed input.
+    // How far the audio head is behind TAI, once per grain for every routed input. Only while
+    // the head moves: a head that never moved since the route (a left flow) or stood still for a
+    // second (no_signal) is no arrival, and its growing distance would hold the peak forever.
     void measureAudio(Input& in, AudioRun::Reader& r)
     {
         mxlFlowRuntimeInfo runtime{};
@@ -1768,7 +1775,17 @@ struct Engine::Impl
         {
             return;
         }
-        auto const now = timestampToIndex(Rate{kAudioRate, 1}, mxlGetTime());
+        auto const nowNs = mxlGetTime();
+        if (r.head != MXL_UNDEFINED_INDEX && runtime.headIndex != r.head)
+        {
+            in.audioMovedAt.store(nowNs);
+        }
+        r.head = runtime.headIndex;
+        if (nowNs > in.audioMovedAt.load() + 1'000'000'000ull)
+        {
+            return;
+        }
+        auto const now = timestampToIndex(Rate{kAudioRate, 1}, nowNs);
         double const behind = now > runtime.headIndex ? static_cast<double>(now - runtime.headIndex) : 0.0;
         in.audioLag.add(behind * 1000.0 / static_cast<double>(kAudioRate));
     }
@@ -2304,22 +2321,6 @@ struct Engine::Impl
 
     // ---- status --------------------------------------------------------------------------
 
-    // The latency that covers the latest arrival seen since each input was routed: grain i - L
-    // must be there when the render of grain i starts, half a grain before its TAI time.
-    [[nodiscard]] int recommendedLatency() const
-    {
-        double worst = 0;
-        for (auto const& in : inputs)
-        {
-            worst = std::max({worst, in->arrival.peak(), in->audioLag.peak()});
-        }
-        for (auto const& key : keys)
-        {
-            worst = std::max(worst, key->arrival.peak());
-        }
-        return latencyFor(worst / periodMs());
-    }
-
     json inputJson(Input const& in, std::uint64_t now) const
     {
         std::string state;
@@ -2338,6 +2339,12 @@ struct Engine::Impl
         if (state == "running" && (lastAt == 0 || now > lastAt + 1'000'000'000ull))
         {
             state = "no_signal";
+        }
+        // Audio: its head stood still for a second.
+        auto const movedAt = in.audioMovedAt.load();
+        if (audioState == "running" && (movedAt == 0 || now > movedAt + 1'000'000'000ull))
+        {
+            audioState = "no_signal";
         }
         json item{{in.key ? "key" : "input", in.number},
             {"name", in.name},
@@ -2376,7 +2383,6 @@ struct Engine::Impl
         out["engine"] = {{"version", FXENG_VERSION},
             {"format", cfg.format},
             {"latency_grains", cfg.latency},
-            {"recommended_latency_grains", recommendedLatency()},
             {"mes", cfg.mes},
             {"inputs", inputs.size()},
             {"players", players.size()},
@@ -2468,6 +2474,8 @@ struct Engine::Impl
         }
         out["keys"] = keyList;
         out["key_flows"] = flowList;
+        // Grain i - L must be there when the render of grain i starts, half a grain before its TAI time.
+        out["engine"]["recommended_latency_grains"] = recommendedLatency(out, periodMs());
         json playerList = json::array();
         for (auto const& player : players)
         {
