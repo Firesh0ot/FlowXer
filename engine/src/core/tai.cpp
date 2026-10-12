@@ -49,10 +49,11 @@ std::uint64_t periodNs(Rate rate)
 int recommendedLatency(nlohmann::json const& status, double periodMs)
 {
     double worst = 0;
-    auto const take = [&](nlohmann::json const& item, char const* window) {
+    // `earlier`: a delayed input's audio is read that much earlier (P5), so its lag counts less.
+    auto const take = [&](nlohmann::json const& item, char const* window, double earlier = 0.0) {
         if (item.value("state", "") == "running" && item.contains(window))
         {
-            worst = std::max(worst, item[window].value("peak", 0.0));
+            worst = std::max(worst, item[window].value("peak", 0.0) - earlier);
         }
     };
     for (auto const& input : status.value("inputs", nlohmann::json::array()))
@@ -60,7 +61,7 @@ int recommendedLatency(nlohmann::json const& status, double periodMs)
         take(input, "arrival_ms");
         if (input.contains("audio"))
         {
-            take(input["audio"], "lag_ms");
+            take(input["audio"], "lag_ms", input["audio"].value("delay_ms", 0.0));
         }
     }
     for (auto const& key : status.value("key_flows", nlohmann::json::array()))

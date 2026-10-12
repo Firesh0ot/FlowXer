@@ -113,6 +113,8 @@ struct Config
     int holdGrains = 0;
     // Longest wait (ms) for input audio that is not there yet when its grain is written.
     int audioWaitMs = 8;
+    // Longest audio delay (ms) of a live input (P5): its delay line holds this much.
+    int audioMaxDelayMs = 1000;
     bool mosaic = true;
     int mosaicFps = 25;
     int mosaicKbps = 6000;

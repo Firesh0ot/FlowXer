@@ -101,6 +101,8 @@ class Settings(BaseSettings):
     frame_rate_den: int = 1
     audio_rate: int = 48000
     audio_channels: int = 2
+    # The longest audio delay of a live input (P5): the engine's delay lines hold this much.
+    audio_max_delay_ms: int = Field(default=1000, ge=0, le=5000)
     video_media_type: str = "video/v210"
     audio_media_type: str = "audio/float32"
 

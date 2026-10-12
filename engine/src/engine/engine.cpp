@@ -1,6 +1,7 @@
 #include "engine/engine.hpp"
 
 #include "core/audio.hpp"
+#include "core/audiomix.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
@@ -65,6 +66,9 @@ constexpr std::uint64_t kLagSettleNs = 2'000'000'000;
 constexpr std::size_t kGrabsPerGrain = 4;
 constexpr std::size_t kGrabBuffers = 8;
 constexpr std::size_t kGrabHistory = 32;
+// Output grains waiting for fx-audio; when it is this far behind, a grain's job is dropped (the
+// next one covers the gap, as a skipped video grain).
+constexpr std::size_t kAudioJobs = 8;
 
 // A sample later than this is no arrival but a grain the clock cannot place (index 0 of a mirror
 // flow that was just created): it would hold the peak forever (small: 1.79e12 ms on a new mirror).
@@ -293,6 +297,13 @@ struct Input
     Window audioLag;
     // When the audio head last moved (TAI ns; 0: not yet): still for a second is no_signal.
     std::atomic<std::uint64_t> audioMovedAt{0};
+    // P5: its audio's delay (48 kHz samples) and channel map (empty: 1:1), set by the control API
+    // (under mu) and applied by fx-audio with a crossfade over one grain; what its delay line holds
+    // (samples) and its flow's channels, published by fx-audio.
+    std::uint32_t audioDelay = 0;
+    std::vector<int> audioMap;
+    std::atomic<std::uint64_t> audioHeld{0};
+    std::atomic<std::uint32_t> audioChannels{0};
 
     [[nodiscard]] Route videoRoute() const
     {
@@ -326,7 +337,7 @@ struct Output
     std::atomic<std::uint64_t> failed{0};
 };
 
-// The PGM audio state of fx-writer (only that thread touches it).
+// The audio state of fx-audio (only that thread touches it).
 struct AudioRun
 {
     struct Reader
@@ -335,17 +346,39 @@ struct AudioRun
         std::string domain;
         mxlFlowReader reader = nullptr;
         std::size_t channels = 0;
+        // The most samples one read may take (MXL's ring).
+        std::size_t maxRead = 0;
         std::uint64_t gen = ~0ull;
         Route route;
         std::chrono::steady_clock::time_point retryAt{};
         std::uint64_t head = MXL_UNDEFINED_INDEX;
+        // P5: the delay line (every channel of the flow), the first sample written since the reader
+        // opened, whether its sound has faded in, the delay and map in use, and its sound of the
+        // grain (delayed and mapped; `before`: the old reading during a change).
+        DelayLine line;
+        std::uint64_t firstIndex = MXL_UNDEFINED_INDEX;
+        bool live = false;
+        std::uint32_t delay = 0;
+        std::vector<int> map;
+        std::vector<float> sound;
+        std::vector<float> before;
     };
     std::vector<Reader> readers;
-    // Channel-major buffers of one grain: per source (inputs, then players), per ME Program.
-    std::vector<std::vector<float>> in;
+    // Per ME its PGM of the grain (channel-major, channels × n).
     std::vector<std::vector<float>> me;
     std::size_t channels = 2;
     std::uint64_t last = 0;
+};
+
+// One output grain for fx-audio, handed over by fx-writer right after its video commit: the MEs'
+// plans and the sound of the clip and stinger players' frames (copied: the frames go with the slot).
+struct AudioJob
+{
+    std::uint64_t index = 0;
+    std::vector<MePlan> plans;
+    // Channel-major (channels × n); empty: silence.
+    std::vector<std::vector<float>> players;
+    std::vector<std::vector<float>> stingers;
 };
 
 // A frame grab (docs/engine-p4.md §6): queued by the control thread, picked by fx-render for an
@@ -602,6 +635,17 @@ struct Engine::Impl
     Window encodeMs;
     Window audioMs;
     Window audioWaitMs;
+    // P5 audio: the mix (made at start, with the PGM flows' channels), its delay lines' length,
+    // fx-audio and its queue of grains (and the jobs it is done with, for reuse).
+    std::unique_ptr<AudioMix> audioMix;
+    std::size_t audioChannels = 2;
+    std::size_t delayLineLength = 0;
+    std::mutex audioMu;
+    std::condition_variable audioCv;
+    std::deque<std::unique_ptr<AudioJob>> audioQueue;
+    std::vector<std::unique_ptr<AudioJob>> audioFree;
+    std::thread audioThread;
+    std::atomic<std::uint64_t> audioJobsDropped{0};
 
     mutable std::mutex snapMu;
     ThreadCpu::Result cpu;
@@ -1904,7 +1948,7 @@ struct Engine::Impl
 
     // ---- writer thread -------------------------------------------------------------------
 
-    void write(Slot& slot, HostRegistry& registry, AudioRun& audio)
+    void write(Slot& slot, HostRegistry& registry)
     {
         cudaStream_t const dl = downloadStream;
         cudaStreamWaitEvent(dl, slot.mark.back(), 0);
@@ -2021,13 +2065,13 @@ struct Engine::Impl
             slot.grabs.clear();
         }
         slot.held.clear();
-        writeAudio(slot, audio);
+        queueAudio(slot);
         slot.players.clear();
         slot.stingers.clear();
         slot.busy.store(false);
     }
 
-    // ---- PGM audio (fx-writer) -----------------------------------------------------------
+    // ---- PGM audio (fx-audio) ------------------------------------------------------------
 
     void setAudioState(Input& in, char const* state)
     {
@@ -2044,7 +2088,8 @@ struct Engine::Impl
         r.reader = nullptr;
     }
 
-    // The input's audio reader for its current route, (re)opened at most once a second.
+    // The input's audio reader for its current route, (re)opened at most once a second. A new
+    // route empties the delay line; an open gives it the flow's channels.
     bool openAudio(Input& in, AudioRun::Reader& r)
     {
         if (in.audioGen.load() != r.gen)
@@ -2062,6 +2107,10 @@ struct Engine::Impl
             in.audioGraceUntil.store(graceFromNow());
             in.audioLag.reset();
             r.head = MXL_UNDEFINED_INDEX;
+            r.line.reset(0, 0);
+            r.firstIndex = MXL_UNDEFINED_INDEX;
+            r.live = false;
+            in.audioHeld.store(0);
             in.audioMovedAt.store(0);
             setAudioState(in, r.route.flow.empty() ? "not_routed" : "starting");
         }
@@ -2101,10 +2150,17 @@ struct Engine::Impl
             return false;
         }
         r.channels = info.continuous.channelCount;
+        r.maxRead = 0;
+        mxlFlowReaderGetMaxReadLengthSamples(r.reader, &r.maxRead);
+        // A (re)opened flow starts its delay line again (and fades in).
+        r.line.reset(r.channels, delayLineLength);
+        r.firstIndex = MXL_UNDEFINED_INDEX;
+        r.live = false;
+        in.audioChannels.store(static_cast<std::uint32_t>(r.channels));
         // Samples from before the open may be missing: a start-up window.
         in.audioGraceUntil.store(graceFromNow());
         setAudioState(in, "running");
-        logInfo("input_audio_open", {{"input", in.name}, {"flow", r.route.flow}, {"channels", r.channels}});
+        logInfo("input_audio_open", {{"input", in.name}, {"flow", r.route.flow}, {"channels", r.channels}, {"max_read", r.maxRead}});
         return true;
     }
 
@@ -2137,15 +2193,64 @@ struct Engine::Impl
         }
     }
 
-    // `count` samples of every channel ending at `end`, channel-major into dst (channels the
-    // flow does not have stay silent). Samples that are not there yet are waited for until
-    // `deadline` (TAI ns), at most audioWaitMs. False when they are not there (late, gone,
-    // re-created).
-    bool readAudio(Input& in, AudioRun::Reader& r, std::uint64_t end, std::size_t count, std::vector<float>& dst, std::size_t channels, std::uint64_t deadline)
+    // `count` samples of every channel from sample index `from`, out of an MXL slice, into the line.
+    static void putSlice(DelayLine& line, mxlWrappedMultiBufferSlice const& slice, std::uint64_t from, std::size_t count)
     {
-        mxlWrappedMultiBufferSlice slice{};
-        auto status = mxlFlowReaderGetSamplesNonBlocking(r.reader, end, count, &slice);
-        if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY)
+        for (std::size_t c = 0; c < std::min(slice.count, line.channels()); ++c)
+        {
+            std::size_t filled = 0;
+            for (auto const& fragment : slice.base.fragments)
+            {
+                if (fragment.pointer == nullptr || filled >= count)
+                {
+                    continue;
+                }
+                std::size_t const n = std::min(fragment.size / sizeof(float), count - filled);
+                line.put(c, from + filled, reinterpret_cast<float const*>(static_cast<std::uint8_t const*>(fragment.pointer) + c * slice.stride), n);
+                filled += n;
+            }
+        }
+    }
+
+    // A live input's new samples into its delay line, up to `end` (the end of its grain i − L). A
+    // heard input waits (bounded, until `deadline`, at most audioWaitMs) for what this grain needs
+    // (up to `need`, its delayed window's end); the others take what is there and get the rest from
+    // MXL's history on the next grain. A gap (samples older than MXL keeps) starts the line again.
+    void fillLine(Input& in, AudioRun::Reader& r, std::uint64_t end, std::uint64_t need, bool heard, std::uint64_t deadline, std::size_t n)
+    {
+        auto& line = r.line;
+        if (line.channels() != r.channels || line.length() != delayLineLength)
+        {
+            line.reset(r.channels, delayLineLength);
+            r.firstIndex = MXL_UNDEFINED_INDEX;
+        }
+        std::uint64_t from = line.started() ? line.end() : (end > n ? end - n : 0);
+        if (from >= end)
+        {
+            return;
+        }
+        if (r.maxRead > 0 && end - from > r.maxRead)
+        {
+            from = end - r.maxRead;
+        }
+        line.begin(from);
+        if (r.firstIndex == MXL_UNDEFINED_INDEX)
+        {
+            r.firstIndex = from;
+        }
+        auto const take = [&](std::uint64_t to) {
+            mxlWrappedMultiBufferSlice slice{};
+            auto const status = mxlFlowReaderGetSamplesNonBlocking(r.reader, to, static_cast<std::size_t>(to - from), &slice);
+            if (status == MXL_STATUS_OK)
+            {
+                putSlice(line, slice, from, static_cast<std::size_t>(to - from));
+                line.commit(to);
+                from = to;
+            }
+            return status;
+        };
+        auto status = take(end);
+        if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY && heard && need > from)
         {
             auto const now = mxlGetTime();
             std::uint64_t const budget = static_cast<std::uint64_t>(cfg.audioWaitMs) * 1'000'000ull;
@@ -2153,9 +2258,37 @@ struct Engine::Impl
             {
                 auto const started = std::chrono::steady_clock::now();
                 ++in.audioWaits;
-                status = mxlFlowReaderGetSamples(r.reader, end, count, std::min(budget, deadline - now), &slice);
+                mxlWrappedMultiBufferSlice slice{};
+                auto const waited = mxlFlowReaderGetSamples(r.reader, need, static_cast<std::size_t>(need - from), std::min(budget, deadline - now), &slice);
                 audioWaitMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                if (waited == MXL_STATUS_OK)
+                {
+                    putSlice(line, slice, from, static_cast<std::size_t>(need - from));
+                    line.commit(need);
+                    from = need;
+                    status = from < end ? take(end) : MXL_STATUS_OK;
+                }
+                else
+                {
+                    status = waited;
+                }
             }
+        }
+        if (status == MXL_ERR_OUT_OF_RANGE_TOO_EARLY && from < end)
+        {
+            // What is there now; the rest comes on the next grain.
+            mxlFlowRuntimeInfo runtime{};
+            if (mxlFlowReaderGetRuntimeInfo(r.reader, &runtime) == MXL_STATUS_OK && runtime.headIndex != MXL_UNDEFINED_INDEX && runtime.headIndex > from)
+            {
+                status = take(std::min<std::uint64_t>(runtime.headIndex, end));
+            }
+        }
+        if (status == MXL_ERR_OUT_OF_RANGE_TOO_LATE)
+        {
+            // Older than MXL still holds: start again with this grain.
+            from = end > n ? end - n : 0;
+            line.begin(from);
+            status = take(end);
         }
         if (status == MXL_ERR_FLOW_INVALID)
         {
@@ -2163,140 +2296,101 @@ struct Engine::Impl
             closeAudio(r);
             r.retryAt = {};
             ++in.audioReopens;
-            return false;
         }
-        if (status != MXL_STATUS_OK)
-        {
-            return false;
-        }
-        for (std::size_t c = 0; c < std::min(slice.count, channels); ++c)
-        {
-            std::size_t filled = 0;
-            for (auto const& fragment : slice.base.fragments)
-            {
-                if (fragment.pointer == nullptr)
-                {
-                    continue;
-                }
-                std::size_t const n = std::min(fragment.size / sizeof(float), count - filled);
-                std::memcpy(dst.data() + c * count + filled, static_cast<std::uint8_t const*>(fragment.pointer) + c * slice.stride, n * sizeof(float));
-                filled += n;
-            }
-        }
-        return true;
     }
 
-    // PGM audio of output grain `index`: the audio of the PGM source, read L grains back on the
-    // same TAI grid as the video (a clip player's own audio of the grain), crossfaded (equal
-    // power) while a Mix runs and around a stinger's cut point; a stinger's sound is added.
-    void audioGrain(std::uint64_t index, Slot const& slot, AudioRun& audio)
+    // The sound of output grain `index`: every routed live input into its delay line and out of it
+    // delayed and mapped (a change of delay or map crossfades over the grain), the clip and stinger
+    // players' frames, the MEs' mixes (core/audiomix), written to each ME's PGM audio flow.
+    void audioGrain(std::uint64_t index, AudioJob const& job, AudioRun& audio)
     {
-        auto const& plans = slot.plans;
         auto const out = grainSamples(cfg.rate, index);
-        auto const src = grainSamples(cfg.rate, inputIndexFor(index, cfg.latency));
         std::size_t const n = out.end - out.first;
-        std::uint64_t const delta = out.first - src.first;
         std::size_t const ch = audio.channels;
-        std::size_t const nIn = inputs.size();
         // Late samples are waited for until 1 ms before the end of this grain's window.
         auto const deadline = windowStart(cfg.rate, index + 1) - 1'000'000ull;
-        std::vector<bool> needed(nIn + players.size(), false);
-        for (auto const& plan : plans)
+        bool const own = index == job.index;
+        auto const heard = audioMix->heardInputs(job.plans);
+        MixSources sources;
+        sources.inputs.assign(inputs.size(), nullptr);
+        auto const span = delayedSamples(cfg.rate, index, cfg.latency, 0);
+        for (std::size_t k = 0; k < inputs.size(); ++k)
         {
-            for (auto const& source : {plan.a, plan.b})
+            auto& in = *inputs[k];
+            auto& r = audio.readers[k];
+            std::uint32_t delay = 0;
+            std::vector<int> map;
             {
-                int const s = sourceSlot(source);
-                if (s >= 0 && (source == plan.a || plan.mixing || plan.stinger > 0))
+                std::lock_guard lock{in.mu};
+                delay = in.audioDelay;
+                map = in.audioMap;
+            }
+            auto const window = delayedSamples(cfg.rate, index, cfg.latency, delay);
+            if (r.reader != nullptr)
+            {
+                fillLine(in, r, span.end, window.end, k < heard.size() && heard[k], deadline, n);
+            }
+            in.audioHeld.store(r.line.started() ? r.line.end() - r.line.start() : 0);
+            if (r.route.flow.empty())
+            {
+                // Not routed: silence (a change of delay or map applies when it is).
+                r.delay = delay;
+                r.map = map;
+                continue;
+            }
+            r.sound.resize(ch * n);
+            r.line.readMapped(channelMap(map, ch, r.line.channels()), window.first, n, r.sound.data());
+            if ((delay != r.delay || map != r.map) && r.line.started())
+            {
+                // From the old reading to the new one, linearly over this grain.
+                r.before.resize(ch * n);
+                r.line.readMapped(channelMap(r.map, ch, r.line.channels()), delayedSamples(cfg.rate, index, cfg.latency, r.delay).first, n, r.before.data());
+                for (std::size_t c = 0; c < ch; ++c)
                 {
-                    needed[static_cast<std::size_t>(s)] = true;
+                    crossfadeLinear(r.before.data() + c * n, r.sound.data() + c * n, n, r.sound.data() + c * n);
                 }
             }
-        }
-        for (std::size_t s = 0; s < needed.size(); ++s)
-        {
-            if (!needed[s])
+            r.delay = delay;
+            r.map = map;
+            bool const held = r.reader != nullptr && r.line.holds(window.first, window.end);
+            if (!r.live && r.line.started() && window.end > r.line.start() && window.end > r.firstIndex)
             {
-                continue;
-            }
-            auto& buffer = audio.in[s];
-            buffer.assign(ch * n, 0.f);
-            if (s >= nIn)
-            {
-                // A clip player: the sound of the frame it shows in this grain.
-                auto const& frame = s - nIn < slot.players.size() ? slot.players[s - nIn] : nullptr;
-                if (frame && frame->index == index)
+                // A new route fades in over its first grain of sound.
+                for (std::size_t c = 0; c < ch; ++c)
                 {
-                    copyPlayerAudio(*frame, buffer, n, ch);
+                    float* d = r.sound.data() + c * n;
+                    for (std::size_t s = 0; s < n; ++s)
+                    {
+                        d[s] *= static_cast<float>(s + 1) / static_cast<float>(n);
+                    }
                 }
-                continue;
+                r.live = true;
             }
-            auto& in = *inputs[s];
-            auto& reader = audio.readers[s];
-            if (reader.route.flow.empty())
-            {
-                continue;
-            }
-            if (reader.reader != nullptr && readAudio(in, reader, out.end - delta, n, buffer, ch, deadline))
+            if (held)
             {
                 ++in.audioBlocks;
             }
             else
             {
-                ++(index <= in.audioGraceUntil.load() ? in.audioStartup : in.audioMissing);
+                // Before the first sample of the route (its delay at the start) or in the start-up
+                // window: start-up; later: missing (silence).
+                bool const startup = index <= in.audioGraceUntil.load() || (r.firstIndex != MXL_UNDEFINED_INDEX && window.first < r.firstIndex);
+                ++(startup ? in.audioStartup : in.audioMissing);
             }
+            sources.inputs[k] = r.sound.data();
         }
-        auto const sourceOf = [&](Source source) -> std::vector<float> const* {
-            if (source.kind == Source::Kind::Me)
-            {
-                return &audio.me[static_cast<std::size_t>(source.index - 1)];
-            }
-            int const s = sourceSlot(source);
-            return s >= 0 ? &audio.in[static_cast<std::size_t>(s)] : nullptr;
-        };
-        std::vector<float> const silence(ch * n, 0.f);
-        std::vector<float> sting;
-        // Render order (ME n before ME m): a re-entered Program's audio is ready.
-        for (auto const& plan : plans)
+        for (std::size_t k = 0; k < job.players.size(); ++k)
         {
-            auto& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
-            auto const* a = sourceOf(plan.a);
-            a = a != nullptr && a->size() == ch * n ? a : &silence;
-            if (plan.mixing || plan.stinger > 0)
-            {
-                auto const* b = sourceOf(plan.b);
-                b = b != nullptr && b->size() == ch * n ? b : &silence;
-                dst.resize(ch * n);
-                for (std::size_t c = 0; c < ch; ++c)
-                {
-                    crossfadeBlock(a->data() + c * n, b->data() + c * n, dst.data() + c * n, n, plan.tPrev, plan.t);
-                }
-            }
-            else
-            {
-                dst = *a;
-            }
-            auto const& stingFrame =
-                plan.stinger > 0 && static_cast<std::size_t>(plan.stinger) <= slot.stingers.size() ? slot.stingers[static_cast<std::size_t>(plan.stinger - 1)] : nullptr;
-            if (stingFrame && stingFrame->index == index && stingFrame->samples > 0)
-            {
-                copyPlayerAudio(*stingFrame, sting, n, ch);
-                for (std::size_t s = 0; s < dst.size(); ++s)
-                {
-                    dst[s] += sting[s];
-                }
-            }
-            // Fade to Black takes the sound with it, ramping within the grain.
-            if (plan.ftb > 0.f || plan.ftbPrev > 0.f)
-            {
-                for (std::size_t c = 0; c < ch; ++c)
-                {
-                    for (std::size_t s = 0; s < n; ++s)
-                    {
-                        float const g = plan.ftbPrev + (plan.ftb - plan.ftbPrev) * static_cast<float>(s + 1) / static_cast<float>(n);
-                        dst[c * n + s] *= 1.f - g;
-                    }
-                }
-            }
+            sources.players.push_back(own && !job.players[k].empty() ? job.players[k].data() : nullptr);
+        }
+        for (std::size_t k = 0; k < job.stingers.size(); ++k)
+        {
+            sources.stingers.push_back(own && !job.stingers[k].empty() ? job.stingers[k].data() : nullptr);
+        }
+        audioMix->grain(job.plans, sources, n, audio.me);
+        for (auto const& plan : job.plans)
+        {
+            auto const& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
             auto& output = *audioOutputs[static_cast<std::size_t>(plan.me - 1)];
             mxlMutableWrappedMultiBufferSlice slice{};
             if (mxlFlowWriterOpenSamples(output.writer, out.end, n, &slice) != MXL_STATUS_OK)
@@ -2337,10 +2431,71 @@ struct Engine::Impl
         }
     }
 
-    // Audio for every grain since the last one written: a skipped video grain leaves no hole
-    // (a hole would replay old samples from the ring). Every routed input's reader is kept open
-    // (so a cut to it has its sound at once) and its lag measured.
-    void writeAudio(Slot const& slot, AudioRun& audio)
+    // fx-writer, after the video commit of a grain: its job for fx-audio (the plans, and the sound
+    // of the clip and stinger players' frames). When fx-audio is kAudioJobs behind, the grain is
+    // dropped here and the next job covers it.
+    void queueAudio(Slot const& slot)
+    {
+        std::unique_ptr<AudioJob> job;
+        {
+            std::lock_guard lock{audioMu};
+            if (audioQueue.size() >= kAudioJobs)
+            {
+                ++audioJobsDropped;
+                return;
+            }
+            if (!audioFree.empty())
+            {
+                job = std::move(audioFree.back());
+                audioFree.pop_back();
+            }
+        }
+        if (!job)
+        {
+            job = std::make_unique<AudioJob>();
+        }
+        auto const span = grainSamples(cfg.rate, slot.index);
+        std::size_t const n = span.end - span.first;
+        job->index = slot.index;
+        job->plans = slot.plans;
+        job->players.resize(players.size());
+        job->stingers.resize(stingers.size());
+        for (std::size_t k = 0; k < players.size(); ++k)
+        {
+            auto const& frame = k < slot.players.size() ? slot.players[k] : nullptr;
+            if (frame && frame->index == slot.index)
+            {
+                // A clip player: the sound of the frame it shows in this grain.
+                copyPlayerAudio(*frame, job->players[k], n, audioChannels);
+            }
+            else
+            {
+                job->players[k].clear();
+            }
+        }
+        for (std::size_t k = 0; k < stingers.size(); ++k)
+        {
+            auto const& frame = k < slot.stingers.size() ? slot.stingers[k] : nullptr;
+            if (frame && frame->index == slot.index && frame->samples > 0)
+            {
+                copyPlayerAudio(*frame, job->stingers[k], n, audioChannels);
+            }
+            else
+            {
+                job->stingers[k].clear();
+            }
+        }
+        {
+            std::lock_guard lock{audioMu};
+            audioQueue.push_back(std::move(job));
+        }
+        audioCv.notify_one();
+    }
+
+    // Audio for every grain since the last one: a skipped video grain (or a dropped job) leaves no
+    // hole (a hole would replay old samples from the ring). Every routed input's reader is kept
+    // open and its lag measured.
+    void runAudio(AudioJob const& job, AudioRun& audio)
     {
         auto const started = std::chrono::steady_clock::now();
         for (std::size_t k = 0; k < inputs.size(); ++k)
@@ -2350,17 +2505,56 @@ struct Engine::Impl
                 measureAudio(*inputs[k], audio.readers[k]);
             }
         }
-        std::uint64_t first = slot.index;
-        if (audio.last != 0 && slot.index > audio.last && slot.index - audio.last <= 25)
+        std::uint64_t first = job.index;
+        if (audio.last != 0 && job.index > audio.last && job.index - audio.last <= 25)
         {
             first = audio.last + 1;
         }
-        for (std::uint64_t k = first; k <= slot.index; ++k)
+        for (std::uint64_t k = first; k <= job.index; ++k)
         {
-            audioGrain(k, slot, audio);
+            audioGrain(k, job, audio);
         }
-        audio.last = slot.index;
+        audio.last = job.index;
         audioMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+    }
+
+    void audioMain()
+    {
+        nameThread("fx-audio");
+        AudioRun audio;
+        audio.readers.resize(inputs.size());
+        audio.me.resize(audioOutputs.size());
+        audio.channels = audioChannels;
+        // Open the routed audio before the first grain.
+        for (std::size_t k = 0; k < inputs.size(); ++k)
+        {
+            openAudio(*inputs[k], audio.readers[k]);
+        }
+        while (true)
+        {
+            std::unique_ptr<AudioJob> job;
+            {
+                std::unique_lock lock{audioMu};
+                audioCv.wait(lock, [&] { return !audioQueue.empty() || !run.load(); });
+                if (audioQueue.empty())
+                {
+                    break;
+                }
+                job = std::move(audioQueue.front());
+                audioQueue.pop_front();
+            }
+            runAudio(*job, audio);
+            std::lock_guard lock{audioMu};
+            audioFree.push_back(std::move(job));
+        }
+        for (auto& reader : audio.readers)
+        {
+            closeAudio(reader);
+            if (reader.instance != nullptr)
+            {
+                mxlDestroyInstance(reader.instance);
+            }
+        }
     }
 
     // Page-locks every grain of every writer before the first output grain: locking a grain
@@ -2393,20 +2587,6 @@ struct Engine::Impl
         lockWriterGrains(registry);
         logInfo("writer_grains_locked", {{"grains", registry.lockedCount()},
                                             {"ms", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()}});
-        AudioRun audio;
-        audio.readers.resize(inputs.size());
-        audio.in.resize(inputs.size() + players.size());
-        audio.me.resize(audioOutputs.size());
-        audio.channels = 1;
-        for (auto const& output : audioOutputs)
-        {
-            audio.channels = std::max<std::size_t>(audio.channels, output->channels);
-        }
-        // Open the routed audio before the first grain.
-        for (std::size_t k = 0; k < inputs.size(); ++k)
-        {
-            openAudio(*inputs[k], audio.readers[k]);
-        }
         writerWarm.set_value();
         while (true)
         {
@@ -2421,18 +2601,10 @@ struct Engine::Impl
                 k = writeQueue.front();
                 writeQueue.pop_front();
             }
-            write(slots[static_cast<std::size_t>(k)], registry, audio);
+            write(slots[static_cast<std::size_t>(k)], registry);
         }
         cudaStreamSynchronize(downloadStream);
         registry.release();
-        for (auto& reader : audio.readers)
-        {
-            closeAudio(reader);
-            if (reader.instance != nullptr)
-            {
-                mxlDestroyInstance(reader.instance);
-            }
-        }
     }
 
     // ---- grab thread -----------------------------------------------------------------------
@@ -2567,6 +2739,17 @@ struct Engine::Impl
     {
         setupGpu();
         setupOutputs();
+        // P5 audio: the PGM's channels are its flows' (an existing flow keeps its own); a delay line
+        // holds the longest delay and L + 3 grains.
+        audioChannels = 1;
+        for (auto const& output : audioOutputs)
+        {
+            audioChannels = std::max<std::size_t>(audioChannels, output->channels);
+        }
+        audioMix = std::make_unique<AudioMix>(cfg.mes, static_cast<int>(inputs.size()), static_cast<int>(players.size()), audioChannels);
+        auto const grainMax = static_cast<std::size_t>((kAudioRate * cfg.rate.den + cfg.rate.num - 1) / cfg.rate.num) + 1;
+        delayLineLength = static_cast<std::size_t>(cfg.audioMaxDelayMs) * static_cast<std::size_t>(kAudioRate / 1000) +
+            static_cast<std::size_t>(cfg.latency + 3) * grainMax;
         if (cfg.mosaic && cfg.ownMediamtx())
         {
             mediamtx = std::make_unique<MediamtxProcess>(cfg);
@@ -2598,6 +2781,7 @@ struct Engine::Impl
         auto warm = writerWarm.get_future();
         writerThread = std::thread([this] { writerMain(); });
         warm.wait();
+        audioThread = std::thread([this] { audioMain(); });
         if (encoder)
         {
             encodeThread = std::thread([this] { encodeMain(); });
@@ -2622,9 +2806,10 @@ struct Engine::Impl
         writeCv.notify_all();
         encodeCv.notify_all();
         statsCv.notify_all();
-        // Render first (no new grains), then the writer drains its queue, then the grabs it copied
-        // are written.
-        for (auto* thread : {&renderThread, &writerThread, &encodeThread, &statsThread})
+        audioCv.notify_all();
+        // Render first (no new grains), then the writer drains its queue, then fx-audio its grains,
+        // then the grabs the writer copied are written.
+        for (auto* thread : {&renderThread, &writerThread, &audioThread, &encodeThread, &statsThread})
         {
             if (thread->joinable())
             {
@@ -2770,12 +2955,16 @@ struct Engine::Impl
         std::string audioState;
         Route video;
         Route audioRoute;
+        std::uint32_t delay = 0;
+        std::vector<int> map;
         {
             std::lock_guard lock{in.mu};
             state = in.state;
             audioState = in.audioState;
             video = in.video;
             audioRoute = in.audio;
+            delay = in.audioDelay;
+            map = in.audioMap;
         }
         auto const lastAt = in.lastGrainAt.load();
         // No grain for a second: shown as no_signal (the picture holds, see holdGrains).
@@ -2815,9 +3004,103 @@ struct Engine::Impl
                 {"startup", in.audioStartup.load()},
                 {"waits", in.audioWaits.load()},
                 {"reopens", in.audioReopens.load()},
-                {"lag_ms", in.audioLag.toJson(true)}};
+                {"lag_ms", in.audioLag.toJson(true)},
+                {"delay_ms", round3(static_cast<double>(delay) * 1000.0 / static_cast<double>(kAudioRate))},
+                {"map", map},
+                {"channels", in.audioChannels.load()},
+                {"held_ms", round3(static_cast<double>(in.audioHeld.load()) * 1000.0 / static_cast<double>(kAudioRate))}};
         }
         return item;
+    }
+
+    // Per ME its master and strips (settings, and each strip's gain and whether it is heard after the
+    // last grain), per live input its delay, map and delay line.
+    json audioSettings() const
+    {
+        json mes = json::array();
+        for (int m = 1; audioMix && m <= cfg.mes; ++m)
+        {
+            json strips = json::object();
+            auto const refs = audioMix->strips(m);
+            auto const states = audioMix->stripStates(m);
+            for (std::size_t s = 0; s < refs.size(); ++s)
+            {
+                auto const set = audioMix->strip(m, refs[s]).value_or(StripSettings{});
+                json item{{"fader_db", set.faderDb}, {"mute", set.mute}};
+                if (refs[s].kind != StripRef::Kind::Stinger)
+                {
+                    item["afv"] = set.afv;
+                }
+                item["gain_db"] = round3(gainToDb(s < states.size() ? states[s].gain : 0.f));
+                item["heard"] = s < states.size() && states[s].heard;
+                strips[stripName(refs[s])] = item;
+            }
+            mes.push_back({{"me", m}, {"master_db", audioMix->master(m)}, {"strips", strips}});
+        }
+        json list = json::array();
+        for (auto const& input : inputs)
+        {
+            std::lock_guard lock{input->mu};
+            list.push_back({{"input", input->number}, {"name", input->name},
+                {"delay_ms", round3(static_cast<double>(input->audioDelay) * 1000.0 / static_cast<double>(kAudioRate))},
+                {"delay_samples", input->audioDelay}, {"map", input->audioMap}, {"channels", input->audioChannels.load()},
+                {"held_ms", round3(static_cast<double>(input->audioHeld.load()) * 1000.0 / static_cast<double>(kAudioRate))}});
+        }
+        return json{{"channels", audioChannels}, {"max_delay_ms", cfg.audioMaxDelayMs}, {"mes", mes}, {"inputs", list}};
+    }
+
+    json audioStatus() const
+    {
+        auto out = audioSettings();
+        out["ms_per_grain"] = audioMs.toJson();
+        out["wait_ms"] = audioWaitMs.toJson();
+        out["max_wait_ms"] = cfg.audioWaitMs;
+        out["jobs_dropped"] = audioJobsDropped.load();
+        return out;
+    }
+
+    // Live input k's delay and channel map (control thread); fx-audio applies a change with a
+    // crossfade over one grain.
+    std::string setInputAudio(int k, std::optional<double> delayMs, std::optional<std::vector<int>> map)
+    {
+        if (k < 1 || k > static_cast<int>(inputs.size()))
+        {
+            return "no input " + std::to_string(k);
+        }
+        std::uint32_t samples = 0;
+        if (delayMs)
+        {
+            if (!(*delayMs >= 0.0 && *delayMs <= static_cast<double>(cfg.audioMaxDelayMs)))
+            {
+                return "delay_ms must be 0.." + std::to_string(cfg.audioMaxDelayMs);
+            }
+            samples = static_cast<std::uint32_t>(std::llround(*delayMs * static_cast<double>(kAudioRate) / 1000.0));
+        }
+        if (map)
+        {
+            if (!map->empty() && map->size() != audioChannels)
+            {
+                return "map needs one entry per PGM channel (" + std::to_string(audioChannels) + "), or none for 1:1";
+            }
+            for (int v : *map)
+            {
+                if (v < 0 || v > 64)
+                {
+                    return "map entries are input channels 1..64, or 0 for silence";
+                }
+            }
+        }
+        auto& in = *inputs[static_cast<std::size_t>(k - 1)];
+        std::lock_guard lock{in.mu};
+        if (delayMs)
+        {
+            in.audioDelay = samples;
+        }
+        if (map)
+        {
+            in.audioMap = *map;
+        }
+        return {};
     }
 
     json status() const
@@ -2999,7 +3282,7 @@ struct Engine::Impl
             {"own_mediamtx", mediamtx ? json{{"running", mediamtxRunning.load()}, {"restarts", mediamtx->restarts()}} : json(nullptr)},
             {"streams", streams}};
         out["mosaic"] = mosaic;
-        out["audio"] = {{"ms_per_grain", audioMs.toJson()}, {"wait_ms", audioWaitMs.toJson()}, {"max_wait_ms", cfg.audioWaitMs}};
+        out["audio"] = audioStatus();
         {
             std::lock_guard lock{grabMu};
             out["grabs"] = {{"total", {{"input", grabsInput.load()}, {"player", grabsPlayer.load()}, {"pgm", grabsPgm.load()}, {"pvw", grabsPvw.load()}}},
@@ -3091,6 +3374,21 @@ int Engine::grab(std::string const& source, bool preview, std::string const& pat
 std::string Engine::grabJson(int id) const
 {
     return impl_->grabJson(id);
+}
+
+AudioMix& Engine::audioMix()
+{
+    return *impl_->audioMix;
+}
+
+std::string Engine::setInputAudio(int k, std::optional<double> delayMs, std::optional<std::vector<int>> map)
+{
+    return impl_->setInputAudio(k, delayMs, std::move(map));
+}
+
+std::string Engine::audioJson() const
+{
+    return impl_->audioSettings().dump(2);
 }
 
 long long Engine::stingerFrames(int k) const
@@ -3218,6 +3516,13 @@ std::string Engine::metricsText() const
         metric("keyer_on_air", key["on"].get<bool>() ? 1.0 : 0.0, l);
         metric("keyer_key_running", k >= 1 && k <= keyList.size() && keyList[k - 1]["state"] == "running" ? 1.0 : 0.0, l);
     }
+    // P5: fx-audio's time per grain (read, mix, meters, write) and its bounded waits.
+    auto const& audio = s["audio"];
+    metric("audio_ms", audio["ms_per_grain"]["avg"].get<double>(), "stat=\"avg\"");
+    metric("audio_ms", audio["ms_per_grain"]["max"].get<double>(), "stat=\"max\"");
+    metric("audio_wait_ms", audio["wait_ms"]["avg"].get<double>(), "stat=\"avg\"");
+    metric("audio_wait_ms", audio["wait_ms"]["max"].get<double>(), "stat=\"max\"");
+    metric("audio_jobs_dropped_total", audio["jobs_dropped"].get<double>());
     // Frame grabs (P4): per source kind, failures, ms from the request to the file.
     auto const& grabs = s["grabs"];
     for (auto const& [kind, count] : grabs["total"].items())

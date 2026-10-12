@@ -325,6 +325,7 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     cfg.pvwOutputs = getBool(values, "FLOWXER_ENGINE_PVW_OUTPUTS", cfg.pvwOutputs);
     cfg.audioChannels = getInt(values, "FLOWXER_ENGINE_AUDIO_CHANNELS", cfg.audioChannels, 1, 64);
     cfg.audioWaitMs = getInt(values, "FLOWXER_ENGINE_AUDIO_WAIT_MS", cfg.audioWaitMs, 0, 40);
+    cfg.audioMaxDelayMs = getInt(values, "FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS", cfg.audioMaxDelayMs, 0, 5000);
     cfg.label = get(values, "FLOWXER_ENGINE_LABEL", cfg.label);
     cfg.workFormat = get(values, "FLOWXER_ENGINE_WORK_FORMAT", cfg.workFormat);
     if (cfg.workFormat != "yuv16" && cfg.workFormat != "rgba16f")

@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from flowxer.api.schemas import (
+    AudioStripUpdate,
     AutoRequest,
     ConsoleState,
     ConvertJobOut,
@@ -17,6 +18,7 @@ from flowxer.api.schemas import (
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
+    InputAudioUpdate,
     KeyerAutoRequest,
     KeyerPresetRequest,
     KeyerRunRequest,
@@ -28,6 +30,7 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
+    PanelAudioUpdate,
     PanelTransition,
     PanelTransitionRequest,
     PanelTransitionUpdate,
@@ -620,6 +623,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         jobs=[ConvertJobOut(**job.model_dump()) for job in mixer.library.queue.list_jobs()],
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
+        audio=mixer.audio_state(),
         pinned={
             field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
         },
@@ -856,6 +860,72 @@ def keyer_preset(keyer_id: str, payload: KeyerPresetRequest, mixer: VisionMixer 
 )
 def dme_presets(mixer: VisionMixer = Depends(get_mixer)) -> list[DmePresetInfo]:
     return mixer.dme_presets()
+
+
+def _audio_error(exc: MixerError) -> HTTPException:
+    """Unknown input, panel or strip: 404; a panel that does not render: 409; a bad value: 422."""
+    text = str(exc)
+    if text.startswith("unknown"):
+        return _http(exc, status.HTTP_404_NOT_FOUND)
+    return _http(exc, status.HTTP_409_CONFLICT if "does not render" in text else 422)
+
+
+@router.get(
+    "/audio",
+    tags=["audio"],
+    summary="Every audio setting: per live input its delay and channel map, per ME its master and strips",
+    description=(
+        "`inputs`: per live input id its `delay_ms` (audio later than its video), `channel_map` (per PGM "
+        "channel the input channel, 1-based, 0 silent; empty 1:1) and its flow's `channels`. `panels`: per "
+        "rendering ME (panel id) its `master_db` and its `strips` in slot order (live inputs, clip players, "
+        "the Programs of higher MEs, `stinger`), each with `fader_db` (-90 off .. +10), `mute` and `afv` "
+        "(audio follows video; none on the stinger). `channels`: the PGM's; `max_delay_ms`: "
+        "FLOWXER_AUDIO_MAX_DELAY_MS."
+    ),
+)
+def get_audio(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_state()
+
+
+@router.patch(
+    "/audio/inputs/{input_id}",
+    tags=["audio"],
+    summary="A live input's audio delay (ms, whole samples) and channel map, for every ME",
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_input(input_id: str, payload: InputAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_input_audio(input_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}",
+    tags=["audio"],
+    summary="An ME's master fader (-90 off .. +10 dB); it ramps over one frame",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_audio_panel(panel_id: str, payload: PanelAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_panel_audio(panel_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}/strips/{strip_id}",
+    tags=["audio"],
+    summary="A strip of an ME's mix: fader, mute, AFV (strip: an input or clip player id, a higher panel id, or stinger)",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_strip(
+    panel_id: str, strip_id: str, payload: AudioStripUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> dict:
+    try:
+        return mixer.update_audio_strip(panel_id, strip_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
 
 
 @router.patch(

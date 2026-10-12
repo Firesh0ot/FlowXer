@@ -622,6 +622,10 @@ TEST(recommended_latency_counts_what_delivers)
     // Audio that runs counts too.
     status["inputs"][1]["audio"]["state"] = "running";
     CHECK_EQ(recommendedLatency(status, 20.0), 51);
+    // A delayed input's audio (P5) counts its lag minus its delay: 1000 − 960 = 40 ms, so the
+    // video's 70 ms decides.
+    status["inputs"][1]["audio"]["delay_ms"] = 960.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 5);
     // Nothing that delivers: 1.
     CHECK_EQ(recommendedLatency(nlohmann::json::object(), 20.0), 1);
 }
@@ -665,6 +669,9 @@ TEST(config_defaults_and_errors)
     CHECK(cfg.httpBind == "127.0.0.1");
     CHECK(cfg.workFormat == "yuv16");
     CHECK_EQ(cfg.audioWaitMs, 8);
+    CHECK_EQ(cfg.audioMaxDelayMs, 1000);
+    CHECK_EQ(loadConfig({{"FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS", "5000"}}).audioMaxDelayMs, 5000);
+    CHECK(configThrows({{"FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS", "5001"}}));
     auto const other = loadConfig({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_FORMAT", "1080p5994"}, {"FLOWXER_ENGINE_MES", "2"},
         {"FLOWXER_ENGINE_PVW_OUTPUTS", "false"}, {"FLOWXER_ENGINE_LATENCY", "6"}});
     CHECK_EQ(other.rate.num, 60000);

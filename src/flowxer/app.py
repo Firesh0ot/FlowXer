@@ -77,6 +77,14 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "audio",
+        "description": (
+            "PGM audio per ME (P5): a strip per live input, clip player, re-entered ME and the stinger with "
+            "a fader, mute and audio follow video; a master per ME; a delay and channel map per live "
+            "input; meters (peak, true peak, RMS, EBU R 128 loudness). No audio preview."
+        ),
+    },
+    {
         "name": "tally",
         "description": (
             "TSL UMD Protocol 5.0 tally lamps and under-monitor labels. "
@@ -150,7 +158,9 @@ def create_app(
             and request.url.path.startswith("/api/v1/")
             and response.status_code < 400
         ):
-            await run_in_threadpool(mixer.persist)
+            # A moving fader sends up to 20 changes a second: audio is saved at most once a second.
+            audio = request.url.path.startswith("/api/v1/audio/")
+            await run_in_threadpool(mixer.persist_soon if audio else mixer.persist)
         return response
 
     # Auth is inner; CORS is added last so it is outermost (preflight stays unauthenticated).
