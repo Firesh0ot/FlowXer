@@ -296,18 +296,20 @@ FLOWXER_PROGRAM_AUTOSTART=true
 
 | What | Metrics |
 |---|---|
-| On air, Program | `flowxer_on_air`, `flowxer_program_stalled`, `flowxer_frames_rendered_total`, `flowxer_frames_dropped_total` (grains skipped to stay on the TAI grid), `flowxer_transitions_total{type}`, `flowxer_program_input`, `flowxer_preview_input` |
+| On air, Program | `flowxer_on_air`, `flowxer_program_stalled`, `flowxer_frames_rendered_total`, `flowxer_frames_dropped_total` (grains skipped to stay on the TAI grid), `flowxer_transitions_total{type}` (`cut`, `mix`, `wipe`, `stinger`), `flowxer_program_input`, `flowxer_preview_input` |
 | Engine output | `flowxer_engine_up`, `flowxer_engine_restarts_total`, `flowxer_engine_output_fps`, `flowxer_engine_output_grains_rendered_total`, `_committed_total`, `_skipped_total`, `_late_total`, `flowxer_engine_output_write_failed_total`, `flowxer_engine_output_lag_grains{stat}`, `flowxer_engine_output_commit_ms{stat}` |
 | Latency | `flowxer_latency_grains`, `flowxer_recommended_latency_grains` (covers the latest arrival seen) |
 | Inputs (FlowXer ids) | `flowxer_input_arrival_ms{input,essence,stat}`, `flowxer_input_late_total{input}`, `flowxer_input_missing_total{input,essence}`, `flowxer_input_state{input,essence,state}` |
-| Inputs (engine names `in<n>`, `key<n>`) | `flowxer_engine_input_running`, `_grains_total`, `_late_total`, `_missing_total`, `_resyncs_total`, `_reopens_total`, `flowxer_engine_input_audio_blocks_total`, `_audio_missing_total`, `_audio_waits_total` |
+| Inputs (engine names `in<n>`, `key<n>`) | `flowxer_engine_input_running`, `_grains_total`, `_late_total`, `_missing_total`, `_resyncs_total`, `_reopens_total`, `flowxer_engine_input_upload_ms{stat}` (also of each key flow), `flowxer_engine_input_audio_blocks_total`, `_audio_missing_total`, `_audio_waits_total` |
 | GPU time | `flowxer_engine_gpu_stage_ms{stage,stat}` with `stage` = `upload_per_input`, `unpack`, `me` (and `me="<n>"`, per ME), `pack`, `mosaic`, `render`, `download`, `total`; `flowxer_engine_gpu_utilization_percent`, `flowxer_engine_gpu_device_used_mb`, `flowxer_engine_gpu_engine_allocated_mb` |
 | Clip players | `flowxer_engine_player_playing{player}`, `flowxer_engine_player_frames_decoded_total`, `flowxer_engine_player_frames_late_total`, `flowxer_engine_player_decode_ms{stat}` |
+| Stingers | `flowxer_engine_stingers_played_total`, `flowxer_engine_stinger_wait_grains_total` (grains a take waited for its first frame), `flowxer_engine_stinger_cuts_total` (takes that became a cut after 50 grains), per player `flowxer_engine_stinger_player_state{player,state}` (1 for `empty`, `cued`, `playing`, `paused` or `ended`), `flowxer_engine_stinger_frames_decoded_total`, `_frames_late_total`, `flowxer_engine_stinger_decode_ms{stat}` |
+| Keyers | `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` (on or fading), `flowxer_engine_keyer_key_running{…}` (its key flow runs; 0 for a linear key is NO KEY) |
 | Preview mosaic | `flowxer_engine_mosaic_frames_total`, `_dropped_total`, `flowxer_engine_mosaic_encode_ms`, `flowxer_engine_mosaic_connected` (publishing), `flowxer_engine_mosaic_bytes_total`, `flowxer_engine_gpu_encoder_sessions`, `flowxer_engine_gpu_encoder_percent`; own MediaMTX: `flowxer_engine_preview_mediamtx_running`, `_restarts_total` |
 | Library | `flowxer_library_jobs{state=queued\|running}`, `flowxer_library_conversions_total{result}`, `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc` |
 | Control plane | `flowxer_control_plane_busy_seconds`, `flowxer_nmos_registry_up`, `flowxer_nmos_activations_total{result}`, `flowxer_tally_export_*`, `flowxer_engine_cpu_percent{thread}`, `flowxer_process_cpu_percent`, `flowxer_process_memory_bytes` |
 
-Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains and GPU time.
+Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains, GPU time (render, download, upload, per ME), GPU memory and NVENC sessions, stingers (played, waits, cuts, player state) and keyers (on air per ME, linear keys without a key signal).
 
 ### Upgrading from FlowXer 14
 

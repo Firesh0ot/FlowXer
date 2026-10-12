@@ -5,6 +5,17 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: metrics of P3 (M4)
+
+- Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;
+  per player `flowxer_engine_stinger_player_state{player,state}`, `_stinger_frames_decoded_total`,
+  `_stinger_frames_late_total`, `_stinger_decode_ms`. The engine's `/status` gains `stingers.played`.
+- Keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` and `flowxer_engine_keyer_key_running`.
+- `flowxer_engine_input_upload_ms{input,stat}` for every input and key flow.
+- `flowxer_transitions_total` counts `wipe` too.
+- Grafana (`deploy/grafana/flowxer.json`): download, upload and per-ME GPU time, GPU memory and
+  NVENC sessions, stingers, keyers on air and linear keys without a key signal.
+
 ### Changed: stingers play on the GPU (P3 M3)
 
 - Stingers play again, on the GPU with alpha and sound, over the upstream keys and under the

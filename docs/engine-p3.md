@@ -563,6 +563,28 @@ ME, plus the mosaic, at 1080p50 in yuv16.
 - **GPU memory:** P2's 1268 MiB (4 MEs, 8 inputs, 2 clip players, 1 key, the mosaic) + 85 MB per
   routed key flow + 0.35 GB per cued stinger player. Wipes and the fused kernel add none.
 
+### M4 as built
+
+- **Metrics** (`/metrics`; the full list is in the README):
+  - stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`,
+    `_stinger_cuts_total`, per player `_stinger_player_state{player,state}`,
+    `_stinger_frames_decoded_total`, `_stinger_frames_late_total`, `_stinger_decode_ms`;
+  - keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}`, `_keyer_key_running`;
+  - the upload ms of each input and key flow: `flowxer_engine_input_upload_ms{input,stat}`;
+  - `flowxer_transitions_total{type="wipe"}`.
+- **Worst case in the engine** (`fxp3-worst.py`, lab GPU 0, PCIe Gen4 x4 like an A4000 on Gen3 x8):
+  4 MEs with PGM and PVW, 8 live inputs, 2 clip players, the mosaic; 2 upstream keyers and 4 DSKs
+  per ME (24 linear keys, all on), 4 stinger players. A wipe and a stinger cannot run on one ME at
+  once, so it measures two cases: every ME holding a wipe at t = 0.5 (circle, soft edge, border)
+  under its 6 keys, and every ME running a 50-frame ProRes 4444 stinger again and again under its
+  6 keys; each with 1 key flow and with 8 distinct key flows. Results: after the run.
+- **2 h soak** (`fxp3-soak.py`, the P3 defaults with 2 stinger players): 4 MEs with PVW, 8 live
+  inputs, a looping clip and the bars; per ME Key 1 linear (browser source v210a), Key 2 luma of
+  the clip, DSK 1 linear: all on. Every 10 s on a rotating ME a mix, a wipe (the 23 codes, soft
+  and border varied, flip-flop) or a stinger (a PNG stinger with sound and a ProRes 4444 graphic,
+  loaded on demand); a T-bar move every minute; FTB on and off every 3 min; a clip import every
+  15 min; 5 WHEP viewers. Results: after the run.
+
 ## 11. Milestones
 
 Each milestone is tested on the lab (A16 GPU 0) before the next one starts. Small and the

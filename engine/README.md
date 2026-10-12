@@ -142,7 +142,7 @@ luma of a lossless HEVC 4:2:0 10-bit stream, `alphaToKey` into the key plane) in
 - **Sound:** frame f's samples are added to the ME's PGM audio, on the library's grid (to the
   sample); the background crossfades over 4 grains around the cut point (above).
 - After a stinger its player cues frame 0 again. `GET /status` → `stingers`: per player its
-  state, file, alpha, frames ahead, late frames; `waits`, `cuts`; `mes[].stinger` while one runs.
+  state, file, alpha, frames ahead, late frames; `played`, `waits`, `cuts`; `mes[].stinger` while one runs.
 - GPU memory per stinger player: 9 v210a pictures (71 MiB at 1080p) from the start, plus the two
   NVDEC decoders while a stinger is loaded (276 MiB on the lab: 347 MiB per player).
 
@@ -299,7 +299,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
 | `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
-| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`) |
+| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |
 
