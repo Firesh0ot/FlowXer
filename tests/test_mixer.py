@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from flowxer.api.metrics import render_prometheus
-from flowxer.api.schemas import InputKind, LogicalInputCreate, MixerStartRequest, MixerState, TransitionType, WorkspaceUpdate
+from flowxer.api.schemas import Dme, InputKind, LogicalInputCreate, MixerStartRequest, MixerState, TransitionType, WorkspaceUpdate
 from flowxer.domain import nmos
 from flowxer.engine.mixer import MixerError, VisionMixer
 
@@ -165,12 +165,45 @@ def test_keyers_per_me(mixer: VisionMixer) -> None:
     assert mixer.get_keyer("dsk-1").rate_ms == 1000 and mixer.get_keyer("dsk-1").enabled is True
     # A luma key of a camera on ME 1's upstream keyer 1.
     mixer.update_keyer("me-1-key-1", mode="luma", source_id="cam-2", clip=0.4, soft=0.05, invert=True)
-    assert calls[-1] == ("POST", "/keyer/1/settings", {"mode": "luma", "clip": 0.4, "soft": 0.05, "gain": 1.0, "invert": True, "source": "in2"})
+    assert calls[-1] == (
+        "POST",
+        "/keyer/1/settings",
+        {"mode": "luma", "clip": 0.4, "soft": 0.05, "gain": 1.0, "invert": True, "source": "in2", "dme": Dme().model_dump()},
+    )
     with pytest.raises(MixerError, match="needs a source"):
         mixer.update_keyer("me-1-key-2", mode="luma")
     assert mixer.get_keyer("me-1-key-2").mode.value == "linear"
     with pytest.raises(MixerError, match="unknown keyer"):
         mixer.update_keyer("dsk-9", enabled=True)
+
+
+def test_pip_and_dme_keyers(mixer: VisionMixer) -> None:
+    calls = _record_engine(mixer)
+    # A pip of cam-3 in a box with a border: the engine gets the source and the whole box.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-3", dme={"x": 0.75, "size": 0.4, "border": {"width": 4, "color": "#ff0000"}})
+    method, path, body = calls[-1]
+    assert (method, path, body["mode"], body["source"]) == ("POST", "/keyer/1/settings", "pip", "in3")
+    assert body["dme"]["x"] == 0.75 and body["dme"]["size"] == 0.4 and body["dme"]["border"] == {"width": 4.0, "soft": 0.0, "color": "#ff0000", "opacity": 1.0}
+    # A partial box keeps the other fields.
+    keyer = mixer.update_keyer("me-1-key-1", dme={"y": 0.25, "shadow": {"opacity": 0.5}})
+    assert keyer.dme.x == 0.75 and keyer.dme.y == 0.25 and keyer.dme.border.width == 4.0 and keyer.dme.shadow.opacity == 0.5
+    # A box on a linear key; ranges; upstream keyers only; a pip needs a source.
+    mixer.update_keyer("me-1-key-2", dme={"enabled": True, "crop": {"left": 0.2}})
+    assert mixer.get_keyer("me-1-key-2").dme.enabled and calls[-1][2]["mode"] == "linear"
+    with pytest.raises(MixerError, match="invalid key"):
+        mixer.update_keyer("me-1-key-2", dme={"crop": {"right": 0.9}})
+    with pytest.raises(MixerError, match="invalid key"):
+        mixer.update_keyer("me-1-key-2", dme={"size": 3})
+    with pytest.raises(MixerError, match="upstream"):
+        mixer.update_keyer("dsk-1", mode="pip", source_id="cam-1")
+    with pytest.raises(MixerError, match="upstream"):
+        mixer.update_keyer("dsk-1", dme={"enabled": True})
+    with pytest.raises(MixerError, match="needs a source"):
+        mixer.update_keyer("me-1-key-2", mode="pip")
+    assert mixer.get_keyer("me-1-key-2").dme.crop.right == 0.0 and mixer.get_keyer("dsk-1").mode.value == "linear"
+    # A DSK's settings carry no box.
+    mixer.update_keyer("dsk-1", gain=0.5)
+    assert "dme" not in calls[-1][2]
 
 
 def test_status_reports_a_program_without_frames(mixer: VisionMixer) -> None:

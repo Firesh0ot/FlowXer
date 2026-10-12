@@ -724,7 +724,7 @@ def list_keyers(mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
     "/keyers/{keyer_id}",
     response_model=Keyer,
     tags=["keyers"],
-    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma), luma source, clip, soft, gain, invert",
+    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma, pip), source, clip, soft, gain, invert, box (dme)",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)

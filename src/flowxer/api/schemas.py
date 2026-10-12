@@ -456,12 +456,58 @@ class KeyerStage(str, Enum):
 class KeyMode(str, Enum):
     linear = "linear"
     luma = "luma"
+    pip = "pip"
+
+
+class DmeCrop(BaseModel):
+    left: float = Field(default=0.0, ge=0.0, le=1.0)
+    right: float = Field(default=0.0, ge=0.0, le=1.0)
+    top: float = Field(default=0.0, ge=0.0, le=1.0)
+    bottom: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _leaves_a_picture(self) -> "DmeCrop":
+        if self.left + self.right >= 1.0 or self.top + self.bottom >= 1.0:
+            raise ValueError("the crop must leave a picture (left + right < 1, top + bottom < 1)")
+        return self
+
+
+class DmeBorder(BaseModel):
+    width: float = Field(default=0.0, ge=0.0, le=64.0, description="Outer border width in raster pixels (0: none)")
+    soft: float = Field(default=0.0, ge=0.0, le=64.0, description="Soft outer edge of the border in pixels")
+    color: str = Field(default="#ffffff", pattern=r"^#[0-9a-fA-F]{6}$")
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class DmeShadow(BaseModel):
+    dx: float = Field(default=0.0, ge=-128.0, le=128.0, description="Offset in raster pixels")
+    dy: float = Field(default=0.0, ge=-128.0, le=128.0)
+    blur: float = Field(default=0.0, ge=0.0, le=128.0, description="Soft edge of the shadow in pixels")
+    opacity: float = Field(default=0.0, ge=0.0, le=1.0, description="0: no shadow")
+
+
+class Dme(BaseModel):
+    """A keyer's box (docs/engine-p4.md §3): its fill (and key) cropped, scaled and placed. x and
+    y are the centre of the uncropped picture as fractions of the raster, size its scale (1 = the
+    full raster); the crop cuts the picture without moving it. Upstream keyers only; always on
+    for a pip."""
+
+    enabled: bool = False
+    x: float = Field(default=0.5, ge=-1.0, le=2.0)
+    y: float = Field(default=0.5, ge=-1.0, le=2.0)
+    size: float = Field(default=0.5, ge=0.0, le=2.0)
+    soft: float = Field(default=0.0, ge=0.0, le=64.0, description="Soft edge of the picture without a border, in pixels")
+    crop: DmeCrop = Field(default_factory=DmeCrop)
+    border: DmeBorder = Field(default_factory=DmeBorder)
+    shadow: DmeShadow = Field(default_factory=DmeShadow)
 
 
 class Keyer(BaseModel):
     """An upstream keyer (before the transition) or a DSK (after it) of one ME. Keys show on the
     ME's Program only (keys have no preview). Linear: its key input, a v210a fill + key MXL flow
-    (NMOS receiver `receiver_label`). Luma: a self key of a source the ME may take."""
+    (NMOS receiver `receiver_label`). Luma: a self key of a source the ME may take. Pip (upstream
+    only): a source the ME may take, opaque, in a box. An upstream keyer's `dme` puts its key in a
+    box (always on for a pip)."""
 
     id: str
     label: str
@@ -470,11 +516,12 @@ class Keyer(BaseModel):
     enabled: bool = Field(default=False, description="On air")
     rate_ms: int = Field(default=500, ge=1, le=10000, description="Duration of its Auto (fade on or off)")
     mode: KeyMode = Field(default=KeyMode.linear)
-    source_id: str | None = Field(default=None, description="Luma: the keyed source (an input or me-<n>)")
+    source_id: str | None = Field(default=None, description="Luma and pip: the source (an input or me-<n>)")
     clip: float = Field(default=0.5, ge=0.0, le=1.0, description="Luma: the level that keys (0 black .. 1 white)")
     soft: float = Field(default=0.1, ge=0.0, le=1.0, description="Luma: the softness above the clip")
     gain: float = Field(default=1.0, ge=0.0, le=1.0, description="Scales the key")
     invert: bool = Field(default=False, description="Luma: key the dark parts")
+    dme: Dme = Field(default_factory=Dme, description="The box (upstream keyers)")
 
     @property
     def receiver_label(self) -> str:
@@ -577,6 +624,10 @@ class KeyerUpdate(BaseModel):
     soft: float | None = Field(default=None, ge=0.0, le=1.0)
     gain: float | None = Field(default=None, ge=0.0, le=1.0)
     invert: bool | None = None
+    dme: dict[str, Any] | None = Field(
+        default=None,
+        description="Box fields to change (see Dme: enabled, x, y, size, soft, crop, border, shadow); missing fields keep their values",
+    )
 
 
 class StingerSlotUpdate(BaseModel):

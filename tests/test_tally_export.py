@@ -88,6 +88,13 @@ def test_keys_light_their_key_inputs_and_luma_sources(mixer: VisionMixer) -> Non
     # A luma key of ME 2's Program lights its re-entry INDEX 1002.
     mixer.update_keyer("me-1-key-1", source_id="me-2")
     assert lit(mixer)[0] == {"cam-1", "3101", "me-2"}
+    # A pip lights its source like a luma key (LH, while on air); a linear box keeps its key INDEX.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4")
+    assert lit(mixer)[0] == {"cam-1", "3101", "cam-4"}
+    mixer.update_keyer("me-1-key-1", enabled=False)
+    assert lit(mixer)[0] == {"cam-1", "3101"}
+    mixer.update_keyer("me-1-key-2", dme={"enabled": True}, enabled=True)
+    assert lit(mixer)[0] == {"cam-1", "3101", "2102"}
     assert len(mixer._tally_snapshot().inputs) == len(mixer.inputs)
 
 def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:

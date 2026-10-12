@@ -98,6 +98,14 @@ def _frames(duration_ms: int, fps: float) -> int:
     return max(1, int(round(duration_ms * fps / 1000.0)))
 
 
+def _merged(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """`base` with `patch` applied, nested objects merged (a keyer's box from a partial PATCH)."""
+    out = dict(base)
+    for name, value in patch.items():
+        out[name] = _merged(out[name], value) if isinstance(value, dict) and isinstance(out.get(name), dict) else value
+    return out
+
+
 class MixerError(RuntimeError):
     pass
 
@@ -489,8 +497,8 @@ class VisionMixer:
         return self.keyers.index(keyer) + 1
 
     def update_keyer(self, keyer_id: str, **changes: Any) -> Keyer:
-        """On or off (at the next frame), rate, label, and the key: mode, luma source, clip, soft,
-        gain, invert."""
+        """On or off (at the next frame), rate, label, and the key: mode, source (luma, pip),
+        clip, soft, gain, invert, and the box (`dme`, merged into the current one)."""
         keyer = self.get_keyer(keyer_id)
         label = changes.pop("label", None)
         enabled = changes.pop("enabled", None)
@@ -501,15 +509,19 @@ class VisionMixer:
             # Its key receiver carries the label.
             self.nmos.mark_changed()
         key = {name: value for name, value in changes.items() if name != "rate_ms" and value is not None}
+        if "dme" in key:
+            key["dme"] = _merged(keyer.dme.model_dump(), key["dme"])
         if key:
             try:
                 updated = Keyer.model_validate({**keyer.model_dump(), **key})
             except ValidationError as exc:
                 raise MixerError(f"invalid key: {exc.errors()[0]['msg']}") from exc
-            if updated.mode == KeyMode.luma:
+            if updated.mode in (KeyMode.luma, KeyMode.pip):
                 if not updated.source_id:
-                    raise MixerError("a luma key needs a source")
+                    raise MixerError(f"a {updated.mode.value} key needs a source")
                 self._check_source(self.get_panel(keyer.panel_id), updated.source_id)
+            if (updated.mode == KeyMode.pip or updated.dme.enabled) and updated.stage != KeyerStage.upstream:
+                raise MixerError("pip and dme only on upstream keyers")
             for name in key:
                 setattr(keyer, name, getattr(updated, name))
             self._push_key_settings(keyer)
@@ -532,8 +544,10 @@ class VisionMixer:
 
     def _push_key_settings(self, keyer: Keyer, client: EngineClient | None = None) -> None:
         body: dict[str, Any] = {"mode": keyer.mode.value, "clip": keyer.clip, "soft": keyer.soft, "gain": keyer.gain, "invert": keyer.invert}
-        if keyer.mode == KeyMode.luma:
+        if keyer.mode in (KeyMode.luma, KeyMode.pip):
             body["source"] = self._engine_source(keyer.source_id)
+        if keyer.stage == KeyerStage.upstream:
+            body["dme"] = keyer.dme.model_dump()
         self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
 
     def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
@@ -1952,7 +1966,7 @@ class VisionMixer:
                 continue
             transition = self._mixes.get(panel.id)
             keyers = [keyer for keyer in self.keyers if keyer.panel_id == panel.id]
-            keyed = tuple(k.source_id for k in keyers if k.enabled and k.mode == KeyMode.luma and k.source_id)
+            keyed = tuple(k.source_id for k in keyers if k.enabled and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
             keys = tuple(self._key_tally(keyer) for keyer in keyers if keyer.mode == KeyMode.linear)
             mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
         return TallySnapshot(

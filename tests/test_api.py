@@ -122,6 +122,15 @@ def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer
     assert mixer.get_keyer("dsk-1").rate_ms == 800
 
 
+def test_keyer_pip_and_box(client: TestClient) -> None:
+    keyer = client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "pip", "source_id": "cam-2", "dme": {"x": 0.7, "size": 0.33}}).json()
+    assert keyer["mode"] == "pip" and keyer["dme"]["x"] == 0.7 and keyer["dme"]["size"] == 0.33 and keyer["dme"]["crop"]["left"] == 0.0
+    assert client.patch("/api/v1/keyers/me-1-key-1", json={"dme": {"size": 5}}).status_code == 409
+    assert client.patch("/api/v1/keyers/dsk-1", json={"mode": "pip", "source_id": "cam-2"}).status_code == 409
+    assert client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "chroma"}).status_code == 422
+    assert client.get("/api/v1/keyers").json()[0]["dme"]["size"] == 0.33
+
+
 def test_health_and_config(client: TestClient) -> None:
     health = client.get("/api/v1/health").json()
     assert health["status"] == "ok"
