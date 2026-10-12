@@ -297,6 +297,8 @@ struct Input
     Window audioLag;
     // When the audio head last moved (TAI ns; 0: not yet): still for a second is no_signal.
     std::atomic<std::uint64_t> audioMovedAt{0};
+    // When the audio head started to move again after standing still (TAI ns; 0: not yet).
+    std::atomic<std::uint64_t> audioResumedAt{0};
     // P5: its audio's delay (48 kHz samples) and channel map (empty: 1:1), set by the control API
     // (under mu) and applied by fx-audio with a crossfade over one grain; what its delay line holds
     // (samples) and its flow's channels, published by fx-audio.
@@ -2177,10 +2179,18 @@ struct Engine::Impl
         auto const nowNs = mxlGetTime();
         if (r.head != MXL_UNDEFINED_INDEX && runtime.headIndex != r.head)
         {
+            // A head that starts to move after standing still (a mirror flow written only after
+            // the route's settle window) catches up first: no steady-state lag either.
+            auto const movedAt = in.audioMovedAt.load();
+            if (movedAt == 0 || nowNs > movedAt + 1'000'000'000ull)
+            {
+                in.audioResumedAt.store(nowNs);
+            }
             in.audioMovedAt.store(nowNs);
         }
         r.head = runtime.headIndex;
-        if (nowNs > in.audioMovedAt.load() + 1'000'000'000ull || settling(in.audioGraceUntil.load()))
+        if (nowNs > in.audioMovedAt.load() + 1'000'000'000ull || settling(in.audioGraceUntil.load()) ||
+            nowNs < in.audioResumedAt.load() + kLagSettleNs)
         {
             return;
         }

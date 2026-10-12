@@ -46,6 +46,9 @@ in `docs/platform-integration-plan.md` §8.
   needs about 3.
 - Arrival and audio lag samples later than 10 s are ignored: they are no arrivals but grains the
   clock cannot place (index 0 of a mirror flow that was just created showed 1.79e12 ms on small).
+- The audio lag statistics also skip 2 s after an input's audio head starts to move again after
+  standing still: on small (P4 trial) a mirror flow written only after the route's settle window
+  caught up with one 541 ms peak and held the recommendation at 28 grains again.
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 
