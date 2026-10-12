@@ -355,8 +355,8 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
 | `POST /grab` | `{"source": "in3"\|"cp1"\|"me1", "bus": "pgm"\|"pvw", "path"}` | a frame grab of the next grain as raw v210 into `path` (`bus` for an ME); answers at once with its id and state; 409 with 8 in flight |
 | `GET /grab/{id}` | – | `{grab, source, bus, path, state, error, index, tai, source_index, ms}` (the last 32 grabs) |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
-| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, `gpu_ms.dme` (per ME the resample of its boxes), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
+| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage (and `dme_ms` per ME), grabs, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |
 
@@ -786,3 +786,12 @@ The tables are in `docs/engine-p3.md` ("M4 as built"). In short, on A16 GPU 0 (P
 - **2 h soak** (keys, mixes, wipes, stingers, T-bar, FTB, imports, 5 viewers): 0 skipped, 3 single
   late grains, lag 4, render + download 10.81 ms (max 12.74), GPU memory flat at 1993 MiB, 0 API
   errors.
+
+## P4 M4: worst case with boxes (lab, 2026-10-12)
+
+The table is in `docs/engine-p4.md` ("M4 as built"). On A16 GPU 3, on top of P3's worst case (4 MEs,
+8 inputs, 24 linear keys, held wipes, the mosaic: render + download 12.61 ms): a half-size pip on
+every ME 14.06 ms (max 15.46, 0 skipped), a quad on ME 1 and a pip on the others 15.13 ms (max
+16.36, 0 skipped); 32 boxes at 1/4 render in 22 ms (> 20 ms: skipped grains). A half-size box adds
+0.36 ms to its ME, `flowxer_engine_dme_ms` shows its resample (0.24–0.35 ms); a moving box costs
+what a static one does; 12.4 MB of GPU memory per keyer with a box.

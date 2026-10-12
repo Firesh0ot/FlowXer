@@ -5,7 +5,8 @@ DME on linear and luma keyers, API, GUI fields, tally; M1 gate met (0.29 ms per 
 with border and shadow on the A16). M2 (keyframes, fly with the keyer's Auto, presets, the box
 editor, the `dme` widget) implemented in #91, with the details in
 [Implementation notes (M2)](#implementation-notes-m2). M3 (keyer ties, frame grab) implemented in
-#91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
+#91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4: `dme_ms`, the
+worst case with boxes in the running engine ([M4 as built](#m4-as-built)) and the 2 h soak. P4 builds on P3 (transitions and keying, #89) and on P2
 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
 the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
@@ -388,7 +389,13 @@ sources. No new senders or receivers.
     the intermediate (12.4 MB), allocated on first use;
   - × 4 at 2160p; the weight tables are under 1 MB per box.
   - With the defaults (4 MEs, 2 keyers) that is +200 MB; at the maximum (4 × 8) +800 MB.
-- **PCIe:** none added. A grab of an unloaded PVW copies 5.5 MB once.
+  - **As built (M1, measured in M4):** 12.4 MB (11.9 MiB) per keyer whose box is used, allocated when
+    its box is first enabled (the fused resample needs no intermediate), plus about 0.5 MB once for
+    the weight table: + 12.4 × renderMes × keyersPerMe at most (+100 MB with the defaults, +400 MB at
+    4 × 8). A frame grab uses page-locked host memory (5.5 MB per grab in flight, at most 8), no GPU
+    memory.
+- **PCIe:** none added. A grab copies 5.5 MB once over the download link (also for an ME's PVW, which
+  is packed every grain).
 
 ## 9. GPU budget
 
@@ -443,6 +450,38 @@ The A4000 has 2.24 × the A16's memory bandwidth (P3 §10), so its estimate divi
 - The A4000 is time-sliced with the node's other GPU functions. The engine reports the box ms per
   ME (`flowxer_engine_dme_ms{me}`), and M4 checks the budget.
 - **2160p50:** everything × 4; boxes only on 1 ME, as P3's keys.
+
+### M4 as built
+
+Measured in the running engine (`fxp4-worst.py`, image from #91, lab A16 GPU 3, PCIe Gen4 x4) on top
+of P3's worst case: 4 MEs (PGM + PVW), 8 live inputs, a looping clip, the bars, the mosaic, a wipe
+held at 0.5 on every ME and 24 linear keys on one key flow (upstream keyers 1–2 and 4 DSKs per ME,
+`FLOWXER_KEYERS_PER_ME=8`). The boxes have a 4 px border and a shadow. 60 s per phase (5 s windows):
+
+| Phase | Boxes | Render avg / max | Download | Render + download avg / max | `dme_ms` per ME (avg) | Skipped / late | Engine memory |
+|---|---|---|---|---|---|---|---|
+| P3's worst case | 0 | 5.73 / 6.47 ms | 6.89 ms | **12.61 / 14.04 ms** | 0.01 | 0 / 0 | 964 MiB |
+| + a half-size pip on every ME | 4 | 7.03 / 7.83 | 7.03 | **14.06 / 15.46** | 0.24–0.35 | 0 / 0 | +47.5 MiB |
+| + ME 1 a quad, MEs 2–4 a half pip | 7 | 7.89 / 8.74 | 7.24 | **15.13 / 16.36** | 0.87 (ME 1), 0.24–0.37 | 0 / 0 | +83 MiB |
+| 8 boxes at 1/4 on every ME (2 of them linear) | 32 | 21.96 / 24.45 | 7.43 | 29.39 / 31.85 | 3.97–4.03 | 435 / 2602 | +380 MiB |
+| the same 32, 24 of them flying (pingpong) | 32 | 21.88 / 24.38 | 7.43 | 29.30 / 31.38 | 3.95–4.00 | 422 / 2620 | +380 MiB |
+
+- **Per box in the running engine:** a half-size pip with border and shadow adds 0.36 ms to its ME
+  (resample and box layer; `dme_ms` 0.24–0.35 ms of it) under this load; the isolated M1 bench had
+  0.29 ms. A box at 1/4 costs about 0.5 ms on average in the 32-box phase: two of each ME's eight
+  are linear boxes, which resample the v210a key flow (fill and key) and cost more.
+- **A moving box costs what a static one does** (fly32 against box32), as in M2.
+- **GPU memory:** 11.9 MiB (12.4 MB) per keyer with a box, allocated when its box is first enabled,
+  as designed; with 32 boxes +380 MiB.
+- **On the lab A16** P3's worst case leaves room for about 4–6 half-size boxes in all before the
+  15 ms target (1 half pip per ME: 14.1 ms, max 15.5); 32 boxes do not fit (render 22 ms > the 20 ms
+  grain: skipped and late grains).
+- **A4000 estimate** (render ÷ 2.24, the same download on Gen3 x8, as P3 §10): P3's worst case
+  9.4 ms; + a half pip per ME 10.2 ms (max 11.2); + a quad on ME 1 10.8 ms (max 11.7); a box adds
+  about 0.16 ms (half size) to 0.23 ms (the 1/4 mix with linear boxes). So the defaults (2 boxes on
+  every ME) fit with room (≈ 10.7 ms), and about 24 boxes in all fit next to P3's worst case; 32
+  boxes at 1/4 on 4 MEs (≈ 17.2 ms) do not. Boxes on fewer MEs (or without P3's 24 keys and held
+  wipes) leave room for more; the engine shows each ME's box time (`flowxer_engine_dme_ms`).
 
 ## 10. Milestones
 

@@ -5,6 +5,13 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: the boxes' GPU time (P4 M4)
+
+- `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes
+  (their box layers are part of the ME's time). Grafana shows it next to the ME times.
+- Measured with boxes on top of P3's worst case (`docs/engine-p4.md`, "M4 as built"): a half-size
+  box adds about 0.36 ms to its ME on the lab A16 (≈ 0.16 ms estimated on an RTX A4000).
+
 ### Added: keyer ties and frame grab (P4 M3)
 
 - Keyer ties: `PATCH /panels/{id}/transition` takes `ties` (the ME's upstream keyers) and
