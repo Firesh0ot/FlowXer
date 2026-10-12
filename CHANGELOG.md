@@ -12,6 +12,10 @@ in `docs/platform-integration-plan.md` §8.
   grains, clip players and stinger players never count. An input's audio whose head stood still
   for a second is `no_signal` (like video) and adds no lag (a left flow's growing distance held
   the peak).
+- The arrival and audio lag statistics (and so `recommended_latency_grains`) skip a source's
+  start-up window and 2 s after it, at every (re)route: on small one 546 ms audio peak while the
+  routes were applied at an Up held the recommendation at 28 grains although the steady state
+  needs about 3.
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 

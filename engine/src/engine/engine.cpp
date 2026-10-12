@@ -56,6 +56,9 @@ constexpr int kWindow = 250;
 // Output grains after a route (or the start) during which a missing grain or missing audio is a
 // start-up window, not counted as missing.
 constexpr std::uint64_t kGraceGrains = 4;
+// After a (re)route the arrival and audio lag statistics wait this long past the start-up window:
+// a mirror or a writer settling then is no steady-state lag (small saw one 546 ms audio peak at a re-route).
+constexpr std::uint64_t kLagSettleNs = 2'000'000'000;
 
 void check(cudaError_t err, char const* what)
 {
@@ -900,6 +903,12 @@ struct Engine::Impl
         return currentIndex() + static_cast<std::uint64_t>(cfg.latency) + kGraceGrains;
     }
 
+    // True in a source's start-up window and kLagSettleNs after it: its lag statistics skip that time.
+    [[nodiscard]] bool settling(std::uint64_t graceUntil) const
+    {
+        return graceUntil != 0 && mxlGetTime() < indexToTimestamp(cfg.rate, graceUntil) + kLagSettleNs;
+    }
+
     void inputMain(Input& in)
     {
         nameThread("fx-" + in.name);
@@ -1035,7 +1044,7 @@ struct Engine::Impl
             // The arrival of grain `next`: the head's write time when it is there already, else
             // the moment the blocking read returns it.
             bool const waiting = next > runtime.headIndex;
-            if (next == runtime.headIndex && runtime.lastWriteTime != 0)
+            if (next == runtime.headIndex && runtime.lastWriteTime != 0 && !settling(in.graceUntil.load()))
             {
                 auto const due = indexToTimestamp(cfg.rate, next);
                 in.arrival.add(runtime.lastWriteTime > due ? static_cast<double>(runtime.lastWriteTime - due) / 1e6 : 0.0);
@@ -1066,7 +1075,7 @@ struct Engine::Impl
                 pause(5);
                 continue;
             }
-            if (waiting)
+            if (waiting && !settling(in.graceUntil.load()))
             {
                 auto const now = mxlGetTime();
                 auto const due = indexToTimestamp(cfg.rate, grain.index);
@@ -1781,7 +1790,7 @@ struct Engine::Impl
             in.audioMovedAt.store(nowNs);
         }
         r.head = runtime.headIndex;
-        if (nowNs > in.audioMovedAt.load() + 1'000'000'000ull)
+        if (nowNs > in.audioMovedAt.load() + 1'000'000'000ull || settling(in.audioGraceUntil.load()))
         {
             return;
         }
