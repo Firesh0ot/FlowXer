@@ -396,7 +396,8 @@ FXENG_HD inline void dmeRowTaps(DmeBox const& b, DmeTable const& t, int oy, floa
     }
 }
 
-// One vertical-pass sample of buffer column e from its row taps.
+// One vertical-pass sample of buffer column e from its row taps (the GPU kernel runs the same sum
+// from shared memory).
 template <int N>
 FXENG_HD inline std::int16_t dmeVSampleTaps(DmeBox const& b, std::int16_t const* mid, int e, float const* w, int const* r)
 {

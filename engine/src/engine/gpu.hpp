@@ -77,13 +77,12 @@ constexpr int kMaxLayers = 14;
 // Box layers per compose: the upstream keyers of an ME.
 constexpr int kMaxBoxes = 8;
 
-// Device scratch of the boxes' resample: the weight table and the horizontal pass's rows. One
-// set serves every box, as the boxes resample one after another on the render stream.
+// Device scratch of the boxes' resample: the weight table. One serves every box, as the boxes
+// resample one after another on the render stream.
 struct DmeScratch
 {
     int* start = nullptr;
     float* weights = nullptr;
-    std::int16_t* mid = nullptr;
     std::size_t bytes = 0;
 };
 cudaError_t allocDmeScratch(DmeScratch& scratch, int width, int height);
@@ -91,8 +90,8 @@ void freeDmeScratch(DmeScratch& scratch);
 // Bytes of a box buffer for any box on a W × H raster (the full raster, with a key plane).
 std::size_t dmeBufferBytes(int width, int height);
 // A box's resample into its box buffer (device, b.bh lines of b.cols int16): the weight table,
-// then the horizontal pass over the crop's rows b.r0 …, then the vertical pass. Nothing for a box
-// that is not on the raster.
+// then one kernel that runs the horizontal pass into shared memory and the vertical pass from
+// there, per tile of box rows. Nothing for a box that is not on the raster.
 cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer);
 
 // One ME's Program in one pass (docs/engine-p3.md §2): the background (A; the dissolve of A to B

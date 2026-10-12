@@ -637,69 +637,83 @@ __global__ void dmeTableKernel(DmeBox b, int* start, float* weights)
     }
 }
 
-// The horizontal pass: one thread per buffer column (all planes side by side), its weights and
-// source indices in registers, over kDmeRows source rows.
-constexpr int kDmeRows = 16;
+// The resample in one kernel: a block keeps the horizontal pass of the source rows its tile of
+// box rows needs in shared memory (at most kDmeTileRows), then runs the vertical pass from there.
+// One thread per buffer column (all planes side by side); the column's weights and source indices
+// in registers, each box row's taps in shared memory. The same sums as dmeResampleCpu.
+constexpr int kDmeTileRows = 64;
+constexpr int kDmeTileTaps = 512;
 
-template <int N, bool Linear>
-__global__ void __launch_bounds__(128) dmeHPassKernel(DmeBox b, DmeSource src, DmeTable t, std::int16_t* mid)
+// Box rows per tile: their source rows ((rows − 1) / s + taps + 1) fit in kDmeTileRows, their
+// taps in kDmeTileTaps.
+int dmeTileRows(DmeBox const& b)
 {
-    int const e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= b.cols)
-    {
-        return;
-    }
-    int entry = 0;
-    int lo = 0;
-    int hi = 0;
-    int const plane = dmePlaneOf(b, e, entry, lo, hi);
-    float w[N];
-    int j[N];
-    dmeTaps<N>(t, entry, lo, hi, w, j);
-    int const r0 = blockIdx.y * kDmeRows;
-    int const r1 = min(r0 + kDmeRows, b.rows);
-    for (int r = r0; r < r1; ++r)
-    {
-        int const row = b.r0 + r;
-        std::int16_t v;
-        if constexpr (Linear)
-        {
-            v = dmeHSampleLinear<N>(dmeWords(src, row), dmeKeyLine(src, row), plane, w, j);
-        }
-        else
-        {
-            v = dmeHSampleOpaque<N>(dmeLine(src, plane, row), w, j);
-        }
-        mid[static_cast<std::size_t>(r) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = v;
-    }
+    int const rows = static_cast<int>(std::floor(static_cast<float>(kDmeTileRows - b.taps - 3) * b.s)) + 1;
+    return std::max(1, std::min({rows, 64, kDmeTileTaps / b.taps}));
 }
 
-// The vertical pass: one block per box row (its taps in shared memory), one thread per buffer
-// sample.
-template <int N>
-__global__ void __launch_bounds__(128) dmeVPassKernel(DmeBox b, DmeTable t, std::int16_t const* mid, std::int16_t* out)
+template <int N, bool Linear>
+__global__ void __launch_bounds__(128) dmeResampleKernel(DmeBox b, DmeSource src, DmeTable t, int tileRows, std::int16_t* out)
 {
-    __shared__ float w[N];
-    __shared__ int r[N];
-    int const oy = blockIdx.y;
-    if (threadIdx.x == 0)
+    __shared__ std::int16_t mid[kDmeTileRows][128];
+    __shared__ float rowW[kDmeTileTaps];
+    __shared__ int rowR[kDmeTileTaps];
+    int const rowEntry = b.bw + b.bw / 2;
+    int const oy0 = static_cast<int>(blockIdx.y) * tileRows;
+    int const oy1 = min(oy0 + tileRows, b.bh);
+    // The tile's rows of the horizontal pass (relative to b.r0): from its first box row's first
+    // tap to its last box row's last tap.
+    int const first = dmeClampI(dmeClampI(t.start[rowEntry + oy0], b.ct, b.cb - 1) - b.r0, 0, b.rows - 1);
+    int const last = dmeClampI(dmeClampI(t.start[rowEntry + oy1 - 1] + N - 1, b.ct, b.cb - 1) - b.r0, 0, b.rows - 1);
+    int const n = min(last - first + 1, kDmeTileRows);
+    for (int k = static_cast<int>(threadIdx.x); k < (oy1 - oy0) * N; k += static_cast<int>(blockDim.x))
     {
-        float tw[N];
-        int tr[N];
-        dmeRowTaps<N>(b, t, oy, tw, tr);
-        for (int i = 0; i < N; ++i)
+        int const entry = rowEntry + oy0 + k / N;
+        int const i = k % N;
+        rowW[k] = t.w[static_cast<std::size_t>(i) * static_cast<std::size_t>(t.entries) + static_cast<std::size_t>(entry)];
+        rowR[k] = dmeClampI(dmeClampI(dmeClampI(t.start[entry] + i, b.ct, b.cb - 1) - b.r0, 0, b.rows - 1) - first, 0, n - 1);
+    }
+    int const e = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    bool const live = e < b.cols;
+    if (live)
+    {
+        int entry = 0;
+        int lo = 0;
+        int hi = 0;
+        int const plane = dmePlaneOf(b, e, entry, lo, hi);
+        float w[N];
+        int j[N];
+        dmeTaps<N>(t, entry, lo, hi, w, j);
+        for (int r = 0; r < n; ++r)
         {
-            w[i] = tw[i];
-            r[i] = tr[i];
+            int const row = b.r0 + first + r;
+            if constexpr (Linear)
+            {
+                mid[r][threadIdx.x] = dmeHSampleLinear<N>(dmeWords(src, row), dmeKeyLine(src, row), plane, w, j);
+            }
+            else
+            {
+                mid[r][threadIdx.x] = dmeHSampleOpaque<N>(dmeLine(src, plane, row), w, j);
+            }
         }
     }
     __syncthreads();
-    int const e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= b.cols)
+    if (!live)
     {
         return;
     }
-    out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeVSampleTaps<N>(b, mid, e, w, r);
+    bool const premultiplied = b.kind == DmeKind::Linear && e < 2 * b.bw;
+    for (int oy = oy0; oy < oy1; ++oy)
+    {
+        int const k0 = (oy - oy0) * N;
+        float acc = 0.f;
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            acc += rowW[k0 + i] * static_cast<float>(mid[rowR[k0 + i]][threadIdx.x]);
+        }
+        out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeToBox(acc, premultiplied);
+    }
 }
 } // namespace
 
@@ -714,7 +728,7 @@ cudaError_t allocDmeScratch(DmeScratch& scratch, int width, int height)
     std::size_t const entries = static_cast<std::size_t>(width + width / 2 + height);
     std::size_t const startBytes = entries * sizeof(int);
     std::size_t const weightBytes = entries * kDmeMaxTaps * sizeof(float);
-    scratch.bytes = startBytes + weightBytes + dmeBufferBytes(width, height);
+    scratch.bytes = startBytes + weightBytes;
     void* p = nullptr;
     cudaError_t const err = cudaMalloc(&p, scratch.bytes);
     if (err != cudaSuccess)
@@ -725,7 +739,6 @@ cudaError_t allocDmeScratch(DmeScratch& scratch, int width, int height)
     auto* bytes = static_cast<std::uint8_t*>(p);
     scratch.weights = reinterpret_cast<float*>(bytes);
     scratch.start = reinterpret_cast<int*>(bytes + weightBytes);
-    scratch.mid = reinterpret_cast<std::int16_t*>(bytes + weightBytes + startBytes);
     return cudaSuccess;
 }
 
@@ -747,19 +760,18 @@ cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const&
     int const entries = dmeEntries(box);
     dmeTableKernel<<<static_cast<unsigned>((entries + 127) / 128), 128, 0, stream>>>(box, scratch.start, scratch.weights);
     DmeTable const table{scratch.start, scratch.weights, entries};
-    dim3 const hGrid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>((box.rows + kDmeRows - 1) / kDmeRows));
-    dim3 const vGrid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>(box.bh));
+    int const tileRows = dmeTileRows(box);
+    dim3 const grid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>((box.bh + tileRows - 1) / tileRows));
     dmeDispatch(box.taps, [&](auto n) {
         constexpr int N = decltype(n)::value;
         if (source.v210a != nullptr)
         {
-            dmeHPassKernel<N, true><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+            dmeResampleKernel<N, true><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
         }
         else
         {
-            dmeHPassKernel<N, false><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+            dmeResampleKernel<N, false><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
         }
-        dmeVPassKernel<N><<<vGrid, 128, 0, stream>>>(box, table, scratch.mid, buffer);
     });
     return cudaGetLastError();
 }
