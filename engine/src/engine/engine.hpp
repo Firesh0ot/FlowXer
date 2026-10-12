@@ -76,6 +76,10 @@ public:
     std::string setInputAudio(int k, std::optional<double> delayMs, std::optional<std::vector<int>> map);
     // Per ME its master and strips, per live input its delay and map (the status's `audio`).
     [[nodiscard]] std::string audioJson() const;
+    // The meters of the last finished 100 ms block (GET /audio/meters).
+    [[nodiscard]] std::string metersJson() const;
+    // ME m's integrated loudness from the next block on; false for a bad m.
+    bool resetLoudness(int me);
 
     [[nodiscard]] std::string statusJson() const;
     [[nodiscard]] std::string metricsText() const;

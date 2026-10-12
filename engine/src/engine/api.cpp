@@ -604,6 +604,10 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "application/json", engine.audioJson()};
         }
+        if (request.path == "/audio/meters")
+        {
+            return HttpResponse{200, "application/json", engine.metersJson()};
+        }
         if (request.path == "/livez")
         {
             return HttpResponse{200, "text/plain", "ok\n"};
@@ -655,6 +659,10 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         if (rest == "audio")
         {
             return meAudio(engine, me, body);
+        }
+        if (rest == "audio/loudness/reset")
+        {
+            return engine.resetLoudness(me) ? reply(200, json{{"me", me}, {"loudness_reset", true}}) : error(404, "no ME " + std::to_string(me));
         }
         return meCommand(engine, me, rest, body);
     }

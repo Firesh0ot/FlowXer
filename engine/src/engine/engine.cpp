@@ -2,6 +2,7 @@
 
 #include "core/audio.hpp"
 #include "core/audiomix.hpp"
+#include "core/meter.hpp"
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
@@ -85,6 +86,11 @@ void check(cudaError_t err, char const* what)
 double round3(double v)
 {
     return std::round(v * 1000.0) / 1000.0;
+}
+
+double round2(double v)
+{
+    return std::round(v * 100.0) / 100.0;
 }
 
 // Average and maximum over windows of `size` samples, and the peak since the last reset.
@@ -370,6 +376,26 @@ struct AudioRun
     std::vector<std::vector<float>> me;
     std::size_t channels = 2;
     std::uint64_t last = 0;
+    // P5 meters (docs/engine-p5.md §7): per live input (after its delay and map), clip player and
+    // stinger player peak and RMS; per ME PGM (what goes to MXL) also true peak, overs, loudness.
+    std::vector<Meter> inputMeters;
+    std::vector<Meter> playerMeters;
+    std::vector<Meter> stingerMeters;
+    std::vector<Meter> meMeters;
+};
+
+// The meters of the last finished 100 ms block, published by fx-audio for the API and metrics.
+struct MeterSnapshot
+{
+    bool valid = false;
+    std::uint64_t block = 0;
+    std::vector<MeterValues> inputs;
+    std::vector<MeterValues> players;
+    std::vector<MeterValues> stingers;
+    std::vector<MeterValues> mes;
+    // Per ME its strips (AudioMix::strips order): the gain in PGM and whether heard.
+    std::vector<std::vector<StripRef>> stripRefs;
+    std::vector<std::vector<StripState>> strips;
 };
 
 // One output grain for fx-audio, handed over by fx-writer right after its video commit: the MEs'
@@ -648,6 +674,10 @@ struct Engine::Impl
     std::vector<std::unique_ptr<AudioJob>> audioFree;
     std::thread audioThread;
     std::atomic<std::uint64_t> audioJobsDropped{0};
+    // The meters of the last block (under meterMu), and a loudness reset per ME for fx-audio.
+    mutable std::mutex meterMu;
+    MeterSnapshot meters;
+    std::vector<std::unique_ptr<std::atomic<bool>>> loudnessReset;
 
     mutable std::mutex snapMu;
     ThreadCpu::Result cpu;
@@ -2398,6 +2428,32 @@ struct Engine::Impl
             sources.stingers.push_back(own && !job.stingers[k].empty() ? job.stingers[k].data() : nullptr);
         }
         audioMix->grain(job.plans, sources, n, audio.me);
+        // Meters, all on the same grid of 100 ms blocks of the output's sample index.
+        bool finished = false;
+        for (std::size_t k = 0; k < audio.inputMeters.size(); ++k)
+        {
+            finished = audio.inputMeters[k].add(sources.inputs[k], n, out.first) || finished;
+        }
+        for (std::size_t k = 0; k < audio.playerMeters.size(); ++k)
+        {
+            finished = audio.playerMeters[k].add(k < sources.players.size() ? sources.players[k] : nullptr, n, out.first) || finished;
+        }
+        for (std::size_t k = 0; k < audio.stingerMeters.size(); ++k)
+        {
+            finished = audio.stingerMeters[k].add(k < sources.stingers.size() ? sources.stingers[k] : nullptr, n, out.first) || finished;
+        }
+        for (std::size_t m = 0; m < audio.meMeters.size(); ++m)
+        {
+            if (loudnessReset[m]->exchange(false))
+            {
+                audio.meMeters[m].resetLoudness();
+            }
+            finished = audio.meMeters[m].add(audio.me[m].size() == ch * n ? audio.me[m].data() : nullptr, n, out.first) || finished;
+        }
+        if (finished)
+        {
+            publishMeters(audio);
+        }
         for (auto const& plan : job.plans)
         {
             auto const& dst = audio.me[static_cast<std::size_t>(plan.me - 1)];
@@ -2439,6 +2495,30 @@ struct Engine::Impl
                 ++output.failed;
             }
         }
+    }
+
+    void publishMeters(AudioRun const& audio)
+    {
+        MeterSnapshot snap;
+        snap.valid = true;
+        auto const take = [](std::vector<Meter> const& list, std::vector<MeterValues>& into) {
+            for (auto const& meter : list)
+            {
+                into.push_back(meter.values());
+            }
+        };
+        take(audio.inputMeters, snap.inputs);
+        take(audio.playerMeters, snap.players);
+        take(audio.stingerMeters, snap.stingers);
+        take(audio.meMeters, snap.mes);
+        snap.block = snap.mes.empty() ? 0 : snap.mes.front().block;
+        for (int m = 1; m <= cfg.mes; ++m)
+        {
+            snap.stripRefs.push_back(audioMix->strips(m));
+            snap.strips.push_back(audioMix->stripStates(m));
+        }
+        std::lock_guard lock{meterMu};
+        meters = std::move(snap);
     }
 
     // fx-writer, after the video commit of a grain: its job for fx-audio (the plans, and the sound
@@ -2535,6 +2615,10 @@ struct Engine::Impl
         audio.readers.resize(inputs.size());
         audio.me.resize(audioOutputs.size());
         audio.channels = audioChannels;
+        audio.inputMeters.assign(inputs.size(), Meter(audioChannels, false));
+        audio.playerMeters.assign(players.size(), Meter(audioChannels, false));
+        audio.stingerMeters.assign(stingers.size(), Meter(audioChannels, false));
+        audio.meMeters.assign(audioOutputs.size(), Meter(audioChannels, true));
         // Open the routed audio before the first grain.
         for (std::size_t k = 0; k < inputs.size(); ++k)
         {
@@ -2757,6 +2841,10 @@ struct Engine::Impl
             audioChannels = std::max<std::size_t>(audioChannels, output->channels);
         }
         audioMix = std::make_unique<AudioMix>(cfg.mes, static_cast<int>(inputs.size()), static_cast<int>(players.size()), audioChannels);
+        for (int m = 0; m < cfg.mes; ++m)
+        {
+            loudnessReset.push_back(std::make_unique<std::atomic<bool>>(false));
+        }
         auto const grainMax = static_cast<std::size_t>((kAudioRate * cfg.rate.den + cfg.rate.num - 1) / cfg.rate.num) + 1;
         delayLineLength = static_cast<std::size_t>(cfg.audioMaxDelayMs) * static_cast<std::size_t>(kAudioRate / 1000) +
             static_cast<std::size_t>(cfg.latency + 3) * grainMax;
@@ -3057,6 +3145,63 @@ struct Engine::Impl
                 {"held_ms", round3(static_cast<double>(input->audioHeld.load()) * 1000.0 / static_cast<double>(kAudioRate))}});
         }
         return json{{"channels", audioChannels}, {"max_delay_ms", cfg.audioMaxDelayMs}, {"mes", mes}, {"inputs", list}};
+    }
+
+    // GET /audio/meters (docs/engine-p5.md §7): the last finished 100 ms block. Sources: in<k>
+    // (after the delay and map), cp<k>, st<k> (stinger players): peak and RMS per channel. MEs:
+    // also the true peak, the loudness per channel pair, the overs and per strip its gain and
+    // whether it is heard. dB values below −120 are −120.
+    json metersJson() const
+    {
+        MeterSnapshot snap;
+        {
+            std::lock_guard lock{meterMu};
+            snap = meters;
+        }
+        if (!snap.valid)
+        {
+            return json{{"block", nullptr}, {"channels", audioChannels}, {"sources", json::object()}, {"mes", json::object()}};
+        }
+        auto const db = [](std::vector<float> const& values) {
+            json out = json::array();
+            for (float v : values)
+            {
+                out.push_back(round2(levelDb(v)));
+            }
+            return out;
+        };
+        json sources = json::object();
+        auto const add = [&](std::vector<MeterValues> const& list, char const* prefix) {
+            for (std::size_t k = 0; k < list.size(); ++k)
+            {
+                sources[prefix + std::to_string(k + 1)] = {{"peak_dbfs", db(list[k].peak)}, {"rms_dbfs", db(list[k].rms)}};
+            }
+        };
+        add(snap.inputs, "in");
+        add(snap.players, "cp");
+        add(snap.stingers, "st");
+        json mes = json::object();
+        for (std::size_t m = 0; m < snap.mes.size(); ++m)
+        {
+            auto const& v = snap.mes[m];
+            json loudness = json::array();
+            for (std::size_t p = 0; p < v.loudness.size(); ++p)
+            {
+                loudness.push_back({{"pair", p + 1}, {"momentary", round2(v.loudness[p].momentary)}, {"short_term", round2(v.loudness[p].shortTerm)},
+                    {"integrated", round2(v.loudness[p].integrated)}});
+            }
+            json strips = json::object();
+            if (m < snap.stripRefs.size())
+            {
+                for (std::size_t s = 0; s < snap.stripRefs[m].size() && s < snap.strips[m].size(); ++s)
+                {
+                    strips[stripName(snap.stripRefs[m][s])] = {{"gain_db", round2(gainToDb(snap.strips[m][s].gain))}, {"heard", snap.strips[m][s].heard}};
+                }
+            }
+            mes[std::to_string(m + 1)] = {{"peak_dbfs", db(v.peak)}, {"true_peak_dbtp", db(v.truePeak)}, {"rms_dbfs", db(v.rms)}, {"loudness", loudness},
+                {"overs", v.overs}, {"strips", strips}};
+        }
+        return json{{"block", snap.block}, {"channels", audioChannels}, {"sources", sources}, {"mes", mes}};
     }
 
     json audioStatus() const
@@ -3391,6 +3536,21 @@ AudioMix& Engine::audioMix()
     return *impl_->audioMix;
 }
 
+std::string Engine::metersJson() const
+{
+    return impl_->metersJson().dump();
+}
+
+bool Engine::resetLoudness(int me)
+{
+    if (me < 1 || me > static_cast<int>(impl_->loudnessReset.size()))
+    {
+        return false;
+    }
+    impl_->loudnessReset[static_cast<std::size_t>(me - 1)]->store(true);
+    return true;
+}
+
 std::string Engine::setInputAudio(int k, std::optional<double> delayMs, std::optional<std::vector<int>> map)
 {
     return impl_->setInputAudio(k, delayMs, std::move(map));
@@ -3533,6 +3693,56 @@ std::string Engine::metricsText() const
     metric("audio_wait_ms", audio["wait_ms"]["avg"].get<double>(), "stat=\"avg\"");
     metric("audio_wait_ms", audio["wait_ms"]["max"].get<double>(), "stat=\"max\"");
     metric("audio_jobs_dropped_total", audio["jobs_dropped"].get<double>());
+    // P5 meters over the last second (values below −120 dB are −120).
+    MeterSnapshot meters;
+    {
+        std::lock_guard lock{impl_->meterMu};
+        meters = impl_->meters;
+    }
+    if (meters.valid)
+    {
+        auto const levels = [&](std::vector<MeterValues> const& list, char const* prefix) {
+            for (std::size_t k = 0; k < list.size(); ++k)
+            {
+                for (std::size_t c = 0; c < list[k].peak1s.size(); ++c)
+                {
+                    std::string const l = "source=\"" + std::string(prefix) + std::to_string(k + 1) + "\",channel=\"" + std::to_string(c + 1) + "\"";
+                    metric("audio_level_dbfs", levelDb(list[k].peak1s[c]), l + ",stat=\"peak\"");
+                    metric("audio_level_dbfs", levelDb(list[k].rms1s[c]), l + ",stat=\"rms\"");
+                }
+            }
+        };
+        levels(meters.inputs, "in");
+        levels(meters.players, "cp");
+        levels(meters.stingers, "st");
+        for (std::size_t m = 0; m < meters.mes.size(); ++m)
+        {
+            auto const& v = meters.mes[m];
+            std::string const me = "me=\"" + std::to_string(m + 1) + "\"";
+            for (std::size_t c = 0; c < v.peak1s.size(); ++c)
+            {
+                std::string const l = me + ",channel=\"" + std::to_string(c + 1) + "\"";
+                metric("pgm_audio_level_dbfs", levelDb(v.peak1s[c]), l + ",stat=\"peak\"");
+                metric("pgm_audio_level_dbfs", levelDb(v.truePeak1s[c]), l + ",stat=\"true_peak\"");
+                metric("pgm_audio_level_dbfs", levelDb(v.rms1s[c]), l + ",stat=\"rms\"");
+            }
+            for (std::size_t p = 0; p < v.loudness.size(); ++p)
+            {
+                std::string const l = me + ",pair=\"" + std::to_string(p + 1) + "\"";
+                metric("pgm_loudness_lufs", v.loudness[p].momentary, l + ",window=\"momentary\"");
+                metric("pgm_loudness_lufs", v.loudness[p].shortTerm, l + ",window=\"short_term\"");
+                metric("pgm_loudness_lufs", v.loudness[p].integrated, l + ",window=\"integrated\"");
+            }
+            metric("pgm_audio_overs_total", static_cast<double>(v.overs), me);
+            if (m < meters.stripRefs.size())
+            {
+                for (std::size_t s = 0; s < meters.stripRefs[m].size() && s < meters.strips[m].size(); ++s)
+                {
+                    metric("audio_strip_heard", meters.strips[m][s].heard ? 1.0 : 0.0, me + ",strip=\"" + stripName(meters.stripRefs[m][s]) + "\"");
+                }
+            }
+        }
+    }
     // Frame grabs (P4): per source kind, failures, ms from the request to the file.
     auto const& grabs = s["grabs"];
     for (auto const& [kind, count] : grabs["total"].items())
