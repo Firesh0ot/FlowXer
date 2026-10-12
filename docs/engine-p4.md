@@ -517,8 +517,8 @@ phase (5 s windows):
 **Disk per grab** (1080p; measured with FlowXer's ffmpeg command): the v210 still 5.53 MB, a
 thumbnail of 1–7 kB and the FFV1 original, whose size depends on the picture: 43–46 kB for the lab's
 pattern flows, 0.24–0.29 MB for the test clips, 2.7 / 3.4 / 4.4 MB for a test picture with ffmpeg's
-noise at 8 / 20 / 60, 5.2 MB for random samples (the worst case). A camera picture is about 8–9 MB per
-grab, at most 10.8 MB; × 4 at 2160p. Grabs stay in the library until they are deleted.
+noise at 8 / 20 / 60, 5.2 MB for random samples (the worst case). A camera picture comes to about
+8–9 MB per grab (estimated from the noise tests), at most 10.8 MB; × 4 at 2160p. Grabs stay in the library until they are deleted.
 
 **2 h soak** (`fxp4-soak.py`, image `fxp4:m4a`: this branch's engine, ee74d35; A16 GPU 3,
 `docker --cpus 6`, L = 4; 2026-10-12, 15:08 to 17:08):
