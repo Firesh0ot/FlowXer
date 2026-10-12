@@ -8,6 +8,7 @@
 #include "core/mixer.hpp"
 #include "core/tai.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -610,8 +611,13 @@ TEST(audio_changes_are_click_free)
     }
     double const residual = worstDb(highPass(pgm), 2 * n);
     CHECK(residual < -80.0);
-    // P4's hard Cut of the same tone to silence at a grain boundary.
-    std::vector<float> hard(pgm.begin(), pgm.begin() + static_cast<long>(4 * n));
+    // A hard switch of the same tone to silence (P4's Cut) near its peak.
+    std::size_t k = 3 * n;
+    while (k < 4 * n && std::abs(pgm[k]) < 0.45f)
+    {
+        ++k;
+    }
+    std::vector<float> hard(pgm.begin(), pgm.begin() + static_cast<long>(k));
     hard.insert(hard.end(), 4 * n, 0.f);
     CHECK(worstDb(highPass(hard), 2 * n) > -40.0);
 }
