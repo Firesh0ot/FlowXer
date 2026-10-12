@@ -48,7 +48,21 @@ export interface MixerPanel {
   ftb?: boolean;
 }
 
-/** An upstream keyer or a DSK of one ME: linear (its v210a key input) or luma (a source). */
+/** A keyer's box (docs/engine-p4.md §3): x, y the centre of the uncropped picture (fractions of
+ * the raster), size its scale; crop fractions of the source; border and shadow in raster pixels. */
+export interface Dme {
+  enabled: boolean;
+  x: number;
+  y: number;
+  size: number;
+  soft: number;
+  crop: { left: number; right: number; top: number; bottom: number };
+  border: { width: number; soft: number; color: string; opacity: number };
+  shadow: { dx: number; dy: number; blur: number; opacity: number };
+}
+
+/** An upstream keyer or a DSK of one ME: linear (its v210a key input), luma (a source) or pip (a
+ * source in a box, upstream only). An upstream keyer's `dme` puts its key in a box. */
 export interface Keyer {
   id: string;
   label: string;
@@ -57,12 +71,13 @@ export interface Keyer {
   enabled: boolean;
   /** Duration of its Auto. */
   rate_ms: number;
-  mode: "linear" | "luma";
+  mode: "linear" | "luma" | "pip";
   source_id: string | null;
   clip: number;
   soft: number;
   gain: number;
   invert: boolean;
+  dme: Dme;
 }
 
 /** What the engine reports for an input (GET /console `sources`); clip players add the transport. */

@@ -250,6 +250,13 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .key-settings label.check { display: flex; align-items: center; gap: 6px; color: var(--text); }
 .key-settings input[type="range"] { width: 100%; }
 .key-settings select { background: #0b1220; color: var(--text); border: 1px solid var(--line); padding: 3px; }
+.dme-fields { display: grid; gap: 4px; border-top: 1px solid var(--line); padding-top: 6px; }
+.dme-row { display: flex; gap: 4px; flex-wrap: wrap; }
+.dme-row .num { display: grid; gap: 2px; }
+.dme-row .num input { width: 58px; }
+.dme-row .num input[type="color"] { width: 40px; height: 22px; padding: 0; }
+.key-settings:has(.dme-fields) { min-width: 300px; }
+.key-settings .on-air { margin-left: 6px; color: #fff; background: #c62828; border-radius: 3px; padding: 0 4px; font-size: 10px; }
 .dsk-control input {
   width: 44px; background: #0b1220; color: var(--text); border: 1px solid var(--line); font: inherit; padding: 1px 3px;
 }
