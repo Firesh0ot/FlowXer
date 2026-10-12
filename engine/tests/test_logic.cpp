@@ -12,6 +12,8 @@
 #include <cmath>
 #include <set>
 
+#include <nlohmann/json.hpp>
+
 using namespace fxeng;
 
 namespace
@@ -552,6 +554,46 @@ TEST(latency_for_the_arrival_lag)
     // An input up to 5.2 grains late (small's RDMA mirrors): L = 6.
     CHECK_EQ(latencyFor(5.2), 6);
     CHECK_EQ(latencyFor(-1.0), 1);
+}
+
+TEST(recommended_latency_counts_what_delivers)
+{
+    // small's test-all (1080p50, 20 ms grains): Cameras 1-3 routed, Camera 4 not, two clip
+    // players, ME 1 Key 1/2 and DSK 1 Key without a key flow, an empty stinger player. Only what
+    // delivers counts: the routed cameras' video and running audio. A large peak of an unrouted
+    // input, of a key flow without grains or of a still audio head (no_signal) does not.
+    auto status = nlohmann::json::parse(R"({
+        "inputs": [
+            {"input": 1, "state": "running", "arrival_ms": {"avg": 31.0, "max": 36.0, "peak": 55.0},
+             "audio": {"state": "running", "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 41.0}}},
+            {"input": 2, "state": "running", "arrival_ms": {"avg": 29.0, "max": 35.0, "peak": 50.0},
+             "audio": {"state": "no_signal", "lag_ms": {"avg": 800.0, "max": 1000.0, "peak": 1000.0}}},
+            {"input": 3, "state": "running", "arrival_ms": {"avg": 33.0, "max": 36.0, "peak": 52.0},
+             "audio": {"state": "running", "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 33.0}}},
+            {"input": 4, "state": "not_routed", "arrival_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0},
+             "audio": {"state": "not_routed", "lag_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0}}}
+        ],
+        "keys": [
+            {"key": 1, "label": "ME 1 Key 1", "state": "not_routed", "flow_slot": null},
+            {"key": 2, "label": "ME 1 Key 2", "state": "not_routed", "flow_slot": null},
+            {"key": 3, "label": "DSK 1 Key", "state": "flow_not_found", "flow_slot": 1,
+             "arrival_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0}}
+        ],
+        "key_flows": [{"key": 1, "name": "key1", "state": "flow_not_found", "arrival_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0}}],
+        "players": [{"player": 1, "state": "empty"}, {"player": 2, "state": "empty"}],
+        "stingers": {"players": [{"player": 1, "label": "Stinger 1", "state": "empty", "ahead": 0, "late": 0}]}
+    })");
+    // 55 ms = 2.75 grains: L = 4.
+    CHECK_EQ(recommendedLatency(status, 20.0), 4);
+    // A key flow that runs counts like an input, in ms: 70 ms = 3.5 grains, L = 5.
+    status["key_flows"][0]["state"] = "running";
+    status["key_flows"][0]["arrival_ms"]["peak"] = 70.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 5);
+    // Audio that runs counts too.
+    status["inputs"][1]["audio"]["state"] = "running";
+    CHECK_EQ(recommendedLatency(status, 20.0), 51);
+    // Nothing that delivers: 1.
+    CHECK_EQ(recommendedLatency(nlohmann::json::object(), 20.0), 1);
 }
 
 TEST(skip_on_late_never_slides)

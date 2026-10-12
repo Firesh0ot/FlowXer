@@ -6,6 +6,8 @@
 
 #include <cstdint>
 
+#include <nlohmann/json_fwd.hpp>
+
 namespace fxeng
 {
 struct Rate
@@ -47,6 +49,13 @@ inline int latencyFor(double lagGrains)
     }
     return latency < 1 ? 1 : latency;
 }
+
+// The latency that covers the latest arrival seen (each source's `peak` since it was routed, ms)
+// of what delivers, from the engine's status: each input's video and its audio while they run
+// (`inputs[].arrival_ms`, `inputs[].audio.lag_ms`) and each key flow in use while it runs
+// (`key_flows[].arrival_ms`). Unrouted or silent inputs and key flows, clip players and stinger
+// players do not count.
+int recommendedLatency(nlohmann::json const& status, double periodMs);
 
 // The input grain that output grain `output` is composed from (fixed latency L).
 inline std::uint64_t inputIndexFor(std::uint64_t output, int latency)

@@ -112,6 +112,9 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   padding: 3px 8px; font-size: 11px; letter-spacing: 0.04em; line-height: 1.2;
 }
 .aux-row button.on, .me-tabs button.active { outline: 2px solid var(--accent); }
+/* A linear keyer without a key signal (NO KEY): amber, so ON does not look like a key on air. */
+.aux-row button.nokey { color: #e0b025; }
+.aux-row button.on.nokey { outline-color: #e0b025; }
 .stinger-chip { display: flex; align-items: stretch; gap: 0; }
 .stinger-chip button:first-child {
   border: 1px solid var(--line); background: #151b26; border-radius: 4px 0 0 4px;

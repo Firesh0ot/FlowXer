@@ -298,7 +298,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
 | `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |

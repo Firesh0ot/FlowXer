@@ -1,5 +1,9 @@
 #include "core/tai.hpp"
 
+#include <algorithm>
+
+#include <nlohmann/json.hpp>
+
 namespace fxeng
 {
 std::uint64_t timestampToIndex(Rate rate, std::uint64_t ns)
@@ -40,6 +44,30 @@ std::uint64_t periodNs(Rate rate)
         return 0;
     }
     return static_cast<std::uint64_t>(static_cast<__int128>(1'000'000'000) * rate.den / rate.num);
+}
+
+int recommendedLatency(nlohmann::json const& status, double periodMs)
+{
+    double worst = 0;
+    auto const take = [&](nlohmann::json const& item, char const* window) {
+        if (item.value("state", "") == "running" && item.contains(window))
+        {
+            worst = std::max(worst, item[window].value("peak", 0.0));
+        }
+    };
+    for (auto const& input : status.value("inputs", nlohmann::json::array()))
+    {
+        take(input, "arrival_ms");
+        if (input.contains("audio"))
+        {
+            take(input["audio"], "lag_ms");
+        }
+    }
+    for (auto const& key : status.value("key_flows", nlohmann::json::array()))
+    {
+        take(key, "arrival_ms");
+    }
+    return latencyFor(periodMs > 0 ? worst / periodMs : 0.0);
 }
 
 NextIndex nextOutputIndex(std::uint64_t next, std::uint64_t current)
