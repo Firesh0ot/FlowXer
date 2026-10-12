@@ -72,6 +72,11 @@ in `docs/platform-integration-plan.md` §8.
 - The audio lag statistics also skip 2 s after an input's audio head starts to move again after
   standing still: on small (P4 trial) a mirror flow written only after the route's settle window
   caught up with one 541 ms peak and held the recommendation at 28 grains again.
+- `recommended_latency_grains` covers the latest arrival of the last minute (`recent` in each
+  arrival and audio lag statistic; `peak` stays the maximum since the route): with
+  dev-14.21.55 small still showed one 525 ms audio peak of the mirrored cameras after an Up
+  (recommendation 27) although the head never stood still. A transient now ages out after a
+  minute; lateness that repeats within a minute still counts.
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
 

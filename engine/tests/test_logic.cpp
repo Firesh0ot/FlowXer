@@ -626,6 +626,13 @@ TEST(recommended_latency_counts_what_delivers)
     // video's 70 ms decides.
     status["inputs"][1]["audio"]["delay_ms"] = 960.0;
     CHECK_EQ(recommendedLatency(status, 20.0), 5);
+    // The last minute's maximum counts, not the peak since the route: input 1's audio adds 13 ms,
+    // not 525 ms, so its video (55 ms) still sets L = 4.
+    status["inputs"][1]["audio"]["state"] = "no_signal";
+    status["key_flows"][0]["state"] = "flow_not_found";
+    status["inputs"][0]["audio"]["lag_ms"]["recent"] = 13.0;
+    status["inputs"][0]["audio"]["lag_ms"]["peak"] = 525.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 4);
     // Nothing that delivers: 1.
     CHECK_EQ(recommendedLatency(nlohmann::json::object(), 20.0), 1);
 }
