@@ -1,6 +1,6 @@
 # FlowXer engine P3: transitions and keying
 
-Status: design, not implemented. P3 builds on P2 (the C++/CUDA engine is FlowXer's media path,
+Status: the design; M1–M3 are implemented in #89 (M3 as built: [§6](#m3-as-built)). P3 builds on P2 (the C++/CUDA engine is FlowXer's media path,
 #86). The user's P3 decisions of 2026-10-11 are binding. The numbers come from prototype kernels
 and test encodes on the lab host (A16 GPU 0) on 2026-10-11 ([Appendix](#appendix-lab-measurements-2026-10-11)).
 
@@ -337,14 +337,34 @@ One stinger playing at 50 frames/s uses 5 % of the decoders.
   - a frame not decoded in time repeats the last one and is counted (`late`).
 - **Sound:** the samples of frame *f*, on the library's grid, are added to the ME's PGM audio
   ([§3](#3-transition-engine-per-me)).
-- **GPU memory per stinger player while cued:** about 0.35 GB, to be measured in M3. The
-  estimate:
+- **GPU memory per stinger player while cued:** about 0.35 GB; measured in M3: 347 MiB (the
+  pool 71 MiB, the colour and alpha decoders 276 MiB). The estimate:
   - P2's clip decoder takes 170 MB;
   - the 4:2:0 alpha decoder takes about half of that (the FFmpeg CLI measured alpha / colour =
     0.54);
   - 9 v210a frames take 75 MB.
 - **NVDEC:** one playing stinger uses 5 % of an A16 GPU's two decoders. The A4000 may have fewer
   decoders (check `nNumNVDECs` on host-03); its share would then be about twice that.
+
+### M3 as built
+
+- **Auto and the T-bar with the type stinger:** the engine's next transition carries no stinger
+  player, so FlowXer sends a take with the player and the cut frame; the engine's own Auto with
+  the type stinger is a cut.
+- **Waiting for the first frame:** at most 50 grains (1 s at 50p), then the take is a cut
+  (`stingers.cuts`); the wait is counted (`stingers.waits`).
+- **Which stinger player k holds:** the stinger ME k's next Cut or Auto plays, in this order:
+  Preview's auto-stinger, an armed Wipe's slot, the slot of the type stinger. A player is free
+  again 0.1 s after its stinger (1 s for one loaded on demand).
+- **Armed Wipe:** as in FlowXer 14, a Cut that plays Preview's auto-stinger leaves Wipe armed;
+  the Cut that plays the armed Wipe's stinger uses it up.
+- **Alpha of 8-bit sources:** FFmpeg widens it to 10 bits (255 → 1023); the mezzanine stores the
+  10-bit alpha losslessly, and the engine keys with key / 1023.
+- **The background sound** at the cut point: t at the end of frames cut − 2 … cut + 1 is 0.25,
+  0.5, 0.75, 1; frame 0 starts from 0 and the last frame ends at 1, so a cut point near either
+  end does not jump.
+- **Removed:** `FLOWXER_RAM_CLIP_MAX_S` and `FLOWXER_RAM_BUDGET_MB` (only P2's stinger conversion
+  used them).
 
 ## 7. Engine and control plane changes
 

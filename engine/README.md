@@ -30,6 +30,8 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   The downstream keyer keys over its ME's Program there (keys have no preview).
 - **Clip player threads** (`fx-cp1` …), one per clip player: decode the loaded clip ahead
   (NVDEC) or upload the still once; see [Clip players](#clip-players).
+- **Stinger player threads** (`fx-st1` …): decode the loaded stinger's colour and alpha in
+  lockstep; see [Stingers](#stingers).
 - **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
   queues the DMA download straight into the MXL grain on a separate download stream, waits
   for each copy and commits. Then it writes the PGM audio of grain *i* (see below). Upload,
@@ -53,12 +55,13 @@ waits in MXL, condition variables): no busy loops.
   `me2`..`me4`. ME *m* may take the Program of ME *n* only when *n > m* (re-entry, 0 frames,
   no loops possible).
 - Program renders every grain into its own bus buffer in one fused compose pass: the background
-  (a copy, the dissolve during a Mix, or the wipe during a Wipe), then the key layers (the DSKs),
-  written once. Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
+  (a copy, the dissolve during a Mix, or the wipe during a Wipe), then the key layers (the
+  upstream keyers, a running stinger, the DSKs, Fade to Black), written once. Preview renders the preview source. Both are written to MXL (`<label> ME<m> PGM`,
   `<label> ME<m> PVW`).
 - Cut swaps Program and Preview at the next grain. Auto runs the ME's next transition (Mix or
-  Wipe; a stinger is a cut until stingers play) over N grains, then swaps. Its progress follows
-  the grain index, so skipped grains do not stretch it.
+  Wipe) over N grains, then swaps. Its progress follows the grain index, so skipped grains do not
+  stretch it. A stinger runs from a take with its stinger player ([Stingers](#stingers)); Auto
+  and the T-bar with the type stinger have no player and cut (FlowXer sends the take).
 - Wipes (`core/wipe.hpp`): the SMPTE codes 1, 2, 3–6, 21–26, 41, 42, 45, 46, 101, 102, 119 and
   201–204 map each pixel to s in [0, 1]; the front F = t · (1 + soft + border) gives the mask,
   with the soft edge split around the border; reverse is 1 − s; t = 0 is all A and t = 1 all B.
@@ -74,7 +77,9 @@ waits in MXL, condition variables): no busy loops.
   none.
 - During a Mix the two sources crossfade with **equal power** (gains cos and sin of t·90°, so
   two unrelated sources keep their loudness; −3 dB each in the middle). t ramps sample by
-  sample through each grain, so there are no steps.
+  sample through each grain, so there are no steps. A stinger crossfades the background over its
+  frames cut − 2 … cut + 1 (t at the end of those frames: 0.25, 0.5, 0.75, 1) and adds its own
+  sound.
 - Same TAI grid and latency as the video: the audio of output grain *i* (48 kHz samples of
   grain *i*'s time span) is the input audio of grain *i − L*. A/V stay aligned as they came in.
 - float32, 48 kHz. Channels: those of the output flow (`FLOWXER_ENGINE_AUDIO_CHANNELS`, default
@@ -117,6 +122,29 @@ of the library item for the current format) and drives the transport.
   for the NVDEC decoder while a clip is loaded (its surfaces and FFmpeg's frame pool, 4:4:4
   16-bit). NVDEC: one 1080p50 player at 40–60 Mbit/s takes about 4 % of the A16 GPU's
   decoders, 6 % of a CPU core.
+
+### Stingers
+
+A stinger player (`FLOWXER_ENGINE_STINGER_PLAYERS`, 0–4) is a clip player whose pictures are
+v210a: FlowXer loads a library stinger onto it (`POST /stinger/<p>/load` with its colour, alpha
+and sound files and its frames); it decodes the colour (the clip mezzanine) and the alpha (the
+luma of a lossless HEVC 4:2:0 10-bit stream, `alphaToKey` into the key plane) in lockstep, up to
+5 frames ahead; without an alpha file the key is full (an opaque stinger).
+
+- **Take:** `POST /me/<m>/take` `{"source", "type": "stinger", "stinger": p, "cut": c,
+  "preview"}`. The stinger starts at the first grain its player has frame 0 decoded (cued: the
+  next grain; else a few grains, counted as `stingers.waits`; after 50 grains it is a cut,
+  `stingers.cuts`). Started at grain s, it shows frame f in grain s + f; the background is the
+  old Program until grain s + c, then the new one; after its last frame the buses swap. Skipped
+  grains advance it. A Cut or a take during a stinger ends it as if it had run to its end.
+- **Layer:** the stinger is a linear key (α = key / 1023) over the upstream keyers and under the
+  DSKs and Fade to Black; Preview shows only its source.
+- **Sound:** frame f's samples are added to the ME's PGM audio, on the library's grid (to the
+  sample); the background crossfades over 4 grains around the cut point (above).
+- After a stinger its player cues frame 0 again. `GET /status` → `stingers`: per player its
+  state, file, alpha, frames ahead, late frames; `waits`, `cuts`; `mes[].stinger` while one runs.
+- GPU memory per stinger player: 9 v210a pictures (71 MiB at 1080p) from the start, plus the two
+  NVDEC decoders while a stinger is loaded (276 MiB on the lab: 347 MiB per player).
 
 ### Keyers
 
@@ -200,6 +228,7 @@ will read and write.
 | `FLOWXER_ENGINE_INPUTS` | (none) | JSON array of the live inputs in slot order, `{"label", "domain", "video_flow", "audio_flow", "audio_domain"}`; the routes are optional (`PUT /input/{k}` sets them at run time); no video flow = black slot, no audio flow = silent |
 | `FLOWXER_ENGINE_PLAYERS` | (none) | JSON array of the clip players `{"label"}`; inputs and players together at most 23 |
 | `FLOWXER_ENGINE_KEYS` | (none) | JSON array of up to 4 key inputs `{"label", "me", "domain", "flow"}`: a v210a flow and the ME of its DSK |
+| `FLOWXER_ENGINE_STINGER_PLAYERS` | `0` | stinger players (0–4) |
 | `FLOWXER_ENGINE_MES` | `1` | rendering MEs (1–4), all rendering every grain |
 | `FLOWXER_ENGINE_LATENCY` | `4` | L: output grain *i* is made from input grains *i − L* (1–10) |
 | `FLOWXER_ENGINE_FORMAT` | `1080p50` | `720p`/`1080p`/`2160p` with `25`, `2997`, `30`, `50`, `5994`, `60`; inputs and clips must match |
@@ -255,7 +284,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /me/{m}/preview` | `{"source": "in3"}` | the ME; 400 for a source the ME may not take, 409 during a Mix |
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
 | `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb"}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code |
-| `POST /me/{m}/take` | `{"source", "frames", "preview", "type"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, `stinger`), mixed (`mix`, the default) or wiped with the ME's wipe (`wipe`) |
+| `POST /me/{m}/take` | `{"source", "frames", "preview", "type", "stinger", "cut"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, or `stinger` without a player), mixed (`mix`, the default), wiped with the ME's wipe (`wipe`), or by the stinger on player `stinger` with its cut frame `cut` (`stinger`; 404 for no such player; a player without a stinger cuts) |
 | `POST /me/{m}/cut` | – | the ME |
 | `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition, or the rest of a held T-bar transition; 409 while one runs |
 | `POST /me/{m}/ftb`, `/me/{m}/ftb/auto` | `{"on": true}`, `{"frames": 30}` | Fade to Black of the ME's whole output (a black layer after the DSKs; the PGM audio fades with it); the buses stay |
@@ -267,8 +296,9 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma", "source", "clip", "soft", "gain", "invert"}` | the key; a luma source must be one the keyer's ME may take |
 | `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
+| `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag), clip players, DSKs, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
 | `GET /metrics` | – | Prometheus text (`flowxer_engine_*`) |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |

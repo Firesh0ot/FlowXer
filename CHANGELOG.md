@@ -5,6 +5,29 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: stingers play on the GPU (P3 M3)
+
+- Stingers play again, on the GPU with alpha and sound, over the upstream keys and under the
+  DSKs: an auto-stinger, an armed Wipe with a Cut, Auto with the transition type STING,
+  `/stinger/play` and a take with `transition: "stinger"`. The background switches at the cut
+  frame, its sound crossfades over 4 frames there, and the stinger's sound goes into PGM. Both
+  sources are red on the tally. A stinger that still converts, or one with every stinger player
+  busy, is a cut. The armed Wipe stays armed when a Cut plays Preview's auto-stinger (as in
+  FlowXer 14).
+- `FLOWXER_STINGER_PLAYERS` (0–4, default 1, at most the rendering MEs): stingers that can play
+  at once; pinned like the panels (workspace `stinger_players`).
+- Library: TGA or PNG sequences with one optional WAV (the sound), and video with alpha (ProRes
+  4444, QuickTime Animation, PNG/RGBA in MOV, FFV1, VP9 with alpha). The stinger mezzanine is
+  the clip mezzanine (colour), a lossless HEVC 4:2:0 alpha stream and the sound; stingers
+  converted before (ProRes 4444) are converted again at the next start, their originals stay.
+  Library items gain `has_sound`.
+
+### Removed
+
+- `FLOWXER_RAM_CLIP_MAX_S` and `FLOWXER_RAM_BUDGET_MB`: only the P2 stinger conversion used
+  them (stingers now decode ahead on the GPU like clips). They are no longer read; a platform
+  that sets them can drop them.
+
 ### Changed: the engine replaces the GStreamer mixer (P2)
 
 FlowXer's media plane is its C++/CUDA engine (`engine/`), a child process of the
