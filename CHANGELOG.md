@@ -5,6 +5,24 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: keyer ties and frame grab (P4 M3)
+
+- Keyer ties: `PATCH /panels/{id}/transition` takes `ties` (the ME's upstream keyers) and
+  `background` (BKGD). Cut, Auto and the T-bar take the tied keyers along: a fading keyer fades
+  with the mix or wipe, a flying keyer flies its keyframes squeezed into the transition, with a
+  stinger they cut at its cut point. BKGD off is key only: Cut cuts the tied keyers, Auto runs
+  each one's own Auto. A tied keyer's tally follows it (on air while it goes off).
+- Frame grab: `POST /library/grab {source, player?, name?}` grabs a live input, a clip player, or
+  an ME's Program or Preview (`<panel>:pvw`) as it is in the next grain: a library still (source
+  `grab`, tag `grab`) named `Grab <source> <date time>`, ready at once in the production raster
+  with no conversion; `player` loads it into a clip player (the frame memory). Its lossless
+  original (FFV1 in Matroska) and thumbnail follow in the background. The engine copies the
+  picture with the grain's downloads (no stall) and writes it in its own thread.
+- GUI: BKGD, KEY 1 … and GRAB in the transition section; right click on a source tile or the
+  Preview or Program monitor grabs (also into a clip player); the `bus` widget has the tie buttons.
+- Metrics: `flowxer_engine_grabs_total{source}`, `flowxer_engine_grab_failed_total`,
+  `flowxer_engine_grab_ms`.
+
 ### Fixed: P3 trial on small
 
 - `recommended_latency_grains` counts only what delivers: each input's video and audio while

@@ -4,7 +4,8 @@ Status: M1 (the box) implemented in #91: `core/dme.hpp`, the resample and box la
 DME on linear and luma keyers, API, GUI fields, tally; M1 gate met (0.29 ms per half-size box
 with border and shadow on the A16). M2 (keyframes, fly with the keyer's Auto, presets, the box
 editor, the `dme` widget) implemented in #91, with the details in
-[Implementation notes (M2)](#implementation-notes-m2). M3–M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
+[Implementation notes (M2)](#implementation-notes-m2). M3 (keyer ties, frame grab) implemented in
+#91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4 to come. P4 builds on P3 (transitions and keying, #89) and on P2
 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
 the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
@@ -295,6 +296,46 @@ Where M2 fills in or differs from the text above:
   and a GRAB button in the ME's transition section (grabs that ME's PGM). A toast names the new
   still; it appears in the library's stills.
 - **Metrics:** `flowxer_engine_grabs_total{source}`, `flowxer_engine_grab_ms`.
+
+### Implementation notes (M3)
+
+Where M3 fills in or differs from §5 and §6:
+- **Ties:** upstream keyers only (the tie buttons are BKGD and KEY 1 … K; DSK ties are not in P4).
+  They belong to the ME's next transition and stay set: `PATCH /panels/{id}/transition {ties,
+  background}` (keyer ids; `background` is BKGD, false needs a tie). The engine gets the keyer
+  numbers in `POST /me/{m}/transition {ties}`; BKGD is the control plane's: key only, Cut cuts the
+  tied keyers and Auto (and the T-bar off 0) runs each one's own Auto, as the keyer's Auto button.
+- **Which commands:** the transition section's Cut, Auto and the T-bar (the control plane sends a
+  take with `ties: true`; the engine's `/me/{m}/cut`, `/auto`, `/position` do it themselves). A take
+  to Program from a source tile or `/mixer/take` and `/stinger/play` leave the keyers alone.
+- **Timing:** each tied keyer toggles; with a Mix or Wipe a fade has gain `from·(1 − t) + to·t` and
+  a fly is at timeline position `u0·(1 − t) + u1·t` in every grain (t of that grain; exact at 0 and
+  1). A fly on starts at keyframe 0 (or turns back a fly off where it is), a fly from off the path
+  goes straight to its keyframe with that keyframe's ease. The grain at t = 1 shows the end; a fly
+  off is on air in that grain and off from the next one, as M2's fly. The T-bar back at 0 leaves
+  the keyers as they were. A stinger's tied keyers cut in the grain that shows its cut frame (with
+  the background); a stinger that ends first or becomes a cut cuts them then.
+- **Ends:** a take, a new Program or a Cut on the engine during a tied transition end it as at its
+  end. The keyer's own Cut, Auto, run, stop or new keyframes take it out of the tie where it is (a
+  tied fly that stops stays on air, as M2's stop). The control plane's Cut during an Auto is a new
+  take (as before), so its tied keyers toggle again with it.
+- **Tally:** as M2: a tied keyer that goes on is on air from the command; one that goes off stays
+  on air for the transition's frames (a stinger's whole length); while the T-bar holds a transition
+  its tied keyers are on air.
+- **Engine grab API:** `POST /grab {source, bus, path}` answers at once with an id (the HTTP thread
+  does not wait for a grain); `GET /grab/{id}` gives the state, the output grain and its TAI time
+  (and a live input's own grain). The control plane polls it (a grab is done in 22–45 ms on the lab).
+- **Copy:** the render thread picks the grain and the picture; the writer thread copies it after
+  that grain's downloads on the download stream (PVW is packed every grain, so no extra pack); a
+  page-locked buffer per grab in flight (at most 8, allocated on the first grabs).
+- **Library:** the engine writes the still's mezzanine of the production format into the new item
+  (`still-<format>.v210`), which is ready at once; a low-priority job makes the FFV1 original and
+  the thumbnail (and converts other formats from that original; at the grab's raster without
+  scaling, so the samples stay). Source ids: an input or clip player id, a panel id (its Program,
+  also `<panel>:pgm`) or `<panel>:pvw`; the label in the name is the input's, or `ME n PGM` /
+  `ME n PVW`.
+- **GUI:** the GRAB button sits in the tie row; the context menu offers *Grab still* and *Grab to*
+  each clip player. The `bus` widget shows the tie buttons (BG, K1 …) with its transition type.
 
 ## 7. GUI and widgets
 
