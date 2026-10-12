@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/dme.hpp"
+#include "core/keyframes.hpp"
 #include "core/wipe.hpp"
 
 #include <cstdint>
@@ -110,6 +111,7 @@ struct MePlan
 // times the gain (pixel.hpp lumaAlpha), or a pip: a source as an opaque picture in a box. A
 // linear key's α is key / 1023 · gain. With dme.enabled (always for a pip; upstream keyers only)
 // the fill and key are cropped, scaled and placed in a box (core/dme.hpp, docs/engine-p4.md).
+// With `fly` the keyer's Auto flies its box along its keyframes instead of fading it.
 struct KeySettings
 {
     bool luma = false;
@@ -119,6 +121,7 @@ struct KeySettings
     float soft = 0.f;
     float gain = 1.f;
     bool invert = false;
+    bool fly = false;
     DmeSettings dme;
 };
 
@@ -168,16 +171,36 @@ struct MeView
     TransitionSettings next;
 };
 
+// A keyer's run along its keyframes (docs/engine-p4.md §5).
+struct KeyRunView
+{
+    // A run waits for its first grain or runs; `fly`: it is the keyer's Auto.
+    bool running = false;
+    bool fly = false;
+    DmeLoop loop = DmeLoop::Off;
+    // Its first grain and the step of the last grain rendered (1 = the first).
+    std::uint64_t start = 0;
+    std::uint64_t step = 0;
+    // The keyframe the box moves to, or (not running) the one it is at; −1: none.
+    int keyframe = -1;
+    // On the keyframes' path at timeline position u (grains), or off it (edited by hand).
+    bool onPath = false;
+    float u = 0.f;
+};
+
 struct KeyView
 {
     int key = 1;
     int me = 1;
     bool upstream = false;
-    // On air (or going on air during an auto).
+    // On air (or going on air during an auto or a fly).
     bool on = false;
     bool transition = false;
     float gain = 0.f;
+    // The box in `settings.dme` is the one of the last grain rendered.
     KeySettings settings;
+    std::vector<DmeKeyframe> keyframes;
+    KeyRunView run;
 };
 
 enum class MixResult
@@ -190,6 +213,7 @@ enum class MixResult
     BadPosition,
     BadKey,
     BadDme,
+    BadKeyframes,
     Busy
 };
 
@@ -227,12 +251,27 @@ public:
     MixResult position(int me, float t);
 
     // Keyer k (1-based): on or off at the next grain, or a fade to the other state over `frames`
-    // grains (an auto during an auto turns back from where it is).
+    // grains (an auto during an auto turns back from where it is). A keyer that flies (`fly`, a
+    // box, at least 2 keyframes): its Auto on turns it on and runs its box from keyframe 0 to the
+    // last; Auto off runs from where the box is to keyframe 0 and turns it off after that grain;
+    // an Auto during a fly turns back from where the box is. Cut on and off jump to the last
+    // keyframe and to keyframe 0.
     MixResult keySet(int key, bool on);
     MixResult keyAuto(int key, int frames);
     // Its mode and settings; a luma key's or a pip's source must be one its ME may take. A pip
-    // and a box (dme) only on upstream keyers, with the ranges of dmeValid.
-    MixResult keySettings(int key, KeySettings const& settings);
+    // and a box (dme) only on upstream keyers, with the ranges of dmeValid. `editBox` changes the
+    // keyer's current box (without it the box becomes settings.dme). A change of an animated box
+    // field stops a run (the box holds there, with the change).
+    MixResult keySettings(int key, KeySettings const& settings, std::function<void(DmeSettings&)> const& editBox = {});
+    // Its keyframes (0..8, upstream keyers): a run stops where the box is.
+    MixResult keyKeyframes(int key, std::vector<DmeKeyframe> const& keyframes);
+    // A run of its box (a box and keyframes needed): from where the box is to keyframe `to` (the
+    // last, keyframe 0 with `reverse`), through the keyframes in between at their own frames and
+    // ease, starting at the next grain; a loop (wrap, pingpong; 2 keyframes) runs until stopped;
+    // `frames` 0 jumps to keyframe `to` at the next grain. A fly in progress ends where it is.
+    MixResult keyRun(int key, std::optional<int> to, bool reverse, DmeLoop loop, std::optional<int> frames);
+    // Stops a run: the box holds where it is (a keyer that was flying off stays on air).
+    MixResult keyStop(int key);
     // Fade to Black of ME m's whole output, keys included: on or off at the next grain, or a fade
     // over `frames` grains (an auto during an auto turns back).
     MixResult ftbSet(int me, bool on);
@@ -294,7 +333,7 @@ private:
         bool waiting = false;
         TransitionSettings next;
     };
-    // A keyer's (with its place and settings) or an FTB's fade.
+    // A keyer's (with its place and settings) or an FTB's fade; a keyer's keyframes and run.
     struct Fade
     {
         int me = 1;
@@ -308,6 +347,19 @@ private:
         bool pending = false;
         bool running = false;
         std::uint64_t start = 0;
+        std::vector<DmeKeyframe> keyframes;
+        // Where the box is: on the path at u (keyframe `keyframe` when exactly at one), or off it.
+        bool onPath = false;
+        float u = 0.f;
+        int keyframe = -1;
+        // A run: waiting for its first grain, or running since runStart (runStep: the last step).
+        bool runPending = false;
+        bool runActive = false;
+        std::uint64_t runStart = 0;
+        std::uint64_t runStep = 0;
+        DmeRun run;
+        // The run is the keyer's Auto (a fly; off when `on` is false).
+        bool flying = false;
     };
 
     [[nodiscard]] bool validMe(int me) const
@@ -321,6 +373,15 @@ private:
     static void fadeSet(Fade& fade, bool on);
     static void fadeAuto(Fade& fade, int frames);
     static bool fadeAdvance(Fade& fade, std::uint64_t index);
+    // A keyer's box along its keyframes (lock held): whether its Auto flies; the keyframe the
+    // box is at (if any); a jump to keyframe j; a run from where the box is; a stop where it is;
+    // the box of grain `index` (true when a run ended at that grain).
+    static bool canFly(Fade const& key);
+    static void placeOnPath(Fade& key);
+    static void jumpTo(Fade& key, int j);
+    static void startRun(Fade& key, int to, DmeLoop loop, bool reverse);
+    static void stopRun(Fade& key);
+    static bool runAdvance(Fade& key, std::uint64_t index);
     void notify() const
     {
         if (changed_)

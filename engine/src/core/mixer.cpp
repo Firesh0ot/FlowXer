@@ -475,6 +475,73 @@ float Mixer::ftbGain(int me) const
     return validMe(me) ? ftbs_[static_cast<std::size_t>(me - 1)].gain : 0.f;
 }
 
+bool Mixer::canFly(Fade const& key)
+{
+    return key.settings.fly && key.upstream && (key.settings.pip || key.settings.dme.enabled) && key.keyframes.size() >= 2;
+}
+
+void Mixer::placeOnPath(Fade& key)
+{
+    key.keyframe = dmeKeyframeOf(key.keyframes, key.settings.dme);
+    key.onPath = key.keyframe >= 0;
+    key.u = key.onPath ? dmeKeyTime(key.keyframes, key.keyframe) : 0.f;
+}
+
+void Mixer::jumpTo(Fade& key, int j)
+{
+    key.runPending = false;
+    key.runActive = false;
+    key.settings.dme = dmeWithState(key.settings.dme, key.keyframes[static_cast<std::size_t>(j)].box);
+    key.onPath = true;
+    key.u = dmeKeyTime(key.keyframes, j);
+    key.keyframe = j;
+}
+
+void Mixer::startRun(Fade& key, int to, DmeLoop loop, bool reverse)
+{
+    key.run = dmeRunFrom(key.keyframes, key.settings.dme, key.onPath, key.u, to, loop, reverse);
+    key.runPending = true;
+    key.runActive = false;
+    key.runStep = 0;
+}
+
+void Mixer::stopRun(Fade& key)
+{
+    if (key.flying && (key.runPending || key.runActive) && !key.on)
+    {
+        // A fly off that stops: the box is still visible, so the keyer stays on air.
+        key.on = true;
+    }
+    key.runPending = false;
+    key.runActive = false;
+    key.flying = false;
+}
+
+bool Mixer::runAdvance(Fade& key, std::uint64_t index)
+{
+    if (key.runPending)
+    {
+        key.runPending = false;
+        key.runActive = true;
+        key.runStart = index;
+    }
+    if (!key.runActive)
+    {
+        return false;
+    }
+    key.runStep = index >= key.runStart ? index - key.runStart + 1 : 1;
+    auto const state = dmeRunAt(key.keyframes, key.run, key.runStep, key.settings.dme);
+    key.settings.dme = state.box;
+    key.onPath = state.onPath;
+    key.u = state.u;
+    key.keyframe = state.keyframe;
+    if (state.done)
+    {
+        key.runActive = false;
+    }
+    return state.done;
+}
+
 MixResult Mixer::keySet(int key, bool on)
 {
     if (key < 1 || key > static_cast<int>(keys_.size()))
@@ -483,13 +550,20 @@ MixResult Mixer::keySet(int key, bool on)
     }
     {
         std::lock_guard lock{mu_};
-        fadeSet(keys_[static_cast<std::size_t>(key - 1)], on);
+        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        if (canFly(keyer))
+        {
+            // A cut of a flying keyer jumps: on at the last keyframe, off at keyframe 0.
+            stopRun(keyer);
+            jumpTo(keyer, on ? static_cast<int>(keyer.keyframes.size()) - 1 : 0);
+        }
+        fadeSet(keyer, on);
     }
     notify();
     return MixResult::Ok;
 }
 
-MixResult Mixer::keySettings(int key, KeySettings const& settings)
+MixResult Mixer::keySettings(int key, KeySettings const& settings, std::function<void(DmeSettings&)> const& editBox)
 {
     if (key < 1 || key > static_cast<int>(keys_.size()))
     {
@@ -509,15 +583,119 @@ MixResult Mixer::keySettings(int key, KeySettings const& settings)
     {
         return MixResult::BadSource;
     }
-    if ((settings.pip || settings.dme.enabled) && (!spec.upstream || !dmeValid(settings.dme)))
+    {
+        std::lock_guard lock{mu_};
+        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        DmeSettings box = keyer.settings.dme;
+        if (editBox)
+        {
+            editBox(box);
+        }
+        else
+        {
+            box = settings.dme;
+        }
+        box.enabled = settings.pip || box.enabled;
+        if (box.enabled && (!spec.upstream || !dmeValid(box)))
+        {
+            return MixResult::BadDme;
+        }
+        bool const moved = !dmeSameState(box, keyer.settings.dme);
+        keyer.settings = settings;
+        keyer.settings.dme = box;
+        if (moved)
+        {
+            stopRun(keyer);
+            placeOnPath(keyer);
+        }
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::keyKeyframes(int key, std::vector<DmeKeyframe> const& keyframes)
+{
+    if (key < 1 || key > static_cast<int>(keys_.size()))
+    {
+        return MixResult::BadMe;
+    }
+    if (!keys_[static_cast<std::size_t>(key - 1)].upstream)
     {
         return MixResult::BadDme;
     }
+    if (keyframes.size() > static_cast<std::size_t>(kMaxKeyframes))
+    {
+        return MixResult::BadKeyframes;
+    }
+    for (auto const& keyframe : keyframes)
+    {
+        if (keyframe.frames < 1 || keyframe.frames > kMaxFrames)
+        {
+            return MixResult::BadFrames;
+        }
+        if (!dmeValid(keyframe.box))
+        {
+            return MixResult::BadDme;
+        }
+    }
     {
         std::lock_guard lock{mu_};
-        auto& stored = keys_[static_cast<std::size_t>(key - 1)].settings;
-        stored = settings;
-        stored.dme.enabled = settings.pip || settings.dme.enabled;
+        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        stopRun(keyer);
+        keyer.keyframes = keyframes;
+        placeOnPath(keyer);
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::keyRun(int key, std::optional<int> to, bool reverse, DmeLoop loop, std::optional<int> frames)
+{
+    if (key < 1 || key > static_cast<int>(keys_.size()))
+    {
+        return MixResult::BadMe;
+    }
+    if (frames && (*frames != 0 || loop != DmeLoop::Off))
+    {
+        // Only frames 0 (a jump), and not with a loop.
+        return MixResult::BadFrames;
+    }
+    {
+        std::lock_guard lock{mu_};
+        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        if (!keyer.upstream || !(keyer.settings.pip || keyer.settings.dme.enabled))
+        {
+            return MixResult::BadDme;
+        }
+        int const n = static_cast<int>(keyer.keyframes.size());
+        int const j = to.value_or(reverse ? 0 : n - 1);
+        if (n == 0 || j < 0 || j >= n || (loop != DmeLoop::Off && n < 2))
+        {
+            return MixResult::BadKeyframes;
+        }
+        stopRun(keyer);
+        if (frames)
+        {
+            jumpTo(keyer, j);
+        }
+        else
+        {
+            startRun(keyer, j, loop, reverse);
+        }
+    }
+    notify();
+    return MixResult::Ok;
+}
+
+MixResult Mixer::keyStop(int key)
+{
+    if (key < 1 || key > static_cast<int>(keys_.size()))
+    {
+        return MixResult::BadMe;
+    }
+    {
+        std::lock_guard lock{mu_};
+        stopRun(keys_[static_cast<std::size_t>(key - 1)]);
     }
     notify();
     return MixResult::Ok;
@@ -535,7 +713,28 @@ MixResult Mixer::keyAuto(int key, int frames)
     }
     {
         std::lock_guard lock{mu_};
-        fadeAuto(keys_[static_cast<std::size_t>(key - 1)], frames);
+        auto& keyer = keys_[static_cast<std::size_t>(key - 1)];
+        if (canFly(keyer))
+        {
+            // A fly: the keyer is on (gain 1) while its box runs. Auto on starts at keyframe 0
+            // (the off state) unless it turns back a fly off; every fly runs from where the box
+            // is.
+            bool const turningBack = keyer.flying && (keyer.runPending || keyer.runActive);
+            keyer.on = !keyer.on;
+            keyer.pending = false;
+            keyer.running = false;
+            keyer.gain = 1.f;
+            if (keyer.on && !turningBack)
+            {
+                jumpTo(keyer, 0);
+            }
+            startRun(keyer, keyer.on ? static_cast<int>(keyer.keyframes.size()) - 1 : 0, DmeLoop::Off, false);
+            keyer.flying = true;
+        }
+        else
+        {
+            fadeAuto(keyer, frames);
+        }
     }
     notify();
     return MixResult::Ok;
@@ -659,7 +858,18 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
     for (auto& keyer : keys_)
     {
         ended = fadeAdvance(keyer, index) || ended;
+        bool const runEnded = runAdvance(keyer, index);
         out.keys.push_back(KeyPlan{key++, keyer.me, keyer.upstream, keyer.gain, keyer.settings});
+        if (runEnded)
+        {
+            // A fly off ends: this grain showed keyframe 0, from the next one the keyer is off.
+            if (keyer.flying && !keyer.on)
+            {
+                keyer.gain = 0.f;
+            }
+            keyer.flying = false;
+            ended = true;
+        }
     }
     lock.unlock();
     if (ended)
@@ -719,7 +929,15 @@ std::vector<KeyView> Mixer::keyView() const
     int key = 1;
     for (auto const& keyer : keys_)
     {
-        views.push_back(KeyView{key++, keyer.me, keyer.upstream, keyer.on, keyer.pending || keyer.running, keyer.gain, keyer.settings});
+        bool const running = keyer.runPending || keyer.runActive;
+        KeyRunView run{running, running && keyer.flying, keyer.run.loop, keyer.runStart, keyer.runStep, keyer.keyframe, keyer.onPath, keyer.u};
+        if (!running)
+        {
+            run.loop = DmeLoop::Off;
+            run.keyframe = dmeKeyframeOf(keyer.keyframes, keyer.settings.dme);
+        }
+        views.push_back(KeyView{key++, keyer.me, keyer.upstream, keyer.on, keyer.pending || keyer.running || run.fly, keyer.gain, keyer.settings,
+            keyer.keyframes, run});
     }
     return views;
 }

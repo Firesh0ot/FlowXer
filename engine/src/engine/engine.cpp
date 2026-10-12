@@ -4,6 +4,7 @@
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
+#include "engine/api.hpp"
 #include "engine/encoder.hpp"
 #include "engine/gpu.hpp"
 #include "engine/hostmem.hpp"
@@ -476,8 +477,9 @@ struct Engine::Impl
     // Black in the working format (the Black source, an empty clip player).
     gpu::WorkBuffer blackWork;
     // DME (yuv16): the weight table of the resample, and keyer k's box buffer at k − 1
-    // (allocated when its box is first drawn).
+    // (allocated by the control thread when its box is first enabled: prepareBox).
     gpu::DmeScratch dmeScratch;
+    std::mutex boxMu;
     std::vector<std::int16_t*> boxBuffers;
     std::array<Slot, kSlots> slots;
     std::array<MosaicSlot, kMosaicSlots> mosaicSlots;
@@ -581,6 +583,38 @@ struct Engine::Impl
     void allocDevice(void** ptr, std::size_t bytes, char const* what)
     {
         check(cudaMalloc(ptr, bytes), what);
+        allocated += bytes;
+    }
+
+    // Keyer k's box buffer, when its box is enabled and it has none yet: allocated here on the
+    // control thread, stream-ordered on the download stream (the render stream does not wait),
+    // so the render thread never allocates.
+    void prepareBox(int k)
+    {
+        if (work != gpu::WorkFormat::Yuv16 || k < 1 || k > static_cast<int>(boxBuffers.size()))
+        {
+            return;
+        }
+        auto const key = mixer.keyView()[static_cast<std::size_t>(k - 1)];
+        if (!key.upstream || !key.settings.dme.enabled)
+        {
+            return;
+        }
+        std::lock_guard lock{boxMu};
+        auto& buffer = boxBuffers[static_cast<std::size_t>(k - 1)];
+        if (buffer != nullptr)
+        {
+            return;
+        }
+        std::size_t const bytes = gpu::dmeBufferBytes(cfg.width, cfg.height);
+        void* data = nullptr;
+        cudaSetDevice(cfg.gpu);
+        if (cudaMallocAsync(&data, bytes, downloadStream) != cudaSuccess || cudaStreamSynchronize(downloadStream) != cudaSuccess)
+        {
+            logError("box buffer", {{"keyer", k}, {"mb", bytes / 1048576}});
+            return;
+        }
+        buffer = static_cast<std::int16_t*>(data);
         allocated += bytes;
     }
 
@@ -1540,16 +1574,14 @@ struct Engine::Impl
                         {
                             source = gpu::dmeSource(workOf(set.source));
                         }
-                        auto& buffer = boxBuffers[static_cast<std::size_t>(key.key - 1)];
+                        std::int16_t* buffer = nullptr;
+                        {
+                            std::lock_guard lock{boxMu};
+                            buffer = boxBuffers[static_cast<std::size_t>(key.key - 1)];
+                        }
                         if (buffer == nullptr)
                         {
-                            std::size_t const bytes = gpu::dmeBufferBytes(cfg.width, cfg.height);
-                            if (cudaMalloc(reinterpret_cast<void**>(&buffer), bytes) != cudaSuccess)
-                            {
-                                buffer = nullptr;
-                                continue;
-                            }
-                            allocated += bytes;
+                            continue;
                         }
                         DmeDraw& d = draws[static_cast<std::size_t>(boxCount++)];
                         d.box = makeDmeBox(set.dme, kind, cfg.width, cfg.height);
@@ -2605,9 +2637,7 @@ struct Engine::Impl
         json keyers = json::array();
         for (auto const& key : mixer.keyView())
         {
-            keyers.push_back({{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on},
-                {"transition", key.transition}, {"gain", round3(key.gain)}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"},
-                {"dme", {{"enabled", key.settings.dme.enabled}, {"x", key.settings.dme.x}, {"y", key.settings.dme.y}, {"size", key.settings.dme.size}}}});
+            keyers.push_back(keyerJson(key));
         }
         out["keyers"] = keyers;
         json mosaic = {{"enabled", cfg.mosaic}, {"fps", cfg.mosaicFps}, {"frames", mosaicFrames.load()}, {"dropped", mosaicDropped.load()}, {"encode_ms", encodeMs.toJson()}};
@@ -2683,6 +2713,11 @@ bool Engine::routeInput(int k, Route const& video, Route const& audio)
 bool Engine::routeKey(int k, Route const& route)
 {
     return impl_->routeKeyer(k, route);
+}
+
+void Engine::prepareBox(int k)
+{
+    impl_->prepareBox(k);
 }
 
 std::string Engine::playerCommand(int k, PlayerCommand const& command)

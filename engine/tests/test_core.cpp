@@ -306,6 +306,38 @@ TEST(wipe_soft_edge_and_border)
     CHECK_EQ(out.cb[250], 612);
 }
 
+TEST(dme_vectors_for_the_gui)
+{
+    // The GUI's box editor draws the picture rectangle with a port of makeDmeBox's geometry that
+    // is checked against these values.
+    std::ifstream file(FXENG_DME_VECTORS);
+    auto const doc = nlohmann::json::parse(file, nullptr, false);
+    CHECK(!doc.is_discarded() && doc["vectors"].size() == 12u);
+    if (doc.is_discarded())
+    {
+        return;
+    }
+    float worst = 0.f;
+    for (auto const& v : doc["vectors"])
+    {
+        DmeSettings s;
+        s.enabled = true;
+        s.x = v[0].get<float>();
+        s.y = v[1].get<float>();
+        s.size = v[2].get<float>();
+        s.cropLeft = v[3].get<float>();
+        s.cropRight = v[4].get<float>();
+        s.cropTop = v[5].get<float>();
+        s.cropBottom = v[6].get<float>();
+        auto const b = makeDmeBox(s, DmeKind::Pip, doc["width"].get<int>(), doc["height"].get<int>());
+        for (auto [got, i] : {std::pair{b.L, 7}, std::pair{b.R, 8}, std::pair{b.T, 9}, std::pair{b.B, 10}})
+        {
+            worst = std::max(worst, std::abs(got - v[static_cast<std::size_t>(i)].get<float>()));
+        }
+    }
+    CHECK(worst < 1e-3f);
+}
+
 TEST(wipe_vectors_for_the_gui)
 {
     // The GUI's icons use a port of s(u, v) that is checked against these values.

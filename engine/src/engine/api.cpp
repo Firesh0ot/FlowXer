@@ -143,6 +143,51 @@ json meView(Engine& engine, int me)
     return json::object();
 }
 
+std::optional<KeyView> keyerView(Engine& engine, int k)
+{
+    for (auto const& key : engine.mixer().keyView())
+    {
+        if (key.key == k)
+        {
+            return key;
+        }
+    }
+    return std::nullopt;
+}
+
+// A keyframe: the box fields over `box` (the keyer's box: missing fields keep its values), its
+// frames and ease. An error text, or empty.
+std::string parseKeyframe(json const& body, DmeSettings const& box, DmeKeyframe& keyframe)
+{
+    if (!body.is_object())
+    {
+        return "each keyframe must be an object";
+    }
+    keyframe.box = box;
+    if (auto const failed = parseDme(body, keyframe.box); !failed.empty())
+    {
+        return failed;
+    }
+    if (body.contains("frames"))
+    {
+        if (!body["frames"].is_number_integer())
+        {
+            return "a keyframe's frames must be an integer";
+        }
+        keyframe.frames = body["frames"].get<int>();
+    }
+    if (body.contains("ease"))
+    {
+        auto const ease = parseEase(text(body, "ease"));
+        if (!ease)
+        {
+            return "ease must be linear, ease, ease-in, ease-out or hold";
+        }
+        keyframe.ease = *ease;
+    }
+    return {};
+}
+
 HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string const& what)
 {
     switch (result)
@@ -162,7 +207,9 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
     case MixResult::BadKey:
         return error(400, "clip, soft and gain must be 0..1");
     case MixResult::BadDme:
-        return error(400, "pip and dme only on upstream keyers, dme within its ranges (docs/engine-p4.md §3)");
+        return error(400, "pip and dme only on upstream keyers, dme within its ranges (docs/engine-p4.md §3); a run needs a box");
+    case MixResult::BadKeyframes:
+        return error(400, "at most 8 keyframes; a run needs its keyframe (a loop 2 keyframes)");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -362,6 +409,16 @@ HttpResponse playerCommand(Engine& engine, int k, std::string const& action, jso
 }
 } // namespace
 
+json keyerJson(KeyView const& key)
+{
+    auto const& run = key.run;
+    return json{{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on}, {"transition", key.transition},
+        {"gain", key.gain}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"}, {"fly", key.settings.fly},
+        {"dme", dmeJson(key.settings.dme)}, {"keyframes", key.keyframes.size()},
+        {"run", {{"running", run.running}, {"fly", run.fly}, {"loop", loopName(run.loop)}, {"start", run.start}, {"step", run.step},
+                    {"keyframe", run.keyframe >= 0 ? json(run.keyframe) : json(nullptr)}, {"on_path", run.onPath}, {"u", run.u}}}};
+}
+
 HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
 {
     if (request.method == "GET")
@@ -464,6 +521,8 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         }
         else if (rest == "settings")
         {
+            // Mode, source, clip, soft, gain, invert and fly as given (defaults when missing); a
+            // `dme` changes the given fields of the keyer's box (without one the box stays).
             KeySettings set;
             auto const mode = text(body, "mode");
             if (mode != "linear" && mode != "luma" && mode != "pip")
@@ -481,16 +540,19 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
                 }
                 set.source = *source;
             }
+            json patch = json::object();
             if (auto const it = body.find("dme"); it != body.end())
             {
+                DmeSettings probe;
                 if (!it->is_object())
                 {
                     return error(400, "dme must be an object");
                 }
-                if (auto const failed = parseDme(*it, set.dme); !failed.empty())
+                if (auto const failed = parseDme(*it, probe); !failed.empty())
                 {
                     return error(400, failed);
                 }
+                patch = *it;
             }
             try
             {
@@ -498,12 +560,70 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
                 set.soft = body.value("soft", set.soft);
                 set.gain = body.value("gain", set.gain);
                 set.invert = body.value("invert", set.invert);
+                set.fly = body.value("fly", set.fly);
             }
             catch (json::exception const&)
             {
-                return error(400, "clip, soft and gain must be numbers, invert a boolean");
+                return error(400, "clip, soft and gain must be numbers, invert and fly booleans");
             }
-            result = mixer.keySettings(k, set);
+            result = mixer.keySettings(k, set, [&patch](DmeSettings& box) { parseDme(patch, box); });
+            if (result == MixResult::Ok)
+            {
+                // The box buffer, on this thread when the box is first enabled.
+                engine.prepareBox(k);
+            }
+        }
+        else if (rest == "keyframes")
+        {
+            auto const key = keyerView(engine, k);
+            auto const it = body.find("keyframes");
+            if (!key)
+            {
+                return error(404, "no keyer " + std::to_string(k));
+            }
+            if (it == body.end() || !it->is_array())
+            {
+                return error(400, "keyframes must be an array");
+            }
+            std::vector<DmeKeyframe> keyframes;
+            for (auto const& item : *it)
+            {
+                DmeKeyframe keyframe;
+                if (auto const failed = parseKeyframe(item, key->settings.dme, keyframe); !failed.empty())
+                {
+                    return error(400, failed);
+                }
+                keyframes.push_back(keyframe);
+            }
+            result = mixer.keyKeyframes(k, keyframes);
+            if (result == MixResult::BadFrames)
+            {
+                return error(400, "a keyframe's frames must be 1.." + std::to_string(Mixer::kMaxFrames));
+            }
+        }
+        else if (rest == "run")
+        {
+            if ((body.contains("to") && !body["to"].is_number_integer()) || (body.contains("frames") && !body["frames"].is_number_integer()) ||
+                (body.contains("reverse") && !body["reverse"].is_boolean()))
+            {
+                return error(400, "to and frames must be integers, reverse a boolean");
+            }
+            auto const loop = body.contains("loop") ? parseLoop(text(body, "loop")) : DmeLoop::Off;
+            if (!loop)
+            {
+                return error(400, "loop must be off, wrap or pingpong");
+            }
+            auto const to = body.contains("to") ? std::optional<int>(body["to"].get<int>()) : std::nullopt;
+            auto const n = body.contains("frames") ? std::optional<int>(body["frames"].get<int>()) : std::nullopt;
+            if (n && (*n != 0 || *loop != DmeLoop::Off))
+            {
+                return error(400, "frames must be 0 (a jump to the keyframe), without a loop");
+            }
+            result = mixer.keyRun(k, to, body.value("reverse", false), *loop, n);
+        }
+        else if (rest == "stop")
+        {
+            result = mixer.keyStop(k);
         }
         else
         {
@@ -513,14 +633,8 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return mixResult(engine, result, k, "keyer");
         }
-        for (auto const& key : mixer.keyView())
-        {
-            if (key.key == k)
-            {
-                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}, {"dme", dmeJson(key.settings.dme)}});
-            }
-        }
-        return reply(200, json{{"key", k}});
+        auto const key = keyerView(engine, k);
+        return reply(200, key ? keyerJson(*key) : json{{"key", k}});
     }
     return error(404, "not found");
 }

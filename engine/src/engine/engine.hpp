@@ -44,6 +44,9 @@ public:
     bool routeInput(int k, Route const& video, Route const& audio);
     // Routes key input k (1-based).
     bool routeKey(int k, Route const& route);
+    // Keyer k's box buffer once its box is enabled (called by the control API after a settings
+    // change, so the render thread never allocates).
+    void prepareBox(int k);
     // Clip player k (1-based). Returns an error message, empty when done.
     std::string playerCommand(int k, PlayerCommand const& command);
     // Stinger player k (1-based), and the frames of its loaded stinger (0: none; -1: no such

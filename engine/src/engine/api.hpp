@@ -9,15 +9,24 @@
 //   POST /me/{m}/take {"source", "frames", "preview", "type"}   frames 0: cut; preview: Preview afterwards
 //   POST /me/{m}/cut, /auto {"frames"}, /position {"t"}, /ftb {"on"}, /ftb/auto {"frames"}
 //   POST /keyer/{k} {"on"}, /keyer/{k}/auto {"frames"},
-//        /keyer/{k}/settings {"mode": "linear"|"luma", "source", "clip", "soft", "gain", "invert"}
+//        /keyer/{k}/settings {"mode": "linear"|"luma"|"pip", "source", "clip", "soft", "gain", "invert", "fly",
+//                             "dme": the box fields to change}
+//   PUT  /keyer/{k}/keyframes {"keyframes": [{box fields, "frames", "ease"}, ...]}   up to 8
+//   POST /keyer/{k}/run {"to", "reverse", "loop": "off"|"wrap"|"pingpong", "frames": 0}, /keyer/{k}/stop
 // Sources: "in1".., "cp1".., "black", "me2".."me4".
 #pragma once
 
+#include "core/mixer.hpp"
 #include "engine/http.hpp"
+
+#include <nlohmann/json.hpp>
 
 namespace fxeng
 {
 class Engine;
 
 HttpResponse handleRequest(Engine& engine, HttpRequest const& request);
+// A keyer as /status and the keyer commands show it: on air, mode, fly, its box (the last grain
+// rendered), its keyframe count and its run.
+nlohmann::json keyerJson(KeyView const& key);
 } // namespace fxeng

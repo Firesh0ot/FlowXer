@@ -21,6 +21,7 @@ add_library(fxeng-core STATIC
     src/core/audio.cpp
     src/core/config.cpp
     src/core/dme.cpp
+    src/core/keyframes.cpp
     src/core/mixer.cpp
     src/core/mosaic_map.cpp
     src/core/playout.cpp
@@ -36,9 +37,10 @@ target_compile_options(fxeng-core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract
 
 if(FXENG_BUILD_TESTS)
     enable_testing()
-    add_executable(fxeng-tests tests/test_main.cpp tests/test_core.cpp tests/test_logic.cpp)
+    add_executable(fxeng-tests tests/test_main.cpp tests/test_core.cpp tests/test_keyframes.cpp tests/test_logic.cpp)
     target_link_libraries(fxeng-tests PRIVATE fxeng-core)
-    target_compile_definitions(fxeng-tests PRIVATE FXENG_WIPE_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/wipe-vectors.json")
+    target_compile_definitions(fxeng-tests PRIVATE FXENG_WIPE_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/wipe-vectors.json"
+        FXENG_DME_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/dme-vectors.json")
     target_compile_options(fxeng-tests PRIVATE -Wall -Wextra)
     add_test(NAME fxeng-tests COMMAND fxeng-tests)
 endif()
