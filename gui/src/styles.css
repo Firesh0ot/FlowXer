@@ -138,7 +138,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
   border-top: 1px solid var(--line); background: #0b0e14;
 }
 .transition-section {
-  display: grid; grid-template-rows: auto auto 1fr; gap: 8px; padding: 10px; min-width: 0;
+  display: grid; grid-template-rows: auto auto auto 1fr; gap: 8px; padding: 10px; min-width: 0;
   border-left: 1px solid var(--line); font-size: 12px;
 }
 .transition-section button {
@@ -154,6 +154,19 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .transition-section input[type="number"], .transition-section select {
   background: #0b1220; color: var(--text); border: 1px solid var(--line); padding: 4px;
 }
+.tie-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.tie-row button { padding: 4px 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; }
+.tie-row button.on-air { box-shadow: inset 0 -3px 0 var(--pgm); }
+.tie-row button:disabled { cursor: default; opacity: 0.8; }
+.tie-row .grab { margin-left: auto; }
+.grab-menu-backdrop { position: fixed; inset: 0; z-index: 20; }
+.grab-menu {
+  position: fixed; z-index: 21; display: grid; min-width: 180px; padding: 4px 0;
+  background: #0f1520; border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 24px #0008;
+}
+.grab-menu .title { padding: 4px 12px; font-size: 11px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+.grab-menu button { font: inherit; font-size: 12px; color: var(--text); background: none; border: 0; text-align: left; padding: 6px 12px; cursor: pointer; }
+.grab-menu button:hover { background: #1a2434; }
 .wipe-settings { display: grid; gap: 6px; }
 .patterns { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 3px; }
 .patterns button { padding: 2px; line-height: 0; }
@@ -349,6 +362,7 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .toast {
   position: fixed; bottom: 16px; right: 16px; background: #3a1520; padding: 8px 12px; border-radius: 6px;
 }
+.toast.notice { background: #13361f; bottom: 56px; }
 @media (max-width: 900px) {
   .monitors { grid-template-columns: 1fr; }
   .deck { grid-template-columns: 1fr; }

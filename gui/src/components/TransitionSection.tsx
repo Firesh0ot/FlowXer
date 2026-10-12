@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { MixerPanel, PanelTransition, StingerSlot, TransitionKind } from "../api";
+import type { Keyer, MixerPanel, PanelTransition, StingerSlot, TransitionKind } from "../api";
 import { WIPE_PATTERNS, wipePattern } from "../wipe";
 
 const TYPES: { type: TransitionKind; label: string }[] = [
@@ -58,10 +58,61 @@ function TBar({ value, onMove }: { value: number; onMove: (position: number) => 
   );
 }
 
+/** The next transition's elements: BKGD and the ME's upstream keyers (KEY 1 .. K), each lit when
+ * it goes with Cut, Auto and the T-bar. At least one stays lit. */
+function TieRow({
+  transition,
+  keyers,
+  onChange,
+  onGrab,
+}: {
+  transition: PanelTransition;
+  keyers: Keyer[];
+  onChange: (patch: Record<string, unknown>) => void;
+  onGrab: () => void;
+}) {
+  const ties = transition.ties ?? [];
+  const background = transition.background ?? true;
+  const toggle = (id: string) =>
+    onChange({ ties: ties.includes(id) ? ties.filter((tie) => tie !== id) : [...ties, id] });
+  return (
+    <div className="tie-row" role="group" aria-label="Next transition">
+      <button
+        className={background ? "on" : ""}
+        aria-pressed={background}
+        disabled={background && ties.length === 0}
+        title="BKGD: the background goes with the transition (off: key only)"
+        onClick={() => onChange({ background: !background })}
+      >
+        BKGD
+      </button>
+      {keyers.map((keyer, index) => {
+        const tied = ties.includes(keyer.id);
+        return (
+          <button
+            key={keyer.id}
+            className={`${tied ? "on" : ""}${keyer.enabled ? " on-air" : ""}`}
+            aria-pressed={tied}
+            disabled={tied && !background && ties.length === 1}
+            title={`${keyer.label}: tied to the transition (Cut, Auto and the T-bar turn it ${keyer.enabled ? "off" : "on"})`}
+            onClick={() => toggle(keyer.id)}
+          >
+            KEY {index + 1}
+          </button>
+        );
+      })}
+      <button className="grab" title="Grab this ME's Program as a still in the library" onClick={onGrab}>
+        GRAB
+      </button>
+    </div>
+  );
+}
+
 /** One ME's transition section: the next transition (type, rate, wipe pattern and edge, stinger
- * slot) and Cut, Auto and Fade to Black. */
+ * slot, keyer ties) and Cut, Auto and Fade to Black; GRAB grabs its Program. */
 export function TransitionSection({
   panel,
+  keyers,
   stingerSlots,
   fps,
   onChange,
@@ -69,8 +120,11 @@ export function TransitionSection({
   onAuto,
   onPosition,
   onFadeToBlack,
+  onGrab,
 }: {
   panel: MixerPanel;
+  /** The ME's upstream keyers (the tie buttons). */
+  keyers: Keyer[];
   stingerSlots: StingerSlot[];
   fps: number;
   onChange: (patch: Record<string, unknown>) => void;
@@ -78,6 +132,7 @@ export function TransitionSection({
   onAuto: () => void;
   onPosition: (position: number) => void;
   onFadeToBlack: () => void;
+  onGrab: () => void;
 }) {
   const transition: PanelTransition = panel.transition;
   // The lever: where the operator holds it, or where an Auto is (it runs at the ME's rate).
@@ -100,7 +155,7 @@ export function TransitionSection({
       if (t < 1) animation.current = window.requestAnimationFrame(step);
     };
     window.cancelAnimationFrame(animation.current);
-    if (transition.type !== "stinger") animation.current = window.requestAnimationFrame(step);
+    if (transition.type !== "stinger" && (transition.background ?? true)) animation.current = window.requestAnimationFrame(step);
   };
   useEffect(() => () => window.cancelAnimationFrame(animation.current), []);
   const wipe = transition.wipe;
@@ -133,6 +188,7 @@ export function TransitionSection({
           fr
         </label>
       </div>
+      <TieRow transition={transition} keyers={keyers} onChange={onChange} onGrab={onGrab} />
       {transition.type === "wipe" ? (
         <div className="wipe-settings">
           <div className="patterns">

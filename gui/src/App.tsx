@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { LibraryModal } from "./components/LibraryModal";
 import { BoxEditor } from "./components/BoxEditor";
@@ -38,6 +38,9 @@ export default function App() {
   const [libraryKind, setLibraryKind] = useState<"clip" | "stinger" | null>(null);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
+  // A picture's context menu (GRAB) at the mouse, and the toast that names a new still.
+  const [grabMenu, setGrabMenu] = useState<{ source: string; label: string; x: number; y: number } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const refresh = async () => {
     try {
@@ -61,6 +64,12 @@ export default function App() {
       setError(err instanceof Error ? err.message : "command failed");
     }
   };
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   useEffect(() => {
     void refresh();
@@ -87,6 +96,18 @@ export default function App() {
     ...snapshot.panels.slice(snapshot.panels.indexOf(panel) + 1).map((item) => ({ id: item.id, label: item.label })),
   ];
   const playable = (snapshot.library ?? []).filter((item) => item.ready && (item.kind === "clip" || item.kind === "still"));
+  const players = snapshot.inputs.filter((item) => item.kind === "clip_player");
+  // A frame grab (the next grain) into the library, optionally into a clip player (frame memory).
+  const grab = (source: string, player?: string) =>
+    void command(async () => {
+      const item = await api.grab(source, player);
+      const into = players.find((entry) => entry.id === player);
+      setNotice(`${item.name}${into ? ` → ${into.label}` : ""}`);
+    });
+  const openGrab = (source: string, label: string) => (event: MouseEvent) => {
+    event.preventDefault();
+    setGrabMenu({ source, label, x: event.clientX, y: event.clientY });
+  };
 
   return (
     <div className="console">
@@ -189,11 +210,21 @@ export default function App() {
         <div className="monitors">
           <div className="bus-column">
             <h2>Preview</h2>
-            <Monitor tileId={`panel:${panel.id}:pvw`} label={panel.preview_input_id ?? "NO SRC"} tally="pvw" />
+            <Monitor
+              tileId={`panel:${panel.id}:pvw`}
+              label={panel.preview_input_id ?? "NO SRC"}
+              tally="pvw"
+              onMenu={openGrab(`${panel.id}:pvw`, `${panel.label} PVW`)}
+            />
           </div>
           <div className="bus-column">
             <h2>Program</h2>
-            <Monitor tileId={`panel:${panel.id}:pgm`} label={panel.program_input_id ?? "NO SRC"} tally="pgm">
+            <Monitor
+              tileId={`panel:${panel.id}:pgm`}
+              label={panel.program_input_id ?? "NO SRC"}
+              tally="pgm"
+              onMenu={openGrab(panel.id, `${panel.label} PGM`)}
+            >
               {boxes.length > 0 && format ? (
                 <BoxEditor
                   keyers={boxes}
@@ -271,11 +302,13 @@ export default function App() {
               onProgram={() => void command(() => api.take(input.id, panel.id))}
               onSettings={() => setSourceEdit(input)}
               onPlayer={(fn) => void command(fn)}
+              onGrab={openGrab(input.id, input.label)}
             />
           ))}
         </div>
         <TransitionSection
           panel={panel}
+          keyers={snapshot.keyers.filter((keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream")}
           stingerSlots={snapshot.stinger_slots}
           fps={fps}
           onPosition={(position) => void api.position(panel.id, position).catch((err: Error) => setError(err.message))}
@@ -283,9 +316,43 @@ export default function App() {
           onCut={() => void command(() => api.cut(panel.id))}
           onAuto={() => void command(() => api.auto(panel.id))}
           onFadeToBlack={() => void command(() => api.fadeToBlack(panel.id))}
+          onGrab={() => grab(panel.id)}
         />
       </section>
 
+      {grabMenu ? (
+        <>
+          <div className="grab-menu-backdrop" onClick={() => setGrabMenu(null)} onContextMenu={(event) => {
+            event.preventDefault();
+            setGrabMenu(null);
+          }} />
+          <div className="grab-menu" role="menu" style={{ left: grabMenu.x, top: grabMenu.y }}>
+            <div className="title">{grabMenu.label}</div>
+            <button
+              role="menuitem"
+              onClick={() => {
+                grab(grabMenu.source);
+                setGrabMenu(null);
+              }}
+            >
+              Grab still
+            </button>
+            {players.map((player) => (
+              <button
+                key={player.id}
+                role="menuitem"
+                onClick={() => {
+                  grab(grabMenu.source, player.id);
+                  setGrabMenu(null);
+                }}
+              >
+                Grab to {player.label}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : null}
+      {notice ? <div className="toast notice">{notice}</div> : null}
       {error ? <div className="toast">{error}</div> : null}
 
       {settingsOpen ? (

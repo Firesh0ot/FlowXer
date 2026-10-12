@@ -34,6 +34,10 @@ export interface PanelTransition {
     border_color: string;
   };
   stinger_slot_id: string | null;
+  /** Keyer ties: the ME's upstream keyers (ids) that Cut, Auto and the T-bar turn on or off. */
+  ties: string[];
+  /** BKGD: the background transitions; false: only the tied keyers (key only). */
+  background: boolean;
 }
 
 export interface MixerPanel {
@@ -357,6 +361,14 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(patch),
     }).then((r) => parse<PanelTransition>(r)),
+  /** A frame grab of the next grain (an input or clip player id, a panel id for its Program,
+   * <panel id>:pvw for its Preview) as a library still; `player`: load it into that clip player. */
+  grab: (source: string, player?: string) =>
+    fetch("/api/v1/library/grab", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(player ? { source, player } : { source }),
+    }).then((r) => parse<LibraryItem>(r)),
   fadeToBlack: (panel_id: string) =>
     fetch("/api/v1/mixer/fade-to-black", {
       method: "POST",
