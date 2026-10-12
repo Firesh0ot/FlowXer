@@ -5,6 +5,34 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: the boxes' GPU time (P4 M4)
+
+- `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes
+  (their box layers are part of the ME's time). Grafana shows it next to the ME times.
+- Measured with boxes on top of P3's worst case (`docs/engine-p4.md`, "M4 as built"): a half-size
+  box adds about 0.31–0.33 ms on the lab A16 (≈ 0.14 ms estimated on an RTX A4000).
+- Recommended at 1080p50 with 4 MEs at full load: at most 4 boxes per ME, up to 8 per ME on one or
+  two MEs; a linear box costs as much as 4 pips. The 2 h soak with flies, ties, stingers and 849
+  grabs: 0 skipped, 0 late, GPU memory flat, 0 failed grabs.
+
+### Added: keyer ties and frame grab (P4 M3)
+
+- Keyer ties: `PATCH /panels/{id}/transition` takes `ties` (the ME's upstream keyers) and
+  `background` (BKGD). Cut, Auto and the T-bar take the tied keyers along: a fading keyer fades
+  with the mix or wipe, a flying keyer flies its keyframes squeezed into the transition, with a
+  stinger they cut at its cut point. BKGD off is key only: Cut cuts the tied keyers, Auto runs
+  each one's own Auto. A tied keyer's tally follows it (on air while it goes off).
+- Frame grab: `POST /library/grab {source, player?, name?}` grabs a live input, a clip player, or
+  an ME's Program or Preview (`<panel>:pvw`) as it is in the next grain: a library still (source
+  `grab`, tag `grab`) named `Grab <source> <date time>`, ready at once in the production raster
+  with no conversion; `player` loads it into a clip player (the frame memory). Its lossless
+  original (FFV1 in Matroska) and thumbnail follow in the background. The engine copies the
+  picture with the grain's downloads (no stall) and writes it in its own thread.
+- GUI: BKGD, KEY 1 … and GRAB in the transition section; right click on a source tile or the
+  Preview or Program monitor grabs (also into a clip player); the `bus` widget has the tie buttons.
+- Metrics: `flowxer_engine_grabs_total{source}`, `flowxer_engine_grab_failed_total`,
+  `flowxer_engine_grab_ms`.
+
 ### Fixed: P3 trial on small
 
 - `recommended_latency_grains` counts only what delivers: each input's video and audio while
@@ -20,6 +48,35 @@ in `docs/platform-integration-plan.md` §8.
   clock cannot place (index 0 of a mirror flow that was just created showed 1.79e12 ms on small).
 - GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
   ON does not look like a key on air.
+
+### Added: DME keyframes, presets, box editor and the dme widget (P4 M2)
+
+- Keyframes: up to 8 per upstream keyer (`PUT /keyers/{id}/keyframes`): position, size (in log
+  space), crop, border and shadow, each with its time in frames and an ease (linear, ease,
+  ease-in, ease-out, hold). `POST /keyers/{id}/run` runs the box from where it is to a keyframe,
+  back (`reverse`), in a loop (`wrap`, `pingpong`) or jumps (`frames: 0`); `/stop` holds it. The
+  engine computes the box of every grain from the grain index: exact and reproducible.
+- `fly`: the keyer's Auto flies the box on (keyframe 0 to the last) and off; an Auto during a fly
+  turns back; cut on and off jump. The raw tally keeps a keyer on air while it fades or flies off.
+- Presets (`POST /keyers/{id}/preset`, `GET /dme/presets`): four corner PiPs, split (keyers 1
+  and 2), quad (keyers 1 to 4), full; on air the box flies there.
+- `PUT /keyers/{id}/dme` replaces a box (PATCH merges); a pip keyer is always a box.
+- GUI: the box editor over the active ME's Program (drag to move, corner handles to scale, ON AIR
+  while on air), the keyframe list with RUN, STOP, loops and the presets in the keyer panel.
+- Widget `dme` (`/widget/dme?me=<n>&keyer=<k>`): On/Off, Auto, Run back and forth, Stop, presets.
+- Box buffers are allocated when a box is first enabled, not by the render thread.
+
+### Added: DME boxes (P4 M1)
+
+- An upstream keyer can put its key in a box: `dme` with position, size, crop, soft edge, an
+  outer border (width, soft, colour, opacity) and a black rectangular shadow (offset, blur,
+  opacity). The keyer mode `pip` shows any source the ME may take (an input, a clip player, a
+  higher ME) opaque in a box. `PATCH /keyers/{id}` takes `mode: "pip"` and a partial `dme`;
+  the GUI's keyer panel has the box fields. DSKs have no DME.
+- Scaling is Catmull-Rom (anti-aliased when shrinking) with sub-pixel positions; chroma on its
+  own 4:2:2 grid; a linear box is scaled premultiplied. GPU and CPU reference agree bit for bit.
+- Tally: a pip's source lights LH while the keyer is on air, like a luma key's.
+- Cost on the lab A16: about 0.29 ms per half-size 1080p box (resample and box layer).
 
 ### Added: metrics of P3 (M4)
 

@@ -13,7 +13,9 @@
 //   (descending, so re-entry is same-grain), keys the DSKs, packs, draws the mosaic, hands the
 //   grain slot to the writer;
 // - fx-writer: owns the MXL writers: opens grain i, DMA-downloads into it on the download
-//   stream, waits for each copy, commits; then the PGM audio of grain i;
+//   stream, waits for each copy, commits; then the PGM audio of grain i; copies the frame grabs
+//   of grain i (picked by fx-render) into host memory;
+// - fx-grab: writes each frame grab's raw v210 file;
 // - fx-encode: NVENC + RTSP of the mosaic;
 // - fx-stats: CPU per thread and NVML once a second.
 #pragma once
@@ -44,12 +46,21 @@ public:
     bool routeInput(int k, Route const& video, Route const& audio);
     // Routes key input k (1-based).
     bool routeKey(int k, Route const& route);
+    // Keyer k's box buffer once its box is enabled (called by the control API after a settings
+    // change, so the render thread never allocates).
+    void prepareBox(int k);
     // Clip player k (1-based). Returns an error message, empty when done.
     std::string playerCommand(int k, PlayerCommand const& command);
     // Stinger player k (1-based), and the frames of its loaded stinger (0: none; -1: no such
     // player).
     std::string stingerCommand(int k, PlayerCommand const& command);
     [[nodiscard]] long long stingerFrames(int k) const;
+    // A frame grab (docs/engine-p4.md §6) of `source` ("in<k>", "cp<k>", "me<n>": its Program, or
+    // its Preview with `preview`) as it is in the next output grain, written as raw v210 to `path`.
+    // Its id (0 with an error message in `error`); at most 4 grabs per grain, 8 in flight.
+    int grab(std::string const& source, bool preview, std::string const& path, std::string& error);
+    // A grab's state as JSON ("" for an unknown id; the last 32 are kept).
+    [[nodiscard]] std::string grabJson(int id) const;
 
     [[nodiscard]] std::string statusJson() const;
     [[nodiscard]] std::string metricsText() const;

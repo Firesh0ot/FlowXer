@@ -34,6 +34,10 @@ export interface PanelTransition {
     border_color: string;
   };
   stinger_slot_id: string | null;
+  /** Keyer ties: the ME's upstream keyers (ids) that Cut, Auto and the T-bar turn on or off. */
+  ties: string[];
+  /** BKGD: the background transitions; false: only the tied keyers (key only). */
+  background: boolean;
 }
 
 export interface MixerPanel {
@@ -48,7 +52,56 @@ export interface MixerPanel {
   ftb?: boolean;
 }
 
-/** An upstream keyer or a DSK of one ME: linear (its v210a key input) or luma (a source). */
+/** A keyer's box (docs/engine-p4.md §3): x, y the centre of the uncropped picture (fractions of
+ * the raster), size its scale; crop fractions of the source; border and shadow in raster pixels. */
+export interface Dme {
+  enabled: boolean;
+  x: number;
+  y: number;
+  size: number;
+  soft: number;
+  crop: { left: number; right: number; top: number; bottom: number };
+  border: { width: number; soft: number; color: string; opacity: number };
+  shadow: { dx: number; dy: number; blur: number; opacity: number };
+}
+
+export type Ease = "linear" | "ease" | "ease-in" | "ease-out" | "hold";
+export type DmeLoop = "off" | "wrap" | "pingpong";
+export type DmePresetName = "corner-tl" | "corner-tr" | "corner-bl" | "corner-br" | "split" | "quad" | "full";
+
+/** A keyframe: a box state (no `enabled`, no border colour) and the time from the keyframe before. */
+export interface DmeKeyframe {
+  frames: number;
+  ease: Ease;
+  x: number;
+  y: number;
+  size: number;
+  soft: number;
+  crop: Dme["crop"];
+  border: { width: number; soft: number; opacity: number };
+  shadow: Dme["shadow"];
+}
+
+/** The engine's run of a keyer's box (none off-air). */
+export interface KeyerRun {
+  running: boolean;
+  fly: boolean;
+  loop: DmeLoop;
+  /** The keyframe the box moves to, or (not running) the one it is at. */
+  keyframe: number | null;
+  step: number;
+}
+
+export interface DmePresetInfo {
+  name: DmePresetName;
+  title: string;
+  keyers: number;
+  description: string;
+}
+
+/** An upstream keyer or a DSK of one ME: linear (its v210a key input), luma (a source) or pip (a
+ * source in a box, upstream only). An upstream keyer's `dme` puts its key in a box; its keyframes
+ * animate the box, and with `fly` its Auto flies the box instead of fading it. */
 export interface Keyer {
   id: string;
   label: string;
@@ -57,12 +110,16 @@ export interface Keyer {
   enabled: boolean;
   /** Duration of its Auto. */
   rate_ms: number;
-  mode: "linear" | "luma";
+  mode: "linear" | "luma" | "pip";
   source_id: string | null;
   clip: number;
   soft: number;
   gain: number;
   invert: boolean;
+  dme: Dme;
+  fly: boolean;
+  keyframes: DmeKeyframe[];
+  run?: KeyerRun | null;
 }
 
 /** What the engine reports for an input (GET /console `sources`); clip players add the transport. */
@@ -304,6 +361,14 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(patch),
     }).then((r) => parse<PanelTransition>(r)),
+  /** A frame grab of the next grain (an input or clip player id, a panel id for its Program,
+   * <panel id>:pvw for its Preview) as a library still; `player`: load it into that clip player. */
+  grab: (source: string, player?: string) =>
+    fetch("/api/v1/library/grab", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(player ? { source, player } : { source }),
+    }).then((r) => parse<LibraryItem>(r)),
   fadeToBlack: (panel_id: string) =>
     fetch("/api/v1/mixer/fade-to-black", {
       method: "POST",
@@ -339,6 +404,25 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload),
     }).then((r) => parse<Keyer>(r)),
+  /** The keyer's keyframes (up to 8); missing box fields take the keyer's box. */
+  keyframes: (id: string, keyframes: Partial<DmeKeyframe>[]) =>
+    fetch(`/api/v1/keyers/${id}/keyframes`, {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify(keyframes),
+    }).then((r) => parse<Keyer>(r)),
+  /** Run the box: to a keyframe, back (reverse), a loop, or a jump (frames 0). */
+  keyerRun: (id: string, body: { to?: number; reverse?: boolean; loop?: DmeLoop; frames?: 0 } = {}) =>
+    fetch(`/api/v1/keyers/${id}/run`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }).then((r) =>
+      parse<Keyer>(r),
+    ),
+  keyerStop: (id: string) =>
+    fetch(`/api/v1/keyers/${id}/stop`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) => parse<Keyer>(r)),
+  keyerPreset: (id: string, name: DmePresetName) =>
+    fetch(`/api/v1/keyers/${id}/preset`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ name }) }).then((r) =>
+      parse<Keyer[]>(r),
+    ),
+  dmePresets: () => fetch("/api/v1/dme/presets").then((r) => parse<DmePresetInfo[]>(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",

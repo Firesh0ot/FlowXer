@@ -63,6 +63,30 @@ FXENG_HD inline void packGroup(std::uint16_t const y[6], std::uint16_t const cb[
     w[3] = (y[4] & 0x3ffu) | (static_cast<std::uint32_t>(cr[2] & 0x3ffu) << 10) | (static_cast<std::uint32_t>(y[5] & 0x3ffu) << 20);
 }
 
+// One sample read in place from a packed v210 line (x in pixels for luma, in chroma pairs for Cb
+// and Cr).
+FXENG_HD inline unsigned v210Luma(std::uint32_t const* words, int x)
+{
+    int const i = x % 6;
+    int const word = (x / 6) * 4 + (i == 0 ? 0 : i <= 2 ? 1 : i == 3 ? 2 : 3);
+    int const shift = (i == 1 || i == 4) ? 0 : (i == 0 || i == 3) ? 10 : 20;
+    return (words[word] >> shift) & 0x3ffu;
+}
+
+FXENG_HD inline unsigned v210Cb(std::uint32_t const* words, int cx)
+{
+    int const j = cx % 3;
+    return (words[(cx / 3) * 4 + j] >> (j * 10)) & 0x3ffu;
+}
+
+FXENG_HD inline unsigned v210Cr(std::uint32_t const* words, int cx)
+{
+    int const j = cx % 3;
+    int const word = (cx / 3) * 4 + (j == 0 ? 0 : j + 1);
+    int const shift = j == 0 ? 20 : j == 1 ? 0 : 10;
+    return (words[word] >> shift) & 0x3ffu;
+}
+
 // Dissolve of one 10-bit sample: t = 0 gives a, t = 1 gives b.
 FXENG_HD inline std::uint16_t mix10(std::uint16_t a, std::uint16_t b, float t)
 {

@@ -1,3 +1,4 @@
+import type { MouseEvent } from "react";
 import { api, type LibraryItem, type LogicalInput, type MixerPanel, type SourceRuntime } from "../api";
 import { Monitor } from "./Monitor";
 import { PlayerBar, PlayerPosition, PlayerSelect } from "./PlayerBar";
@@ -14,6 +15,7 @@ export function SourceTile({
   onProgram,
   onSettings,
   onPlayer,
+  onGrab,
 }: {
   input: LogicalInput;
   panel: MixerPanel;
@@ -25,6 +27,8 @@ export function SourceTile({
   onProgram: () => void;
   onSettings: () => void;
   onPlayer: (command: () => Promise<unknown>) => void;
+  /** Its picture's context menu (GRAB); none for Black. */
+  onGrab?: (event: MouseEvent) => void;
 }) {
   const isPgm = panel.program_input_id === input.id;
   const isPvw = panel.preview_input_id === input.id;
@@ -47,7 +51,8 @@ export function SourceTile({
           ⚙
         </button>
       </header>
-      <div className="source-picture">
+      {/* The picture's context menu (GRAB) over the tile's PVW and PGM hit areas too. */}
+      <div className="source-picture" onContextMenu={input.kind === "black" ? undefined : onGrab}>
         <Monitor
           tileId={`source:${input.id}`}
           label=""

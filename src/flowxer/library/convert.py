@@ -23,6 +23,7 @@ from flowxer.library.ffmpeg import (
     RunResult,
     build_clip_audio_command,
     build_clip_video_command,
+    build_grab_original_command,
     build_still_command,
     build_still_filter,
     build_stinger_alpha_command,
@@ -512,16 +513,22 @@ class ConversionQueue:
     def _convert_still(
         self, item: LibraryItem, fmt: VideoFormat, job: ConvertJob, cancel: threading.Event
     ) -> ConversionInfo:
-        """A still: its first picture at the raster, as one raw v210 picture."""
+        """A still: its first picture at the raster, as one raw v210 picture. A frame grab's own
+        picture is its mezzanine as it is: its first job makes the lossless original and the
+        thumbnail from it (_grab_original); at the grab's raster the original converts without
+        scaling (the same samples)."""
         if not self.ffmpeg.which():
             return ConversionInfo(status=ConversionStatus.failed, error="ffmpeg not available")
-        original = self._original_path(item)
         directory = self.store.item_dir(item.id)
+        if item.source == "grab" and not (directory / str(item.original.get("path") or "original.mkv")).is_file():
+            return self._grab_original(item, fmt, job, cancel)
+        original = self._original_path(item)
         still = self.store.mezz_path(item.id, fmt.id, LibraryKind.still)
         still_tmp = directory / f"{still.stem}.{job.id}.tmp.v210"
         thumb = self.store.thumb_path(item.id)
         thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
-        vf = build_still_filter(width=fmt.width, height=fmt.height, fit=item.options.fit.value)
+        raster = (item.original.get("width"), item.original.get("height")) == (fmt.width, fmt.height)
+        vf = None if item.source == "grab" and raster else build_still_filter(width=fmt.width, height=fmt.height, fit=item.options.fit.value)
         picture_bytes = (fmt.width + 47) // 48 * 128 * fmt.height
         try:
             job.progress = 0.3
@@ -537,6 +544,38 @@ class ConversionQueue:
             for tmp in (still_tmp, thumb_tmp):
                 tmp.unlink(missing_ok=True)
         return ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=still.name, playback="ram")
+
+    def _grab_original(
+        self, item: LibraryItem, fmt: VideoFormat, job: ConvertJob, cancel: threading.Event
+    ) -> ConversionInfo:
+        """A frame grab: its raw v210 picture (the engine wrote it as the mezzanine of the grab's
+        format) as the lossless original (FFV1 in Matroska) and the thumbnail; then the job's own
+        format converts from that original like any still."""
+        directory = self.store.item_dir(item.id)
+        grabbed = format_by_id(str(item.original.get("format_id") or fmt.id))
+        picture = self.store.mezz_path(item.id, grabbed.id, LibraryKind.still)
+        original = directory / str(item.original.get("path") or "original.mkv")
+        original_tmp = directory / f"original.{job.id}.tmp.mkv"
+        thumb = self.store.thumb_path(item.id)
+        thumb_tmp = directory / f"thumb.{job.id}.tmp.jpg"
+        if not picture.is_file():
+            return ConversionInfo(status=ConversionStatus.failed, error="the grabbed picture is missing")
+        try:
+            job.progress = 0.3
+            self._emit(job)
+            command = build_grab_original_command(picture=picture, original_tmp=original_tmp, width=grabbed.width, height=grabbed.height)
+            result = self._run(item, command, 120.0, cancel)
+            if result.code != 0 or not original_tmp.is_file():
+                return ConversionInfo(status=ConversionStatus.failed, error="the grab's original failed")
+            self._run(item, build_thumb_command(mezz=original_tmp, thumb=thumb_tmp), 120.0, cancel)
+            self._publish(original_tmp, original)
+            self._publish(thumb_tmp, thumb)
+        finally:
+            for tmp in (original_tmp, thumb_tmp):
+                tmp.unlink(missing_ok=True)
+        if grabbed.id != fmt.id:
+            return self._convert_still(item, fmt, job, cancel)
+        return ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=picture.name, playback="ram")
 
     def _unpack_zip(self, item: LibraryItem, job: ConvertJob) -> None:
         """Unpack an uploaded sequence ZIP (frames and a WAV) into sequence/ (done here, not in the

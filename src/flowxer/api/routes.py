@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
@@ -8,12 +10,16 @@ from flowxer.api.schemas import (
     AutoRequest,
     ConsoleState,
     ConvertJobOut,
+    Dme,
+    DmePresetInfo,
     DomainInfo,
     Keyer,
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
     KeyerAutoRequest,
+    KeyerPresetRequest,
+    KeyerRunRequest,
     KeyerUpdate,
     LogicalInput,
     LogicalInputCreate,
@@ -177,12 +183,14 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
         "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
         "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
         "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
-        "upstream keyers and DSKs with On/Off and Auto."
+        "upstream keyers and DSKs with On/Off and Auto. `dme`: one upstream keyer's box: On/Off, "
+        "Auto, Run back and forth, and the presets."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
     transition = {"type": "boolean", "default": True, "title": "Transition type"}
+    keyer = {"type": "integer", "minimum": 1, "maximum": max(1, mixer.workspace.keyers_per_me), "title": "Upstream keyer"}
     return [
         {
             "id": "bus",
@@ -196,6 +204,13 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "title": "FlowXer keys",
             "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
             "min_size": {"w": 240, "h": 150},
+            "version": __version__,
+        },
+        {
+            "id": "dme",
+            "title": "FlowXer DME",
+            "params": {"type": "object", "properties": {"me": me, "keyer": keyer}, "required": ["me", "keyer"]},
+            "min_size": {"w": 320, "h": 120},
             "version": __version__,
         },
     ]
@@ -593,7 +608,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         ],
         inputs=mixer.list_inputs(),
         panels=mixer.panels,
-        keyers=mixer.keyers,
+        keyers=mixer.keyer_views(),
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
         resources=ResourceInfo.model_validate(collect_resources(mixer)),
@@ -717,14 +732,14 @@ def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
     summary="The upstream keyers and DSKs of every rendering ME, in order",
 )
 def list_keyers(mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
-    return mixer.keyers
+    return mixer.keyer_views()
 
 
 @router.patch(
     "/keyers/{keyer_id}",
     response_model=Keyer,
     tags=["keyers"],
-    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma), luma source, clip, soft, gain, invert",
+    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma, pip), source, clip, soft, gain, invert, box (dme)",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -744,7 +759,7 @@ def patch_keyer(
     "/keyers/{keyer_id}/auto",
     response_model=Keyer,
     tags=["keyers"],
-    summary="Fade the keyer on (or off when it is on)",
+    summary="Fade the keyer on (or off when it is on); with fly, fly its box from keyframe 0 to the last (or back)",
 )
 def keyer_auto(
     keyer_id: str, payload: KeyerAutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -753,6 +768,94 @@ def keyer_auto(
         return mixer.keyer_auto(keyer_id, (payload or KeyerAutoRequest()).duration_ms)
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND)
+
+
+def _keyer_error(exc: MixerError) -> HTTPException:
+    return _http(exc, status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT)
+
+
+@router.put(
+    "/keyers/{keyer_id}/dme",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Replace the keyer's box (missing fields: defaults; PATCH /keyers/{id} merges); stops a run",
+)
+def put_keyer_dme(keyer_id: str, payload: Dme, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    try:
+        return mixer.replace_keyer_box(keyer_id, payload)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.put(
+    "/keyers/{keyer_id}/keyframes",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Replace the keyer's keyframes (up to 8): box fields (missing: the keyer's box), frames and ease each",
+    description=(
+        "Each keyframe is a box state (see DmeKeyframe: x, y, size, soft, crop, border width, soft "
+        "and opacity, shadow) with `frames` (1..1000: the time from the keyframe before) and `ease` "
+        "(linear, ease, ease-in, ease-out, hold). Size is interpolated in log space. A run stops "
+        "where the box is."
+    ),
+)
+def put_keyer_keyframes(
+    keyer_id: str, payload: list[dict[str, Any]] = Body(...), mixer: VisionMixer = Depends(get_mixer)
+) -> Keyer:
+    try:
+        return mixer.set_keyframes(keyer_id, payload)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/run",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Run the box from where it is to a keyframe (default the last; 0 with reverse), loop (wrap, pingpong), or jump (frames 0)",
+)
+def run_keyer(keyer_id: str, payload: KeyerRunRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    request = payload or KeyerRunRequest()
+    try:
+        return mixer.run_keyer(keyer_id, to=request.to, reverse=request.reverse, loop=request.loop, frames=request.frames)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/stop",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Stop the box's run: it holds where it is",
+)
+def stop_keyer(keyer_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    try:
+        return mixer.stop_keyer(keyer_id)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/preset",
+    response_model=list[Keyer],
+    tags=["keyers"],
+    summary="Write a DME preset (box and keyframes) into the keyer (split and quad: the ME's keyers 1-2 and 1-4); returns the keyers written",
+)
+def keyer_preset(keyer_id: str, payload: KeyerPresetRequest, mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
+    try:
+        return mixer.apply_preset(keyer_id, payload.name)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.get(
+    "/dme/presets",
+    response_model=list[DmePresetInfo],
+    tags=["keyers"],
+    summary="The DME presets: corner PiPs, split, quad, full",
+)
+def dme_presets(mixer: VisionMixer = Depends(get_mixer)) -> list[DmePresetInfo]:
+    return mixer.dme_presets()
 
 
 @router.patch(

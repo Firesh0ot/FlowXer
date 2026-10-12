@@ -35,7 +35,9 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
 - **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
   queues the DMA download straight into the MXL grain on a separate download stream, waits
   for each copy and commits. Then it writes the PGM audio of grain *i* (see below). Upload,
-  render and download of consecutive grains overlap on their streams.
+  render and download of consecutive grains overlap on their streams. The frame grabs of grain
+  *i* are copied after its downloads on the same stream (see [Frame grab](#frame-grab)).
+- **Grab thread** (`fx-grab`): writes each frame grab's raw v210 file.
 - **Encode thread** (`fx-encode`): copies the NV12 mosaic into an NVENC frame on the GPU,
   encodes it (one session, whatever the number of viewers) and sends it over RTSP/TCP to
   MediaMTX: the platform's shared one (`PREVIEW_PUBLISH_URL`) or, without it, the MediaMTX
@@ -159,10 +161,60 @@ fused compose: the background, the upstream keyers, the DSKs, Fade to Black.
 - **Luma:** a self key of a source the ME may take (an input, a clip player, `me<n>` with n > m):
   α = clamp(((Y − 64) / 876 − clip) / soft) (hard with no softness), inverted, times the gain;
   the fill is the source. A clip player keyed on air counts as on air.
+- **Pip** (upstream keyers): a source the ME may take, opaque, in a box.
+- **DME boxes** (P4 M1, `docs/engine-p4.md` §3, `core/dme.hpp`): an upstream keyer with
+  `dme.enabled` (always for a pip) crops, scales and places its fill (and a linear key's key,
+  premultiplied) in a box: one weight-table kernel and one resample kernel per box (Catmull-Rom,
+  widened by 1 / size when shrinking, at most 32 taps; the horizontal pass into shared memory per
+  tile of box rows, then the vertical pass), into the keyer's box buffer (12.4 MB at 1080p,
+  allocated by the control thread when the box is first enabled, so the render thread never
+  allocates). The fused compose draws it as a `box` layer: a black
+  rectangular shadow (smoothstep edges), the outer border, then the picture (anti-aliased or soft
+  edges), each rounded to 10 bits; the keyer's gain scales all three. A linear box limits its
+  premultiplied fill to what its key allows, so the cubic's ringing at a hard key edge leaves no
+  fringe. yuv16 only. The CPU reference (`dmeResampleCpu`, `dmeLayerCpu`) and the kernels share
+  the code and agree bit for bit.
+- **Keyframes** (P4 M2, `docs/engine-p4.md` §5, `core/keyframes.hpp`): up to 8 box states per
+  upstream keyer, each reached from the one before over its `frames` with an ease (linear, ease,
+  ease-in, ease-out, hold); size in log space (0 as 0.01), the rest linear. The box of every grain
+  is computed on the CPU from the grain index (a run started at grain s shows step f in grain
+  s + f − 1, skipped grains do not stretch it) and handed to the GPU with the plan; only + − × ÷
+  and exact scaling (own ln and exp), so the CPU reference of the tests computes the same bits.
+  A run goes from where the box is to a keyframe through the ones in between (a box off the
+  keyframes' path, e.g. edited by hand, first goes straight to the run's first keyframe over that
+  keyframe's frames and ease); loops: wrap (to the last keyframe, then keyframe 0 the next grain)
+  and pingpong; stop holds. A change of the box's animated fields stops a run there. **Fly**
+  (`fly`, 2 keyframes): the keyer's Auto on turns it on and runs keyframe 0 → last, Auto off runs
+  back and turns it off after the grain at keyframe 0, an Auto during a fly turns back, cut on and
+  off jump to the last keyframe and to 0. `/status` shows each keyer's box and run.
+- **Ties** (P4 M3, `docs/engine-p4.md` §5): an ME's next transition names its tied upstream
+  keyers (`ties`). Cut and Auto (`/me/<m>/cut`, `/auto`, a take with `ties`) and the T-bar take
+  them along: each goes to its other state. A cut cuts it at the next grain; with a Mix or Wipe a
+  fading keyer's gain is `tieAt(from, to, t)` with the transition's t, and a flying keyer (fly, a
+  box, 2 keyframes) is on air while its box runs along its keyframes at timeline position
+  `tieAt(u0, u1, t)` (squeezed into the transition; from off the path straight to its keyframe with
+  that keyframe's ease); with a stinger they cut at its cut point. The grain at t = 1 shows the
+  end; a fly off is off from the next grain; the T-bar back at 0 leaves them as they were. A Cut
+  during a tied transition ends it as at its end; the keyer's own Cut, Auto (a tied fly turns back
+  from where it is), run, stop or new keyframes take it out of the tie where it is.
 - **Key flows:** keyers routed to the same flow share one reader and upload; a flow's frames
   are allocated when it is first routed (stream-ordered), not at start.
 - `POST /keyer/<k>` `{"on": bool}` cuts it, `/keyer/<k>/auto` `{"frames": n}` fades the gain over
   n grains, `/keyer/<k>/settings` sets the mode and its values.
+
+### Frame grab
+
+P4 M3, `docs/engine-p4.md` §6. `POST /grab` queues a grab of a live input, a clip player or an
+ME's Program or Preview and answers its id at once (the control thread never waits for the GPU).
+The render thread takes up to 4 grabs per output grain *i* (more wait for the next one) with the
+picture that grain uses: a live input's grain *i − L* (or the one it held), a clip player's
+picture, the ME's packed Program or Preview (both are packed every grain). The writer thread
+copies each one (one 5.5 MB DMA at 1080p) into a page-locked buffer after the grain's downloads
+on the download stream: the render stream and the commits do not wait for it. The grab thread
+writes `path.part` and renames it to `path`. At most 8 grabs are in flight (their buffers are
+allocated on the first grabs and kept). `GET /grab/<id>` gives its state (pending, copying,
+writing, done, failed), output grain and TAI time, a live input's own grain and the ms from the
+request to the file; `/status` `grabs` and the metrics count them per source kind.
 
 ### Working format
 
@@ -283,9 +335,9 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 |---|---|---|
 | `POST /me/{m}/preview` | `{"source": "in3"}` | the ME; 400 for a source the ME may not take, 409 during a Mix |
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
-| `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb"}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code |
-| `POST /me/{m}/take` | `{"source", "frames", "preview", "type", "stinger", "cut"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, or `stinger` without a player), mixed (`mix`, the default), wiped with the ME's wipe (`wipe`), or by the stinger on player `stinger` with its cut frame `cut` (`stinger`; 404 for no such player; a player without a stinger cuts) |
-| `POST /me/{m}/cut` | – | the ME |
+| `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb", "ties": [k, …]}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code or a tie that is no upstream keyer of the ME |
+| `POST /me/{m}/take` | `{"source", "frames", "preview", "type", "stinger", "cut", "ties"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, or `stinger` without a player), mixed (`mix`, the default), wiped with the ME's wipe (`wipe`), or by the stinger on player `stinger` with its cut frame `cut` (`stinger`; 404 for no such player; a player without a stinger cuts); `ties: true` takes the ME's tied keyers along |
+| `POST /me/{m}/cut` | – | the ME (the tied keyers cut; during a transition: its end) |
 | `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition, or the rest of a held T-bar transition; 409 while one runs |
 | `POST /me/{m}/ftb`, `/me/{m}/ftb/auto` | `{"on": true}`, `{"frames": 30}` | Fade to Black of the ME's whole output (a black layer after the DSKs; the PGM audio fades with it); the buses stay |
 | `POST /me/{m}/position` | `{"t": 0.4}` (0–1) | the T-bar: t > 0 starts the ME's next transition and holds it at t (audio ramps to it within a grain); 1 completes it after that grain, 0 ends it without the swap; a stinger runs as an Auto; 409 during an Auto |
@@ -293,13 +345,18 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `PUT /key/{k}` | `{"domain", "flow"}` | routes keyer k's key input (v210a); a flow another keyer reads is shared |
 | `POST /keyer/{k}` | `{"on": true}` | the keyer on or off at the next grain |
 | `POST /keyer/{k}/auto` | `{"frames": 25}` | fades the keyer on (or off when it is on) |
-| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma", "source", "clip", "soft", "gain", "invert"}` | the key; a luma source must be one the keyer's ME may take |
+| `POST /keyer/{k}/settings` | `{"mode": "linear"\|"luma"\|"pip", "source", "clip", "soft", "gain", "invert", "fly", "dme"}` | the key; a luma or pip source must be one the keyer's ME may take; `dme` changes the given fields of the keyer's live box `{enabled, x, y, size, soft, crop {left, right, top, bottom}, border {width, soft, color "#RRGGBB", opacity}, shadow {dx, dy, blur, opacity}}` (without `dme` the box stays; a change of position, size, crop, soft, border width, soft or opacity or shadow stops a run there); pip and dme on upstream keyers only |
+| `PUT /keyer/{k}/keyframes` | `{"keyframes": [{box fields, "frames": 25, "ease": "linear"\|"ease"\|"ease-in"\|"ease-out"\|"hold"}]}` | up to 8 (upstream keyers; missing box fields: the keyer's box); a run stops where the box is |
+| `POST /keyer/{k}/run` | `{"to", "reverse", "loop": "off"\|"wrap"\|"pingpong", "frames": 0}` | a run of the box from the next grain: to keyframe `to` (the last; 0 with `reverse`), a loop, or (`frames` 0) a jump; needs a box and the keyframe |
+| `POST /keyer/{k}/stop` | – | stops a run: the box holds (a keyer flying off stays on) |
 | `POST /player/{k}/load` | `{"path", "kind": "clip"\|"still", "audio", "channels", "frames", "loop", "play_on_cut"}` | loads and cues the first frame (`path` "" unloads: black); the file loaded already only changes loop and play on cut; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers, CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
-| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
+| `POST /grab` | `{"source": "in3"\|"cp1"\|"me1", "bus": "pgm"\|"pvw", "path"}` | a frame grab of the next grain as raw v210 into `path` (`bus` for an ME); answers at once with its id and state; 409 with 8 in flight |
+| `GET /grab/{id}` | – | `{grab, source, bus, path, state, error, index, tai, source_index, ms}` (the last 32 grabs) |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, `gpu_ms.dme` (per ME the resample of its boxes), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
+| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage (and `dme_ms` per ME), grabs, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |
 
@@ -382,7 +439,26 @@ ME 2 → ME 1 gives the same picture in the same output grain; ME 2 may not take
 GPU self-test: yuv16 round trip and dissolve exact, rgba16f round trip exact on the test
 picture, dissolve within 1 code. P3 adds every wipe code (5 positions, 4 soft/border settings, both
 directions: 920 cases) bit for bit against the CPU reference, and the fused compose (a wipe and two
-key layers) exact.
+key layers) exact. P4 adds 9 DME boxes (pip, luma and linear; sizes 0.1–1.5, crops, sub-pixel
+positions, soft edges, borders, shadows, partly off the raster): box buffers and composed pictures
+bit for bit.
+
+DME cost on the lab (A16 GPU 3, 1080p, border + shadow, resample + box layer, CUDA events over
+300 runs): corner PiP 1/3 0.26 ms, half-size PiP 0.29 ms, split 2 × 1/2 0.31 ms per box, quad
+0.29 ms per box, 8 × 1/4 0.24 ms per box, full size 0.48 ms, upscale 1.5 0.42 ms. In the running
+engine a half-size pip adds 0.27 ms to its ME (2 boxes: 0.23 ms per box).
+
+P4 M2 on the lab (`fxp4-functional-m2.py`, GPU 3): every grain of a fly read back from MXL equals
+the CPU reference of its step (fly in and off with the keyer's Auto over 3 keyframes, a turn-back,
+presets flying on air, pingpong and wrap loops over 61 grains each); no output grain skipped; a
+moving half-size box costs what a static one does (0.51 against 0.50 ms on ME 1).
+
+P4 M3 on the lab (`fxp4-functional-m3.py`, GPU 3): a tied fade and a tied fly keyer equal the CPU
+reference in every grain of an Auto mix and an Auto wipe (with the background, grain by grain), at
+held T-bar positions, and cut with the background at a stinger's cut grain; grabs of a live input,
+a clip player and ME 1 PGM and PVW equal their grains on MXL bit for bit (16 grabs, 4 at a time,
+too), a grab loaded into a clip player is on air bit for bit, its FFV1 original decodes to the
+grab; no output grain skipped; a grab is in the library 22–45 ms after the request.
 
 ### Against the success criteria
 
@@ -710,3 +786,23 @@ The tables are in `docs/engine-p3.md` ("M4 as built"). In short, on A16 GPU 0 (P
 - **2 h soak** (keys, mixes, wipes, stingers, T-bar, FTB, imports, 5 viewers): 0 skipped, 3 single
   late grains, lag 4, render + download 10.81 ms (max 12.74), GPU memory flat at 1993 MiB, 0 API
   errors.
+
+## P4 M4: worst case with boxes and soak (lab, 2026-10-12)
+
+The tables are in `docs/engine-p4.md` ("M4 as built"). In short, on A16 GPU 3 (PCIe Gen4 x4):
+
+- **Worst case with boxes**, on top of P3's worst case (4 MEs, 8 inputs, 24 linear keys, held
+  wipes, the mosaic: render + download 12.61 ms): a half-size pip on every ME 14.06 ms (max 15.46),
+  a quad on ME 1 and a pip on the others 15.13 ms (max 16.36), 2 half-size pips on every ME (the
+  defaults) 15.47 ms (max 16.86), 8 pips at 1/4 on ME 1 14.57 ms (max 16.69): 0 skipped, 0 late.
+  6 pips at 1/4 on every ME (24) 19.23 ms: late grains; 32 boxes at 1/4 render in 22 ms (> 20 ms:
+  skipped grains).
+- **Per box:** a half-size pip 0.31–0.33 ms, a pip at 1/4 0.22–0.23 ms, a linear box at 1/4 about
+  1.33 ms (it resamples the packed v210a fill and key); `flowxer_engine_dme_ms` shows each ME's
+  resample; a moving box costs what a static one does; 12.4 MB of GPU memory per keyer with a box.
+- **A4000 estimate:** the defaults 10.9 ms (max 12.0), 24 pips 13.0 ms (max 13.6). Recommended at
+  1080p50 with 4 MEs at full load: at most 4 boxes per ME (16 in all, about 12 ms); up to 8 per ME
+  on one or two MEs; a linear box counts as 4.
+- **2 h soak** (2 MEs, 4 pips fading, flying and tied; tied Autos, Cuts, T-bar, stingers, 849
+  grabs): 0 skipped, 0 late, lag 4, render + download 6.01 ms (max 7.78), engine GPU memory flat at
+  594 MiB, 0 failed grabs, 91 of 91 grabs of the bars exact, 0 API errors.

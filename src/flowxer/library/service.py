@@ -12,10 +12,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from flowxer.engine.formats import format_by_id
 from flowxer.engine.security import SecurityError
 from flowxer.library.convert import ConversionQueue
 from flowxer.library.legacy import import_legacy_clips, import_legacy_stingers
 from flowxer.library.models import (
+    ConversionInfo,
     ConversionStatus,
     ConvertJob,
     ConvertOptions,
@@ -144,6 +146,9 @@ class LibraryService:
                 self.queue.enqueue(item.id, self._format_id, low_priority=item.source != "upload")
             elif status == ConversionStatus.ready and not self.queue.ready_on_disk(item, self._format_id):
                 log.info("library item %s: its %s files are missing, converting it again", item.id, self._format_id)
+                self.queue.enqueue(item.id, self._format_id, low_priority=True)
+            elif item.source == "grab" and not (self.store.item_dir(item.id) / str(item.original.get("path") or "")).is_file():
+                # A grab whose original was not made before the restart.
                 self.queue.enqueue(item.id, self._format_id, low_priority=True)
 
     def _seed_colour_bars(self) -> None:
@@ -296,6 +301,49 @@ class LibraryService:
             tmp = path.with_name(f"{name}.tmp")
             tmp.write_text(json.dumps(sorted(values)), encoding="utf-8")
             os.replace(tmp, path)
+
+    # ── frame grabs ──────────────────────────────────────────────────────────
+
+    def grab_target(self, format_id: str) -> tuple[str, Path]:
+        """A new item directory for a frame grab and the file the engine writes: the still's
+        mezzanine of `format_id` (raw v210)."""
+        item_id = new_item_id()
+        self.store.item_dir(item_id).mkdir(parents=True)
+        return item_id, self.store.mezz_path(item_id, format_id, LibraryKind.still)
+
+    def drop_grab(self, item_id: str) -> None:
+        """A grab that failed: its directory goes (no item.json was written)."""
+        shutil.rmtree(self.store.item_dir(item_id), ignore_errors=True)
+
+    def add_grab(self, item_id: str, format_id: str, *, name: str, grab: dict) -> LibraryItem:
+        """A frame grab (written by the engine into grab_target) as a still, ready at once: its v210
+        picture is the mezzanine of `format_id` as it is (no conversion). The lossless original
+        (FFV1 in Matroska) and the thumbnail follow in a background job."""
+        fmt = format_by_id(format_id)
+        picture = self.store.mezz_path(item_id, format_id, LibraryKind.still)
+        now = time.time()
+        item = LibraryItem(
+            id=item_id,
+            kind=LibraryKind.still,
+            name=name,
+            tags=["grab"],
+            created_at=now,
+            updated_at=now,
+            original={
+                "path": "original.mkv",
+                "source_kind": "grab",
+                "format_id": format_id,
+                "width": fmt.width,
+                "height": fmt.height,
+                "grab": grab,
+            },
+            options=ConvertOptions(tags=["grab"]),
+            conversions={format_id: ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=picture.name, playback="ram")},
+            source="grab",
+        )
+        self.store.save(item)
+        self.queue.enqueue(item_id, format_id, low_priority=True)
+        return item
 
     # ── upload / ingest ──────────────────────────────────────────────────────
 

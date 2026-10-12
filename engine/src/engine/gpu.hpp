@@ -3,6 +3,7 @@
 // same author).
 #pragma once
 
+#include "core/dme.hpp"
 #include "core/wipe.hpp"
 
 #include <cuda_runtime_api.h>
@@ -58,7 +59,9 @@ cudaError_t alphaToKey(cudaStream_t stream, std::uint8_t const* luma, int pitch,
 // A key layer: a linear key from a v210a fill + key (device; the key plane follows the fill,
 // `keyRowBytes` per line), α = key/1023 · gain (straight fill); or, with `luma` set, a luma key of
 // a work picture (yuv16 only), α = lumaAlpha(Y, clip, soft, invert, gain), the fill the picture
-// itself. out = fill·α + out·(1 − α) per sample, chroma with the pair's mean α.
+// itself. out = fill·α + out·(1 − α) per sample, chroma with the pair's mean α. With `dme` set it
+// is a box layer instead (yuv16 only; core/dme.hpp dmePair): its box buffer (dmeResample), border
+// and shadow.
 struct KeyLayer
 {
     std::uint8_t const* v210a = nullptr;
@@ -68,8 +71,31 @@ struct KeyLayer
     float clip = 0.f;
     float soft = 0.f;
     bool invert = false;
+    DmeDraw const* dme = nullptr;
 };
 constexpr int kMaxLayers = 14;
+// Box layers per compose: the upstream keyers of an ME.
+constexpr int kMaxBoxes = 8;
+
+// Device scratch of the boxes' resample: the weight table. One serves every box, as the boxes
+// resample one after another on the render stream.
+struct DmeScratch
+{
+    int* start = nullptr;
+    float* weights = nullptr;
+    std::size_t bytes = 0;
+};
+cudaError_t allocDmeScratch(DmeScratch& scratch, int width, int height);
+void freeDmeScratch(DmeScratch& scratch);
+// Bytes of a box buffer for any box on a W × H raster (the full raster, with a key plane).
+std::size_t dmeBufferBytes(int width, int height);
+// A box's resample into its box buffer (device, b.bh lines of b.cols int16): the weight table,
+// then one kernel that runs the horizontal pass into shared memory and the vertical pass from
+// there, per tile of box rows. Nothing for a box that is not on the raster.
+cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer);
+// A box's source: a work picture (yuv16), or a v210a fill + key.
+DmeSource dmeSource(WorkBuffer const& work);
+DmeSource dmeSource(std::uint8_t const* v210a, int width, int height, int rowBytes, int keyRowBytes);
 
 // One ME's Program in one pass (docs/engine-p3.md §2): the background (A; the dissolve of A to B
 // at t; or the wipe of A to B), then the key layers in order, written once. In yuv16 one fused
@@ -107,6 +133,7 @@ cudaError_t mosaic(cudaStream_t stream, MosaicSource const* tiles, int count, st
 
 // Kernel checks against the CPU reference on the current device: v210 round trip (yuv16
 // exact, rgba16f within 2 codes), dissolve (exact), every wipe code (bit-exact), the fused compose
-// with key layers (exact), mosaic. `report` says what was checked or what failed.
+// with key layers (exact), DME boxes (resample and box layers, exact), mosaic. `report` says
+// what was checked or what failed.
 bool selfTest(std::string& report);
 } // namespace fxeng::gpu

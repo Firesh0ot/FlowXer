@@ -4,6 +4,7 @@
 #include "core/mosaic_map.hpp"
 #include "core/pixel.hpp"
 #include "core/tai.hpp"
+#include "engine/api.hpp"
 #include "engine/encoder.hpp"
 #include "engine/gpu.hpp"
 #include "engine/hostmem.hpp"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -59,6 +61,11 @@ constexpr std::uint64_t kGraceGrains = 4;
 // After a (re)route the arrival and audio lag statistics wait this long past the start-up window:
 // a mirror or a writer settling then is no steady-state lag (small saw one 546 ms audio peak at a re-route).
 constexpr std::uint64_t kLagSettleNs = 2'000'000'000;
+// Frame grabs: picked per output grain, in flight (page-locked buffers), kept for GET /grab/{id}.
+constexpr std::size_t kGrabsPerGrain = 4;
+constexpr std::size_t kGrabBuffers = 8;
+constexpr std::size_t kGrabHistory = 32;
+
 // A sample later than this is no arrival but a grain the clock cannot place (index 0 of a mirror
 // flow that was just created): it would hold the peak forever (small: 1.79e12 ms on a new mirror).
 constexpr double kMaxArrivalMs = 10'000.0;
@@ -341,6 +348,42 @@ struct AudioRun
     std::uint64_t last = 0;
 };
 
+// A frame grab (docs/engine-p4.md §6): queued by the control thread, picked by fx-render for an
+// output grain, copied into `host` (page-locked) by fx-writer with that grain's downloads, written
+// to `path` by fx-grab. Its fields change under Impl::grabMu.
+struct Grab
+{
+    int id = 0;
+    Source source;
+    bool preview = false;
+    std::string path;
+    // pending, copying, writing, done, failed.
+    std::string state = "pending";
+    std::string error;
+    // The output grain, its TAI time, and a live input's own grain (i - L, or the one it held).
+    std::uint64_t index = 0;
+    std::uint64_t tai = 0;
+    std::uint64_t sourceIndex = 0;
+    double ms = 0;
+    std::chrono::steady_clock::time_point requested;
+    std::uint8_t* host = nullptr;
+
+    // input, player, pgm or pvw (the metrics' source label).
+    [[nodiscard]] char const* kind() const
+    {
+        return source.kind == Source::Kind::Input ? "input" : source.kind == Source::Kind::Player ? "player" : preview ? "pvw" : "pgm";
+    }
+};
+
+// A grab in an output slot: the packed v210 picture it copies (an input's or a clip player's
+// device picture, which the slot holds until it is written, or the ME's packed output).
+struct SlotGrab
+{
+    std::shared_ptr<Grab> grab;
+    std::uint8_t const* device = nullptr;
+    cudaEvent_t ready = nullptr;
+};
+
 // One output grain in flight: rendered by fx-render, downloaded and committed by fx-writer.
 struct Slot
 {
@@ -355,12 +398,17 @@ struct Slot
     std::vector<std::shared_ptr<PlayerFrame>> stingers;
     std::uint64_t index = 0;
     std::uint64_t inputIndex = 0;
-    // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done.
+    // Render stream: start, unpacked, one per ME (render order), keyed + packed, render done; per ME
+    // (render order) the end of its boxes' resample (it starts with the ME).
     std::vector<cudaEvent_t> mark;
+    std::vector<cudaEvent_t> boxed;
     cudaEvent_t downloadStart = nullptr;
     std::vector<cudaEvent_t> downloaded;
     // The ME plans of this grain (render order), for the audio.
     std::vector<MePlan> plans;
+    // The frame grabs of this grain, and the event after their copies.
+    std::vector<SlotGrab> grabs;
+    cudaEvent_t grabbed = nullptr;
     std::atomic<bool> busy{false};
 };
 
@@ -478,6 +526,11 @@ struct Engine::Impl
     std::vector<gpu::WorkBuffer> pvwWork;
     // Black in the working format (the Black source, an empty clip player).
     gpu::WorkBuffer blackWork;
+    // DME (yuv16): the weight table of the resample, and keyer k's box buffer at k − 1
+    // (allocated by the control thread when its box is first enabled: prepareBox).
+    gpu::DmeScratch dmeScratch;
+    std::mutex boxMu;
+    std::vector<std::int16_t*> boxBuffers;
     std::array<Slot, kSlots> slots;
     std::array<MosaicSlot, kMosaicSlots> mosaicSlots;
     std::vector<MosaicTile> tiles;
@@ -505,6 +558,23 @@ struct Engine::Impl
     std::promise<void> writerWarm;
     std::thread encodeThread;
     std::thread statsThread;
+    // Frame grabs: waiting for fx-render, copied and waiting for fx-grab, the last kGrabHistory;
+    // the page-locked buffers (free, all).
+    mutable std::mutex grabMu;
+    std::condition_variable grabCv;
+    std::deque<std::shared_ptr<Grab>> grabPending;
+    std::deque<std::shared_ptr<Grab>> grabWrite;
+    std::deque<std::shared_ptr<Grab>> grabRecent;
+    std::vector<std::uint8_t*> grabFree;
+    std::vector<std::uint8_t*> grabBuffers;
+    int grabNext = 1;
+    std::thread grabThread;
+    std::atomic<std::uint64_t> grabsInput{0};
+    std::atomic<std::uint64_t> grabsPlayer{0};
+    std::atomic<std::uint64_t> grabsPgm{0};
+    std::atomic<std::uint64_t> grabsPvw{0};
+    std::atomic<std::uint64_t> grabsFailed{0};
+    Window grabMs;
 
     std::atomic<std::uint64_t> rendered{0};
     std::atomic<std::uint64_t> committed{0};
@@ -519,6 +589,8 @@ struct Engine::Impl
     std::atomic<std::uint64_t> startIndex{0};
     Window unpackMs;
     std::vector<std::unique_ptr<Window>> meMs;
+    // Per ME: the resample of its boxes (the box layers are part of its compose).
+    std::vector<std::unique_ptr<Window>> dmeMs;
     Window packMs;
     Window mosaicMs;
     Window downloadMs;
@@ -581,6 +653,122 @@ struct Engine::Impl
     {
         check(cudaMalloc(ptr, bytes), what);
         allocated += bytes;
+    }
+
+    // Keyer k's box buffer, when its box is enabled and it has none yet: allocated here on the
+    // control thread, stream-ordered on the download stream (the render stream does not wait),
+    // so the render thread never allocates.
+    void prepareBox(int k)
+    {
+        if (work != gpu::WorkFormat::Yuv16 || k < 1 || k > static_cast<int>(boxBuffers.size()))
+        {
+            return;
+        }
+        auto const key = mixer.keyView()[static_cast<std::size_t>(k - 1)];
+        if (!key.upstream || !key.settings.dme.enabled)
+        {
+            return;
+        }
+        std::lock_guard lock{boxMu};
+        auto& buffer = boxBuffers[static_cast<std::size_t>(k - 1)];
+        if (buffer != nullptr)
+        {
+            return;
+        }
+        std::size_t const bytes = gpu::dmeBufferBytes(cfg.width, cfg.height);
+        void* data = nullptr;
+        cudaSetDevice(cfg.gpu);
+        if (cudaMallocAsync(&data, bytes, downloadStream) != cudaSuccess || cudaStreamSynchronize(downloadStream) != cudaSuccess)
+        {
+            logError("box buffer", {{"keyer", k}, {"mb", bytes / 1048576}});
+            return;
+        }
+        buffer = static_cast<std::int16_t*>(data);
+        allocated += bytes;
+    }
+
+    // A frame grab of the next output grain (control thread): its id, or 0 and `error`. The
+    // page-locked buffer is allocated here (outside the lock the render thread takes), at most
+    // kGrabBuffers.
+    int requestGrab(std::string const& text, bool preview, std::string const& path, std::string& error)
+    {
+        auto const source = parseSource(text);
+        bool const known = source && ((source->kind == Source::Kind::Input && source->index <= static_cast<int>(inputs.size())) ||
+                                         (source->kind == Source::Kind::Player && source->index <= static_cast<int>(players.size())) ||
+                                         (source->kind == Source::Kind::Me && source->index <= cfg.mes));
+        if (!known)
+        {
+            error = "source must be an input in<k>, a clip player cp<k> or an ME me<n> of this engine";
+            return 0;
+        }
+        if (preview && source->kind != Source::Kind::Me)
+        {
+            error = "bus pvw only for an ME";
+            return 0;
+        }
+        if (path.empty())
+        {
+            error = "a grab needs a path";
+            return 0;
+        }
+        std::uint8_t* buffer = nullptr;
+        {
+            std::lock_guard lock{grabMu};
+            if (!grabFree.empty())
+            {
+                buffer = grabFree.back();
+                grabFree.pop_back();
+            }
+            else if (grabBuffers.size() >= kGrabBuffers)
+            {
+                error = "too many grabs in flight (" + std::to_string(kGrabBuffers) + ")";
+                return 0;
+            }
+        }
+        if (buffer == nullptr)
+        {
+            void* data = nullptr;
+            cudaSetDevice(cfg.gpu);
+            if (cudaHostAlloc(&data, frameBytes, cudaHostAllocPortable) != cudaSuccess)
+            {
+                error = "cannot allocate a grab buffer";
+                return 0;
+            }
+            buffer = static_cast<std::uint8_t*>(data);
+            std::lock_guard lock{grabMu};
+            grabBuffers.push_back(buffer);
+        }
+        auto grab = std::make_shared<Grab>();
+        grab->source = *source;
+        grab->preview = preview;
+        grab->path = path;
+        grab->host = buffer;
+        grab->requested = std::chrono::steady_clock::now();
+        std::lock_guard lock{grabMu};
+        grab->id = grabNext++;
+        grabPending.push_back(grab);
+        grabRecent.push_back(grab);
+        while (grabRecent.size() > kGrabHistory)
+        {
+            grabRecent.pop_front();
+        }
+        return grab->id;
+    }
+
+    [[nodiscard]] std::string grabJson(int id) const
+    {
+        std::lock_guard lock{grabMu};
+        for (auto const& g : grabRecent)
+        {
+            if (g->id == id)
+            {
+                return json{{"grab", g->id}, {"source", sourceName(g->source)}, {"bus", g->source.kind == Source::Kind::Me ? (g->preview ? "pvw" : "pgm") : ""},
+                    {"path", g->path}, {"state", g->state}, {"error", g->error}, {"index", g->index}, {"tai", g->tai},
+                    {"source_index", g->source.kind == Source::Kind::Input ? json(g->sourceIndex) : json(nullptr)}, {"ms", round3(g->ms)}}
+                    .dump();
+            }
+        }
+        return {};
     }
 
     // ---- setup -------------------------------------------------------------------------
@@ -695,6 +883,12 @@ struct Engine::Impl
         addWork(pvwWork, static_cast<std::size_t>(cfg.mes));
         check(gpu::allocWork(blackWork, work, cfg.width, cfg.height), "work buffer");
         allocated += blackWork.bytes;
+        if (work == gpu::WorkFormat::Yuv16)
+        {
+            check(gpu::allocDmeScratch(dmeScratch, cfg.width, cfg.height), "dme scratch");
+            allocated += dmeScratch.bytes;
+        }
+        boxBuffers.assign(cfg.keys.size(), nullptr);
         check(gpu::unpack(renderStream, black, rowBytes, blackWork), "black work");
 
         std::size_t const outCount = static_cast<std::size_t>(2 * cfg.mes);
@@ -706,11 +900,16 @@ struct Engine::Impl
                 allocDevice(reinterpret_cast<void**>(&out), frameBytes, "output frame");
             }
             slot.mark.resize(static_cast<std::size_t>(4 + cfg.mes));
-            for (auto& event : slot.mark)
+            slot.boxed.resize(static_cast<std::size_t>(cfg.mes));
+            for (auto* list : {&slot.mark, &slot.boxed})
             {
-                check(cudaEventCreate(&event), "cudaEventCreate");
+                for (auto& event : *list)
+                {
+                    check(cudaEventCreate(&event), "cudaEventCreate");
+                }
             }
             check(cudaEventCreateWithFlags(&slot.downloadStart, cudaEventDefault), "cudaEventCreate");
+            check(cudaEventCreateWithFlags(&slot.grabbed, cudaEventBlockingSync | cudaEventDisableTiming), "cudaEventCreate");
             slot.downloaded.resize(outCount);
             for (auto& event : slot.downloaded)
             {
@@ -720,6 +919,7 @@ struct Engine::Impl
         for (int m = 0; m < cfg.mes; ++m)
         {
             meMs.push_back(std::make_unique<Window>());
+            dmeMs.push_back(std::make_unique<Window>());
         }
 
         tiles = mosaicTiles(cfg.width, cfg.height, static_cast<int>(inputs.size()), static_cast<int>(players.size()), cfg.mes);
@@ -1364,11 +1564,11 @@ struct Engine::Impl
             }
         }
         // A clip player is on air when it is in an ME's Program (or the incoming source of a Mix),
-        // or the source of a luma key on air.
+        // or the source of a luma key or a pip on air.
         std::vector<bool> onAir(players.size(), false);
         for (auto const& key : plan.keys)
         {
-            if (key.gain > 0.f && key.settings.luma && key.settings.source.kind == Source::Kind::Player)
+            if (key.gain > 0.f && (key.settings.luma || key.settings.pip) && key.settings.source.kind == Source::Kind::Player)
             {
                 onAir[static_cast<std::size_t>(key.settings.source.index - 1)] = true;
             }
@@ -1422,7 +1622,7 @@ struct Engine::Impl
         }
         for (auto const& key : plan.keys)
         {
-            if (key.gain > 0.f && key.settings.luma)
+            if (key.gain > 0.f && (key.settings.luma || key.settings.pip))
             {
                 need(key.settings.source);
             }
@@ -1463,7 +1663,7 @@ struct Engine::Impl
         for (auto const& key : plan.keys)
         {
             int const s = slots[static_cast<std::size_t>(key.key - 1)];
-            if (key.gain > 0.f && !key.settings.luma && s >= 0 && !keyFrames[static_cast<std::size_t>(s)])
+            if (key.gain > 0.f && !key.settings.luma && !key.settings.pip && s >= 0 && !keyFrames[static_cast<std::size_t>(s)])
             {
                 auto& frame = keyFrames[static_cast<std::size_t>(s)];
                 frame = pick(*keys[static_cast<std::size_t>(s)], j, index);
@@ -1474,6 +1674,7 @@ struct Engine::Impl
             }
         }
         // ME n before ME m (n > m): a re-entered Program is the same output grain (with its keys).
+        auto boxed = slot.boxed.begin();
         for (auto const& p : plans)
         {
             auto const me = static_cast<std::size_t>(p.me - 1);
@@ -1481,6 +1682,9 @@ struct Engine::Impl
             // the upstream keyers, the stinger, the DSKs, Fade to Black. Keys have no preview
             // (Preview shows only its source).
             gpu::Compose job;
+            // The ME's boxes (upstream keyers with DME): resampled first, drawn as layers.
+            std::array<DmeDraw, gpu::kMaxBoxes> draws;
+            int boxCount = 0;
             job.a = &workOf(p.background());
             job.b = p.mixing ? &workOf(p.b) : nullptr;
             job.t = p.mixing ? p.t : 0.f;
@@ -1493,6 +1697,8 @@ struct Engine::Impl
             {
                 if (stage == 1)
                 {
+                    // The upstream keyers' boxes are resampled (dme_ms; before a stinger's wait).
+                    cudaEventRecord(*boxed++, st);
                     // The stinger: over the upstream keys, under the DSKs.
                     auto const& frame = p.stinger > 0 ? stingFrames[static_cast<std::size_t>(p.stinger - 1)] : nullptr;
                     if (frame && frame->v210 != nullptr && job.layerCount < gpu::kMaxLayers)
@@ -1515,6 +1721,50 @@ struct Engine::Impl
                     auto const& set = key.settings;
                     gpu::KeyLayer layer;
                     layer.gain = key.gain * set.gain;
+                    if (upstream && set.dme.enabled)
+                    {
+                        // A box: yuv16 only.
+                        if (work != gpu::WorkFormat::Yuv16 || boxCount >= gpu::kMaxBoxes)
+                        {
+                            continue;
+                        }
+                        DmeKind const kind = set.pip ? DmeKind::Pip : set.luma ? DmeKind::Luma : DmeKind::Linear;
+                        DmeSource source;
+                        if (kind == DmeKind::Linear)
+                        {
+                            int const s = slots[static_cast<std::size_t>(key.key - 1)];
+                            auto const& frame = s >= 0 ? keyFrames[static_cast<std::size_t>(s)] : nullptr;
+                            if (!frame)
+                            {
+                                continue;
+                            }
+                            source = gpu::dmeSource(frame->data, cfg.width, cfg.height, rowBytes, keyRowBytes);
+                        }
+                        else
+                        {
+                            source = gpu::dmeSource(workOf(set.source));
+                        }
+                        std::int16_t* buffer = nullptr;
+                        {
+                            std::lock_guard lock{boxMu};
+                            buffer = boxBuffers[static_cast<std::size_t>(key.key - 1)];
+                        }
+                        if (buffer == nullptr)
+                        {
+                            continue;
+                        }
+                        DmeDraw& d = draws[static_cast<std::size_t>(boxCount++)];
+                        d.box = makeDmeBox(set.dme, kind, cfg.width, cfg.height);
+                        d.buffer = buffer;
+                        d.gain = layer.gain;
+                        d.clip = set.clip;
+                        d.soft = set.soft;
+                        d.invert = set.invert;
+                        gpu::dmeResample(st, d.box, source, dmeScratch, buffer);
+                        layer.dme = &d;
+                        job.layers[job.layerCount++] = layer;
+                        continue;
+                    }
                     if (set.luma)
                     {
                         layer.luma = true;
@@ -1559,6 +1809,40 @@ struct Engine::Impl
             renderMosaic(slot, pictures, index);
         }
         cudaEventRecord(*mark, st);
+        // Frame grabs of this grain (at most kGrabsPerGrain; more wait for the next one): the
+        // picture as this grain uses it. fx-writer copies them with this grain's downloads.
+        slot.grabs.clear();
+        {
+            std::lock_guard lock{grabMu};
+            while (!grabPending.empty() && slot.grabs.size() < kGrabsPerGrain)
+            {
+                auto const& g = grabPending.front();
+                SlotGrab item;
+                item.grab = g;
+                item.device = black;
+                auto const k = static_cast<std::size_t>(g->source.index - 1);
+                if (g->source.kind == Source::Kind::Input && frames[k])
+                {
+                    item.device = frames[k]->data;
+                    item.ready = frames[k]->ready;
+                    g->sourceIndex = frames[k]->index;
+                }
+                else if (g->source.kind == Source::Kind::Player && playerFrames[k] && playerFrames[k]->v210 != nullptr)
+                {
+                    item.device = playerFrames[k]->v210;
+                    item.ready = playerFrames[k]->ready;
+                }
+                else if (g->source.kind == Source::Kind::Me)
+                {
+                    item.device = slot.out[2 * k + (g->preview ? 1 : 0)];
+                }
+                g->index = index;
+                g->tai = indexToTimestamp(cfg.rate, index);
+                g->state = "copying";
+                slot.grabs.push_back(item);
+                grabPending.pop_front();
+            }
+        }
         slot.held.clear();
         for (auto* list : {&frames, &keyFrames})
         {
@@ -1643,6 +1927,20 @@ struct Engine::Impl
             }
             cudaEventRecord(slot.downloaded[o], dl);
         }
+        // Frame grabs: after this grain's downloads on the same stream (a picture no ME used was
+        // not waited for by the render stream: its upload is waited for here).
+        for (auto const& item : slot.grabs)
+        {
+            if (item.ready != nullptr)
+            {
+                cudaStreamWaitEvent(dl, item.ready, 0);
+            }
+            cudaMemcpyAsync(item.grab->host, item.device, frameBytes, cudaMemcpyDeviceToHost, dl);
+        }
+        if (!slot.grabs.empty())
+        {
+            cudaEventRecord(slot.grabbed, dl);
+        }
         for (std::size_t o = 0; o < outputs.size(); ++o)
         {
             auto& output = *outputs[o];
@@ -1676,8 +1974,9 @@ struct Engine::Impl
         unpackMs.add(elapsed(mark[0], mark[1]));
         for (std::size_t i = 0; i < mes; ++i)
         {
-            // mark[2 + i] ends the i-th ME in render order (ME mes .. 1).
+            // mark[2 + i] ends the i-th ME in render order (ME mes .. 1), boxed[i] its boxes.
             meMs[mes - 1 - i]->add(elapsed(mark[1 + i], mark[2 + i]));
+            dmeMs[mes - 1 - i]->add(elapsed(mark[1 + i], slot.boxed[i]));
         }
         packMs.add(elapsed(mark[1 + mes], mark[2 + mes]));
         mosaicMs.add(elapsed(mark[2 + mes], mark[3 + mes]));
@@ -1697,6 +1996,30 @@ struct Engine::Impl
             ++late;
         }
         ++committed;
+        if (!slot.grabs.empty())
+        {
+            bool const copied = cudaEventSynchronize(slot.grabbed) == cudaSuccess;
+            {
+                std::lock_guard lock{grabMu};
+                for (auto const& item : slot.grabs)
+                {
+                    item.grab->state = copied ? "writing" : "failed";
+                    if (copied)
+                    {
+                        grabWrite.push_back(item.grab);
+                    }
+                    else
+                    {
+                        item.grab->error = "copy failed";
+                        grabFree.push_back(item.grab->host);
+                        item.grab->host = nullptr;
+                        ++grabsFailed;
+                    }
+                }
+            }
+            grabCv.notify_one();
+            slot.grabs.clear();
+        }
         slot.held.clear();
         writeAudio(slot, audio);
         slot.players.clear();
@@ -2112,6 +2435,61 @@ struct Engine::Impl
         }
     }
 
+    // ---- grab thread -----------------------------------------------------------------------
+
+    // fx-grab: each copied grab as raw v210 (written to path.part, then renamed), off the render
+    // and writer threads.
+    void grabMain()
+    {
+        nameThread("fx-grab");
+        while (true)
+        {
+            std::shared_ptr<Grab> grab;
+            {
+                std::unique_lock lock{grabMu};
+                grabCv.wait(lock, [&] { return !grabWrite.empty() || !run.load(); });
+                if (grabWrite.empty())
+                {
+                    break;
+                }
+                grab = grabWrite.front();
+                grabWrite.pop_front();
+            }
+            std::string const part = grab->path + ".part";
+            std::FILE* file = std::fopen(part.c_str(), "wb");
+            bool ok = file != nullptr && std::fwrite(grab->host, 1, frameBytes, file) == frameBytes;
+            if (file != nullptr)
+            {
+                ok = std::fclose(file) == 0 && ok;
+            }
+            ok = ok && std::rename(part.c_str(), grab->path.c_str()) == 0;
+            int const failure = errno;
+            if (!ok)
+            {
+                std::remove(part.c_str());
+            }
+            double const ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grab->requested).count();
+            {
+                std::lock_guard lock{grabMu};
+                grab->state = ok ? "done" : "failed";
+                grab->error = ok ? "" : "cannot write " + grab->path + ": " + std::strerror(failure);
+                grab->ms = ms;
+                grabFree.push_back(grab->host);
+                grab->host = nullptr;
+            }
+            if (!ok)
+            {
+                ++grabsFailed;
+                logWarn("grab_failed", {{"grab", grab->id}, {"path", grab->path}, {"error", std::strerror(failure)}});
+                continue;
+            }
+            auto const kind = std::string(grab->kind());
+            ++(kind == "input" ? grabsInput : kind == "player" ? grabsPlayer : kind == "pgm" ? grabsPgm : grabsPvw);
+            grabMs.add(ms);
+            logInfo("grab", {{"grab", grab->id}, {"source", sourceName(grab->source)}, {"bus", kind}, {"index", grab->index}, {"ms", round3(ms)}});
+        }
+    }
+
     // ---- encode and stats threads --------------------------------------------------------
 
     void encodeMain()
@@ -2225,6 +2603,7 @@ struct Engine::Impl
             encodeThread = std::thread([this] { encodeMain(); });
         }
         statsThread = std::thread([this] { statsMain(); });
+        grabThread = std::thread([this] { grabMain(); });
         renderThread = std::thread([this] { renderMain(); });
         logInfo("engine_started", {{"gpu", gpuName}, {"inputs", inputs.size()}, {"players", players.size()}, {"stinger_players", stingers.size()},
                                       {"keys", keys.size()}, {"mes", cfg.mes},
@@ -2243,13 +2622,19 @@ struct Engine::Impl
         writeCv.notify_all();
         encodeCv.notify_all();
         statsCv.notify_all();
-        // Render first (no new grains), then the writer drains its queue.
+        // Render first (no new grains), then the writer drains its queue, then the grabs it copied
+        // are written.
         for (auto* thread : {&renderThread, &writerThread, &encodeThread, &statsThread})
         {
             if (thread->joinable())
             {
                 thread->join();
             }
+        }
+        grabCv.notify_all();
+        if (grabThread.joinable())
+        {
+            grabThread.join();
         }
         for (auto* list : {&inputs, &keys})
         {
@@ -2309,21 +2694,55 @@ struct Engine::Impl
             }
         }
         gpu::freeWork(blackWork);
+        gpu::freeDmeScratch(dmeScratch);
+        for (auto* buffer : boxBuffers)
+        {
+            if (buffer != nullptr)
+            {
+                cudaFree(buffer);
+            }
+        }
+        boxBuffers.clear();
         for (auto& slot : slots)
         {
             for (auto* out : slot.out)
             {
                 cudaFree(out);
             }
-            for (auto event : slot.mark)
+            for (auto* list : {&slot.mark, &slot.boxed})
             {
-                cudaEventDestroy(event);
+                for (auto event : *list)
+                {
+                    cudaEventDestroy(event);
+                }
             }
             for (auto event : slot.downloaded)
             {
                 cudaEventDestroy(event);
             }
             cudaEventDestroy(slot.downloadStart);
+            cudaEventDestroy(slot.grabbed);
+            slot.grabs.clear();
+        }
+        {
+            std::lock_guard lock{grabMu};
+            for (auto const& grab : grabRecent)
+            {
+                if (grab->state != "done" && grab->state != "failed")
+                {
+                    grab->state = "failed";
+                    grab->error = "the engine stopped";
+                }
+                grab->host = nullptr;
+            }
+            grabPending.clear();
+            grabWrite.clear();
+            grabFree.clear();
+            for (auto* buffer : grabBuffers)
+            {
+                cudaFreeHost(buffer);
+            }
+            grabBuffers.clear();
         }
         for (auto& slot : mosaicSlots)
         {
@@ -2440,9 +2859,11 @@ struct Engine::Impl
             {"lag_grains", lagGrains.toJson()},
             {"commit_ms", commitMs.toJson()}};
         json me = json::object();
+        json dme = json::object();
         for (std::size_t m = 0; m < meMs.size(); ++m)
         {
             me[std::to_string(m + 1)] = meMs[m]->toJson();
+            dme[std::to_string(m + 1)] = dmeMs[m]->toJson();
         }
         Window::Value uploadSum;
         for (auto const& input : inputs)
@@ -2455,6 +2876,7 @@ struct Engine::Impl
             {"upload_all_inputs", round3(uploadSum.avg)},
             {"unpack", unpackMs.toJson()},
             {"me", me},
+            {"dme", dme},
             {"pack", packMs.toJson()},
             {"mosaic", mosaicMs.toJson()},
             {"download", downloadMs.toJson()},
@@ -2540,6 +2962,9 @@ struct Engine::Impl
                 {"manual", view.manual},
                 {"t", round3(view.t)},
                 {"stinger", view.stinger},
+                {"start", view.start},
+                {"ties", view.next.ties},
+                {"tied", view.tied},
                 {"next_transition", transitionName(view.next.type)},
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},
@@ -2552,8 +2977,7 @@ struct Engine::Impl
         json keyers = json::array();
         for (auto const& key : mixer.keyView())
         {
-            keyers.push_back({{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on},
-                {"transition", key.transition}, {"gain", round3(key.gain)}, {"mode", key.settings.luma ? "luma" : "linear"}});
+            keyers.push_back(keyerJson(key));
         }
         out["keyers"] = keyers;
         json mosaic = {{"enabled", cfg.mosaic}, {"fps", cfg.mosaicFps}, {"frames", mosaicFrames.load()}, {"dropped", mosaicDropped.load()}, {"encode_ms", encodeMs.toJson()}};
@@ -2576,6 +3000,11 @@ struct Engine::Impl
             {"streams", streams}};
         out["mosaic"] = mosaic;
         out["audio"] = {{"ms_per_grain", audioMs.toJson()}, {"wait_ms", audioWaitMs.toJson()}, {"max_wait_ms", cfg.audioWaitMs}};
+        {
+            std::lock_guard lock{grabMu};
+            out["grabs"] = {{"total", {{"input", grabsInput.load()}, {"player", grabsPlayer.load()}, {"pgm", grabsPgm.load()}, {"pvw", grabsPvw.load()}}},
+                {"failed", grabsFailed.load()}, {"pending", grabPending.size()}, {"buffers", grabBuffers.size()}, {"ms", grabMs.toJson()}};
+        }
         json threads = json::object();
         for (auto const& [name, percent] : cpuNow.threads)
         {
@@ -2631,6 +3060,11 @@ bool Engine::routeKey(int k, Route const& route)
     return impl_->routeKeyer(k, route);
 }
 
+void Engine::prepareBox(int k)
+{
+    impl_->prepareBox(k);
+}
+
 std::string Engine::playerCommand(int k, PlayerCommand const& command)
 {
     if (k < 1 || k > static_cast<int>(impl_->players.size()))
@@ -2647,6 +3081,16 @@ std::string Engine::stingerCommand(int k, PlayerCommand const& command)
         return "no stinger player " + std::to_string(k);
     }
     return impl_->stingers[static_cast<std::size_t>(k - 1)]->command(command);
+}
+
+int Engine::grab(std::string const& source, bool preview, std::string const& path, std::string& error)
+{
+    return impl_->requestGrab(source, preview, path, error);
+}
+
+std::string Engine::grabJson(int id) const
+{
+    return impl_->grabJson(id);
 }
 
 long long Engine::stingerFrames(int k) const
@@ -2696,6 +3140,15 @@ std::string Engine::metricsText() const
             {
                 metric("gpu_stage_ms", v["avg"].get<double>(), "stage=\"me\",me=\"" + me + "\",stat=\"avg\"");
                 metric("gpu_stage_ms", v["max"].get<double>(), "stage=\"me\",me=\"" + me + "\",stat=\"max\"");
+            }
+        }
+        else if (stage == "dme")
+        {
+            // The resample of each ME's boxes (P4).
+            for (auto const& [me, v] : value.items())
+            {
+                metric("dme_ms", v["avg"].get<double>(), "me=\"" + me + "\",stat=\"avg\"");
+                metric("dme_ms", v["max"].get<double>(), "me=\"" + me + "\",stat=\"max\"");
             }
         }
         else if (value.is_object())
@@ -2765,6 +3218,15 @@ std::string Engine::metricsText() const
         metric("keyer_on_air", key["on"].get<bool>() ? 1.0 : 0.0, l);
         metric("keyer_key_running", k >= 1 && k <= keyList.size() && keyList[k - 1]["state"] == "running" ? 1.0 : 0.0, l);
     }
+    // Frame grabs (P4): per source kind, failures, ms from the request to the file.
+    auto const& grabs = s["grabs"];
+    for (auto const& [kind, count] : grabs["total"].items())
+    {
+        metric("grabs_total", count.get<double>(), "source=\"" + kind + "\"");
+    }
+    metric("grab_failed_total", grabs["failed"].get<double>());
+    metric("grab_ms", grabs["ms"]["avg"].get<double>(), "stat=\"avg\"");
+    metric("grab_ms", grabs["ms"]["max"].get<double>(), "stat=\"max\"");
     auto const& mosaic = s["mosaic"];
     metric("mosaic_frames_total", mosaic["frames"].get<double>());
     metric("mosaic_dropped_total", mosaic["dropped"].get<double>());

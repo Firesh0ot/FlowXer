@@ -55,7 +55,7 @@ Route routeOf(json const& body)
 }
 
 // "#RRGGBB" as 10-bit BT.709 limited-range Y'CbCr.
-bool parseColour(std::string const& text, WipeSettings& wipe)
+bool parseColour(std::string const& text, std::uint16_t& y, std::uint16_t& cb, std::uint16_t& cr)
 {
     unsigned r = 0;
     unsigned g = 0;
@@ -65,16 +65,67 @@ bool parseColour(std::string const& text, WipeSettings& wipe)
     {
         return false;
     }
-    rgbToYcbcr(Rgb{static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f, static_cast<float>(b) / 255.f}, wipe.borderY, wipe.borderCb,
-        wipe.borderCr);
+    rgbToYcbcr(Rgb{static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f, static_cast<float>(b) / 255.f}, y, cb, cr);
     return true;
+}
+
+// A keyer's box (docs/engine-p4.md §3): {enabled, x, y, size, soft, crop {left, right, top,
+// bottom}, border {width, soft, color, opacity}, shadow {dx, dy, blur, opacity}}; missing fields
+// keep their defaults. An error text, or empty.
+std::string parseDme(json const& body, DmeSettings& dme)
+{
+    try
+    {
+        dme.enabled = body.value("enabled", dme.enabled);
+        dme.x = body.value("x", dme.x);
+        dme.y = body.value("y", dme.y);
+        dme.size = body.value("size", dme.size);
+        dme.soft = body.value("soft", dme.soft);
+        if (auto const it = body.find("crop"); it != body.end())
+        {
+            dme.cropLeft = it->value("left", dme.cropLeft);
+            dme.cropRight = it->value("right", dme.cropRight);
+            dme.cropTop = it->value("top", dme.cropTop);
+            dme.cropBottom = it->value("bottom", dme.cropBottom);
+        }
+        if (auto const it = body.find("border"); it != body.end())
+        {
+            dme.borderWidth = it->value("width", dme.borderWidth);
+            dme.borderSoft = it->value("soft", dme.borderSoft);
+            dme.borderOpacity = it->value("opacity", dme.borderOpacity);
+            if (it->contains("color") && !parseColour(text(*it, "color"), dme.borderY, dme.borderCb, dme.borderCr))
+            {
+                return "dme border color must be #RRGGBB";
+            }
+        }
+        if (auto const it = body.find("shadow"); it != body.end())
+        {
+            dme.shadowDx = it->value("dx", dme.shadowDx);
+            dme.shadowDy = it->value("dy", dme.shadowDy);
+            dme.shadowBlur = it->value("blur", dme.shadowBlur);
+            dme.shadowOpacity = it->value("opacity", dme.shadowOpacity);
+        }
+    }
+    catch (json::exception const&)
+    {
+        return "dme fields must be numbers (enabled a boolean)";
+    }
+    return {};
+}
+
+json dmeJson(DmeSettings const& d)
+{
+    return json{{"enabled", d.enabled}, {"x", d.x}, {"y", d.y}, {"size", d.size}, {"soft", d.soft},
+        {"crop", {{"left", d.cropLeft}, {"right", d.cropRight}, {"top", d.cropTop}, {"bottom", d.cropBottom}}},
+        {"border", {{"width", d.borderWidth}, {"soft", d.borderSoft}, {"opacity", d.borderOpacity}, {"ycbcr", {d.borderY, d.borderCb, d.borderCr}}}},
+        {"shadow", {{"dx", d.shadowDx}, {"dy", d.shadowDy}, {"blur", d.shadowBlur}, {"opacity", d.shadowOpacity}}}};
 }
 
 json transitionJson(TransitionSettings const& next)
 {
     auto const& w = next.wipe;
     return json{{"type", transitionName(next.type)}, {"frames", next.frames}, {"pattern", w.pattern}, {"reverse", w.reverse}, {"soft", w.soft},
-        {"border", w.border}, {"border_ycbcr", {w.borderY, w.borderCb, w.borderCr}}};
+        {"border", w.border}, {"border_ycbcr", {w.borderY, w.borderCb, w.borderCr}}, {"ties", next.ties}};
 }
 
 json meView(Engine& engine, int me)
@@ -85,11 +136,56 @@ json meView(Engine& engine, int me)
         {
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
                 {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
-                {"stinger", view.stinger},
+                {"stinger", view.stinger}, {"start", view.start}, {"tied", view.tied},
                 {"transition", transitionJson(view.next)}};
         }
     }
     return json::object();
+}
+
+std::optional<KeyView> keyerView(Engine& engine, int k)
+{
+    for (auto const& key : engine.mixer().keyView())
+    {
+        if (key.key == k)
+        {
+            return key;
+        }
+    }
+    return std::nullopt;
+}
+
+// A keyframe: the box fields over `box` (the keyer's box: missing fields keep its values), its
+// frames and ease. An error text, or empty.
+std::string parseKeyframe(json const& body, DmeSettings const& box, DmeKeyframe& keyframe)
+{
+    if (!body.is_object())
+    {
+        return "each keyframe must be an object";
+    }
+    keyframe.box = box;
+    if (auto const failed = parseDme(body, keyframe.box); !failed.empty())
+    {
+        return failed;
+    }
+    if (body.contains("frames"))
+    {
+        if (!body["frames"].is_number_integer())
+        {
+            return "a keyframe's frames must be an integer";
+        }
+        keyframe.frames = body["frames"].get<int>();
+    }
+    if (body.contains("ease"))
+    {
+        auto const ease = parseEase(text(body, "ease"));
+        if (!ease)
+        {
+            return "ease must be linear, ease, ease-in, ease-out or hold";
+        }
+        keyframe.ease = *ease;
+    }
+    return {};
 }
 
 HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string const& what)
@@ -110,6 +206,12 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "t must be 0..1");
     case MixResult::BadKey:
         return error(400, "clip, soft and gain must be 0..1");
+    case MixResult::BadDme:
+        return error(400, "pip and dme only on upstream keyers, dme within its ranges (docs/engine-p4.md §3); a run needs a box");
+    case MixResult::BadKeyframes:
+        return error(400, "at most 8 keyframes; a run needs its keyframe (a loop 2 keyframes)");
+    case MixResult::BadTies:
+        return error(400, "ties must be upstream keyers of ME " + std::to_string(me) + ", each once");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -172,9 +274,25 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "pattern must be an integer, reverse a boolean, soft and border numbers");
         }
-        if (body.contains("border_color") && !parseColour(text(body, "border_color"), wipe))
+        if (body.contains("border_color") && !parseColour(text(body, "border_color"), wipe.borderY, wipe.borderCb, wipe.borderCr))
         {
             return error(400, "border_color must be #RRGGBB");
+        }
+        if (auto const it = body.find("ties"); it != body.end())
+        {
+            if (!it->is_array())
+            {
+                return error(400, "ties must be an array of keyer numbers");
+            }
+            next.ties.clear();
+            for (auto const& k : *it)
+            {
+                if (!k.is_number_integer())
+                {
+                    return error(400, "ties must be an array of keyer numbers");
+                }
+                next.ties.push_back(k.get<int>());
+            }
         }
         return mixResult(engine, mixer.setTransition(me, next), me, "ME");
     }
@@ -201,6 +319,10 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "take needs a source (in<n>, cp<n>, black, me<n>) and integer frames");
         }
+        if (body.contains("ties") && !body["ties"].is_boolean())
+        {
+            return error(400, "ties must be true or false");
+        }
         // A stinger: its player's loaded stinger and cut frame (a player without one cuts).
         Sting sting;
         if (*type == Transition::Stinger && body.contains("stinger"))
@@ -217,7 +339,7 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
                 return error(404, "no stinger player " + std::to_string(sting.player));
             }
         }
-        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting), me, "ME");
+        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting, body.value("ties", false)), me, "ME");
     }
     if (action == "cut")
     {
@@ -309,6 +431,16 @@ HttpResponse playerCommand(Engine& engine, int k, std::string const& action, jso
 }
 } // namespace
 
+json keyerJson(KeyView const& key)
+{
+    auto const& run = key.run;
+    return json{{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on}, {"transition", key.transition},
+        {"tie", key.tie > 0 ? json(key.tie) : json(nullptr)}, {"gain", key.gain}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"}, {"fly", key.settings.fly},
+        {"dme", dmeJson(key.settings.dme)}, {"keyframes", key.keyframes.size()},
+        {"run", {{"running", run.running}, {"fly", run.fly}, {"loop", loopName(run.loop)}, {"start", run.start}, {"step", run.step},
+                    {"keyframe", run.keyframe >= 0 ? json(run.keyframe) : json(nullptr)}, {"on_path", run.onPath}, {"u", run.u}}}};
+}
+
 HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
 {
     if (request.method == "GET")
@@ -329,6 +461,19 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "text/plain", "ok\n"};
         }
+        if (request.path.rfind("/grab/", 0) == 0)
+        {
+            auto const digits = request.path.substr(6);
+            if (!digits.empty() && digits.size() <= 9 && digits.find_first_not_of("0123456789") == std::string::npos)
+            {
+                auto const grab = engine.grabJson(std::stoi(digits));
+                if (!grab.empty())
+                {
+                    return HttpResponse{200, "application/json", grab};
+                }
+            }
+            return error(404, "no grab " + digits);
+        }
         return error(404, "not found");
     }
     if (request.method != "POST" && request.method != "PUT")
@@ -339,6 +484,23 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     if (body.is_discarded() || !body.is_object())
     {
         return error(400, "the body must be a JSON object");
+    }
+    if (request.path == "/grab")
+    {
+        // A frame grab of the next output grain (docs/engine-p4.md §6): queued here, copied by
+        // the writer thread with that grain's downloads, written by the grab thread.
+        auto const bus = body.contains("bus") ? text(body, "bus") : std::string("pgm");
+        if (bus != "pgm" && bus != "pvw")
+        {
+            return error(400, "bus must be pgm or pvw");
+        }
+        std::string failed;
+        int const id = engine.grab(text(body, "source"), bus == "pvw", text(body, "path"), failed);
+        if (id == 0)
+        {
+            return error(failed.rfind("too many", 0) == 0 ? 409 : 400, failed);
+        }
+        return HttpResponse{200, "application/json", engine.grabJson(id)};
     }
     std::string rest;
     if (int const me = pathNumber(request.path, "/me/", rest); me > 0)
@@ -411,21 +573,38 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         }
         else if (rest == "settings")
         {
+            // Mode, source, clip, soft, gain, invert and fly as given (defaults when missing); a
+            // `dme` changes the given fields of the keyer's box (without one the box stays).
             KeySettings set;
             auto const mode = text(body, "mode");
-            if (mode != "linear" && mode != "luma")
+            if (mode != "linear" && mode != "luma" && mode != "pip")
             {
-                return error(400, "mode must be linear or luma");
+                return error(400, "mode must be linear, luma or pip");
             }
             set.luma = mode == "luma";
-            if (set.luma)
+            set.pip = mode == "pip";
+            if (set.luma || set.pip)
             {
                 auto const source = parseSource(text(body, "source"));
                 if (!source)
                 {
-                    return error(400, "a luma key needs a source (in<n>, cp<n>, black, me<n>)");
+                    return error(400, "a luma key or a pip needs a source (in<n>, cp<n>, black, me<n>)");
                 }
                 set.source = *source;
+            }
+            json patch = json::object();
+            if (auto const it = body.find("dme"); it != body.end())
+            {
+                DmeSettings probe;
+                if (!it->is_object())
+                {
+                    return error(400, "dme must be an object");
+                }
+                if (auto const failed = parseDme(*it, probe); !failed.empty())
+                {
+                    return error(400, failed);
+                }
+                patch = *it;
             }
             try
             {
@@ -433,12 +612,70 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
                 set.soft = body.value("soft", set.soft);
                 set.gain = body.value("gain", set.gain);
                 set.invert = body.value("invert", set.invert);
+                set.fly = body.value("fly", set.fly);
             }
             catch (json::exception const&)
             {
-                return error(400, "clip, soft and gain must be numbers, invert a boolean");
+                return error(400, "clip, soft and gain must be numbers, invert and fly booleans");
             }
-            result = mixer.keySettings(k, set);
+            result = mixer.keySettings(k, set, [&patch](DmeSettings& box) { parseDme(patch, box); });
+            if (result == MixResult::Ok)
+            {
+                // The box buffer, on this thread when the box is first enabled.
+                engine.prepareBox(k);
+            }
+        }
+        else if (rest == "keyframes")
+        {
+            auto const key = keyerView(engine, k);
+            auto const it = body.find("keyframes");
+            if (!key)
+            {
+                return error(404, "no keyer " + std::to_string(k));
+            }
+            if (it == body.end() || !it->is_array())
+            {
+                return error(400, "keyframes must be an array");
+            }
+            std::vector<DmeKeyframe> keyframes;
+            for (auto const& item : *it)
+            {
+                DmeKeyframe keyframe;
+                if (auto const failed = parseKeyframe(item, key->settings.dme, keyframe); !failed.empty())
+                {
+                    return error(400, failed);
+                }
+                keyframes.push_back(keyframe);
+            }
+            result = mixer.keyKeyframes(k, keyframes);
+            if (result == MixResult::BadFrames)
+            {
+                return error(400, "a keyframe's frames must be 1.." + std::to_string(Mixer::kMaxFrames));
+            }
+        }
+        else if (rest == "run")
+        {
+            if ((body.contains("to") && !body["to"].is_number_integer()) || (body.contains("frames") && !body["frames"].is_number_integer()) ||
+                (body.contains("reverse") && !body["reverse"].is_boolean()))
+            {
+                return error(400, "to and frames must be integers, reverse a boolean");
+            }
+            auto const loop = body.contains("loop") ? parseLoop(text(body, "loop")) : DmeLoop::Off;
+            if (!loop)
+            {
+                return error(400, "loop must be off, wrap or pingpong");
+            }
+            auto const to = body.contains("to") ? std::optional<int>(body["to"].get<int>()) : std::nullopt;
+            auto const n = body.contains("frames") ? std::optional<int>(body["frames"].get<int>()) : std::nullopt;
+            if (n && (*n != 0 || *loop != DmeLoop::Off))
+            {
+                return error(400, "frames must be 0 (a jump to the keyframe), without a loop");
+            }
+            result = mixer.keyRun(k, to, body.value("reverse", false), *loop, n);
+        }
+        else if (rest == "stop")
+        {
+            result = mixer.keyStop(k);
         }
         else
         {
@@ -448,14 +685,8 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return mixResult(engine, result, k, "keyer");
         }
-        for (auto const& key : mixer.keyView())
-        {
-            if (key.key == k)
-            {
-                return reply(200, json{{"key", k}, {"on", key.on}, {"transition", key.transition}, {"gain", key.gain}});
-            }
-        }
-        return reply(200, json{{"key", k}});
+        auto const key = keyerView(engine, k);
+        return reply(200, key ? keyerJson(*key) : json{{"key", k}});
     }
     return error(404, "not found");
 }

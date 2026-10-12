@@ -88,7 +88,34 @@ def test_keys_light_their_key_inputs_and_luma_sources(mixer: VisionMixer) -> Non
     # A luma key of ME 2's Program lights its re-entry INDEX 1002.
     mixer.update_keyer("me-1-key-1", source_id="me-2")
     assert lit(mixer)[0] == {"cam-1", "3101", "me-2"}
+    # A pip lights its source like a luma key (LH, while on air); a linear box keeps its key INDEX.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4")
+    assert lit(mixer)[0] == {"cam-1", "3101", "cam-4"}
+    mixer.update_keyer("me-1-key-1", enabled=False)
+    assert lit(mixer)[0] == {"cam-1", "3101"}
+    mixer.update_keyer("me-1-key-2", dme={"enabled": True}, enabled=True)
+    assert lit(mixer)[0] == {"cam-1", "3101", "2102"}
     assert len(mixer._tally_snapshot().inputs) == len(mixer.inputs)
+
+def test_a_key_stays_on_air_while_it_fades_or_flies_off(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # A pip that flies (2 keyframes, 50 frames: 1 s): its source stays lit until the fly off ends.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4", fly=True)
+    mixer.set_keyframes("me-1-key-1", [{"x": -0.3}, {"x": 0.5, "frames": 50}])
+    mixer.keyer_auto("me-1-key-1")
+    assert "cam-4" in lit(mixer)[0]
+    mixer.keyer_auto("me-1-key-1")
+    assert not mixer.get_keyer("me-1-key-1").enabled and "cam-4" in lit(mixer)[0]
+    assert 0.9 < mixer._key_until["me-1-key-1"] - time.monotonic() <= 1.0
+    mixer._key_until["me-1-key-1"] = time.monotonic() - 0.01
+    assert "cam-4" not in lit(mixer)[0]
+    # A linear key fading off keeps its INDEX lit for its rate; a cut ends it at once.
+    mixer.update_keyer("dsk-1", enabled=True)
+    mixer.keyer_auto("dsk-1")
+    assert "3101" in lit(mixer)[0]
+    mixer.update_keyer("dsk-1", enabled=False)
+    assert "3101" not in lit(mixer)[0]
+
 
 def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))

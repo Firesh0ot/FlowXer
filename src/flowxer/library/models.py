@@ -81,7 +81,7 @@ class LibraryItem(BaseModel):
     cut_frame: int | None = None
     cut_ms: int | None = None
     has_alpha: bool = False
-    source: Literal["upload", "legacy_clip", "legacy_stinger", "import"] = "upload"
+    source: Literal["upload", "legacy_clip", "legacy_stinger", "import", "grab"] = "upload"
     legacy_path: str | None = None
 
     def conversion_for(self, format_id: str) -> ConversionInfo:

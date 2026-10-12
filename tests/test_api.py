@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from flowxer.api.schemas import InputKind, LogicalInputCreate, VideoEssence, AudioEssence
@@ -106,13 +108,27 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus", "keys"]
+    assert [w["id"] for w in widgets] == ["bus", "keys", "dme"]
     assert widgets[1]["params"]["required"] == ["me"] and widgets[1]["min_size"] == {"w": 240, "h": 150}
     bus = widgets[0]
     assert bus["params"]["required"] == ["me"]
     assert bus["params"]["properties"]["me"]["maximum"] == len(mixer.panels)
     assert bus["params"]["properties"]["transition"] == {"type": "boolean", "default": True, "title": "Transition type"}
     assert bus["min_size"] == {"w": 480, "h": 150}
+    dme = widgets[2]
+    assert dme["params"]["required"] == ["me", "keyer"] and dme["min_size"] == {"w": 320, "h": 120}
+    assert dme["params"]["properties"]["keyer"] == {"type": "integer", "minimum": 1, "maximum": mixer.workspace.keyers_per_me, "title": "Upstream keyer"}
+
+
+def test_every_widget_has_a_framed_page_in_nginx(client: TestClient) -> None:
+    # flowxer-gui serves each widget of the list at /widget/<id> with the CSP frame-ancestors.
+    conf = (Path(__file__).parents[1] / "gui" / "nginx.conf").read_text(encoding="utf-8")
+    for widget in client.get("/api/v1/widgets").json():
+        start = conf.index(f"location = /widget/{widget['id']} {{")
+        block = conf[start : conf.index("\n    }", start)]
+        assert "flowxer-widgets-csp.inc" in block and "try_files /widget.html" in block
+        for param in widget["params"]["required"]:
+            assert f"$arg_{param}" in block
 
 
 def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer) -> None:
@@ -120,6 +136,47 @@ def test_keyer_rate_is_kept_and_validated(client: TestClient, mixer: VisionMixer
     assert keyer["rate_ms"] == 800
     assert client.patch("/api/v1/keyers/dsk-1", json={"rate_ms": 0}).status_code == 422
     assert mixer.get_keyer("dsk-1").rate_ms == 800
+
+
+def test_keyer_pip_and_box(client: TestClient) -> None:
+    keyer = client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "pip", "source_id": "cam-2", "dme": {"x": 0.7, "size": 0.33}}).json()
+    assert keyer["mode"] == "pip" and keyer["dme"]["x"] == 0.7 and keyer["dme"]["size"] == 0.33 and keyer["dme"]["crop"]["left"] == 0.0
+    assert client.patch("/api/v1/keyers/me-1-key-1", json={"dme": {"size": 5}}).status_code == 409
+    assert client.patch("/api/v1/keyers/dsk-1", json={"mode": "pip", "source_id": "cam-2"}).status_code == 409
+    assert client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "chroma"}).status_code == 422
+    assert client.get("/api/v1/keyers").json()[0]["dme"]["size"] == 0.33
+
+
+def test_keyer_keyframes_runs_and_presets(client: TestClient) -> None:
+    base = "/api/v1/keyers/me-1-key-1"
+    client.patch(base, json={"mode": "pip", "source_id": "cam-2"})
+    keyer = client.put(f"{base}/keyframes", json=[{"x": -0.3}, {"x": 0.5, "frames": 10, "ease": "ease"}]).json()
+    assert [(k["x"], k["frames"], k["ease"]) for k in keyer["keyframes"]] == [(-0.3, 25, "linear"), (0.5, 10, "ease")]
+    assert client.put(f"{base}/keyframes", json=[{"ease": "bounce"}]).status_code == 409
+    assert client.put(f"{base}/keyframes", json={"x": 1}).status_code == 422
+    assert client.put("/api/v1/keyers/dsk-1/keyframes", json=[]).status_code == 409
+    # Runs (simulate mode: the box is where the run ends at once).
+    assert client.post(f"{base}/run", json={"to": 0}).json()["dme"]["x"] == -0.3
+    assert client.post(f"{base}/run").json()["dme"]["x"] == 0.5
+    assert client.post(f"{base}/run", json={"reverse": True, "loop": "pingpong"}).status_code == 200
+    assert client.post(f"{base}/run", json={"to": 1, "loop": "wrap"}).status_code == 422
+    assert client.post(f"{base}/run", json={"frames": 3}).status_code == 422
+    assert client.post(f"{base}/run", json={"to": 5}).status_code == 409
+    assert client.post(f"{base}/stop").status_code == 200
+    assert client.post("/api/v1/keyers/nope/stop").status_code == 404
+    # Fly, presets, the box replaced.
+    assert client.patch(base, json={"fly": True}).json()["fly"] is True
+    presets = client.get("/api/v1/dme/presets").json()
+    assert [p["name"] for p in presets] == ["corner-tl", "corner-tr", "corner-bl", "corner-br", "split", "quad", "full"]
+    assert [p["keyers"] for p in presets] == [1, 1, 1, 1, 2, 4, 1]
+    written = client.post(f"{base}/preset", json={"name": "split"}).json()
+    assert [k["id"] for k in written] == ["me-1-key-1", "me-1-key-2"] and written[1]["dme"]["crop"]["left"] == 0.25
+    assert client.post(f"{base}/preset", json={"name": "zoom"}).status_code == 422
+    assert client.post(f"{base}/preset", json={"name": "quad"}).status_code == 409
+    keyer = client.put(f"{base}/dme", json={"x": 0.3}).json()
+    assert keyer["dme"]["x"] == 0.3 and keyer["dme"]["crop"]["left"] == 0.0 and keyer["dme"]["enabled"] is True
+    listed = client.get("/api/v1/keyers").json()[0]
+    assert listed["fly"] is True and len(listed["keyframes"]) == 2 and listed["run"] is None
 
 
 def test_health_and_config(client: TestClient) -> None:
