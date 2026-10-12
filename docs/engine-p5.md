@@ -1,7 +1,10 @@
 # FlowXer engine P5: audio
 
-Status: the design; nothing is implemented. P5 builds on P2 (the C++/CUDA engine is FlowXer's
-media path, #86), P3 (transitions and keying, #89) and P4 (DME boxes and frame grab, draft #91).
+Status: the user answered the 11 open questions "all as suggested" on 2026-10-12
+([§14](#14-open-questions-for-the-user)). M1 (the mix) and M2 (meters) are implemented in #97, with
+the details in [Implementation notes (M1)](#implementation-notes-m1) and
+[Implementation notes (M2)](#implementation-notes-m2). P5 builds on P2 (the C++/CUDA engine is
+FlowXer's media path, #86), P3 (transitions and keying, #89) and P4 (DME boxes and frame grab, #91).
 The numbers come from a CPU prototype of the audio path on the lab host (Xeon Gold 6136) on
 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
 
@@ -269,6 +272,49 @@ T(k) is the start of grain *k* on the TAI clock, and d is the input's delay.
   50p, a delay read straight from MXL could reach only about 100 ms back (200 ms − L grains −
   the 11 ms into the window at which the audio runs − the input's arrival lag).
 
+### Implementation notes (M1)
+
+As built in #97 (`core/audiomix`, `engine/engine.cpp` fx-audio, `engine/api.cpp`, the control plane):
+
+- **fx-audio:** fx-writer hands it each grain after the video commit (the plans and a copy of the
+  clip and stinger players' sound); at most 8 grains wait, a grain beyond that is dropped and the
+  next one covers it (counted: `/status` `audio.jobs_dropped`, `flowxer_engine_audio_jobs_dropped_total`).
+  The bounded wait and the grain-gap rule (up to 25 grains) are P4's.
+- **The mix** keeps P4's arithmetic for the defaults, so it is P4's PGM bit for bit (checked by
+  `fxeng-tests` against P4's code through Mixes, Wipes, the T-bar, a stinger, FTB, re-entry and
+  Black, including negative zeros): a transition sums A·cos then B·sin (Black as silence), then the
+  other strips in slot order, then the stinger's sound, then the master, then FTB with P4's ramp.
+  A gain is level (fader, mute) × AFV weight, computed per sample only while something moves.
+- **The Cut crossfade** is general: without a transition every AFV weight moves to its target
+  (1 for Program's strip, 0 for the others) on the equal-power curve over the grain, from where it
+  was. A strip left with a weight by a take during a transition fades out over the next grain
+  instead of jumping.
+- **The first grain** after the engine start begins at the settings (no ramp); the first grain of
+  sound of a new route (or a re-opened flow) fades in over that grain.
+- **Channel map default:** a 1-channel live input plays on every PGM channel (P4: channel 1 only).
+- **Heard** (`/status`, the meters, the metrics): a strip's gain in PGM at the end of the grain is
+  above −90 dB; the stinger strip only while its stinger plays on the ME.
+- **The delay line** is the longest delay + L + 3 grains long, allocated when the input's flow
+  opens with the flow's channels. A delayed read is the window of grain i − L, d samples earlier
+  (`delayedSamples`); what the line does not hold is silence. A delay or map change crossfades
+  linearly from the old reading to the new one over one grain.
+- **Counters:** every routed input is read every grain, so `audio.blocks`, `missing` and
+  `startup` count every routed input (P4: only Program's sources). Before a route's first sample
+  (its delay at the start) and in the start-up window: `startup`.
+- **The recommended latency** counts a delayed input's audio lag minus its delay
+  (`inputs[].audio.delay_ms` in `/status`).
+- **Engine API** as designed, plus `GET /audio` (the settings: per ME `master_db` and per strip
+  `fader_db`, `mute`, `afv`, `gain_db`, `heard`; per input `delay_ms`, `delay_samples`, `map`,
+  `channels`, `held_ms`), also `/status` `audio`.
+- **Control plane:** `GET /audio` (per live input `delay_ms`, `channel_map`, `channels`; per
+  rendering panel `master_db` and its strips in slot order with `label`, `kind`, `fader_db`,
+  `mute`, `afv`), `PATCH /audio/inputs/{id}`, `/audio/panels/{id}`,
+  `/audio/panels/{id}/strips/{strip}`. Unknown ids 404, a panel that does not render 409, a bad
+  value (a delay over `FLOWXER_AUDIO_MAX_DELAY_MS`, a map of the wrong length, `afv` on `stinger`,
+  a clip player's delay) 422. A delay is stored in whole samples. Only values that are not at
+  their defaults are saved (`audio` in the state file and the export); audio changes are saved at
+  most once a second, the last one within a second (and at shutdown).
+
 ## 7. Metering
 
 | Where | Per channel | Per channel pair | Counter |
@@ -295,6 +341,30 @@ T(k) is the start of grain *k* on the TAI clock, and d is the input's delay.
     100 ms old, with one engine call however many viewers poll;
   - metrics take the last second ([§10](#metrics)).
 - Values below −120 dB are −120 (silence). Peak hold, decay and the scale are the GUI's.
+
+### Implementation notes (M2)
+
+As built in #97 (`core/meter`, fx-audio, `GET /audio/meters`, the metrics):
+
+- **One grid:** every meter is fed the grain's samples with the output's sample index, so all
+  blocks end together on multiples of 4800 (the same at 50p, 59.94p and 25p). A jump in the index
+  starts the block again.
+- **Sources** without sound in a grain (an unrouted input, a stopped clip) are metered as silence.
+- **True peak:** the 4 phases of the annex 2 filter as block filters, and never below the sample
+  peak.
+- **Integrated:** a 400 ms gating block per 100 ms block once 4 blocks have passed since the start
+  or the reset (a reset applies from the next block: the block it falls in holds samples from
+  before). The histogram keeps per 0.1 LU bin (−70 … +10 LUFS) the sum of the blocks' powers and
+  their count; the relative gate takes the bins whose centre is above it, so the mean power of the
+  kept blocks is exact. No gated block: −120.
+- **The last second** (10 blocks) for the metrics: the largest sample and true peak, the RMS over
+  the 10 blocks.
+- **Unit tests** (`fxeng-tests`, in CI): EBU Tech 3341 cases 1–5, 9 (short-term) and a momentary
+  case (0.18 s at −20 dBFS, 0.22 s at −30 dBFS) generated in the test, within ±0.1 LU, also with
+  59.94p grains; true-peak sines at fs/4, fs/6 and fs/8 between the samples within +0.2 / −0.4 dB;
+  two programmes on two pairs; a reset; K-weighting; overs; the block grid.
+- **Control plane** `GET /audio/meters` as designed (one engine call per 80 ms whatever the number
+  of viewers); off-air every meter is −120 and each strip shows what its settings and AFV give.
 
 ## 8. Control
 
@@ -540,6 +610,16 @@ with the user's OK. One PR into `dev`, growing per milestone, as #86, #89 and #9
 - **Performance and soak:** the CPU matrix in the engine, and a 2 h soak.
 
 ## 14. Open questions (for the user)
+
+**Answered by the user on 2026-10-12: all as suggested.** So: stereo PGM by default, 16 channels
+where needed, inputs 1:1 with an optional channel map, no downmix or panning (1); meters per source
+peak and RMS, per PGM sample peak, true peak, RMS, BS.1770-4 loudness (M, S, I) per channel pair and
+overs, no loudness per source, no LRA (2); delays 0–1000 ms by default (`FLOWXER_AUDIO_MAX_DELAY_MS`
+up to 5000), audio later than video only, none on clip players (3); fader, mute and AFV per ME,
+delay and channel map per input (4); the `audio` widget (5); no clip-player level presets in P5 (6);
+the Cut crossfades over one grain (7); no audio follows key in P5 (8); no limiter, overs counted and
+true peak metered (9); one stinger strip per ME (10); one collapsible AUDIO strip for the active ME
+(11).
 
 1. **Channels:** the PGM keeps `FLOWXER_AUDIO_CHANNELS` (default 2), and each live input maps 1:1
    with an optional channel map (pairs, mono to all). No downmix, panning or gain per channel.

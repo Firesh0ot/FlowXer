@@ -5,6 +5,29 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: audio (P5 M1, M2)
+
+- Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
+  and the stinger, each with a fader (−90 = off … +10 dB), mute and AFV (audio follows video; off:
+  always in the mix), and a master per ME. A live input has a delay (0 …
+  `FLOWXER_AUDIO_MAX_DELAY_MS`, default 1000 ms) and a channel map for every ME. Every change ramps
+  over one grain; a Cut now crossfades over its grain (equal power). With the defaults the sound is
+  P4's, except the Cut, the first grain of a new route (it fades in) and a 1-channel live input
+  (now on every PGM channel).
+- Meters: per source peak and RMS, per ME PGM sample peak, true peak, RMS, overs and EBU R 128
+  loudness (momentary, short-term, integrated with reset) per channel pair, every 100 ms.
+- API: `GET /audio`, `PATCH /audio/inputs/{id}`, `/audio/panels/{id}`,
+  `/audio/panels/{id}/strips/{strip}`, `POST /audio/panels/{id}/loudness/reset`,
+  `GET /audio/meters`; `GET /console` has `audio`. The saved state and the export have `audio`
+  (a P4 state loads with the defaults). New: `FLOWXER_AUDIO_MAX_DELAY_MS`.
+- The engine's audio runs on its own thread (`fx-audio`) and reads every routed input into a delay
+  line each grain; `audio.missing` counts every routed input. `recommended_latency_grains` counts a
+  delayed input's audio lag minus its delay.
+- Metrics: `flowxer_engine_audio_level_dbfs`, `flowxer_engine_pgm_audio_level_dbfs`,
+  `flowxer_engine_pgm_loudness_lufs`, `flowxer_engine_pgm_audio_overs_total`,
+  `flowxer_engine_audio_strip_heard`, `flowxer_engine_audio_ms`, `flowxer_engine_audio_wait_ms`,
+  `flowxer_engine_audio_jobs_dropped_total`.
+
 ### Added: the boxes' GPU time (P4 M4)
 
 - `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes

@@ -226,8 +226,9 @@ TEST(meter_true_peak_and_overs)
     {
         Meter m(2, true);
         feed(m, {{c.hz, c.dbfs, 1.0, c.phase}});
-        float const tp = levelDb(m.values().truePeak1s[0]);
-        float const sample = levelDb(m.values().peak1s[0]);
+        // The last block (the first one holds the sine's onset, which the filter rings on).
+        float const tp = levelDb(m.values().truePeak[0]);
+        float const sample = levelDb(m.values().peak[0]);
         CHECK(tp >= c.dbfs - 0.4 && tp <= c.dbfs + 0.2);
         CHECK(tp >= sample);
         if (c.hz == 12000.0)

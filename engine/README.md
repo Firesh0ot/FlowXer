@@ -32,11 +32,16 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
   (NVDEC) or upload the still once; see [Clip players](#clip-players).
 - **Stinger player threads** (`fx-st1` …): decode the loaded stinger's colour and alpha in
   lockstep; see [Stingers](#stingers).
-- **Writer thread** (`fx-writer`): owns the MXL writers. It opens grain *i* on each output,
-  queues the DMA download straight into the MXL grain on a separate download stream, waits
-  for each copy and commits. Then it writes the PGM audio of grain *i* (see below). Upload,
-  render and download of consecutive grains overlap on their streams. The frame grabs of grain
-  *i* are copied after its downloads on the same stream (see [Frame grab](#frame-grab)).
+- **Writer thread** (`fx-writer`): owns the MXL video writers. It opens grain *i* on each
+  output, queues the DMA download straight into the MXL grain on a separate download stream,
+  waits for each copy and commits. Then it hands grain *i* to the audio thread (the MEs' plans
+  and a copy of the clip and stinger players' sound). Upload, render and download of
+  consecutive grains overlap on their streams. The frame grabs of grain *i* are copied after its
+  downloads on the same stream (see [Frame grab](#frame-grab)).
+- **Audio thread** (`fx-audio`, P5): owns the audio readers, the live inputs' delay lines, the
+  MEs' audio mixes, the meters and the PGM audio writers; it writes the PGM audio of grain *i*
+  (see [PGM audio](#pgm-audio-p5-strips-afv-delays-meters)). At most 8 grains wait for it; a
+  grain beyond that is dropped and the next one covers it.
 - **Grab thread** (`fx-grab`): writes each frame grab's raw v210 file.
 - **Encode thread** (`fx-encode`): copies the NV12 mosaic into an NVENC frame on the GPU,
   encodes it (one session, whatever the number of viewers) and sends it over RTSP/TCP to
@@ -45,8 +50,9 @@ Each frame of video is a *grain* with an index on the TAI clock (50 per second a
 - **Stats thread** (`fx-stats`): CPU per thread and GPU/NVENC load once a second; watches the
   own MediaMTX.
 
-Ownership is simple: each MXL reader belongs to its input thread (video) or to the writer
-thread (audio), every MXL writer to the writer thread. Grains in flight between render and
+Ownership is simple: each MXL reader belongs to its input thread (video) or to the audio
+thread (audio), every MXL video writer to the writer thread, every audio writer to the audio
+thread. Grains in flight between render and
 writer are bounded (3 slots); input frames come from a fixed pool per input and go back only
 after the downloads that read them are done. Every wait sleeps (blocking CUDA sync, futex
 waits in MXL, condition variables): no busy loops.
@@ -72,24 +78,52 @@ waits in MXL, condition variables): no busy loops.
 - An input without a video flow is a black slot. It keeps the numbering (the TSL tally and the
   operator's habits), e.g. a camera that is not connected.
 
-### PGM audio (audio follows video)
+### PGM audio (P5: strips, AFV, delays, meters)
 
-- Each ME's PGM audio is the audio of its Program source: an input's audio flow, a clip
-  player's sound, or the PGM audio of the re-entered ME. Preview has no audio; the mosaic has
-  none.
-- During a Mix the two sources crossfade with **equal power** (gains cos and sin of t·90°, so
-  two unrelated sources keep their loudness; −3 dB each in the middle). t ramps sample by
-  sample through each grain, so there are no steps. A stinger crossfades the background over its
-  frames cut − 2 … cut + 1 (t at the end of those frames: 0.25, 0.5, 0.75, 1) and adds its own
-  sound.
-- Same TAI grid and latency as the video: the audio of output grain *i* (48 kHz samples of
-  grain *i*'s time span) is the input audio of grain *i − L*. A/V stay aligned as they came in.
+Design and answers: `docs/engine-p5.md`.
+
+- **Each ME mixes strips:** one per live input, clip player, re-entered ME (`me n`, n > m) and
+  the stinger, each with a fader (−90 dB = off … +10 dB), a mute and audio follow video (AFV;
+  not on the stinger strip), and a master per ME. With AFV on (the default) a strip is heard only
+  while its source is on the ME's Program, and along a transition's curve; with AFV off it is
+  always in the mix at its fader (a commentary, a music bed, the sound of a PiP). Preview has no
+  audio; the mosaic has none.
+- **The defaults are P4's sound bit for bit:** every strip AFV on at 0 dB, the master at 0 dB,
+  no delay, 1:1. Exceptions: a Cut crossfades (below), the first grain of sound of a new route
+  fades in, and a 1-channel live input now plays on every PGM channel.
+- **Transitions:** a Mix or Wipe (and the T-bar) crossfades with **equal power** (cos and sin of
+  t·90°, per sample, so two unrelated sources keep their loudness; −3 dB each in the middle). A
+  stinger crossfades the background over its frames cut − 2 … cut + 1 and adds its sound, scaled
+  by the ME's stinger strip. A **Cut** crossfades on the same curve over its grain (P4 switched
+  hard). Fade to Black takes the ME's whole sound, AFV-off strips included.
+- **Every change ramps** over one grain, linearly in amplitude: fader, mute, AFV, master; a
+  delay or channel map change crossfades from the old reading to the new one.
+- **Order:** the strips' sum, plus the stinger's sound, then the master, then FTB, then MXL (and
+  the re-entry into lower MEs).
+- **Per live input** (for every ME): a delay of 0 … `FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS` (whole
+  48 kHz samples; audio later than its video only) and a channel map (per PGM channel the input
+  channel, 1-based, 0 silent; empty: 1:1, a 1-channel flow on every channel). Every routed input
+  is read every grain into its **delay line** (all channels of its flow; the longest delay and
+  L + 3 grains long). A heard input is waited for (bounded, below); the others take what is there
+  and get the rest from MXL's history on the next grain. After a route an input is silent for its
+  delay (counted as start-up).
+- **Timing:** the same TAI grid and latency as the video: the audio of output grain *i* is the
+  input audio of grain *i − L*, d samples earlier for a delay d. Samples that are not there yet
+  are waited for until 1 ms before the end of grain *i*'s window, at most
+  `FLOWXER_ENGINE_AUDIO_WAIT_MS`; then they are silence for that grain and counted (`missing`).
+  A skipped video grain still gets its audio, so the audio flow has no holes.
 - float32, 48 kHz. Channels: those of the output flow (`FLOWXER_ENGINE_AUDIO_CHANNELS`, default
-  2, for a flow the engine creates; an existing flow keeps its own); input channels beyond that
-  are dropped, missing ones are silent.
-- CPU only, in the writer thread: 0.05 ms per grain for 4 MEs. A source whose audio is not
-  there (stalled, missing) is silent for that grain and counted; a skipped video grain still
-  gets its audio, so the audio flow has no holes.
+  2, for a flow the engine creates; an existing flow keeps its own).
+- **Meters** on 100 ms blocks of the 48 kHz sample index (the same at every frame rate):
+  - every live input (after its delay and map, before the fader), clip player and stinger
+    player: sample peak and RMS per channel;
+  - every ME's PGM (what goes to MXL): sample peak, true peak (BS.1770-4 annex 2, 4×), RMS per
+    channel, overs (samples at or above 0 dBFS), and per channel pair the BS.1770-4 / EBU R 128
+    loudness: momentary (400 ms), short-term (3 s), integrated (gated, since the start or
+    `POST /me/{m}/audio/loudness/reset`);
+  - `GET /audio/meters` answers the last block; the metrics take the last second. Values below
+    −120 dB are −120.
+- CPU only (`fx-audio`); its time per grain is `/status` `audio.ms_per_grain`.
 
 ### Clip players
 
@@ -290,6 +324,7 @@ will read and write.
 | `FLOWXER_ENGINE_PVW_OUTPUTS` | `true` | write the PVW video flows; `false` renders PVW for the mosaic only |
 | `FLOWXER_ENGINE_AUDIO_CHANNELS` | `2` | channels of a PGM audio flow the engine creates |
 | `FLOWXER_ENGINE_AUDIO_WAIT_MS` | `8` | longest wait for input audio that is not there yet when its grain is written (0–40) |
+| `FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS` | `1000` | longest audio delay of a live input (0–5000): its delay line holds this much (P5) |
 | `FLOWXER_ENGINE_LABEL` | `FlowXer` | prefix of the labels of the flows the engine creates |
 | `FLOWXER_ENGINE_WORK_FORMAT` | `yuv16` | `yuv16` or `rgba16f` |
 | `FLOWXER_ENGINE_GPU` | `0` | CUDA device index (inside the container) |
@@ -342,6 +377,11 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /me/{m}/ftb`, `/me/{m}/ftb/auto` | `{"on": true}`, `{"frames": 30}` | Fade to Black of the ME's whole output (a black layer after the DSKs; the PGM audio fades with it); the buses stay |
 | `POST /me/{m}/position` | `{"t": 0.4}` (0–1) | the T-bar: t > 0 starts the ME's next transition and holds it at t (audio ramps to it within a grain); 1 completes it after that grain, 0 ends it without the swap; a stinger runs as an Auto; 409 during an Auto |
 | `PUT /input/{k}` | `{"video": {"domain", "flow"}, "audio": {"domain", "flow"}}` | opens (or, without a flow, closes) the input's readers |
+| `POST /input/{k}/audio` | `{"delay_ms": 40, "map": [1, 2]}` (each optional) | live input k's audio delay (0 … `FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS`, whole samples) and channel map (one entry per PGM channel: the input channel, 1-based, 0 silent; `[]` 1:1); a change crossfades over one grain; answers the input's audio (`delay_ms`, `delay_samples`, `map`, `channels`, `held_ms`); 400 for a bad value |
+| `POST /me/{m}/audio` | `{"master_db": 0, "strips": {"in1": {"fader_db": -6, "mute": false, "afv": false}, "cp1": {…}, "me3": {…}, "stinger": {"fader_db": -3}}}` (any subset) | the ME's master and strips (fader −90 … +10 dB; −90 is off); each change ramps over the next grain; all or nothing; 404 for a strip the ME does not have (`me n` with n ≤ m), 400 for `afv` on `stinger` or a bad value; answers the ME's audio |
+| `POST /me/{m}/audio/loudness/reset` | – | ME m's integrated loudness from the next 100 ms block on |
+| `GET /audio` | – | per ME its `master_db` and `strips` (settings, `gain_db` now and `heard`), per live input its delay, map, flow channels and delay line (`held_ms`), the PGM's `channels`, `max_delay_ms` |
+| `GET /audio/meters` | – | the last 100 ms `block`: `sources` (`in<k>`, `cp<k>`, `st<k>`: `peak_dbfs`, `rms_dbfs` per channel), `mes` (per ME `peak_dbfs`, `true_peak_dbtp`, `rms_dbfs`, `loudness` per pair: `momentary`, `short_term`, `integrated`; `overs`; `strips`: `gain_db`, `heard`); `block` null before the first one |
 | `PUT /key/{k}` | `{"domain", "flow"}` | routes keyer k's key input (v210a); a flow another keyer reads is shared |
 | `POST /keyer/{k}` | `{"on": true}` | the keyer on or off at the next grain |
 | `POST /keyer/{k}/auto` | `{"frames": 25}` | fades the keyer on (or off when it is on) |
@@ -355,8 +395,8 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
 | `POST /grab` | `{"source": "in3"\|"cp1"\|"me1", "bus": "pgm"\|"pvw", "path"}` | a frame grab of the next grain as raw v210 into `path` (`bus` for an ME); answers at once with its id and state; 409 with 8 in flight |
 | `GET /grab/{id}` | – | `{grab, source, bus, path, state, error, index, tai, source_index, ms}` (the last 32 grabs) |
-| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, `gpu_ms.dme` (per ME the resample of its boxes), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` |
-| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage (and `dme_ms` per ME), grabs, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), mosaic, CPU, GPU |
+| `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, `gpu_ms.dme` (per ME the resample of its boxes), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` (as `GET /audio`, plus fx-audio's `ms_per_grain`, `wait_ms`, `jobs_dropped`); each input's `audio` also has its `delay_ms`, `map`, `channels` and `held_ms`, and `recommended_latency_grains` counts a delayed input's audio lag minus its delay |
+| `GET /metrics` | – | Prometheus text (`flowxer_engine_*`; the list is in the top README's metrics table): output, GPU ms per stage (and `dme_ms` per ME), grabs, inputs and key flows (with their upload ms), clip and stinger players (state, played, waits, cuts), keyers (on air, key flow running), audio (fx-audio ms and waits; levels, true peak, loudness, overs and heard strips over the last second), mosaic, CPU, GPU |
 | `GET /mosaic/map` | – | canvas size, stream `path`, `whep_base`/`hls_base` (or own ports), tiles `{id, kind, label, x, y, w, h}` |
 | `GET /livez` | – | `ok` |
 
