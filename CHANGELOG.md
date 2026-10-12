@@ -10,6 +10,7 @@ in `docs/platform-integration-plan.md` §8.
 - Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;
   per player `flowxer_engine_stinger_player_state{player,state}`, `_stinger_frames_decoded_total`,
   `_stinger_frames_late_total`, `_stinger_decode_ms`. The engine's `/status` gains `stingers.played`.
+  Control plane: `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`): takes it made a cut.
 - Keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` and `flowxer_engine_keyer_key_running`.
 - `flowxer_engine_input_upload_ms{input,stat}` for every input and key flow.
 - `flowxer_transitions_total` counts `wipe` too.

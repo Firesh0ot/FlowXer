@@ -141,6 +141,8 @@ class VisionMixer:
         # Operations that need the control plane; /livez fails when one is stuck.
         self.watchdog = ControlPlaneWatchdog()
         self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "wipe": 0, "stinger": 0}
+        # Stinger takes that became cuts here: no mezzanine yet, or every stinger player busy.
+        self.stinger_fallbacks: dict[str, int] = {"not_ready": 0, "busy": 0}
         self._lock = threading.RLock()
         # (input id, essence) -> MXL domain id of a route whose domain is missing; routed once it
         # appears.
@@ -1840,12 +1842,14 @@ class VisionMixer:
         media = self._stinger_media(slot, stinger_id)
         if media is None or not self._rendered(panel):
             log.warning("stinger %s is not ready: a cut", stinger_id or (slot.stinger_id if slot else None))
+            self.stinger_fallbacks["not_ready"] += 1
             return False
         body, cut = media
         now = time.monotonic()
         free = [p for p in range(1, self._stinger_players() + 1) if self._stinger_until.get(p, 0.0) <= now]
         if not free:
             log.warning("every stinger player plays a stinger: a cut")
+            self.stinger_fallbacks["busy"] += 1
             return False
         player = next((p for p in free if self._stinger_cued.get(p) == body["path"]), free[0])
         cued = self._stinger_cued.get(player) == body["path"]

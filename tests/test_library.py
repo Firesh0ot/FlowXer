@@ -566,6 +566,8 @@ def test_stinger_not_ready_hard_cut(client, mixer):
         },
     )
     assert response.status_code == 200
+    assert mixer.stinger_fallbacks["not_ready"] == 1
+    assert 'flowxer_stinger_fallbacks_total{reason="not_ready"} 1' in client.get("/metrics").text
 
 
 def test_conversion_end_refreshes_inputs_and_slots(client, mixer):

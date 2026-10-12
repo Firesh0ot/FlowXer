@@ -123,6 +123,7 @@
         { "expr": "increase(flowxer_engine_stingers_played_total[5m])", "legendFormat": "played", "refId": "A" },
         { "expr": "increase(flowxer_engine_stinger_wait_grains_total[5m])", "legendFormat": "grains waited for a first frame", "refId": "B" },
         { "expr": "increase(flowxer_engine_stinger_cuts_total[5m])", "legendFormat": "cuts (not ready)", "refId": "C" },
+        { "expr": "increase(flowxer_stinger_fallbacks_total[5m])", "legendFormat": "cuts in the control plane ({{reason}})", "refId": "E" },
         { "expr": "increase(flowxer_engine_stinger_frames_late_total[5m])", "legendFormat": "late frames, player {{player}}", "refId": "D" }
       ]
     },

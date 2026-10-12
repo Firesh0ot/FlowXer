@@ -140,6 +140,13 @@ def render_prometheus(mixer) -> str:
     for kind in ("cut", "mix", "wipe", "stinger"):
         lines.append(_line("flowxer_transitions_total", int(counts.get(kind, 0)), {"type": kind}))
     lines += [
+        "# HELP flowxer_stinger_fallbacks_total Stinger takes that became cuts in the control plane",
+        "# TYPE flowxer_stinger_fallbacks_total counter",
+    ]
+    fallbacks = getattr(mixer, "stinger_fallbacks", {}) or {}
+    for reason in ("not_ready", "busy"):
+        lines.append(_line("flowxer_stinger_fallbacks_total", int(fallbacks.get(reason, 0)), {"reason": reason}))
+    lines += [
         "# HELP flowxer_input_state 1 for the current per-essence input state",
         "# TYPE flowxer_input_state gauge",
     ]
