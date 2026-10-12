@@ -239,3 +239,40 @@ def test_a_stop_ends_the_program_autostart_attempts(mixer: VisionMixer, monkeypa
     count = len(attempts)
     time.sleep(0.3)
     assert len(attempts) == count <= 2
+
+
+def _stinger_ready(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch, frames: int) -> None:
+    """ME 1's next transition is a stinger of `frames` frames whose mezzanine is ready."""
+    body = {"path": "/storage/library/st/mezz.mkv", "alpha": "", "audio": "", "channels": 2, "frames": frames}
+    monkeypatch.setattr(mixer, "_stinger_media", lambda slot, stinger_id=None: (body, 2))
+    mixer.start(MixerStartRequest(program_input_id="cam-1"))
+    mixer.set_preview("cam-2")
+    mixer.get_panel("me-1").transition.type = TransitionType.stinger
+
+
+def test_back_to_back_stinger_autos_both_play(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One stinger player, holding the stinger: it is free 0.1 s after the stinger's end. An Auto
+    # sent before that waits for it and plays the stinger too.
+    _stinger_ready(mixer, monkeypatch, frames=5)
+    mixer._stinger_cued[1] = "/storage/library/st/mezz.mkv"
+    mixer.auto("me-1")
+    start = time.monotonic()
+    mixer.auto("me-1")
+    waited = time.monotonic() - start
+    assert mixer.transition_counts["stinger"] == 2 and mixer.transition_counts["cut"] == 0
+    assert mixer.stinger_fallbacks["busy"] == 0
+    assert (mixer.program_input_id, mixer.preview_input_id) == ("cam-1", "cam-2")
+    assert waited < 0.5
+
+
+def test_stinger_auto_with_no_player_free_in_time_is_a_cut(mixer: VisionMixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A stinger loaded on demand keeps its player for its length + 1 s: a second Auto right after
+    # it does not wait (no player is free within 0.5 s) and is a cut, counted as busy.
+    _stinger_ready(mixer, monkeypatch, frames=50)
+    mixer.auto("me-1")
+    start = time.monotonic()
+    mixer.auto("me-1")
+    assert time.monotonic() - start < 0.1
+    assert mixer.transition_counts["stinger"] == 1 and mixer.transition_counts["cut"] == 1
+    assert mixer.stinger_fallbacks["busy"] == 1
+    assert 'flowxer_stinger_fallbacks_total{reason="busy"} 1' in render_prometheus(mixer)

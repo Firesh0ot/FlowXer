@@ -85,6 +85,8 @@ AUTOSTART_BACKOFF_S = (2.0, 5.0, 10.0, 30.0)
 KIND_ORDER = {InputKind.mxl_live: 0, InputKind.clip_player: 1, InputKind.black: 2}
 # The re-entered Program of ME n is the source "me-<n>" (TSL INDEX 1000 + n).
 REENTRY_INDEX = 1000
+# A stinger take that finds every stinger player busy waits this long for one to be free.
+STINGER_WAIT_S = 0.5
 
 
 def _autostart_pause(attempt: int) -> float:
@@ -1837,16 +1839,24 @@ class VisionMixer:
         self, panel: MixerPanel, slot: StingerSlot | None, incoming: str, *, flip_flop: bool, stinger_id: str | None = None
     ) -> bool:
         """Plays a stinger on the ME to `incoming`: on the player that holds it, else on a free one
-        (loaded now; the engine starts it when its first frame is decoded). False when it cannot
-        play (no mezzanine yet, no free player): the caller cuts."""
+        (loaded now; the engine starts it when its first frame is decoded). With every player busy
+        it waits up to STINGER_WAIT_S for one. False when it cannot play (no mezzanine yet, no
+        player free in time): the caller cuts."""
         media = self._stinger_media(slot, stinger_id)
         if media is None or not self._rendered(panel):
             log.warning("stinger %s is not ready: a cut", stinger_id or (slot.stinger_id if slot else None))
             self.stinger_fallbacks["not_ready"] += 1
             return False
         body, cut = media
+        players = range(1, self._stinger_players() + 1)
         now = time.monotonic()
-        free = [p for p in range(1, self._stinger_players() + 1) if self._stinger_until.get(p, 0.0) <= now]
+        free = [p for p in players if self._stinger_until.get(p, 0.0) <= now]
+        soonest = min((self._stinger_until.get(p, 0.0) for p in players), default=None)
+        if not free and soonest is not None and soonest - now <= STINGER_WAIT_S:
+            # A player is free again soon (for example right after its stinger): wait for it.
+            time.sleep(soonest - now)
+            now = time.monotonic()
+            free = [p for p in players if self._stinger_until.get(p, 0.0) <= now]
         if not free:
             log.warning("every stinger player plays a stinger: a cut")
             self.stinger_fallbacks["busy"] += 1
