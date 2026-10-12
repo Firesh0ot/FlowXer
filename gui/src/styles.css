@@ -257,8 +257,15 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .dme-row .num input[type="color"] { width: 40px; height: 22px; padding: 0; }
 .key-settings:has(.dme-fields) { min-width: 300px; }
 .key-settings .on-air { margin-left: 6px; color: #fff; background: #c62828; border-radius: 3px; padding: 0 4px; font-size: 10px; }
-/* The keyframe list, runs and presets of a keyer's box. */
-.dme-keyframes { display: grid; gap: 4px; border-top: 1px solid var(--line); padding-top: 6px; }
+/* The keyframe list, runs and presets of a keyer's box: a second column next to the box fields
+   (the panel stays short enough for the screen). */
+.key-settings:has(.dme-keyframes) { width: max-content; }
+.dme-fields:has(.dme-keyframes) { grid-template-columns: auto auto; align-items: start; column-gap: 10px; }
+.dme-fields:has(.dme-keyframes) > :not(.dme-keyframes) { grid-column: 1; }
+.dme-keyframes {
+  grid-column: 2; grid-row: 1 / span 7; display: grid; gap: 4px; align-content: start;
+  border-left: 1px solid var(--line); padding-left: 10px;
+}
 .kf-list { border-collapse: collapse; font-size: 11px; }
 .kf-list td { padding: 1px 2px; }
 .kf-list .kf-index { color: var(--text); width: 14px; }
