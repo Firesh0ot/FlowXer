@@ -1848,11 +1848,12 @@ class VisionMixer:
             log.warning("every stinger player plays a stinger: a cut")
             return False
         player = next((p for p in free if self._stinger_cued.get(p) == body["path"]), free[0])
+        cued = self._stinger_cued.get(player) == body["path"]
         self._load_stinger(player, body)
         frames = max(1, int(body["frames"]))
         seconds = frames / self.settings.fps
-        # The engine may wait for the first frame (at most 50 grains).
-        self._stinger_until[player] = now + seconds + 1.0
+        # A stinger loaded now may wait for its first frame (the engine waits at most 50 grains).
+        self._stinger_until[player] = now + seconds + (0.1 if cued else 1.0)
         self._put_on_program(panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut})
         self._stinger_run = {
             "id": stinger_id or (slot.stinger_id if slot else None),
@@ -1864,7 +1865,7 @@ class VisionMixer:
             "started": now,
         }
         # When it has played, the player cues the next stinger again.
-        timer = threading.Timer(seconds + 1.1, self._cue_stingers)
+        timer = threading.Timer(self._stinger_until[player] - now + 0.1, self._cue_stingers)
         timer.daemon = True
         timer.start()
         return True
