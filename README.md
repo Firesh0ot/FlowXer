@@ -328,7 +328,7 @@ FLOWXER_PROGRAM_AUTOSTART=true
 | Library | `flowxer_library_jobs{state=queued\|running}`, `flowxer_library_conversions_total{result}`, `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc` |
 | Control plane | `flowxer_control_plane_busy_seconds`, `flowxer_nmos_registry_up`, `flowxer_nmos_activations_total{result}`, `flowxer_tally_export_*`, `flowxer_engine_cpu_percent{thread}`, `flowxer_process_cpu_percent`, `flowxer_process_memory_bytes` |
 
-Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains, GPU time (render, download, upload, per ME), GPU memory and NVENC sessions, stingers (played, waits, cuts, player state) and keyers (on air per ME, linear keys without a key signal).
+Gone with the GStreamer mixer: `flowxer_webrtc_peers`. The preview's viewers are the MediaMTX path's readers (MediaMTX API `/v3/paths/list`, or its own metrics). The Grafana dashboard `deploy/grafana/flowxer.json` shows the engine's fps, skipped and late grains, GPU time (render, download, upload, per ME), GPU memory and NVENC sessions, stingers (played, waits, cuts, player state), keyers (on air per ME, linear keys without a key signal) and audio (PGM loudness and true peak per ME, overs, silent sources, the audio thread and the strips heard).
 
 ### Upgrading from FlowXer 14
 

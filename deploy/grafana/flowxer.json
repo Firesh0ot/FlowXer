@@ -145,6 +145,41 @@
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
       "targets": [{ "expr": "flowxer_engine_keyer_key_running{mode=\"linear\"} == 0", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "PGM loudness (LUFS, EBU R 128)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": -60, "max": 0 } },
+      "targets": [
+        { "expr": "flowxer_engine_pgm_loudness_lufs{window=\"short_term\"}", "legendFormat": "ME {{me}} pair {{pair}} short-term", "refId": "A" },
+        { "expr": "flowxer_engine_pgm_loudness_lufs{window=\"integrated\"}", "legendFormat": "ME {{me}} pair {{pair}} integrated", "refId": "B" }
+      ]
+    },
+    {
+      "title": "PGM true peak (dBTP, max of the channels) and overs",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "none", "max": 3 } },
+      "targets": [
+        { "expr": "max by (me) (flowxer_engine_pgm_audio_level_dbfs{stat=\"true_peak\"})", "legendFormat": "ME {{me}} true peak", "refId": "A" },
+        { "expr": "increase(flowxer_engine_pgm_audio_overs_total[1m])", "legendFormat": "ME {{me}} overs / min", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Silent sources (peak below -90 dBFS on every channel)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "targets": [{ "expr": "max by (source) (flowxer_engine_audio_level_dbfs{stat=\"peak\"}) < -90", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "Audio thread (ms per grain) and strips heard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "targets": [
+        { "expr": "flowxer_engine_audio_ms", "legendFormat": "fx-audio {{stat}}", "refId": "A" },
+        { "expr": "sum by (me) (flowxer_engine_audio_strip_heard)", "legendFormat": "ME {{me}} strips heard", "refId": "B" }
+      ]
     }
   ],
   "refresh": "5s",
