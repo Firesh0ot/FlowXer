@@ -125,7 +125,7 @@ json transitionJson(TransitionSettings const& next)
 {
     auto const& w = next.wipe;
     return json{{"type", transitionName(next.type)}, {"frames", next.frames}, {"pattern", w.pattern}, {"reverse", w.reverse}, {"soft", w.soft},
-        {"border", w.border}, {"border_ycbcr", {w.borderY, w.borderCb, w.borderCr}}};
+        {"border", w.border}, {"border_ycbcr", {w.borderY, w.borderCb, w.borderCr}}, {"ties", next.ties}};
 }
 
 json meView(Engine& engine, int me)
@@ -136,7 +136,7 @@ json meView(Engine& engine, int me)
         {
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
                 {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
-                {"stinger", view.stinger},
+                {"stinger", view.stinger}, {"start", view.start}, {"tied", view.tied},
                 {"transition", transitionJson(view.next)}};
         }
     }
@@ -210,6 +210,8 @@ HttpResponse mixResult(Engine& engine, MixResult result, int me, std::string con
         return error(400, "pip and dme only on upstream keyers, dme within its ranges (docs/engine-p4.md §3); a run needs a box");
     case MixResult::BadKeyframes:
         return error(400, "at most 8 keyframes; a run needs its keyframe (a loop 2 keyframes)");
+    case MixResult::BadTies:
+        return error(400, "ties must be upstream keyers of ME " + std::to_string(me) + ", each once");
     case MixResult::Busy:
         return error(409, "a transition is running on ME " + std::to_string(me));
     }
@@ -276,6 +278,22 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "border_color must be #RRGGBB");
         }
+        if (auto const it = body.find("ties"); it != body.end())
+        {
+            if (!it->is_array())
+            {
+                return error(400, "ties must be an array of keyer numbers");
+            }
+            next.ties.clear();
+            for (auto const& k : *it)
+            {
+                if (!k.is_number_integer())
+                {
+                    return error(400, "ties must be an array of keyer numbers");
+                }
+                next.ties.push_back(k.get<int>());
+            }
+        }
         return mixResult(engine, mixer.setTransition(me, next), me, "ME");
     }
     if (action == "take")
@@ -301,6 +319,10 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
         {
             return error(400, "take needs a source (in<n>, cp<n>, black, me<n>) and integer frames");
         }
+        if (body.contains("ties") && !body["ties"].is_boolean())
+        {
+            return error(400, "ties must be true or false");
+        }
         // A stinger: its player's loaded stinger and cut frame (a player without one cuts).
         Sting sting;
         if (*type == Transition::Stinger && body.contains("stinger"))
@@ -317,7 +339,7 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
                 return error(404, "no stinger player " + std::to_string(sting.player));
             }
         }
-        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting), me, "ME");
+        return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting, body.value("ties", false)), me, "ME");
     }
     if (action == "cut")
     {
@@ -413,7 +435,7 @@ json keyerJson(KeyView const& key)
 {
     auto const& run = key.run;
     return json{{"key", key.key}, {"me", key.me}, {"stage", key.upstream ? "upstream" : "downstream"}, {"on", key.on}, {"transition", key.transition},
-        {"gain", key.gain}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"}, {"fly", key.settings.fly},
+        {"tie", key.tie > 0 ? json(key.tie) : json(nullptr)}, {"gain", key.gain}, {"mode", key.settings.pip ? "pip" : key.settings.luma ? "luma" : "linear"}, {"fly", key.settings.fly},
         {"dme", dmeJson(key.settings.dme)}, {"keyframes", key.keyframes.size()},
         {"run", {{"running", run.running}, {"fly", run.fly}, {"loop", loopName(run.loop)}, {"start", run.start}, {"step", run.step},
                     {"keyframe", run.keyframe >= 0 ? json(run.keyframe) : json(nullptr)}, {"on_path", run.onPath}, {"u", run.u}}}};
@@ -439,6 +461,19 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "text/plain", "ok\n"};
         }
+        if (request.path.rfind("/grab/", 0) == 0)
+        {
+            auto const digits = request.path.substr(6);
+            if (!digits.empty() && digits.size() <= 9 && digits.find_first_not_of("0123456789") == std::string::npos)
+            {
+                auto const grab = engine.grabJson(std::stoi(digits));
+                if (!grab.empty())
+                {
+                    return HttpResponse{200, "application/json", grab};
+                }
+            }
+            return error(404, "no grab " + digits);
+        }
         return error(404, "not found");
     }
     if (request.method != "POST" && request.method != "PUT")
@@ -449,6 +484,23 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     if (body.is_discarded() || !body.is_object())
     {
         return error(400, "the body must be a JSON object");
+    }
+    if (request.path == "/grab")
+    {
+        // A frame grab of the next output grain (docs/engine-p4.md §6): queued here, copied by
+        // the writer thread with that grain's downloads, written by the grab thread.
+        auto const bus = body.contains("bus") ? text(body, "bus") : std::string("pgm");
+        if (bus != "pgm" && bus != "pvw")
+        {
+            return error(400, "bus must be pgm or pvw");
+        }
+        std::string failed;
+        int const id = engine.grab(text(body, "source"), bus == "pvw", text(body, "path"), failed);
+        if (id == 0)
+        {
+            return error(failed.rfind("too many", 0) == 0 ? 409 : 400, failed);
+        }
+        return HttpResponse{200, "application/json", engine.grabJson(id)};
     }
     std::string rest;
     if (int const me = pathNumber(request.path, "/me/", rest); me > 0)
