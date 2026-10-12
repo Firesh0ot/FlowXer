@@ -20,6 +20,7 @@ find_package(nlohmann_json 3 REQUIRED)
 add_library(fxeng-core STATIC
     src/core/audio.cpp
     src/core/config.cpp
+    src/core/dme.cpp
     src/core/mixer.cpp
     src/core/mosaic_map.cpp
     src/core/playout.cpp

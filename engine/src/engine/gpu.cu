@@ -1,5 +1,6 @@
 #include "engine/gpu.hpp"
 
+#include "core/dme.hpp"
 #include "core/pixel.hpp"
 #include "core/v210.hpp"
 #include "core/wipe.hpp"
@@ -25,29 +26,6 @@ struct __align__(8) Half4
 __device__ std::uint32_t const* lineWords(std::uint8_t const* v210, int rowBytes, int row)
 {
     return reinterpret_cast<std::uint32_t const*>(v210 + static_cast<std::size_t>(row) * static_cast<std::size_t>(rowBytes));
-}
-
-// One sample read in place from packed v210 (x in pixels for luma, in chroma pairs for Cb/Cr).
-__device__ unsigned lumaAt(std::uint32_t const* words, int x)
-{
-    int const i = x % 6;
-    int const word = (x / 6) * 4 + (i == 0 ? 0 : i <= 2 ? 1 : i == 3 ? 2 : 3);
-    int const shift = (i == 1 || i == 4) ? 0 : (i == 0 || i == 3) ? 10 : 20;
-    return (words[word] >> shift) & 0x3ffu;
-}
-
-__device__ unsigned cbAt(std::uint32_t const* words, int cx)
-{
-    int const j = cx % 3;
-    return (words[(cx / 3) * 4 + j] >> (j * 10)) & 0x3ffu;
-}
-
-__device__ unsigned crAt(std::uint32_t const* words, int cx)
-{
-    int const j = cx % 3;
-    int const word = (cx / 3) * 4 + (j == 0 ? 0 : j + 1);
-    int const shift = j == 0 ? 20 : j == 1 ? 0 : 10;
-    return (words[word] >> shift) & 0x3ffu;
 }
 
 __device__ void readGroup(std::uint8_t const* v210, int rowBytes, int row, int group, std::uint16_t y[6], std::uint16_t cb[3], std::uint16_t cr[3])
@@ -320,7 +298,7 @@ __global__ void mosaicKernel(MosaicArgs args, std::uint8_t* luma, int lumaPitch,
                 auto const* words = lineWords(tile.v210, tile.rowBytes, sy);
                 for (int sx = x0; sx < x1; ++sx)
                 {
-                    sum += lumaAt(words, sx);
+                    sum += v210Luma(words, sx);
                 }
             }
             unsigned const n = static_cast<unsigned>((y1 - y0) * (x1 - x0));
@@ -343,8 +321,8 @@ __global__ void mosaicKernel(MosaicArgs args, std::uint8_t* luma, int lumaPitch,
         auto const* words = lineWords(tile.v210, tile.rowBytes, sy);
         for (int cx = c0; cx < c1; ++cx)
         {
-            cbSum += cbAt(words, cx);
-            crSum += crAt(words, cx);
+            cbSum += v210Cb(words, cx);
+            crSum += v210Cr(words, cx);
         }
     }
     unsigned const n = static_cast<unsigned>((y1 - y0) * (c1 - c0));
@@ -465,6 +443,9 @@ struct ComposeArgs
     float clip[kMaxLayers];
     float soft[kMaxLayers];
     bool invert[kMaxLayers];
+    // Box layers: the index into `boxes`, or −1.
+    int box[kMaxLayers];
+    DmeDraw boxes[kMaxBoxes];
     int layers;
     int width;
     int height;
@@ -522,6 +503,19 @@ __global__ void composeYuvKernel(ComposeArgs args)
     }
     for (int l = 0; l < args.layers; ++l)
     {
+        if (args.box[l] >= 0)
+        {
+            // A box layer, only where it can change something.
+            DmeDraw const& d = args.boxes[args.box[l]];
+            if (row >= d.box.ey0 && row < d.box.ey1 && group * 6 + 6 > d.box.ex0 && group * 6 < d.box.ex1)
+            {
+                for (int p = 0; p < pairs; ++p)
+                {
+                    dmePair(d, group * 6 + 2 * p, row, &y[2 * p], cb[p], cr[p]);
+                }
+            }
+            continue;
+        }
         std::uint16_t fy[6] = {};
         std::uint16_t fcb[3] = {};
         std::uint16_t fcr[3] = {};
@@ -623,7 +617,117 @@ __global__ void keyRgbaKernel(std::uint8_t const* v210a, int rowBytes, int keyRo
         rgba[base + x] = Half4{__floats2half2_rn(rg.x + (f.r - rg.x) * a, rg.y + (f.g - rg.y) * a), __floats2half2_rn(ba.x + (f.b - ba.x) * a, ba.y)};
     }
 }
+// DME resample (core/dme.hpp): one thread per weight table entry.
+__global__ void dmeTableKernel(DmeBox b, int* start, float* weights)
+{
+    int const e = blockIdx.x * blockDim.x + threadIdx.x;
+    int const entries = dmeEntries(b);
+    if (e >= entries)
+    {
+        return;
+    }
+    float w[kDmeMaxTaps];
+    start[e] = dmeWeights(dmeEntryIndex(b, e), b.fs, b.sup, b.taps, w);
+    for (int i = 0; i < b.taps; ++i)
+    {
+        weights[static_cast<std::size_t>(i) * static_cast<std::size_t>(entries) + static_cast<std::size_t>(e)] = w[i];
+    }
+}
+
+// The horizontal pass: one thread per buffer column (all planes side by side), its weights and
+// source indices in registers, over kDmeRows source rows.
+constexpr int kDmeRows = 16;
+
+template <int N>
+__global__ void dmeHPassKernel(DmeBox b, DmeSource src, DmeTable t, std::int16_t* mid)
+{
+    int const e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= b.cols)
+    {
+        return;
+    }
+    int entry = 0;
+    int lo = 0;
+    int hi = 0;
+    int const plane = dmePlaneOf(b, e, entry, lo, hi);
+    float w[N];
+    int j[N];
+    dmeTaps<N>(t, entry, lo, hi, w, j);
+    int const r0 = blockIdx.y * kDmeRows;
+    int const r1 = min(r0 + kDmeRows, b.rows);
+    for (int r = r0; r < r1; ++r)
+    {
+        mid[static_cast<std::size_t>(r) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeHSample<N>(src, plane, b.r0 + r, w, j);
+    }
+}
+
+// The vertical pass: one thread per box buffer sample.
+template <int N>
+__global__ void dmeVPassKernel(DmeBox b, DmeTable t, std::int16_t const* mid, std::int16_t* out)
+{
+    int const e = blockIdx.x * blockDim.x + threadIdx.x;
+    int const oy = blockIdx.y;
+    if (e >= b.cols || oy >= b.bh)
+    {
+        return;
+    }
+    out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeVSample<N>(b, t, mid, e, oy);
+}
 } // namespace
+
+std::size_t dmeBufferBytes(int width, int height)
+{
+    return static_cast<std::size_t>(3) * static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * sizeof(std::int16_t);
+}
+
+cudaError_t allocDmeScratch(DmeScratch& scratch, int width, int height)
+{
+    freeDmeScratch(scratch);
+    std::size_t const entries = static_cast<std::size_t>(width + width / 2 + height);
+    std::size_t const startBytes = entries * sizeof(int);
+    std::size_t const weightBytes = entries * kDmeMaxTaps * sizeof(float);
+    scratch.bytes = startBytes + weightBytes + dmeBufferBytes(width, height);
+    void* p = nullptr;
+    cudaError_t const err = cudaMalloc(&p, scratch.bytes);
+    if (err != cudaSuccess)
+    {
+        scratch.bytes = 0;
+        return err;
+    }
+    auto* bytes = static_cast<std::uint8_t*>(p);
+    scratch.weights = reinterpret_cast<float*>(bytes);
+    scratch.start = reinterpret_cast<int*>(bytes + weightBytes);
+    scratch.mid = reinterpret_cast<std::int16_t*>(bytes + weightBytes + startBytes);
+    return cudaSuccess;
+}
+
+void freeDmeScratch(DmeScratch& scratch)
+{
+    if (scratch.weights != nullptr)
+    {
+        cudaFree(scratch.weights);
+    }
+    scratch = DmeScratch{};
+}
+
+cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer)
+{
+    if (box.bw == 0 || box.bh == 0)
+    {
+        return cudaSuccess;
+    }
+    int const entries = dmeEntries(box);
+    dmeTableKernel<<<static_cast<unsigned>((entries + 127) / 128), 128, 0, stream>>>(box, scratch.start, scratch.weights);
+    DmeTable const table{scratch.start, scratch.weights, entries};
+    dim3 const hGrid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>((box.rows + kDmeRows - 1) / kDmeRows));
+    dim3 const vGrid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>(box.bh));
+    dmeDispatch(box.taps, [&](auto n) {
+        constexpr int N = decltype(n)::value;
+        dmeHPassKernel<N><<<hGrid, 128, 0, stream>>>(box, source, table, scratch.mid);
+        dmeVPassKernel<N><<<vGrid, 128, 0, stream>>>(box, table, scratch.mid, buffer);
+    });
+    return cudaGetLastError();
+}
 
 cudaError_t from444(cudaStream_t stream, std::uint8_t const* y, std::uint8_t const* cb, std::uint8_t const* cr, int pitch, bool deep, int width,
     int height, std::uint8_t* v210, int rowBytes)
@@ -658,6 +762,7 @@ cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int k
         args.mode = job.b == nullptr ? 0 : job.wiping ? 2 : job.t <= 0.f ? 0 : 1;
         args.t = job.t;
         args.wipe = job.wipe;
+        int boxes = 0;
         for (int l = 0; l < layers; ++l)
         {
             auto const& layer = job.layers[l];
@@ -669,6 +774,12 @@ cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int k
             args.clip[l] = layer.clip;
             args.soft[l] = layer.soft;
             args.invert[l] = layer.invert;
+            args.box[l] = -1;
+            if (layer.dme != nullptr && boxes < kMaxBoxes)
+            {
+                args.boxes[boxes] = *layer.dme;
+                args.box[l] = boxes++;
+            }
         }
         args.layers = layers;
         args.width = out.width;
@@ -689,10 +800,10 @@ cudaError_t compose(cudaStream_t stream, Compose const& job, int rowBytes, int k
     {
         mix(stream, *job.a, job.b, job.t, out);
     }
-    // rgba16f: linear layers only (a luma key needs yuv16).
+    // rgba16f: linear layers only (a luma key and a box need yuv16).
     for (int l = 0; l < layers; ++l)
     {
-        if (job.layers[l].luma)
+        if (job.layers[l].luma || job.layers[l].dme != nullptr)
         {
             continue;
         }
@@ -867,6 +978,209 @@ int maxDiff(Planar422 const& a, Planar422 const& b)
         worst = std::max(worst, std::abs(int(a.cr[i]) - int(b.cr[i])));
     }
     return worst;
+}
+
+// The DME part of the self-test (see selfTest).
+bool dmeSelfTest(Planar422 const& pa, Planar422 const& pb, std::uint8_t const* va, int rowBytes, std::string& failed, int& cases)
+{
+    int const w = pa.width;
+    int const h = pa.height;
+    int const keyRow = keyPlaneRowBytes(w);
+    std::size_t const frameBytes = static_cast<std::size_t>(rowBytes) * h;
+    std::size_t const keyBytes = frameBytes + static_cast<std::size_t>(keyRow) * h;
+    // A linear source: pb with a key pattern over the whole range.
+    std::vector<std::uint8_t> fillKey(keyBytes, 0);
+    packV210(pb, fillKey.data(), rowBytes);
+    for (int y = 0; y < h; ++y)
+    {
+        auto* k = reinterpret_cast<std::uint32_t*>(fillKey.data() + frameBytes + static_cast<std::size_t>(y) * keyRow);
+        for (int x = 0; x < w; ++x)
+        {
+            k[x / 3] |= static_cast<std::uint32_t>((x * 7 + y * 13) % 1024) << ((x % 3) * 10);
+        }
+    }
+    DeviceBytes dkey(keyBytes);
+    DeviceBytes dout(frameBytes);
+    DmeScratch scratch;
+    std::size_t const bufBytes = dmeBufferBytes(w, h);
+    DeviceBytes bufs(bufBytes * 3);
+    WorkBuffer wa;
+    WorkBuffer wb;
+    WorkBuffer wo;
+    if (dkey.get() == nullptr || dout.get() == nullptr || bufs.get() == nullptr || allocDmeScratch(scratch, w, h) != cudaSuccess ||
+        allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wb, WorkFormat::Yuv16, w, h) != cudaSuccess ||
+        allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
+    {
+        failed = "dme: allocation failed";
+        freeDmeScratch(scratch);
+        freeWork(wa);
+        freeWork(wb);
+        freeWork(wo);
+        return false;
+    }
+    cudaMemcpy(dkey.get(), fillKey.data(), keyBytes, cudaMemcpyHostToDevice);
+    unpack(nullptr, va, rowBytes, wa);
+    unpack(nullptr, dkey.get(), rowBytes, wb);
+    std::size_t const yBytes = static_cast<std::size_t>(w) * h * sizeof(std::uint16_t);
+    struct Case
+    {
+        DmeKind kind;
+        DmeSettings set;
+    };
+    auto const settings = [](float x, float y, float size) {
+        DmeSettings s;
+        s.enabled = true;
+        s.x = x;
+        s.y = y;
+        s.size = size;
+        return s;
+    };
+    std::vector<Case> list;
+    {
+        DmeSettings s = settings(0.72f + 0.37f / 1920.f, 0.28f + 0.61f / 1080.f, 0.5f);
+        s.borderWidth = 4.f;
+        s.borderSoft = 1.f;
+        s.borderY = 700;
+        s.borderCb = 300;
+        s.borderCr = 800;
+        s.shadowDx = 8.f;
+        s.shadowDy = 8.f;
+        s.shadowBlur = 12.f;
+        s.shadowOpacity = 0.5f;
+        list.push_back({DmeKind::Pip, s});
+        s = settings(0.3f + 0.21f / 1920.f, 0.4f, 0.4137f);
+        s.cropLeft = 0.1f;
+        s.cropRight = 0.2f;
+        s.cropTop = 0.05f;
+        s.cropBottom = 0.15f;
+        s.soft = 2.f;
+        list.push_back({DmeKind::Pip, s});
+        s = settings(0.6f, 0.55f + 0.83f / 1080.f, 0.77f);
+        s.borderWidth = 6.f;
+        s.borderSoft = 1.5f;
+        s.borderOpacity = 0.8f;
+        s.shadowDx = -12.f;
+        s.shadowDy = 12.f;
+        s.shadowBlur = 16.f;
+        s.shadowOpacity = 0.6f;
+        list.push_back({DmeKind::Luma, s});
+        s = settings(0.25f + 0.5f / 1920.f, 0.7f + 0.25f / 1080.f, 1.f / 3.f);
+        s.cropLeft = 0.05f;
+        s.cropBottom = 0.1f;
+        s.borderWidth = 2.f;
+        list.push_back({DmeKind::Linear, s});
+        s = settings(0.1f, 0.9f, 1.5f);
+        s.shadowOpacity = 1.f;
+        s.shadowBlur = 0.f;
+        s.shadowDx = 3.f;
+        list.push_back({DmeKind::Pip, s});
+        s = settings(0.5f, 0.5f, 0.1f);
+        s.shadowDx = 4.f;
+        s.shadowDy = 4.f;
+        s.shadowBlur = 6.f;
+        s.shadowOpacity = 0.7f;
+        list.push_back({DmeKind::Linear, s});
+        s = settings(0.5f, 0.5f, 1.f);
+        s.soft = 3.f;
+        list.push_back({DmeKind::Luma, s});
+        s = settings(-0.2f, 0.1f, 0.6f);
+        s.borderWidth = 8.f;
+        list.push_back({DmeKind::Pip, s});
+        s = settings(0.5f + 0.13f / 1920.f, 0.5f, 0.25f);
+        s.cropLeft = 0.3f;
+        s.cropRight = 0.3f;
+        s.borderWidth = 3.f;
+        s.borderSoft = 2.f;
+        list.push_back({DmeKind::Linear, s});
+    }
+    std::vector<std::uint8_t> back(frameBytes);
+    std::vector<std::int16_t> refs[3];
+    for (std::size_t first = 0; first < list.size() && failed.empty(); first += 3)
+    {
+        Planar422 want = pa;
+        Compose job;
+        job.a = &wa;
+        DmeDraw draws[3];
+        for (std::size_t k = first; k < std::min(first + 3, list.size()); ++k)
+        {
+            Case const& c = list[k];
+            int const slot = static_cast<int>(k - first);
+            DmeDraw& d = draws[slot];
+            d.box = makeDmeBox(c.set, c.kind, w, h);
+            auto* buf = reinterpret_cast<std::int16_t*>(bufs.get() + bufBytes * static_cast<std::size_t>(slot));
+            d.buffer = buf;
+            d.gain = 0.9f;
+            d.clip = 0.3f;
+            d.soft = 0.2f;
+            DmeSource src;
+            src.width = w;
+            src.height = h;
+            src.rowBytes = rowBytes;
+            src.keyRowBytes = keyRow;
+            WorkBuffer const& fill = c.kind == DmeKind::Pip ? wa : wb;
+            if (c.kind == DmeKind::Linear)
+            {
+                src.v210a = dkey.get();
+            }
+            else
+            {
+                src.plane[0] = static_cast<std::uint16_t const*>(fill.data);
+                src.plane[1] = reinterpret_cast<std::uint16_t const*>(static_cast<std::uint8_t const*>(fill.data) + yBytes);
+                src.plane[2] = reinterpret_cast<std::uint16_t const*>(static_cast<std::uint8_t const*>(fill.data) + yBytes + yBytes / 2);
+            }
+            dmeResample(nullptr, d.box, src, scratch, buf);
+            cudaError_t const err = cudaDeviceSynchronize();
+            // The CPU reads the same source from host memory.
+            Planar422 const& hostFill = c.kind == DmeKind::Pip ? pa : pb;
+            DmeSource cpu = src;
+            cpu.plane[0] = hostFill.y.data();
+            cpu.plane[1] = hostFill.cb.data();
+            cpu.plane[2] = hostFill.cr.data();
+            if (c.kind == DmeKind::Linear)
+            {
+                cpu.v210a = fillKey.data();
+            }
+            std::vector<std::int16_t> ref;
+            dmeResampleCpu(d.box, cpu, ref);
+            std::vector<std::int16_t> got(ref.size());
+            cudaMemcpy(got.data(), buf, got.size() * sizeof(std::int16_t), cudaMemcpyDeviceToHost);
+            int bufDiff = 0;
+            for (std::size_t i = 0; i < ref.size(); ++i)
+            {
+                bufDiff = std::max(bufDiff, std::abs(int(ref[i]) - int(got[i])));
+            }
+            ++cases;
+            if ((err != cudaSuccess || bufDiff != 0) && failed.empty())
+            {
+                failed = "dme box " + std::to_string(k) + " resample: max error " + std::to_string(bufDiff) + " (" + cudaGetErrorString(err) + ")";
+            }
+            DmeDraw cpuDraw = d;
+            std::vector<std::int16_t>& kept = refs[slot];
+            kept = std::move(ref);
+            cpuDraw.buffer = kept.data();
+            dmeLayerCpu(cpuDraw, want);
+            job.layers[job.layerCount].dme = &d;
+            job.layers[job.layerCount].gain = d.gain;
+            ++job.layerCount;
+        }
+        compose(nullptr, job, rowBytes, keyRow, wo);
+        pack(nullptr, wo, dout.get(), rowBytes);
+        cudaError_t const err = cudaDeviceSynchronize();
+        cudaMemcpy(back.data(), dout.get(), frameBytes, cudaMemcpyDeviceToHost);
+        Planar422 got;
+        got.allocate(w, h);
+        unpackV210(back.data(), rowBytes, got);
+        int const diff = maxDiff(want, got);
+        if ((err != cudaSuccess || diff != 0) && failed.empty())
+        {
+            failed = "dme boxes " + std::to_string(first) + "..: compose max error " + std::to_string(diff) + " (" + cudaGetErrorString(err) + ")";
+        }
+    }
+    freeDmeScratch(scratch);
+    freeWork(wa);
+    freeWork(wb);
+    freeWork(wo);
+    return failed.empty();
 }
 } // namespace
 
@@ -1277,6 +1591,20 @@ bool selfTest(std::string& report)
             return false;
         }
         done += "stinger alpha key and layer (under a DSK) exact; ";
+    }
+    // DME boxes: pip, luma and linear boxes (sizes 0.1 to 1.5, sub-pixel positions, crops, soft
+    // edges, borders, shadows, partly off the raster), resampled and composed over A three at a
+    // time, against the CPU reference (dmeResampleCpu, dmeLayerCpu): the box buffers and the
+    // picture exact.
+    {
+        std::string failed;
+        int cases = 0;
+        if (!dmeSelfTest(pa, pb, da.get(), rowBytes, failed, cases))
+        {
+            report = failed;
+            return false;
+        }
+        done += "DME boxes exact (" + std::to_string(cases) + " boxes); ";
     }
     // Mosaic of a flat grey picture: every tile is that grey, a missing source is black.
     Planar422 grey;
