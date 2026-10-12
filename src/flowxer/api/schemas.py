@@ -502,12 +502,63 @@ class Dme(BaseModel):
     shadow: DmeShadow = Field(default_factory=DmeShadow)
 
 
+class Ease(str, Enum):
+    linear = "linear"
+    ease = "ease"
+    ease_in = "ease-in"
+    ease_out = "ease-out"
+    hold = "hold"
+
+
+class DmeLoop(str, Enum):
+    off = "off"
+    wrap = "wrap"
+    pingpong = "pingpong"
+
+
+class DmeKeyframeBorder(BaseModel):
+    width: float = Field(default=0.0, ge=0.0, le=64.0)
+    soft: float = Field(default=0.0, ge=0.0, le=64.0)
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class DmeKeyframe(BaseModel):
+    """A keyframe (docs/engine-p4.md §5): a box state (the Dme fields without `enabled` and the
+    border colour, which are not animated) and the time from the keyframe before: `frames` with
+    its `ease` (linear, ease = smoothstep in and out, ease-in, ease-out, hold = stay, then jump at
+    the end). Size is interpolated in log space, the rest linearly. Keyframe 0's frames and ease
+    are used when a run reaches it from a box off the keyframes' path."""
+
+    frames: int = Field(default=25, ge=1, le=1000)
+    ease: Ease = Field(default=Ease.linear)
+    x: float = Field(default=0.5, ge=-1.0, le=2.0)
+    y: float = Field(default=0.5, ge=-1.0, le=2.0)
+    size: float = Field(default=0.5, ge=0.0, le=2.0)
+    soft: float = Field(default=0.0, ge=0.0, le=64.0)
+    crop: DmeCrop = Field(default_factory=DmeCrop)
+    border: DmeKeyframeBorder = Field(default_factory=DmeKeyframeBorder)
+    shadow: DmeShadow = Field(default_factory=DmeShadow)
+
+
+class KeyerRun(BaseModel):
+    """A keyer's run along its keyframes as the engine reports it (not saved): running (waiting
+    for its first frame or moving), whether it is the keyer's Auto (`fly`), its loop, the keyframe
+    the box moves to (or, not running, the one it is at), and the frames since it started."""
+
+    running: bool = False
+    fly: bool = False
+    loop: DmeLoop = DmeLoop.off
+    keyframe: int | None = None
+    step: int = 0
+
+
 class Keyer(BaseModel):
     """An upstream keyer (before the transition) or a DSK (after it) of one ME. Keys show on the
     ME's Program only (keys have no preview). Linear: its key input, a v210a fill + key MXL flow
     (NMOS receiver `receiver_label`). Luma: a self key of a source the ME may take. Pip (upstream
     only): a source the ME may take, opaque, in a box. An upstream keyer's `dme` puts its key in a
-    box (always on for a pip)."""
+    box (always on for a pip); its `keyframes` animate the box (runs, loops), and with `fly` its
+    Auto flies the box from keyframe 0 (off) to the last (on) instead of fading."""
 
     id: str
     label: str
@@ -521,7 +572,17 @@ class Keyer(BaseModel):
     soft: float = Field(default=0.1, ge=0.0, le=1.0, description="Luma: the softness above the clip")
     gain: float = Field(default=1.0, ge=0.0, le=1.0, description="Scales the key")
     invert: bool = Field(default=False, description="Luma: key the dark parts")
-    dme: Dme = Field(default_factory=Dme, description="The box (upstream keyers)")
+    dme: Dme = Field(default_factory=Dme, description="The box (upstream keyers): where it is now")
+    fly: bool = Field(default=False, description="Auto flies the box along its keyframes (at least 2) instead of fading")
+    keyframes: list[DmeKeyframe] = Field(default_factory=list, max_length=8, description="Up to 8 (upstream keyers)")
+    run: KeyerRun | None = Field(default=None, description="The engine's run of the box (not saved; none off-air)")
+
+    @model_validator(mode="after")
+    def _pip_is_a_box(self) -> "Keyer":
+        # A pip keyer is always a box (states saved before P4 M2 could say otherwise).
+        if self.mode == KeyMode.pip:
+            self.dme.enabled = True
+        return self
 
     @property
     def receiver_label(self) -> str:
@@ -626,8 +687,51 @@ class KeyerUpdate(BaseModel):
     invert: bool | None = None
     dme: dict[str, Any] | None = Field(
         default=None,
-        description="Box fields to change (see Dme: enabled, x, y, size, soft, crop, border, shadow); missing fields keep their values",
+        description="Box fields to change (see Dme: enabled, x, y, size, soft, crop, border, shadow); missing fields keep their values. "
+        "PUT /keyers/{id}/dme replaces the whole box.",
     )
+    fly: bool | None = Field(default=None, description="Auto flies the box along its keyframes instead of fading")
+
+
+class KeyerRunRequest(BaseModel):
+    """A run of the box from where it is: to keyframe `to` (default the last; keyframe 0 with
+    `reverse`) through the keyframes in between, at their own frames and ease; or a loop (wrap:
+    to the last keyframe, then jump to 0; pingpong: back and forth; down first with `reverse`)
+    until stopped. `frames` 0 jumps to keyframe `to` at the next frame."""
+
+    to: int | None = Field(default=None, ge=0, le=7)
+    reverse: bool = False
+    loop: DmeLoop = Field(default=DmeLoop.off)
+    frames: int | None = Field(default=None, ge=0, le=0, description="0: jump to the keyframe")
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "KeyerRunRequest":
+        if self.to is not None and (self.reverse or self.loop != DmeLoop.off):
+            raise ValueError("to excludes reverse and loop")
+        if self.frames is not None and self.loop != DmeLoop.off:
+            raise ValueError("frames 0 (a jump) excludes a loop")
+        return self
+
+
+class DmePreset(str, Enum):
+    corner_tl = "corner-tl"
+    corner_tr = "corner-tr"
+    corner_bl = "corner-bl"
+    corner_br = "corner-br"
+    split = "split"
+    quad = "quad"
+    full = "full"
+
+
+class KeyerPresetRequest(BaseModel):
+    name: DmePreset
+
+
+class DmePresetInfo(BaseModel):
+    name: DmePreset
+    title: str
+    keyers: int = Field(description="1: the keyer it is applied to; 2 and 4: the ME's upstream keyers 1..n")
+    description: str
 
 
 class StingerSlotUpdate(BaseModel):

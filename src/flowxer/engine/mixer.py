@@ -12,8 +12,14 @@ from pydantic import ValidationError
 from flowxer import __version__
 from flowxer.api.schemas import (
     AudioEssence,
+    Dme,
+    DmeKeyframe,
+    DmeLoop,
+    DmePreset,
+    DmePresetInfo,
     InputKind,
     Keyer,
+    KeyerRun,
     KeyerStage,
     KeyMode,
     LogicalInput,
@@ -106,6 +112,62 @@ def _merged(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _box_state(box: dict[str, Any]) -> dict[str, Any]:
+    """The animated fields of a box (Dme, a keyframe or the engine's box): not `enabled`, not the
+    border colour."""
+    border = box.get("border") or {}
+    state = {name: box[name] for name in ("x", "y", "size", "soft", "crop", "shadow") if name in box}
+    state["border"] = {name: border[name] for name in ("width", "soft", "opacity") if name in border}
+    return state
+
+
+# DME presets (docs/engine-p4.md §5): keyframe 0 off screen on the near side, keyframe 1 on.
+DME_PRESETS = [
+    DmePresetInfo(name=DmePreset.corner_tl, title="Top left", keyers=1, description="1/3 size in the top left corner inside the 5 % action-safe margin, 4 px white border, soft shadow"),
+    DmePresetInfo(name=DmePreset.corner_tr, title="Top right", keyers=1, description="1/3 size in the top right corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.corner_bl, title="Bottom left", keyers=1, description="1/3 size in the bottom left corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.corner_br, title="Bottom right", keyers=1, description="1/3 size in the bottom right corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.split, title="Split", keyers=2, description="the ME's keyers 1 and 2: each source cropped to its centre half, full size, side by side"),
+    DmePresetInfo(name=DmePreset.quad, title="Quad", keyers=4, description="the ME's keyers 1 to 4 at 1/2 size, 2 x 2"),
+    DmePresetInfo(name=DmePreset.full, title="Full", keyers=1, description="size 1, centred: keyframe 0 is the box as it is, so the box flies to and from full screen"),
+]
+# Keyframe 0 of a preset: this far beyond the raster edge (fractions), border and shadow included.
+_OFF = 0.05
+_NO_CROP = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+_PLAIN = {"soft": 0.0, "border": {"width": 0.0, "soft": 0.0, "opacity": 1.0}, "shadow": {"dx": 0.0, "dy": 0.0, "blur": 0.0, "opacity": 0.0}}
+
+
+def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """(on, off) box fields of each keyer a preset writes (1, 2 or 4). `current`: the box of the
+    keyer it is applied to (keyframe 0 of `full`)."""
+    if name in (DmePreset.corner_tl, DmePreset.corner_tr, DmePreset.corner_bl, DmePreset.corner_br):
+        size, border = 1.0 / 3.0, 4.0
+        left = name in (DmePreset.corner_tl, DmePreset.corner_bl)
+        top = name in (DmePreset.corner_tl, DmePreset.corner_tr)
+        # The picture and its border inside the 5 % action-safe margin.
+        mx = (0.05 * width + border) / width + size / 2
+        my = (0.05 * height + border) / height + size / 2
+        on = {
+            "x": mx if left else 1.0 - mx, "y": my if top else 1.0 - my, "size": size, "soft": 0.0, "crop": _NO_CROP,
+            "border": {"width": border, "soft": 0.0, "opacity": 1.0, "color": "#ffffff"},
+            "shadow": {"dx": 8.0, "dy": 8.0, "blur": 16.0, "opacity": 0.5},
+        }
+        return [(on, {**on, "x": -size / 2 - _OFF if left else 1.0 + size / 2 + _OFF})]
+    if name == DmePreset.split:
+        crop = {"left": 0.25, "right": 0.25, "top": 0.0, "bottom": 0.0}
+        return [
+            ({"x": x, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN}, {"x": off, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN})
+            for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
+        ]
+    if name == DmePreset.quad:
+        return [
+            ({"x": x, "y": y, "size": 0.5, "crop": _NO_CROP, **_PLAIN}, {"x": off, "y": y, "size": 0.5, "crop": _NO_CROP, **_PLAIN})
+            for y in (0.25, 0.75)
+            for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
+        ]
+    return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
+
+
 class MixerError(RuntimeError):
     pass
 
@@ -159,6 +221,9 @@ class VisionMixer:
         self._missing_domains: dict[tuple[str, str], str] = {}
         # Keyer id -> (MXL domain id, flow id) of its key input (IS-05), flow None when not routed.
         self._key_routes: dict[str, tuple[str | None, str | None]] = {}
+        # Keyer id -> monotonic time until which a keyer that fades or flies off is still on air
+        # (raw tally).
+        self._key_until: dict[str, float] = {}
         # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
         self._autostart_done = threading.Event()
         self.tally = TallyService()
@@ -496,12 +561,57 @@ class VisionMixer:
     def _keyer_number(self, keyer: Keyer) -> int:
         return self.keyers.index(keyer) + 1
 
+    def keyer_views(self) -> list[Keyer]:
+        """The keyers as the engine renders them: while a run moves a box, its `dme` is where the
+        engine's last status (once a second) had it; `run` is the engine's run (none off-air)."""
+        entries = (self.engine_status() or {}).get("keyers") or []
+        return [self._live_keyer(keyer, entries[n] if n < len(entries) else None) for n, keyer in enumerate(self.keyers)]
+
+    def _live_keyer(self, keyer: Keyer, entry: Any) -> Keyer:
+        run = entry.get("run") if isinstance(entry, dict) else None
+        if not isinstance(run, dict):
+            return keyer
+        update: dict[str, Any] = {
+            "run": KeyerRun(
+                running=bool(run.get("running")),
+                fly=bool(run.get("fly")),
+                loop=run.get("loop") if run.get("loop") in {loop.value for loop in DmeLoop} else DmeLoop.off,
+                keyframe=run.get("keyframe") if isinstance(run.get("keyframe"), int) else None,
+                step=int(run.get("step") or 0),
+            )
+        }
+        if run.get("running") and keyer.stage == KeyerStage.upstream and isinstance(entry.get("dme"), dict):
+            update["dme"] = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(entry["dme"])))
+        return keyer.model_copy(update=update)
+
+    def _flies(self, keyer: Keyer) -> bool:
+        """Its Auto flies the box: fly, a box, at least 2 keyframes (else it fades)."""
+        return (
+            keyer.fly and keyer.stage == KeyerStage.upstream and (keyer.mode == KeyMode.pip or keyer.dme.enabled) and len(keyer.keyframes) >= 2
+        )
+
+    def _box_at(self, keyer: Keyer, keyframe: DmeKeyframe) -> Dme:
+        """The keyer's box in the state of `keyframe` (enabled and the border colour stay)."""
+        return Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(keyframe.model_dump())))
+
+    def _box_from_engine(self, keyer: Keyer, reply: Any) -> None:
+        """The box where the engine has it after a command (its reply), unless a run moves it."""
+        if not isinstance(reply, dict) or not isinstance(reply.get("dme"), dict) or (reply.get("run") or {}).get("running"):
+            return
+        keyer.dme = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(reply["dme"])))
+
+    def _with_run(self, keyer: Keyer, reply: Any) -> Keyer:
+        return self._live_keyer(keyer, reply)
+
     def update_keyer(self, keyer_id: str, **changes: Any) -> Keyer:
         """On or off (at the next frame), rate, label, and the key: mode, source (luma, pip),
-        clip, soft, gain, invert, and the box (`dme`, merged into the current one)."""
+        clip, soft, gain, invert, fly, and the box (`dme`, merged into the current one; a change
+        of its position, size, crop, border or shadow stops a run there). A keyer that flies cuts
+        on at its last keyframe and off at keyframe 0."""
         keyer = self.get_keyer(keyer_id)
         label = changes.pop("label", None)
         enabled = changes.pop("enabled", None)
+        box_patch = changes.get("dme")
         if label is not None and label != keyer.label:
             if self._labels_pinned():
                 raise MixerError("keyer labels are fixed while FLOWXER_KEYERS_PER_ME or FLOWXER_DSKS_PER_ME sets the keyers")
@@ -522,33 +632,162 @@ class VisionMixer:
                 self._check_source(self.get_panel(keyer.panel_id), updated.source_id)
             if (updated.mode == KeyMode.pip or updated.dme.enabled) and updated.stage != KeyerStage.upstream:
                 raise MixerError("pip and dme only on upstream keyers")
+            if updated.mode == KeyMode.pip and isinstance(box_patch, dict) and box_patch.get("enabled") is False:
+                raise MixerError("a pip keyer is always a box (dme.enabled stays true)")
             for name in key:
                 setattr(keyer, name, getattr(updated, name))
-            self._push_key_settings(keyer)
+            # A pip is always a box (the engine does the same).
+            keyer.dme.enabled = updated.dme.enabled
+            reply = self._push_key_settings(keyer, box=box_patch if "dme" in key else None)
+            self._box_from_engine(keyer, reply)
         if changes.get("rate_ms") is not None:
             keyer.rate_ms = changes["rate_ms"]
         if enabled is not None:
             keyer.enabled = enabled
+            self._key_until.pop(keyer.id, None)
+            if self._flies(keyer):
+                keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if enabled else 0])
             self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
         self._publish_tally()
         return keyer
 
+    def replace_keyer_box(self, keyer_id: str, box: Dme) -> Keyer:
+        """The whole box (PUT /keyers/{id}/dme; a pip's box stays enabled). Stops a run."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("pip and dme only on upstream keyers")
+        keyer.dme = box.model_copy(deep=True)
+        if keyer.mode == KeyMode.pip:
+            keyer.dme.enabled = True
+        self._box_from_engine(keyer, self._push_key_settings(keyer, box=keyer.dme.model_dump()))
+        return keyer
+
+    def set_keyframes(self, keyer_id: str, items: list[dict[str, Any]]) -> Keyer:
+        """Replaces the keyer's keyframes (up to 8, upstream keyers): each one's missing box fields
+        take the keyer's box. A run stops where the box is."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("keyframes only on upstream keyers")
+        if len(items) > 8:
+            raise MixerError("at most 8 keyframes")
+        state = _box_state(keyer.dme.model_dump())
+        try:
+            keyframes = [DmeKeyframe.model_validate(_merged(state, item)) for item in items]
+        except ValidationError as exc:
+            raise MixerError(f"invalid keyframe: {exc.errors()[0]['msg']}") from exc
+        keyer.keyframes = keyframes
+        self._box_from_engine(keyer, self._push_keyframes(keyer))
+        return keyer
+
+    def run_keyer(
+        self, keyer_id: str, *, to: int | None = None, reverse: bool = False, loop: DmeLoop = DmeLoop.off, frames: int | None = None
+    ) -> Keyer:
+        """A run of the box from where it is to keyframe `to` (the last; 0 with reverse), a loop,
+        or (frames 0) a jump. A run that ends leaves the box at its keyframe."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream or not (keyer.mode == KeyMode.pip or keyer.dme.enabled):
+            raise MixerError("the keyer has no box (dme)")
+        count = len(keyer.keyframes)
+        target = to if to is not None else (0 if reverse else count - 1)
+        if count == 0:
+            raise MixerError("the keyer has no keyframes")
+        if target >= count:
+            raise MixerError(f"no keyframe {target} (the keyer has {count})")
+        if loop != DmeLoop.off and count < 2:
+            raise MixerError("a loop needs 2 keyframes")
+        body: dict[str, Any] = {"reverse": reverse, "loop": loop.value}
+        if to is not None:
+            body["to"] = to
+        if frames is not None:
+            body["frames"] = frames
+        reply = self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/run", body)
+        if loop == DmeLoop.off:
+            keyer.dme = self._box_at(keyer, keyer.keyframes[target])
+        return self._with_run(keyer, reply)
+
+    def stop_keyer(self, keyer_id: str) -> Keyer:
+        """Stops a run: the box holds where it is (a keyer flying off stays on air)."""
+        keyer = self.get_keyer(keyer_id)
+        reply = self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/stop", {})
+        self._box_from_engine(keyer, reply)
+        if isinstance(reply, dict) and reply.get("on") is True and not keyer.enabled:
+            keyer.enabled = True
+            self._key_until.pop(keyer.id, None)
+            self._publish_tally()
+        return self._with_run(keyer, reply)
+
+    def dme_presets(self) -> list[DmePresetInfo]:
+        return list(DME_PRESETS)
+
+    def apply_preset(self, keyer_id: str, name: DmePreset) -> list[Keyer]:
+        """Writes a preset's box and keyframes (0 off screen, 1 on) into the keyer (split: the ME's
+        keyers 1 and 2, quad: 1 to 4), each with its own rate and ease. A keyer on air flies to
+        keyframe 1 from where its box is; one off air is there at once."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("presets only on upstream keyers")
+        boxes = _preset_boxes(name, self.settings.width, self.settings.height, keyer.dme.model_dump())
+        upstream = [k for k in self.keyers if k.panel_id == keyer.panel_id and k.stage == KeyerStage.upstream]
+        if len(boxes) > 1 and len(upstream) < len(boxes):
+            panel = self.get_panel(keyer.panel_id)
+            raise MixerError(f"{name.value} needs {len(boxes)} upstream keyers ({panel.label} has {len(upstream)})")
+        targets = upstream[: len(boxes)] if len(boxes) > 1 else [keyer]
+        for target, (on, off) in zip(targets, boxes):
+            frames = _frames(target.rate_ms, self.settings.fps)
+            on_box = Dme.model_validate(_merged(target.dme.model_dump(), {**on, "enabled": True}))
+            target.keyframes = [
+                DmeKeyframe.model_validate({**_box_state(_merged(on_box.model_dump(), off)), "frames": frames, "ease": "ease"}),
+                DmeKeyframe.model_validate({**_box_state(on_box.model_dump()), "frames": frames, "ease": "ease"}),
+            ]
+            self._push_keyframes(target)
+            if target.enabled:
+                # On air: the box flies there (enabled and the colour change at once).
+                patch = {"enabled": True, "border": {"color": on_box.border.color}}
+                target.dme = Dme.model_validate(_merged(target.dme.model_dump(), patch))
+                self._push_key_settings(target, box=patch)
+                self._engine_call("POST", f"/keyer/{self._keyer_number(target)}/run", {"to": 1, "reverse": False, "loop": "off"})
+                target.dme = on_box
+            else:
+                target.dme = on_box
+                self._box_from_engine(target, self._push_key_settings(target, box=on_box.model_dump()))
+        return targets
+
     def keyer_auto(self, keyer_id: str, duration_ms: int | None = None) -> Keyer:
-        """Fade the keyer on (or off when it is on) over duration_ms (default: its rate)."""
+        """Fade the keyer on (or off when it is on) over duration_ms (default: its rate); a keyer
+        that flies runs its box from keyframe 0 to the last (on) or back to 0 (off) instead."""
         keyer = self.get_keyer(keyer_id)
         keyer.enabled = not keyer.enabled
         frames = _frames(duration_ms or keyer.rate_ms, self.settings.fps)
+        span = frames
+        if self._flies(keyer):
+            keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            span = sum(item.frames for item in keyer.keyframes[1:])
+        if keyer.enabled:
+            self._key_until.pop(keyer.id, None)
+        else:
+            # The raw tally keeps it on air until the fade or the fly has ended.
+            self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
         self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
         self._publish_tally()
         return keyer
 
-    def _push_key_settings(self, keyer: Keyer, client: EngineClient | None = None) -> None:
-        body: dict[str, Any] = {"mode": keyer.mode.value, "clip": keyer.clip, "soft": keyer.soft, "gain": keyer.gain, "invert": keyer.invert}
+    def _push_key_settings(self, keyer: Keyer, client: EngineClient | None = None, box: dict[str, Any] | None = None) -> Any:
+        """Mode, source, clip, soft, gain, invert, fly; `box`: the box fields to change (the whole
+        box when the engine starts). Returns the engine's reply (the keyer), or None."""
+        body: dict[str, Any] = {
+            "mode": keyer.mode.value, "clip": keyer.clip, "soft": keyer.soft, "gain": keyer.gain, "invert": keyer.invert, "fly": keyer.fly,
+        }
         if keyer.mode in (KeyMode.luma, KeyMode.pip):
             body["source"] = self._engine_source(keyer.source_id)
-        if keyer.stage == KeyerStage.upstream:
-            body["dme"] = keyer.dme.model_dump()
-        self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
+        if box is not None and keyer.stage == KeyerStage.upstream:
+            body["dme"] = box
+        return self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
+
+    def _push_keyframes(self, keyer: Keyer, client: EngineClient | None = None) -> Any:
+        if keyer.stage != KeyerStage.upstream:
+            return None
+        body = {"keyframes": [item.model_dump(mode="json") for item in keyer.keyframes]}
+        return self._engine_call("PUT", f"/keyer/{self._keyer_number(keyer)}/keyframes", body, client=client)
 
     def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
         """IS-05 activation of a keyer's key receiver."""
@@ -1140,17 +1379,19 @@ class VisionMixer:
 
     # ── engine ───────────────────────────────────────────────────────────────
 
-    def _engine_call(self, method: str, path: str, body: dict[str, Any], client: EngineClient | None = None) -> None:
-        """A command to the engine. While the engine is not up (off-air, restarting) nothing is
-        sent: its state is pushed when it is ready. A refused command is logged."""
+    def _engine_call(self, method: str, path: str, body: dict[str, Any], client: EngineClient | None = None) -> Any:
+        """A command to the engine, and its reply. While the engine is not up (off-air,
+        restarting) nothing is sent (None): its state is pushed when it is ready. A refused
+        command is logged."""
         try:
             if client is not None:
-                client.request(method, path, body)
-            elif self.engine is not None and self.engine.ready:
-                self.engine.call(method, path, body)
+                return client.request(method, path, body)
+            if self.engine is not None and self.engine.ready:
+                return self.engine.call(method, path, body)
         except EngineError as exc:
             log.warning("%s", exc)
             self.error = str(exc)
+        return None
 
     def _format_token(self) -> str:
         return self.workspace.format_id.replace(".", "")
@@ -1234,9 +1475,12 @@ class VisionMixer:
                 elif item.kind == InputKind.clip_player:
                     self._push_player(item, client)
             for keyer in self.keyers:
+                # On before the settings: a new engine's keyer does not fly yet, so the box stays
+                # where it was (it would jump to a keyframe).
                 self._push_key(keyer, client)
-                self._push_key_settings(keyer, client)
+                self._push_keyframes(keyer, client)
                 self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": keyer.enabled}, client=client)
+                self._push_key_settings(keyer, client, box=keyer.dme.model_dump() if keyer.stage == KeyerStage.upstream else None)
             for panel in self.rendered_panels():
                 self._push_panel(panel, client)
             # A new engine holds no stinger.
@@ -1966,21 +2210,24 @@ class VisionMixer:
                 continue
             transition = self._mixes.get(panel.id)
             keyers = [keyer for keyer in self.keyers if keyer.panel_id == panel.id]
-            keyed = tuple(k.source_id for k in keyers if k.enabled and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
-            keys = tuple(self._key_tally(keyer) for keyer in keyers if keyer.mode == KeyMode.linear)
+            # A keyer is on air while it is on, fading off or flying off.
+            now = time.monotonic()
+            air = {k.id: k.enabled or now < self._key_until.get(k.id, 0.0) for k in keyers}
+            keyed = tuple(k.source_id for k in keyers if air[k.id] and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
+            keys = tuple(self._key_tally(keyer, air[keyer.id]) for keyer in keyers if keyer.mode == KeyMode.linear)
             mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
         return TallySnapshot(
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
         )
 
-    def _key_tally(self, keyer: Keyer) -> tuple[int, str, bool]:
+    def _key_tally(self, keyer: Keyer, on_air: bool) -> tuple[int, str, bool]:
         """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
         ME n) or 3000 + 100·n + k (DSK k), its receiver label, on air."""
         same = [k for k in self.keyers if k.panel_id == keyer.panel_id and k.stage == keyer.stage]
         base = 2000 if keyer.stage == KeyerStage.upstream else 3000
         index = base + 100 * self._panel_number(self.get_panel(keyer.panel_id)) + same.index(keyer) + 1
-        return index, keyer.receiver_label, keyer.enabled
+        return index, keyer.receiver_label, on_air
 
     # ── saved state and config export/import ─────────────────────────────────
 
@@ -1998,7 +2245,7 @@ class VisionMixer:
                 "workspace": self.workspace.model_dump(mode="json"),
                 "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
                 "panels": [panel.model_dump(mode="json") for panel in self.panels],
-                "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
+                "keyers": [keyer.model_dump(mode="json", exclude={"run"}) for keyer in self.keyers],
                 "stinger_slots": slots,
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
