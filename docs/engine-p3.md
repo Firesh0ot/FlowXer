@@ -1,6 +1,6 @@
 # FlowXer engine P3: transitions and keying
 
-Status: the design; M1–M3 are implemented in #89 (M3 as built: [§6](#m3-as-built)). P3 builds on P2 (the C++/CUDA engine is FlowXer's media path,
+Status: the design; M1–M4 are implemented in #89 (M3 as built: [§6](#m3-as-built); the measured budget and the soak: [M4 as built](#m4-as-built)). P3 builds on P2 (the C++/CUDA engine is FlowXer's media path,
 #86). The user's P3 decisions of 2026-10-11 are binding. The numbers come from prototype kernels
 and test encodes on the lab host (A16 GPU 0) on 2026-10-11 ([Appendix](#appendix-lab-measurements-2026-10-11)).
 
@@ -467,6 +467,8 @@ One receiver per keyer of each rendering ME: BCP-007-03 `urn:x-nmos:transport:mx
   - From the values, with every keyer routed to a flow of its own:
     1300 + 85 × renderMes × (keyersPerMe + dsksPerMe) + 350 × stingerPlayers.
   - With the defaults that is 2670 MB for 4 MEs and 1905 MB for 1 ME.
+  - Measured in M4 within 1 % (K = 1 and 8 key flows, 4 stinger players:
+    [M4 as built](#m4-as-built)).
 - **PCIe (host → GPU):** +415 MB/s per distinct routed key flow at 1080p50.
 - **NVDEC:** a stinger's two streams while it plays.
 
@@ -475,7 +477,9 @@ One receiver per keyer of each rendering ME: BCP-007-03 `urn:x-nmos:transport:mx
 - **Sources** stay at most 23 + Black. Key inputs are not sources: they have no slot and no PVW.
 - **Keyers:** at most 4 × (8 + 4) = 48 receivers.
 - **Distinct routed key flows** at 1080p50, next to 8 live inputs:
-  - at most 8 on a link like the lab's (PCIe Gen4 x4 or Gen3 x8, 6.3 GB/s);
+  - at most 8 on a link like the lab's (PCIe Gen4 x4 or Gen3 x8, 6.3 GB/s). Measured in M4: 8 is
+    the edge (the link busy about 20 ms per grain), so plan at most 6
+    ([M4 as built](#m4-as-built));
   - at most 16 on Gen3 x16 ([§10](#10-gpu-budget)).
   
   The engine reports the upload time per grain.
@@ -565,25 +569,112 @@ ME, plus the mosaic, at 1080p50 in yuv16.
 
 ### M4 as built
 
-- **Metrics** (`/metrics`; the full list is in the README):
-  - stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`,
-    `_stinger_cuts_total`, per player `_stinger_player_state{player,state}`,
-    `_stinger_frames_decoded_total`, `_stinger_frames_late_total`, `_stinger_decode_ms`;
-  - keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}`, `_keyer_key_running`;
-  - the upload ms of each input and key flow: `flowxer_engine_input_upload_ms{input,stat}`;
-  - `flowxer_transitions_total{type="wipe"}`.
-- **Worst case in the engine** (`fxp3-worst.py`, lab GPU 0, PCIe Gen4 x4 like an A4000 on Gen3 x8):
-  4 MEs with PGM and PVW, 8 live inputs, 2 clip players, the mosaic; 2 upstream keyers and 4 DSKs
-  per ME (24 linear keys, all on), 4 stinger players. A wipe and a stinger cannot run on one ME at
-  once, so it measures two cases: every ME holding a wipe at t = 0.5 (circle, soft edge, border)
-  under its 6 keys, and every ME running a 50-frame ProRes 4444 stinger again and again under its
-  6 keys; each with 1 key flow and with 8 distinct key flows. Results: after the run.
-- **2 h soak** (`fxp3-soak.py`, the P3 defaults with 2 stinger players): 4 MEs with PVW, 8 live
-  inputs, a looping clip and the bars; per ME Key 1 linear (browser source v210a), Key 2 luma of
-  the clip, DSK 1 linear: all on. Every 10 s on a rotating ME a mix, a wipe (the 23 codes, soft
-  and border varied, flip-flop) or a stinger (a PNG stinger with sound and a ProRes 4444 graphic,
-  loaded on demand); a T-bar move every minute; FTB on and off every 3 min; a clip import every
-  15 min; 5 WHEP viewers. Results: after the run.
+**Metrics** (`/metrics`; the full list is in the README):
+- stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`,
+  `_stinger_cuts_total` (the engine waited 50 grains), per player `_stinger_player_state{player,state}`,
+  `_stinger_frames_decoded_total`, `_stinger_frames_late_total`, `_stinger_decode_ms`; and
+  `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`: takes the control plane made a cut);
+- keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}`, `_keyer_key_running`;
+- the upload ms of each input and key flow: `flowxer_engine_input_upload_ms{input,stat}`;
+- `flowxer_transitions_total{type="wipe"}`.
+
+**Worst case in the engine** (`fxp3-worst.py`, image from this branch, lab A16 GPU 0 on PCIe Gen4
+x4, about an A4000 on Gen3 x8; 2026-10-12):
+- Set-up: 4 MEs with PGM and PVW, 8 live inputs, 2 clip players, the mosaic (1 NVENC session);
+  2 upstream keyers + 4 DSKs per ME (24 linear keys, all on); 4 stinger players.
+- A wipe and a stinger cannot run on one ME at once, so there are two cases:
+  - every ME holds a wipe at t = 0.5 (circle, soft edge 10 %, border 2 %) under its 6 keys;
+  - every ME plays a 50-frame ProRes 4444 stinger again and again under its 6 keys (327 stingers in
+    2 min: a stinger on 68 % of the ME grains).
+- Each case with 1 key flow (all 24 keyers on one flow) and with 8 distinct key flows (3 keyers
+  each). 120 s per phase; ms are the average / maximum of the 5 s windows.
+
+| Phase | Render | Download | Render + download | Per ME (avg) | Upload busy per grain: 8 inputs + key flows | Skipped / late | GPU memory (process) | NVDEC % avg / max |
+|---|---|---|---|---|---|---|---|---|
+| Base (no key, stingers idle) | 3.99 / 4.78 | 6.84 / 7.89 | 10.83 / 12.57 | 0.26–0.29 | 7.3 + 0 | 0 / 0 | 1475 MiB | 4.5 / 5 |
+| Wipe, 1 key flow | 5.52 / 6.24 | 6.89 / 7.88 | **12.41 / 14.01** | 0.67–0.79 | 7.3 + 1.3 | 0 / 0 | 1571 MiB | 4.3 / 5 |
+| Stingers, 1 key flow | 7.03 / 9.83 | 7.06 / 8.02 | **14.09 / 17.57** | 0.87–1.09 | 7.5 + 1.4 | 0 / 0 | 2677 MiB | 18 / 24 |
+| Wipe, 8 key flows | 6.01 / 10.65 | 7.75 / 8.30 | 13.75 / 18.74 | 0.76–0.89 | 7.6 + 12.3 | 0 / 0 | 2115 MiB | 5 / 5 |
+| Stingers, 8 key flows | 7.88 / 19.28 | 7.94 / 8.79 | 15.82 / 28.03 | 1.17–1.27 | 8.0 + 12.9 | **0 / 2**, lag 5 once | 3221 MiB | 20 / 27 |
+
+Against the estimate of this section:
+- **Wipe + 6 layers on 4 MEs:** render 5.52 ms (estimate ≈ 5.5 fused), render + download 12.41 ms,
+  max 14.0 (estimate ≈ 12.4, max ≈ 14). As estimated.
+- **Stingers on all 4 MEs at once:** render 7.03 ms, max 9.8; render + download 14.1 ms, max 17.6.
+  That is 1.5 ms more than the wipe, against +0.26 ms estimated. The stinger layer itself costs
+  about 0.03 ms per ME (M3); the rest comes with 8 HEVC streams decoding at once (NVDEC 18–24 %):
+  the per-ME compose and the pack get slower (pack 1.38 ms against 0.70). 0 skipped, 0 late; the
+  maximum is over the 15 ms target on the A16.
+- **Upload:** 1.34 ms per key flow per grain with one flow (estimate 1.32). With 8 distinct flows
+  the copies share the link and each takes 1.4–1.8 ms: 12.3–12.9 ms for the keys plus 7.6–8.0 ms
+  for the inputs, so the link is busy for about **20 ms of every 20 ms grain** (estimate 17.6).
+  - With the wipes it still held (0 late).
+  - With the 4 stingers on top, the render waited for uploads (unpack max 14.6 ms): 2 late grains
+    in 2 min and a lag of 5 grains once.
+  - **8 distinct key flows next to 8 inputs is the edge of a Gen4 x4 / Gen3 x8 link, not a safe
+    operating point.**
+- **GPU memory:**
+  - a key flow 80 MiB (engine count 79 MB; estimate 85 MB), the first one 96 MiB;
+  - a stinger player 347 MiB with a stinger loaded (pool 71 + decoders 276, as in M3);
+  - the base without stinger pools: 1191 MiB;
+  - `1300 + 85 × K + 350 × P` MB gives 2785 MB for K = 1, P = 4 (measured 2807 MB) and 3380 MB for
+    K = 8, P = 4 (measured 3378 MB): within 1 %.
+- **A4000** (kernels memory-bound, 2.24 × the A16 GPU's bandwidth; the same link class as the lab
+  on Gen3 x8):
+  - render ≈ 2.5 ms (wipe), 3.1 ms (stingers; max ≈ 4.4), 3.5 ms (stingers, 8 flows; max ≈ 8.6);
+  - download 6.9–7.9 ms on Gen3 x8 (3.5–4 ms on Gen3 x16);
+  - render + download ≈ 9.4–10.2 ms on average, max ≈ 12.4 ms with 1 key flow: inside the 15 ms
+    target, which leaves 5 ms for the node's other GPU functions;
+  - the upload does not get faster with the GPU: on Gen3 x8 the 8-flow case stays at the edge.
+    Plan **at most 6 distinct key flows** at 1080p50 next to 8 inputs on Gen3 x8 (about
+    7.5 + 6 × 1.5 = 16.5 ms of link time per grain); keyers that share a flow count once. On Gen3
+    x16 the estimate of 16 stays (not measured).
+
+**2 h soak** (`fxp3-soak.py`, image from this branch, A16 GPU 0, `docker --cpus 6`, L = 4;
+2026-10-12, 08:24 to 10:27):
+- The P3 defaults with 2 stinger players; 4 MEs with PVW, 8 live inputs, clip-1 looping a clip,
+  clip-2 the bars.
+- Per ME: Key 1 linear (mxl-browser-source v210a), Key 2 luma of clip-1, DSK 1 linear, all on
+  (12 keyers on one key flow).
+- Every 10 s on a rotating ME: a new Preview and a mix, a wipe (the 23 codes; soft, border and
+  flip-flop varied) or a stinger. The slot alternates a 20-frame PNG stinger with sound and the
+  50-frame ProRes 4444 graphic, so each stinger loads on demand.
+- Every minute a T-bar move; every 3 min FTB on and off; every 15 min the 10 s clip imported again;
+  5 WHEP viewers. One sample a minute, 121 samples.
+
+| | Result |
+|---|---|
+| Operator | 719 transitions (240 mixes, 240 wipes, 239 stingers), 120 T-bar moves, 39 FTB on/off, 0 API errors |
+| Output, every ME | 0 skipped and 0 write failures during the run (2 skipped and 6 late at start-up, while the inputs and keys were routed) |
+| Late grains (committed after their grain) | 3 in 2 h, one each at about 08:54, 09:46 and 10:10 |
+| Output lag | 4.0 grains (L) in every sample; commit 11.1 ms into the window on average |
+| GPU render / render + download | 3.99 ms (max 4.96) / 10.81 ms (max 12.74); per ME 0.40–0.52 ms |
+| Upload (8 inputs) | 7.35 ms per grain |
+| Container CPU | 0.82 cores average, max 1.02; 0 throttled periods |
+| GPU memory (`nvidia-smi`, GPU 0) | 1993 MiB from minute 15 to the end (1714 MiB at minute 1, before the second stinger player had loaded) |
+| NVENC / NVDEC | 1 session (the mosaic), at most 4 %; NVDEC 4.6 % average, at most 10 % |
+| Mosaic and viewers | 25.00 fps, 0 dropped during the run; 5 readers throughout, each decoding 25.0 fps |
+| Stingers | 239 played, 0 cuts; 1080 grains waited for a first frame (4.5 per stinger: each was loaded on demand); stinger players 0 late frames |
+| Keys | 12 keyers on throughout; the key flow running, 0 late, 0 missing |
+| Clip-1 | 361 172 frames decoded, 3.1 ms each, 0 late |
+| Imports | 8 of 8 ready, 5.1–5.6 s each |
+| Inputs | 0 missing; replay PGM/PVW 901 and 840 late grains of their own (as in P2) |
+
+- **The 3 late grains:** a late grain is still written, only after its own 20 ms window. Each was
+  a single grain (the minute's commit maximum stayed at 12.6 ms, the lag at 4). One falls in the
+  minute of a clip import; the host's journal shows nothing at the others. The decklink test
+  (09:11–09:13), the P4 benchmark on GPU 3 (09:05–09:17) and a lab VPN drop (about 09:05) left no
+  mark: no counter changed from 08:55 to 09:46. P2's soak had 1 such grain in 2 h.
+- **The 2 skipped grains** are from the start, before the first sample (08:24:53), while the soak
+  routed the inputs and keys; the counter did not change during the 2 h.
+- A first run (25 min, image `fxp3:m3d`) was clean too (150 transitions, 0 skipped, 0 late); a
+  test-script error ended it.
+- **Back-to-back Autos with stingers:** in the worst case the test sent the next Auto as soon as
+  the engine reported an ME's stinger done. The control plane counted 365 cuts next to 734
+  stingers: it frees a stinger player 0.1 s after its stinger's expected end, so an Auto sent
+  before that found every player busy and became a cut (now counted as
+  `flowxer_stinger_fallbacks_total{reason="busy"}`). An operator who presses Auto again in that
+  moment, with no other player free, gets a cut.
 
 ## 11. Milestones
 

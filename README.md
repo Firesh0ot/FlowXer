@@ -242,7 +242,7 @@ The engine reads the live inputs from MXL (one DMA upload per grain), plays the 
 
 FlowXer writes the engine's configuration (`FLOWXER_ENGINE_*`) itself, starts it with the GPU of the container, and after every start pushes the routes, clip players, keyers and buses. An engine that exits is started again after 1, 2, 5, then every 10 s; `GET /api/v1/health` (`engine`) and `GET /api/v1/engine` show its state. A crashed engine's MediaMTX is reaped by tini (PID 1).
 
-GPU memory: about 0.6 GiB for 1 ME up to 0.8 GiB for 4 MEs with 8 inputs and the mosaic, about 50 MB per clip player and 170 MB per loaded clip, about 350 MB per stinger player with a stinger loaded (lab: 867 MiB with 2 MEs, 4 inputs, a clip and a still, 1 key input and the mosaic).
+GPU memory: about 0.6 GiB for 1 ME up to 0.8 GiB for 4 MEs with 8 inputs and the mosaic, about 50 MB per clip player and 170 MB per loaded clip, about 350 MB per stinger player with a stinger loaded, about 80 MB per distinct routed key flow (lab: 867 MiB with 2 MEs, 4 inputs, a clip and a still, 1 key input and the mosaic). Key flows also take PCIe: next to 8 inputs at 1080p50, plan at most 6 distinct key flows on a Gen4 x4 or Gen3 x8 link (measured: `docs/engine-p3.md`, M4 as built).
 
 ### Saved state, export and import
 

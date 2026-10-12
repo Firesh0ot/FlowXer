@@ -695,3 +695,18 @@ again every 15 min. One sample a minute, 121 samples:
 
 NVML's GPU utilization was 86 % on average; it counts the DMA copy time (P1a: 78 % with 4 MEs and
 no clip players).
+
+## P3 M4: worst case and soak (lab, 2026-10-12)
+
+The tables are in `docs/engine-p3.md` ("M4 as built"). In short, on A16 GPU 0 (PCIe Gen4 x4):
+
+- **Worst case** (4 MEs, 8 inputs, 24 linear keys on, 4 stinger players, the mosaic): a held wipe
+  on every ME renders in 5.52 ms (render + download 12.41 ms, max 14.0), as estimated. Stingers on
+  all 4 MEs at once: 7.03 ms (14.09 ms, max 17.6), 0 skipped, 0 late.
+- **Upload:** 1.34 ms per key flow per grain. 8 distinct key flows next to 8 inputs keep the link
+  busy about 20 ms per grain: with stingers on top, 2 late grains in 2 min. Plan at most 6 distinct
+  key flows on Gen4 x4 / Gen3 x8.
+- **GPU memory:** 80 MiB per key flow, 347 MiB per stinger player with a stinger loaded.
+- **2 h soak** (keys, mixes, wipes, stingers, T-bar, FTB, imports, 5 viewers): 0 skipped, 3 single
+  late grains, lag 4, render + download 10.81 ms (max 12.74), GPU memory flat at 1993 MiB, 0 API
+  errors.
