@@ -514,3 +514,153 @@ TEST(audio_delay_lines_and_channel_maps)
     auto const g1 = delayedSamples(Rate{60000, 1001}, 100'001, 4, 0);
     CHECK(g1.end - g1.first == 800u || g1.end - g1.first == 801u);
 }
+
+namespace
+{
+// An 8th-order Butterworth high pass (4 RBJ biquads with the Butterworth Qs), in double.
+std::vector<double> highPass(std::vector<float> const& x, double fc = 5000.0)
+{
+    std::vector<double> y(x.begin(), x.end());
+    double const w0 = 2.0 * 3.14159265358979323846 * fc / 48000.0;
+    for (int k = 0; k < 4; ++k)
+    {
+        double const q = 1.0 / (2.0 * std::cos((2.0 * k + 1.0) * 3.14159265358979323846 / 16.0));
+        double const alpha = std::sin(w0) / (2.0 * q);
+        double const cw = std::cos(w0);
+        double const a0 = 1.0 + alpha;
+        double const b0 = (1.0 + cw) / 2.0 / a0;
+        double const b1 = -(1.0 + cw) / a0;
+        double const b2 = b0;
+        double const a1 = -2.0 * cw / a0;
+        double const a2 = (1.0 - alpha) / a0;
+        double x1 = 0.0;
+        double x2 = 0.0;
+        double y1 = 0.0;
+        double y2 = 0.0;
+        for (auto& v : y)
+        {
+            double const o = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1;
+            x1 = v;
+            y2 = y1;
+            y1 = o;
+            v = o;
+        }
+    }
+    return y;
+}
+
+double worstDb(std::vector<double> const& y, std::size_t from)
+{
+    double worst = 0.0;
+    for (std::size_t i = from; i < y.size(); ++i)
+    {
+        worst = std::max(worst, std::abs(y[i]));
+    }
+    return worst > 0.0 ? 20.0 * std::log10(worst) : -999.0;
+}
+} // namespace
+
+TEST(audio_changes_are_click_free)
+{
+    // A 997 Hz tone at −6 dBFS on in1 (in2 silent) through fader moves, a mute, AFV toggles, a
+    // delay-free Cut to the silent input and back, and master moves, grain by grain: the residual
+    // above 5 kHz stays below −80 dBFS. The same tone switched hard (P4's Cut) is a click.
+    std::size_t const n = 960;
+    AudioMix mix(1, 2, 0, 1);
+    std::vector<float> tone(n);
+    std::vector<float> silent(n, 0.f);
+    std::vector<float> pgm;
+    std::vector<std::vector<float>> out;
+    std::uint64_t at = 1'000'000;
+    auto const run = [&](Source program, int grains) {
+        for (int g = 0; g < grains; ++g, at += n)
+        {
+            for (std::size_t s = 0; s < n; ++s)
+            {
+                tone[s] = static_cast<float>(0.5 * std::sin(2.0 * 3.14159265358979323846 * 997.0 * static_cast<double>(at + s) / 48000.0));
+            }
+            mix.grain({still(1, program)}, MixSources{{tone.data(), silent.data()}, {}, {}}, n, out);
+            pgm.insert(pgm.end(), out[0].begin(), out[0].end());
+        }
+    };
+    StripRef const in1{StripRef::Kind::Input, 1};
+    StripRef const in2{StripRef::Kind::Input, 2};
+    run(in(1), 5);
+    for (float db : {-1.f, -2.f, -4.f, -8.f, -14.f, -20.f, -12.f, -4.f, 0.f})
+    {
+        mix.setStrip(1, in1, StripSettings{db, false, true});
+        run(in(1), 2);
+    }
+    mix.setStrip(1, in1, StripSettings{0.f, true, true});
+    run(in(1), 5);
+    mix.setStrip(1, in1, StripSettings{0.f, false, true});
+    run(in(1), 5);
+    mix.setStrip(1, in1, StripSettings{0.f, false, false});
+    run(in(2), 5);
+    mix.setStrip(1, in1, StripSettings{0.f, false, true});
+    run(in(2), 5);
+    run(in(1), 5);
+    run(in(2), 5);
+    run(in(1), 5);
+    for (float db : {-3.f, -10.f, 0.f})
+    {
+        mix.setMaster(1, db);
+        run(in(1), 3);
+    }
+    double const residual = worstDb(highPass(pgm), 2 * n);
+    CHECK(residual < -80.0);
+    // P4's hard Cut of the same tone to silence at a grain boundary.
+    std::vector<float> hard(pgm.begin(), pgm.begin() + static_cast<long>(4 * n));
+    hard.insert(hard.end(), 4 * n, 0.f);
+    CHECK(worstDb(highPass(hard), 2 * n) > -40.0);
+}
+
+TEST(audio_delay_is_exact_to_the_sample)
+{
+    // A live input whose sample n is (n mod 2^20) / 2^20 (channel 2 negative), filled into its delay
+    // line grain by grain as fx-audio does and read L grains + d later: every PGM sample is the
+    // input's sample n − d of grain i − L exactly, at 50p, 59.94p and 25p, through delay changes.
+    for (Rate rate : {Rate{50, 1}, Rate{60000, 1001}, Rate{25, 1}})
+    {
+        DelayLine line;
+        line.reset(2, 48000 + 7 * 1921);
+        std::vector<float> chunk;
+        std::vector<float> got;
+        int exact = 0;
+        int wrong = 0;
+        for (std::uint64_t i = 400'000; i < 400'300; ++i)
+        {
+            auto const span = delayedSamples(rate, i, 4, 0);
+            line.begin(line.started() ? line.end() : span.first);
+            for (std::size_t c = 0; c < 2; ++c)
+            {
+                chunk.resize(span.end - span.first);
+                for (std::size_t s = 0; s < chunk.size(); ++s)
+                {
+                    float const v = static_cast<float>((span.first + s) % 1048576) / 1048576.f;
+                    chunk[s] = c == 0 ? v : -v;
+                }
+                line.put(c, span.first, chunk.data(), chunk.size());
+            }
+            line.commit(span.end);
+            std::uint64_t const d = i < 400'100 ? 0 : i < 400'200 ? 48 : 24'000;
+            auto const window = delayedSamples(rate, i, 4, d);
+            std::size_t const n = window.end - window.first;
+            got.resize(2 * n);
+            line.readMapped({1, 2}, window.first, n, got.data());
+            if (!line.holds(window.first, window.end))
+            {
+                continue;
+            }
+            for (std::size_t s = 0; s < n; ++s)
+            {
+                float const v = static_cast<float>((window.first + s) % 1048576) / 1048576.f;
+                bool const ok = got[s] == v && got[n + s] == -v;
+                exact += ok ? 1 : 0;
+                wrong += ok ? 0 : 1;
+            }
+        }
+        CHECK(exact > 100'000 && wrong == 0);
+    }
+}
