@@ -64,6 +64,22 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .key-label.nokey { color: #e0b025; }
 .key-row button.on.nokey { background: #e0b025; border-color: #e0b025; color: #041018; }
 .keys-widget button:hover { filter: brightness(1.15); }
+.dme-widget {
+  position: relative; min-width: 320px; min-height: 120px; height: 100%;
+  display: grid; grid-template-rows: auto 1fr auto; gap: 6px; padding: 8px; background: var(--panel);
+}
+.dme-head { display: grid; grid-template-columns: minmax(0, 1fr) 64px 64px; gap: 4px; min-height: 30px; }
+.dme-run { display: grid; grid-template-columns: 1fr 64px 1fr; gap: 4px; min-height: 30px; }
+.dme-presets { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }
+.dme-widget button {
+  font: inherit; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text); cursor: pointer;
+  background: var(--button); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; min-width: 0;
+}
+.dme-presets button { font-size: 10px; padding: 4px 0; }
+.dme-widget .dme-head button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+.dme-widget button:hover { filter: brightness(1.15); }
+.dme-flag { margin-left: 6px; padding: 0 4px; font-size: 10px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); }
+.dme-flag.running { color: #fff; background: #2a4a6a; border-color: #4a7ab0; }
 .empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
 .widget-error {
   position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;

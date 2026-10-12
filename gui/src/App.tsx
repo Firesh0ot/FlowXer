@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
 import { LibraryModal } from "./components/LibraryModal";
+import { BoxEditor } from "./components/BoxEditor";
 import { Monitor } from "./components/Monitor";
 import { KeyerControl } from "./components/KeyerControl";
 import { previewSession } from "./preview";
@@ -74,7 +75,12 @@ export default function App() {
   }
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
-  const fps = framesPerSecond(snapshot.formats.find((item) => item.id === snapshot.workspace.format_id)?.frame_rate);
+  const format = snapshot.formats.find((item) => item.id === snapshot.workspace.format_id);
+  const fps = framesPerSecond(format?.frame_rate);
+  // The active ME's boxes (upstream keyers with a box), for the box editor over its Program.
+  const boxes = snapshot.keyers.filter(
+    (keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream" && (keyer.mode === "pip" || keyer.dme.enabled),
+  );
   // A luma key may key any source the ME may take: the inputs and the Programs of higher MEs.
   const keySources = [
     ...snapshot.inputs.map((item) => ({ id: item.id, label: item.label })),
@@ -187,7 +193,17 @@ export default function App() {
           </div>
           <div className="bus-column">
             <h2>Program</h2>
-            <Monitor tileId={`panel:${panel.id}:pgm`} label={panel.program_input_id ?? "NO SRC"} tally="pgm" />
+            <Monitor tileId={`panel:${panel.id}:pgm`} label={panel.program_input_id ?? "NO SRC"} tally="pgm">
+              {boxes.length > 0 && format ? (
+                <BoxEditor
+                  keyers={boxes}
+                  width={format.width}
+                  height={format.height}
+                  onDone={() => void refresh()}
+                  onError={setError}
+                />
+              ) : null}
+            </Monitor>
           </div>
         </div>
         <div className="aux-row">

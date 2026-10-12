@@ -1,5 +1,139 @@
 import { useEffect, useState } from "react";
-import { api, type Keyer } from "../api";
+import { api, type Dme, type DmeKeyframe, type DmeLoop, type Ease, type Keyer } from "../api";
+import { PRESET_BUTTONS } from "../dme";
+
+const EASES: Ease[] = ["linear", "ease", "ease-in", "ease-out", "hold"];
+
+/** A box's animated fields: what a keyframe stores. */
+function boxState(dme: Dme): Omit<DmeKeyframe, "frames" | "ease"> {
+  return {
+    x: dme.x,
+    y: dme.y,
+    size: dme.size,
+    soft: dme.soft,
+    crop: { ...dme.crop },
+    border: { width: dme.border.width, soft: dme.border.soft, opacity: dme.border.opacity },
+    shadow: { ...dme.shadow },
+  };
+}
+
+/** A keyer's keyframes (up to 8): STORE adds the box as it is; per keyframe its frames (the time
+ * from the one before) and ease, GO (jump there), SET (the box as it is), move up and down,
+ * delete. FLY: the keyer's Auto flies the box. RUN ◀ ▶ (with LOOP), STOP; the presets. */
+function DmeKeyframes({ keyer, fps, onCommand }: { keyer: Keyer; fps: number; onCommand: (fn: () => Promise<unknown>) => void }) {
+  const [loop, setLoop] = useState<DmeLoop>("off");
+  const keyframes = keyer.keyframes;
+  const save = (list: DmeKeyframe[]) => onCommand(() => api.keyframes(keyer.id, list));
+  const change = (j: number, patch: Partial<DmeKeyframe>) => save(keyframes.map((k, i) => (i === j ? { ...k, ...patch } : k)));
+  const swap = (j: number) => {
+    const list = [...keyframes];
+    [list[j], list[j + 1]] = [list[j + 1], list[j]];
+    save(list);
+  };
+  const rate = Math.max(1, Math.round((keyer.rate_ms * fps) / 1000));
+  const run = keyer.run;
+  const status = run?.running
+    ? `${run.loop === "off" ? "RUN" : run.loop.toUpperCase()} → ${run.keyframe ?? ""}`
+    : run?.keyframe != null
+      ? `AT ${run.keyframe}`
+      : "";
+  return (
+    <div className="dme-keyframes">
+      <label className="check" title="Auto flies the box from keyframe 0 (off) to the last (on) instead of fading">
+        <input type="checkbox" checked={keyer.fly} onChange={(e) => onCommand(() => api.patchKeyer(keyer.id, { fly: e.target.checked }))} />
+        FLY with Auto
+      </label>
+      {keyframes.length > 0 ? (
+        <table className="kf-list">
+          <tbody>
+            {keyframes.map((k, j) => (
+              <tr key={j} data-keyframe={j}>
+                <td className="kf-index">{j}</td>
+                <td>
+                  <NumberField
+                    label=""
+                    value={k.frames}
+                    min={1}
+                    max={1000}
+                    onCommit={(v) => change(j, { frames: Math.round(v) })}
+                  />
+                </td>
+                <td>
+                  <select value={k.ease} title="Ease from the keyframe before" onChange={(e) => change(j, { ease: e.target.value as Ease })}>
+                    {EASES.map((ease) => (
+                      <option key={ease} value={ease}>
+                        {ease}
+                      </option>
+                    ))}
+                  </select>
+                </td>
+                <td className="kf-actions">
+                  <button title="Jump the box to this keyframe" onClick={() => onCommand(() => api.keyerRun(keyer.id, { to: j, frames: 0 }))}>
+                    GO
+                  </button>
+                  <button title="Store the box as it is in this keyframe" onClick={() => change(j, boxState(keyer.dme))}>
+                    SET
+                  </button>
+                  <button title="Move up" disabled={j === 0} onClick={() => swap(j - 1)}>
+                    ▲
+                  </button>
+                  <button title="Move down" disabled={j === keyframes.length - 1} onClick={() => swap(j)}>
+                    ▼
+                  </button>
+                  <button title="Delete" onClick={() => save(keyframes.filter((_, i) => i !== j))}>
+                    ✕
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : null}
+      <div className="dme-row">
+        <button
+          className="kf-store"
+          title="Add the box as it is as the next keyframe (its time: the keyer's rate)"
+          disabled={keyframes.length >= 8}
+          onClick={() => save([...keyframes, { ...boxState(keyer.dme), frames: rate, ease: "linear" }])}
+        >
+          STORE
+        </button>
+        <button
+          className="kf-run back"
+          title="Run back to keyframe 0"
+          disabled={keyframes.length === 0}
+          onClick={() => onCommand(() => api.keyerRun(keyer.id, loop === "off" ? { reverse: true } : { reverse: true, loop }))}
+        >
+          ◀ RUN
+        </button>
+        <button className="kf-stop" title="Stop the run: the box holds" onClick={() => onCommand(() => api.keyerStop(keyer.id))}>
+          STOP
+        </button>
+        <button
+          className="kf-run"
+          title="Run to the last keyframe"
+          disabled={keyframes.length === 0}
+          onClick={() => onCommand(() => api.keyerRun(keyer.id, loop === "off" ? {} : { loop }))}
+        >
+          RUN ▶
+        </button>
+        <select className="kf-loop" value={loop} title="Loop of RUN" onChange={(e) => setLoop(e.target.value as DmeLoop)}>
+          <option value="off">once</option>
+          <option value="wrap">wrap</option>
+          <option value="pingpong">pingpong</option>
+        </select>
+        {status ? <span className="kf-status">{status}</span> : null}
+      </div>
+      <div className="dme-row presets">
+        {PRESET_BUTTONS.map((preset) => (
+          <button key={preset.name} title={preset.title} onClick={() => onCommand(() => api.keyerPreset(keyer.id, preset.name))}>
+            {preset.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 /** A number that is sent when the field is left or Enter is pressed (`scale` 100: a percentage of
  * a 0..1 value). */
@@ -50,10 +184,11 @@ function NumberField({
   );
 }
 
-/** A keyer (upstream or DSK): cut on or off, Auto (a fade over its rate), the rate in frames, and
- * behind ⚙ its key: linear (its key input, NO KEY without a signal), luma (source, clip, soft,
- * gain, invert) or, upstream, pip (a source in a box); an upstream keyer's box (position, size,
- * crop, border, shadow; changes go to Program at once while it is on air). */
+/** A keyer (upstream or DSK): cut on or off, Auto (a fade over its rate, or a fly), the rate in
+ * frames, and behind ⚙ its key: linear (its key input, NO KEY without a signal), luma (source,
+ * clip, soft, gain, invert) or, upstream, pip (a source in a box); an upstream keyer's box
+ * (position, size, crop, border, shadow; changes go to Program at once while it is on air), its
+ * keyframes, runs and presets. */
 export function KeyerControl({
   keyer,
   keyState,
@@ -211,6 +346,7 @@ export function KeyerControl({
                   <div className="dme-row">
                     <NumberField label="edge soft px" value={dme.soft} min={0} max={64} step={0.5} onCommit={(v) => box({ soft: v })} />
                   </div>
+                  <DmeKeyframes keyer={keyer} fps={fps} onCommand={onCommand} />
                 </>
               ) : null}
             </div>

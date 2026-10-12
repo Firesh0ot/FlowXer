@@ -1,19 +1,21 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { tileCrop, usePreview } from "../preview";
 
 /** One picture of the preview mosaic (a source, or an ME's Program or Preview), cropped from the
- * page's one stream. */
+ * page's one stream; `children` are drawn over it (the box editor). */
 export function Monitor({
   tileId,
   label,
   tally,
   placeholder,
+  children,
 }: {
   tileId: string;
   label: string;
   tally?: "pgm" | "pvw" | "off";
   /** Shown instead of a picture (e.g. Black); else the reason the mosaic has none. */
   placeholder?: string;
+  children?: ReactNode;
 }) {
   const preview = usePreview();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -33,6 +35,7 @@ export function Monitor({
       ) : (
         <div className="monitor-empty">{placeholder ?? preview.map?.reason ?? "No picture"}</div>
       )}
+      {children}
       {label ? <div className="monitor-label">{label}</div> : null}
     </div>
   );

@@ -257,6 +257,38 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .dme-row .num input[type="color"] { width: 40px; height: 22px; padding: 0; }
 .key-settings:has(.dme-fields) { min-width: 300px; }
 .key-settings .on-air { margin-left: 6px; color: #fff; background: #c62828; border-radius: 3px; padding: 0 4px; font-size: 10px; }
+/* The keyframe list, runs and presets of a keyer's box. */
+.dme-keyframes { display: grid; gap: 4px; border-top: 1px solid var(--line); padding-top: 6px; }
+.kf-list { border-collapse: collapse; font-size: 11px; }
+.kf-list td { padding: 1px 2px; }
+.kf-list .kf-index { color: var(--text); width: 14px; }
+.kf-list .num input { width: 52px; }
+.kf-list select, .kf-loop { background: #0b1220; color: var(--text); border: 1px solid var(--line); padding: 1px; }
+.dme-keyframes button { padding: 2px 6px; font-size: 10px; border: 1px solid var(--line); background: #151b26; border-radius: 3px; }
+.dme-keyframes button:disabled { opacity: 0.4; }
+.kf-status { align-self: center; color: var(--text); font-size: 10px; }
+.dme-row.presets button { min-width: 34px; }
+/* The box editor over an ME's Program: the raster's frame, each box's outline and corner handles. */
+.box-frame {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none;
+}
+.dme-box {
+  position: absolute; box-sizing: border-box; border: 1px dashed #ffd54a; pointer-events: auto; cursor: move; touch-action: none;
+}
+.dme-box.on-air { border: 1px solid #ff5252; }
+.dme-box.dragging { background: #ffffff14; }
+.dme-box-label {
+  position: absolute; left: 0; top: 0; transform: translateY(-100%); white-space: nowrap; font-size: 10px;
+  background: #000a; color: #ffd54a; padding: 0 4px; pointer-events: none;
+}
+.dme-box.on-air .dme-box-label { color: #fff; }
+.dme-box .on-air-mark { margin-left: 4px; color: #fff; background: #c62828; border-radius: 2px; padding: 0 3px; }
+.dme-handle { position: absolute; width: 9px; height: 9px; background: #ffd54a; border: 1px solid #000; }
+.dme-box.on-air .dme-handle { background: #ff5252; }
+.dme-handle.tl { left: -5px; top: -5px; cursor: nwse-resize; }
+.dme-handle.tr { right: -5px; top: -5px; cursor: nesw-resize; }
+.dme-handle.bl { left: -5px; bottom: -5px; cursor: nesw-resize; }
+.dme-handle.br { right: -5px; bottom: -5px; cursor: nwse-resize; }
 .dsk-control input {
   width: 44px; background: #0b1220; color: var(--text); border: 1px solid var(--line); font: inherit; padding: 1px 3px;
 }
