@@ -2399,12 +2399,12 @@ struct Engine::Impl
             r.line.readMapped(channelMap(map, ch, r.line.channels()), window.first, n, r.sound.data());
             if ((delay != r.delay || map != r.map) && r.line.started())
             {
-                // From the old reading to the new one, linearly over this grain.
+                // From the old reading to the new one over this grain (S-shaped, no click).
                 r.before.resize(ch * n);
                 r.line.readMapped(channelMap(r.map, ch, r.line.channels()), delayedSamples(cfg.rate, index, cfg.latency, r.delay).first, n, r.before.data());
                 for (std::size_t c = 0; c < ch; ++c)
                 {
-                    crossfadeLinear(r.before.data() + c * n, r.sound.data() + c * n, n, r.sound.data() + c * n);
+                    crossfadeSmooth(r.before.data() + c * n, r.sound.data() + c * n, n, r.sound.data() + c * n);
                 }
             }
             r.delay = delay;

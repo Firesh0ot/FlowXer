@@ -159,7 +159,7 @@ Every change ramps; nothing jumps.
 
 | Change | How |
 |---|---|
-| Fader, master, mute, AFV on/off | Linear in amplitude, from the previous grain's gain to the new one, over one grain (20 ms at 50p, 16.7 ms at 60p, 40 ms at 25p). A fader moved in the GUI sends a value about every 50 ms: a chain of ramps without steps. |
+| Fader, master, mute, AFV on/off | Linear in amplitude (as built: S-shaped, see [M1 notes](#implementation-notes-m1)), from the previous grain's gain to the new one, over one grain (20 ms at 50p, 16.7 ms at 60p, 40 ms at 25p). A fader moved in the GUI sends a value about every 50 ms: a chain of ramps without steps. |
 | Mix, wipe, T-bar, stinger | As today: the equal-power curve, per sample. |
 | Cut | Today a hard switch at the grain boundary. Proposed: an equal-power crossfade over the cut grain, A out and B in; the picture cuts at the start of that grain ([open question 7](#14-open-questions-for-the-user)). |
 | Delay or channel map | A linear crossfade from the old reading to the new one over one grain: no jump and no pitch change. |
@@ -285,6 +285,13 @@ As built in #97 (`core/audiomix`, `engine/engine.cpp` fx-audio, `engine/api.cpp`
   Black, including negative zeros): a transition sums A·cos then B·sin (Black as silence), then the
   other strips in slot order, then the stinger's sound, then the master, then FTB with P4's ramp.
   A gain is level (fader, mute) × AFV weight, computed per sample only while something moves.
+- **Ramps are S-shaped, not linear** (a deviation from §3): a level change (fader, mute, AFV,
+  master, the stinger strip) is g0 + (g1 − g0) · w(s) with w(s) = 0.5 − 0.5 · cos(π (s + 1) / n), a
+  Cut's equal-power curve runs over u = w(s), and a delay or map change crossfades with w(s). The
+  corners of a linear ramp are audible: a full-range change (a mute, a Cut) of a 997 Hz tone at
+  −6 dBFS leaves −77 dBFS (linear ramp) and −73 dBFS (equal power over a linear u) above 5 kHz,
+  more than the test plan's −80; with w(s) it is −117 dBFS (a hard switch: −16 dBFS). Transitions
+  (Mix, Wipe, T-bar, stinger) and FTB keep P4's curves, so the defaults stay P4's bit for bit.
 - **The Cut crossfade** is general: without a transition every AFV weight moves to its target
   (1 for Program's strip, 0 for the others) on the equal-power curve over the grain, from where it
   was. A strip left with a weight by a take during a transition fades out over the next grain

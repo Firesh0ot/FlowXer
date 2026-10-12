@@ -129,7 +129,7 @@ TEST(audio_gains_and_ramps)
     CHECK(std::abs(dbToGain(-6.0206f) - 0.5f) < 1e-5f && std::abs(dbToGain(6.0206f) - 2.f) < 1e-4f);
     CHECK(std::abs(dbToGain(10.f) - 3.1622777f) < 1e-5f);
     CHECK(gainToDb(0.f) == -90.f && gainToDb(1.f) == 0.f && std::abs(gainToDb(0.5f) + 6.0206f) < 1e-3f);
-    // g0 + (g1 − g0) · (s + 1) / n, exactly g1 at the last sample of a whole-number step.
+    // P4's linear ramp (FTB): g0 + (g1 − g0) · (s + 1) / n.
     std::vector<float> r(960);
     linearRamp(1.f, 0.5f, r.size(), r.data());
     for (std::size_t s = 0; s < r.size(); ++s)
@@ -137,6 +137,14 @@ TEST(audio_gains_and_ramps)
         CHECK(r[s] == 1.f + (0.5f - 1.f) * static_cast<float>(s + 1) / 960.f);
     }
     CHECK(r.back() == 0.5f && r.front() < 1.f);
+    // A level change: g0 + (g1 − g0) · w(s), S-shaped (no slope at the ends), exactly g1 at the end.
+    smoothRamp(1.f, 0.5f, r.size(), r.data());
+    for (std::size_t s = 0; s + 1 < r.size(); ++s)
+    {
+        CHECK(r[s] == 1.f + (0.5f - 1.f) * smoothStep(s, 960));
+    }
+    CHECK(r.back() == 0.5f && r.front() < 1.f && r.front() > 0.99999f && std::abs(r[479] - 0.75f) < 1e-3f);
+    CHECK(smoothStep(959, 960) == 1.f && smoothStep(0, 960) < 1e-5f);
     // The Cut curve: equal power, ending exactly where it goes.
     std::vector<float> down(960);
     std::vector<float> up(960);
@@ -145,8 +153,8 @@ TEST(audio_gains_and_ramps)
     CHECK(down.back() == 0.f && up.back() == 1.f);
     for (std::size_t s = 0; s < down.size(); ++s)
     {
-        auto const g = crossfade(static_cast<float>(s + 1) / 960.f);
-        CHECK(s + 1 == down.size() || (down[s] == g.a && up[s] == g.b));
+        auto const g = crossfade(smoothStep(s, 960));
+        CHECK(s + 1 == down.size() || (down[s] == 0.f + 1.f * g.a && up[s] == 0.f + 1.f * g.b));
         CHECK(std::abs(down[s] * down[s] + up[s] * up[s] - 1.f) < 1e-5f);
     }
     std::vector<float> flatCurve(10);
@@ -163,12 +171,12 @@ TEST(audio_gains_and_ramps)
     CHECK(sameBits(a, ref));
     crossfadeBlock(zeros.data(), ones.data(), ref.data(), ref.size(), 0.25f, 0.5f);
     CHECK(sameBits(b, ref));
-    // A linear crossfade (delay and map changes).
+    // A delay or map change: from the old reading to the new one, S-shaped.
     std::vector<float> x(4, 1.f);
     std::vector<float> y(4, 3.f);
     std::vector<float> z(4);
-    crossfadeLinear(x.data(), y.data(), 4, z.data());
-    CHECK(z[0] == 1.5f && z[1] == 2.f && z[2] == 2.5f && z[3] == 3.f);
+    crossfadeSmooth(x.data(), y.data(), 4, z.data());
+    CHECK(std::abs(z[0] - 1.2929f) < 1e-4f && z[1] == 2.f && std::abs(z[2] - 2.7071f) < 1e-4f && z[3] == 3.f);
 }
 
 TEST(audio_strip_names_and_settings)
@@ -360,7 +368,7 @@ TEST(audio_fader_mute_and_afv)
     bool ramp = true;
     for (std::size_t s = 0; s < n; ++s)
     {
-        float const l = 1.f + (g - 1.f) * static_cast<float>(s + 1) / static_cast<float>(n);
+        float const l = s + 1 == n ? g : 1.f + (g - 1.f) * smoothStep(s, n);
         ramp = ramp && out[0][s] == 0.8f * (l * 1.f);
     }
     CHECK(ramp);
@@ -384,7 +392,7 @@ TEST(audio_fader_mute_and_afv)
     // AFV off on in2: in the mix at its fader whatever is on Program, ramping in over one grain.
     CHECK(mix.setStrip(1, StripRef{StripRef::Kind::Input, 2}, StripSettings{0.f, false, false}) == AudioMix::Result::Ok);
     mix.grain({still(1, in(1))}, sources, n, out);
-    float const a0 = 1.f + (0.f - 1.f) * 1.f / 960.f;
+    float const a0 = 1.f + (0.f - 1.f) * smoothStep(0, 960);
     CHECK(out[0][0] == 0.8f + 0.1f * (1.f * (a0 * 0.f + (1.f - a0))) && out[0][n - 1] == 0.8f + 0.1f);
     mix.grain({still(1, in(1))}, sources, n, out);
     CHECK(out[0][0] == 0.8f + 0.1f && mix.stripStates(1)[1].heard);

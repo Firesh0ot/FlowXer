@@ -32,6 +32,28 @@ float gainToDb(float gain)
     return db < kFaderOffDb ? kFaderOffDb : db;
 }
 
+float smoothStep(std::size_t s, std::size_t n)
+{
+    if (s + 1 >= n)
+    {
+        return 1.f;
+    }
+    return 0.5f - 0.5f * std::cos(3.14159265358979f * (static_cast<float>(s + 1) / static_cast<float>(n)));
+}
+
+void smoothRamp(float g0, float g1, std::size_t n, float* out)
+{
+    float const d = g1 - g0;
+    for (std::size_t s = 0; s + 1 < n; ++s)
+    {
+        out[s] = g0 + d * smoothStep(s, n);
+    }
+    if (n > 0)
+    {
+        out[n - 1] = g1;
+    }
+}
+
 void linearRamp(float g0, float g1, std::size_t n, float* out)
 {
     float const d = g1 - g0;
@@ -66,21 +88,19 @@ void cutCurve(float w0, float w1, std::size_t n, float* out)
         std::fill(out, out + n, w1);
         return;
     }
-    auto const fn = static_cast<float>(n);
     for (std::size_t s = 0; s + 1 < n; ++s)
     {
-        auto const g = crossfade(static_cast<float>(s + 1) / fn);
+        auto const g = crossfade(smoothStep(s, n));
         out[s] = w1 < w0 ? w1 + (w0 - w1) * g.a : w0 + (w1 - w0) * g.b;
     }
     out[n - 1] = w1;
 }
 
-void crossfadeLinear(float const* from, float const* to, std::size_t n, float* out)
+void crossfadeSmooth(float const* from, float const* to, std::size_t n, float* out)
 {
-    auto const fn = static_cast<float>(n);
     for (std::size_t s = 0; s < n; ++s)
     {
-        out[s] = from[s] + (to[s] - from[s]) * static_cast<float>(s + 1) / fn;
+        out[s] = s + 1 >= n ? to[s] : from[s] + (to[s] - from[s]) * smoothStep(s, n);
     }
 }
 
@@ -577,11 +597,11 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
             }
             if (l0 != l1)
             {
-                linearRamp(l0, l1, n, ramp_.data());
+                smoothRamp(l0, l1, n, ramp_.data());
             }
             if (a0 != a1)
             {
-                linearRamp(a0, a1, n, blend_.data());
+                smoothRamp(a0, a1, n, blend_.data());
             }
             for (std::size_t i = 0; i < n; ++i)
             {
@@ -668,7 +688,7 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
             {
                 if (l0 != l1)
                 {
-                    linearRamp(l0, l1, n, ramp_.data());
+                    smoothRamp(l0, l1, n, ramp_.data());
                 }
                 add(sting, l0 != l1 ? ramp_.data() : nullptr, l1);
             }
@@ -683,7 +703,7 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
         {
             if (m0 != m1)
             {
-                linearRamp(m0, m1, n, ramp_.data());
+                smoothRamp(m0, m1, n, ramp_.data());
             }
             for (std::size_t c = 0; c < ch; ++c)
             {

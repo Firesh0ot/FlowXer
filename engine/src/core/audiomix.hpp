@@ -28,18 +28,23 @@ float dbToGain(float db);
 // For the status: 0 (and anything at or below −90 dB) is −90.
 float gainToDb(float gain);
 
-// One grain of a gain ramp: g0 + (g1 − g0) · (s + 1) / n at sample s (P4's Fade to Black formula).
+// The S-shaped step of a change over one grain: w(s) = 0.5 − 0.5 · cos(π · (s + 1) / n), 0 … 1 with
+// no slope at either end (a linear ramp's corners are audible above 5 kHz on a full-range change).
+float smoothStep(std::size_t s, std::size_t n);
+// One grain of a linear ramp: g0 + (g1 − g0) · (s + 1) / n at sample s (P4's Fade to Black).
 void linearRamp(float g0, float g1, std::size_t n, float* out);
+// One grain of a level change (fader, mute, AFV, master): g0 + (g1 − g0) · w(s), exactly g1 at the end.
+void smoothRamp(float g0, float g1, std::size_t n, float* out);
 // A transition's equal-power curve (P4): t moves linearly from tPrev to t within the grain, a = cos
 // and b = sin of t · 90° (crossfade()).
 void transitionCurve(float tPrev, float t, std::size_t n, float* a, float* b);
 // An AFV weight from w0 to w1 on the equal-power curve over one grain (a Cut): down as
-// w1 + (w0 − w1) · cos(u · 90°), up as w0 + (w1 − w0) · sin(u · 90°), u = (s + 1) / n; exactly w1 at
-// the end.
+// w1 + (w0 − w1) · cos(u · 90°), up as w0 + (w1 − w0) · sin(u · 90°), u = w(s) (smoothStep); exactly
+// w1 at the end.
 void cutCurve(float w0, float w1, std::size_t n, float* out);
-// A linear crossfade from `from` to `to` over n samples (a delay or channel map change):
-// from + (to − from) · (s + 1) / n.
-void crossfadeLinear(float const* from, float const* to, std::size_t n, float* out);
+// A crossfade from `from` to `to` over n samples (a delay or channel map change):
+// from + (to − from) · w(s), exactly `to` at the end.
+void crossfadeSmooth(float const* from, float const* to, std::size_t n, float* out);
 
 // A strip of an ME's mix: live input k, clip player k, the re-entered Program of ME k, or the stinger.
 struct StripRef
