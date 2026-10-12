@@ -677,8 +677,11 @@ Against the estimate of this section:
   stingers: it frees a stinger player 0.1 s after its stinger's expected end, and an Auto sent
   before that found every player busy and became a cut. Changed after M4 (the user's decision): a
   take that finds every player busy waits up to 0.5 s for one, then plays; only if none is free by
-  then is it a cut, counted as `flowxer_stinger_fallbacks_total{reason="busy"}`. Lab check: see
-  below.
+  then is it a cut, counted as `flowxer_stinger_fallbacks_total{reason="busy"}`. Lab check
+  (`fxp3-busy.py`, 60 s each, the next Auto as soon as the engine reports the stinger done): 1 ME
+  with 1 stinger player, 55 Autos: 55 stingers played, 0 cuts; 4 MEs with 4 players, 220 Autos:
+  220 played, 0 cuts; 0 skipped, 0 late. Such an Auto now takes 85–111 ms on average (max 207 ms)
+  while it waits for its player.
 
 ## 11. Milestones
 
