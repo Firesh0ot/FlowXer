@@ -982,7 +982,7 @@ TEST(take_held_until_its_grain)
     auto p = mixer.frame(9).mes;
     CHECK(p[1].me == 1 && p[1].a == in(1));
     p = mixer.frame(10).mes;
-    CHECK(p[1].a == (Source{Source::Kind::Player, 1}) && !mixer.view()[0].deferred);
+    CHECK(p[1].a == (Source{Source::Kind::Player, 1}) && !mixer.view()[0].deferred && mixer.view()[0].deferredMade == 10);
     // A Mix held for grain 20 over 4 grains: t 0.25 at grain 20, the target in full at grain 23.
     CHECK(mixer.takeAt(20, 1, in(2), 4, Source{Source::Kind::Player, 1}, Transition::Mix) == MixResult::Ok);
     p = mixer.frame(19).mes;
@@ -1004,7 +1004,7 @@ TEST(take_held_until_its_grain)
     CHECK(mixer.view()[0].deferred && *mixer.view()[0].deferred == 41);
     mixer.runDeferred(1);
     p = mixer.frame(30).mes;
-    CHECK(p[1].a == in(5) && !mixer.view()[0].deferred);
+    CHECK(p[1].a == in(5) && !mixer.view()[0].deferred && mixer.view()[0].deferredMade == 0);
     // A held stinger starts at its grain (its player ready): its cut point there + cut.
     CHECK(mixer.takeAt(50, 1, in(6), 0, std::nullopt, Transition::Stinger, Sting{1, 10, 4}) == MixResult::Ok);
     p = mixer.frame(49, {true}).mes;

@@ -341,6 +341,8 @@ void Mixer::runHeld(std::uint64_t index, bool all, std::optional<int> me)
     for (auto const& [m, d] : due)
     {
         take(m, d.target, d.frames, d.preview, d.type, d.sting, d.ties);
+        std::lock_guard lock{mu_};
+        state_[static_cast<std::size_t>(m - 1)].heldMade = all ? 0 : index;
     }
 }
 
@@ -1172,6 +1174,7 @@ std::vector<MeView> Mixer::view() const
         {
             view.deferred = held->at;
         }
+        view.deferredMade = state.heldMade;
         views.push_back(view);
     }
     return views;

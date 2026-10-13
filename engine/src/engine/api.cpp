@@ -139,7 +139,8 @@ json meView(Engine& engine, int me)
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
                 {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
                 {"stinger", view.stinger}, {"start", view.start}, {"tied", view.tied},
-                {"deferred_at", view.deferred ? json(*view.deferred) : json(nullptr)}, {"transition", transitionJson(view.next)}};
+                {"deferred_at", view.deferred ? json(*view.deferred) : json(nullptr)}, {"deferred_made", view.deferredMade},
+                {"transition", transitionJson(view.next)}};
         }
     }
     return json::object();

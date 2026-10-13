@@ -183,8 +183,10 @@ struct MeView
     // The keyers tied to the running transition.
     std::vector<int> tied;
     TransitionSettings next;
-    // The grain of a take held for later (takeAt), if any.
+    // The grain of a take held for later (takeAt), if any, and the grain the last one was made
+    // in when it was due (0: none yet, or another command made it early).
     std::optional<std::uint64_t> deferred;
+    std::uint64_t deferredMade = 0;
 };
 
 // A keyer's run along its keyframes (docs/engine-p4.md §5).
@@ -369,6 +371,8 @@ private:
         Sting sting;
         bool waiting = false;
         TransitionSettings next;
+        // The grain its last held take was made in (0: none, or made early).
+        std::uint64_t heldMade = 0;
     };
     // A keyer's (with its place and settings) or an FTB's fade; a keyer's keyframes and run.
     struct Fade
