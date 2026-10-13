@@ -4,7 +4,9 @@
 // /widget/keys?me=<n>[&theme=...] shows one ME's keyers and DSKs with On/Off and Auto;
 // /widget/dme?me=<n>&keyer=<k>[&theme=...] one upstream keyer's box: On/Off, Auto, Run back and
 // forth, Stop and the presets; /widget/audio?me=<n>[&faders=false][&theme=...] one ME's audio
-// strips (meter, MUTE, AFV, fader) and its master meter with the loudness. It runs on flowxer-gui's own
+// strips (meter, MUTE, AFV, fader) and its master meter with the loudness;
+// /widget/snapshots[?me=<n>][&all=false][&theme=...] recall buttons for one ME's snapshots and
+// (unless all=false) those of all MEs. It runs on flowxer-gui's own
 // origin (its /api); only the origins in WIDGET_FRAME_ANCESTORS may frame it. It posts
 // {type: "widget-ready"} and {type: "widget-size", w, h} to the page that frames it.
 import React from "react";
@@ -13,6 +15,7 @@ import { AudioWidget } from "./components/AudioWidget";
 import { BusWidget } from "./components/BusWidget";
 import { DmeWidget } from "./components/DmeWidget";
 import { KeysWidget } from "./components/KeysWidget";
+import { SnapshotsWidget } from "./components/SnapshotsWidget";
 import "./widget.css";
 
 const params = new URLSearchParams(location.search);
@@ -30,6 +33,8 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <KeysWidget me={Number(params.get("me")) || 1} />
     ) : location.pathname.endsWith("/audio") ? (
       <AudioWidget me={Number(params.get("me")) || 1} faders={params.get("faders") !== "false"} />
+    ) : location.pathname.endsWith("/snapshots") ? (
+      <SnapshotsWidget me={Number(params.get("me")) || null} all={params.get("all") !== "false"} />
     ) : location.pathname.endsWith("/dme") ? (
       <DmeWidget me={Number(params.get("me")) || 1} keyer={Number(params.get("keyer")) || 1} />
     ) : (

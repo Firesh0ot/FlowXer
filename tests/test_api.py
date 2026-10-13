@@ -108,7 +108,10 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio"]
+    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio", "snapshots"]
+    snapshots = widgets[4]
+    assert snapshots["params"]["required"] == [] and snapshots["params"]["properties"]["all"]["default"] is True
+    assert snapshots["min_size"] == {"w": 240, "h": 120}
     audio = widgets[3]
     assert audio["params"]["required"] == ["me"] and audio["params"]["properties"]["faders"]["default"] is True
     assert audio["min_size"] == {"w": 480, "h": 240}
@@ -130,7 +133,7 @@ def test_every_widget_has_a_framed_page_in_nginx(client: TestClient) -> None:
         start = conf.index(f"location = /widget/{widget['id']} {{")
         block = conf[start : conf.index("\n    }", start)]
         assert "flowxer-widgets-csp.inc" in block and "try_files /widget.html" in block
-        for param in widget["params"]["required"]:
+        for param in widget["params"]["required"] or widget["params"]["properties"]:
             assert f"$arg_{param}" in block
 
 

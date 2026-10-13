@@ -85,6 +85,15 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "snapshots",
+        "description": (
+            "Named memories (1..99) of one ME or of all MEs: Program and Preview, FTB, the transition, the "
+            "keyers and DSKs and the audio. A recall sets Preview, the transition and the keyers' settings; "
+            "with Program/on-air also Program, the keys' on-air state and FTB (cuts); with audio the strips "
+            "and masters. One can be recalled whenever the mixer starts."
+        ),
+    },
+    {
         "name": "tally",
         "description": (
             "TSL UMD Protocol 5.0 tally lamps and under-monitor labels. "
