@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from flowxer.api.schemas import (
+    AudioStripUpdate,
     AutoRequest,
     ConsoleState,
     ConvertJobOut,
@@ -17,6 +18,7 @@ from flowxer.api.schemas import (
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
+    InputAudioUpdate,
     KeyerAutoRequest,
     KeyerPresetRequest,
     KeyerRunRequest,
@@ -28,6 +30,7 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
+    PanelAudioUpdate,
     PanelTransition,
     PanelTransitionRequest,
     PanelTransitionUpdate,
@@ -184,12 +187,14 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
         "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
         "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
         "upstream keyers and DSKs with On/Off and Auto. `dme`: one upstream keyer's box: On/Off, "
-        "Auto, Run back and forth, and the presets."
+        "Auto, Run back and forth, and the presets. `audio`: one ME's audio strips (meter, MUTE, AFV, and the "
+        "fader unless `faders=false`) and its master meter with the loudness."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
     transition = {"type": "boolean", "default": True, "title": "Transition type"}
+    faders = {"type": "boolean", "default": True, "title": "Faders"}
     keyer = {"type": "integer", "minimum": 1, "maximum": max(1, mixer.workspace.keyers_per_me), "title": "Upstream keyer"}
     return [
         {
@@ -211,6 +216,13 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "title": "FlowXer DME",
             "params": {"type": "object", "properties": {"me": me, "keyer": keyer}, "required": ["me", "keyer"]},
             "min_size": {"w": 320, "h": 120},
+            "version": __version__,
+        },
+        {
+            "id": "audio",
+            "title": "FlowXer audio",
+            "params": {"type": "object", "properties": {"me": me, "faders": faders}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 240},
             "version": __version__,
         },
     ]
@@ -620,6 +632,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         jobs=[ConvertJobOut(**job.model_dump()) for job in mixer.library.queue.list_jobs()],
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
+        audio=mixer.audio_state(),
         pinned={
             field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
         },
@@ -856,6 +869,104 @@ def keyer_preset(keyer_id: str, payload: KeyerPresetRequest, mixer: VisionMixer 
 )
 def dme_presets(mixer: VisionMixer = Depends(get_mixer)) -> list[DmePresetInfo]:
     return mixer.dme_presets()
+
+
+def _audio_error(exc: MixerError) -> HTTPException:
+    """Unknown input, panel or strip: 404; a panel that does not render: 409; a bad value: 422."""
+    text = str(exc)
+    if text.startswith("unknown"):
+        return _http(exc, status.HTTP_404_NOT_FOUND)
+    return _http(exc, status.HTTP_409_CONFLICT if "does not render" in text else 422)
+
+
+@router.get(
+    "/audio",
+    tags=["audio"],
+    summary="Every audio setting: per live input its delay and channel map, per ME its master and strips",
+    description=(
+        "`inputs`: per live input id its `delay_ms` (audio later than its video), `channel_map` (per PGM "
+        "channel the input channel, 1-based, 0 silent; empty 1:1) and its flow's `channels`. `panels`: per "
+        "rendering ME (panel id) its `master_db` and its `strips` in slot order (live inputs, clip players, "
+        "the Programs of higher MEs, `stinger`), each with `fader_db` (-90 off .. +10), `mute` and `afv` "
+        "(audio follows video; none on the stinger). `channels`: the PGM's; `max_delay_ms`: "
+        "FLOWXER_AUDIO_MAX_DELAY_MS."
+    ),
+)
+def get_audio(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_state()
+
+
+@router.patch(
+    "/audio/inputs/{input_id}",
+    tags=["audio"],
+    summary="A live input's audio delay (ms, whole samples) and channel map, for every ME",
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_input(input_id: str, payload: InputAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_input_audio(input_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}",
+    tags=["audio"],
+    summary="An ME's master fader (-90 off .. +10 dB); it ramps over one frame",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_audio_panel(panel_id: str, payload: PanelAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_panel_audio(panel_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}/strips/{strip_id}",
+    tags=["audio"],
+    summary="A strip of an ME's mix: fader, mute, AFV (strip: an input or clip player id, a higher panel id, or stinger)",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_strip(
+    panel_id: str, strip_id: str, payload: AudioStripUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> dict:
+    try:
+        return mixer.update_audio_strip(panel_id, strip_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.post(
+    "/audio/panels/{panel_id}/loudness/reset",
+    tags=["audio"],
+    summary="The ME's integrated loudness (EBU R 128) from now on",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def reset_audio_loudness(panel_id: str, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.reset_loudness(panel_id)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.get(
+    "/audio/meters",
+    tags=["audio"],
+    summary="The meters of the last 100 ms block: per source peak and RMS, per ME PGM also true peak, loudness, overs and its strips",
+    description=(
+        "`sources`: live inputs (after their delay and channel map, before the fader) and clip players by id, "
+        "stinger players as `stinger-<k>`: `peak_dbfs` and `rms_dbfs` per channel. `panels`: per rendering ME "
+        "its PGM (what goes to MXL): `peak_dbfs`, `true_peak_dbtp` (BS.1770-4, 4x), `rms_dbfs` per channel, "
+        "`loudness` per channel pair (`momentary` 400 ms, `short_term` 3 s, `integrated` since the start or the "
+        "last reset; LUFS, EBU R 128), `overs` (samples at or above 0 dBFS since the engine started) and "
+        "`strips`: per strip its `gain_db` in PGM now and whether it is `heard`. `block`: the 100 ms block's "
+        "number (its first 48 kHz sample index / 4800); null off-air. Values below -120 dB are -120. Poll at "
+        "10 Hz at most: the answer changes every 100 ms."
+    ),
+)
+def get_audio_meters(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_meters()
 
 
 @router.patch(

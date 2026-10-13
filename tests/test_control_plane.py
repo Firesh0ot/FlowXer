@@ -125,7 +125,7 @@ def test_the_engine_starts_gets_the_state_and_the_commands(engine_mixer, setting
     assert outputs["pgm_video"] == mixer.outputs.video_flow_id and outputs["pgm_audio"] == mixer.outputs.audio_flow_id
     commands = _commands(log)
     # The state push on ready: every live input's route, ME 1's buses.
-    assert sum(1 for c in commands if c["path"].startswith("/input/")) == len(live)
+    assert sum(1 for c in commands if c["path"].startswith("/input/") and not c["path"].endswith("/audio")) == len(live)
     assert {"method": "POST", "path": "/me/1/program", "body": {"source": "in1"}} in [
         {k: c[k] for k in ("method", "path", "body")} for c in commands
     ]

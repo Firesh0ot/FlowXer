@@ -51,10 +51,11 @@ inline int latencyFor(double lagGrains)
 }
 
 // The latency that covers the latest arrival seen (each source's `peak` since it was routed, ms)
-// of what delivers, from the engine's status: each input's video and its audio while they run
-// (`inputs[].arrival_ms`, `inputs[].audio.lag_ms`) and each key flow in use while it runs
-// (`key_flows[].arrival_ms`). Unrouted or silent inputs and key flows, clip players and stinger
-// players do not count.
+// of what delivers, from the engine's status: each input's video while it runs
+// (`inputs[].arrival_ms`), its audio while it runs and some ME hears it (`inputs[].audio.lag_ms`,
+// `audio.heard`) and each key flow in use while it runs (`key_flows[].arrival_ms`). Unrouted or
+// silent inputs and key flows, clip players and stinger players do not count. A delayed input's
+// audio counts its lag minus its delay (`audio.delay_ms`).
 int recommendedLatency(nlohmann::json const& status, double periodMs);
 
 // The input grain that output grain `output` is composed from (fixed latency L).

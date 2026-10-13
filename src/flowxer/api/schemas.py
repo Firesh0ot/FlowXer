@@ -748,6 +748,69 @@ class DmePresetInfo(BaseModel):
     description: str
 
 
+# ── audio (P5, docs/engine-p5.md) ──────────────────────────────────────────
+
+AUDIO_MIN_DB = -90.0
+AUDIO_MAX_DB = 10.0
+
+
+class AudioStrip(BaseModel):
+    """One strip of an ME's audio mix: a live input, a clip player, the re-entered Program of a
+    higher ME (its panel id) or the stinger."""
+
+    fader_db: float = Field(default=0.0, ge=AUDIO_MIN_DB, le=AUDIO_MAX_DB, description="-90 (off) .. +10 dB")
+    mute: bool = Field(default=False, description="Silent; the fader stays where it is")
+    afv: bool = Field(
+        default=True,
+        description=(
+            "Audio follows video: heard only while its source is on the ME's Program (and along a "
+            "transition's curve). Off: always in the mix at its fader level. The stinger strip has none."
+        ),
+    )
+
+
+class AudioStripUpdate(BaseModel):
+    fader_db: float | None = Field(default=None, ge=AUDIO_MIN_DB, le=AUDIO_MAX_DB)
+    mute: bool | None = None
+    afv: bool | None = None
+
+
+class PanelAudio(BaseModel):
+    """An ME's audio: its master fader and the strips that are not at their defaults."""
+
+    master_db: float = Field(default=0.0, ge=AUDIO_MIN_DB, le=AUDIO_MAX_DB, description="-90 (off) .. +10 dB")
+    strips: dict[str, AudioStrip] = Field(default_factory=dict, description="By strip id (input id, panel id or stinger)")
+
+
+class PanelAudioUpdate(BaseModel):
+    master_db: float | None = Field(default=None, ge=AUDIO_MIN_DB, le=AUDIO_MAX_DB)
+
+
+class InputAudio(BaseModel):
+    """A live input's audio, for every ME: its delay and its channel map."""
+
+    delay_ms: float = Field(
+        default=0.0, ge=0.0, le=5000.0, description="Audio later than its video by this (ms, whole 48 kHz samples; at most FLOWXER_AUDIO_MAX_DELAY_MS)"
+    )
+    channel_map: list[int] = Field(
+        default_factory=list,
+        description="Per PGM channel the input channel it takes (1-based, 0 silent); empty: 1:1 (a 1-channel flow on every channel)",
+    )
+
+
+class InputAudioUpdate(BaseModel):
+    delay_ms: float | None = Field(default=None, ge=0.0, le=5000.0)
+    channel_map: list[int] | None = None
+
+
+class AudioConfig(BaseModel):
+    """The saved audio state (the state file's and the export's `audio`): per live input its delay and
+    channel map, per panel its master and strips. Missing values are the defaults."""
+
+    inputs: dict[str, InputAudio] = Field(default_factory=dict)
+    panels: dict[str, PanelAudio] = Field(default_factory=dict)
+
+
 class StingerSlotUpdate(BaseModel):
     stinger_id: str | None = None
     library_item_id: str | None = Field(
@@ -875,6 +938,10 @@ class ConsoleState(BaseModel):
     nmos: dict[str, Any] = Field(
         default_factory=dict,
         description="IS-04/IS-05 node status: registry, node id, per-input receivers.",
+    )
+    audio: dict[str, Any] = Field(
+        default_factory=dict,
+        description="The audio settings, as GET /audio (not the meters: GET /audio/meters)",
     )
     pinned: dict[str, str] = Field(
         default_factory=dict,

@@ -11,12 +11,17 @@ from pydantic import ValidationError
 
 from flowxer import __version__
 from flowxer.api.schemas import (
+    AudioConfig,
     AudioEssence,
+    AudioStrip,
+    AudioStripUpdate,
     Dme,
     DmeKeyframe,
     DmeLoop,
     DmePreset,
     DmePresetInfo,
+    InputAudio,
+    InputAudioUpdate,
     InputKind,
     Keyer,
     KeyerRun,
@@ -31,6 +36,8 @@ from flowxer.api.schemas import (
     MixerState,
     MixerStatus,
     OutputFlows,
+    PanelAudio,
+    PanelAudioUpdate,
     PanelTransition,
     PanelTransitionUpdate,
     ProgramBus,
@@ -95,6 +102,14 @@ REENTRY_INDEX = 1000
 STINGER_WAIT_S = 0.5
 # A frame grab is in the library within a few grains; the control plane waits at most this long.
 GRAB_TIMEOUT_S = 3.0
+# Audio delays are whole 48 kHz samples.
+AUDIO_SAMPLES_PER_MS = 48
+# A fader that moves sends up to 20 values a second: its changes are saved at most this often.
+PERSIST_INTERVAL_S = 1.0
+# GET /audio/meters: one engine call per 100 ms block, however many viewers poll.
+METERS_CACHE_S = 0.08
+# Meter values below this are this (silence).
+METER_FLOOR_DB = -120.0
 
 
 def _autostart_pause(attempt: int) -> float:
@@ -243,6 +258,16 @@ class VisionMixer:
         self._stinger_cued: dict[int, str] = {}
         self._stinger_until: dict[int, float] = {}
         self._stinger_run: dict[str, Any] | None = None
+        # P5 audio: per live input its delay and channel map, per panel its master and strips.
+        self.audio = AudioConfig()
+        # Saves of audio changes, at most once a second (persist_soon).
+        self._persist_lock = threading.Lock()
+        self._persist_at = 0.0
+        self._persist_timer: threading.Timer | None = None
+        # The engine's last /audio/meters and when it was fetched.
+        self._meters_lock = threading.Lock()
+        self._meters_raw: dict[str, Any] | None = None
+        self._meters_at = 0.0
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -486,6 +511,7 @@ class VisionMixer:
         if format_changed:
             # Off-air here; re-convert library items for the new raster/rate.
             self.library.set_format(self.workspace.format_id, fps=self.settings.fps)
+        self._prune_audio()
         self.nmos.reconcile_inputs()
         self._publish_tally()
         self.refresh_library_bindings()
@@ -1018,6 +1044,7 @@ class VisionMixer:
         self._apply_default_domain(logical)
         self.inputs[logical.id] = logical
         self._renumber()
+        self._prune_audio()
         self.nmos.sync_from_rest(logical.id)
         self._publish_tally()
         return logical
@@ -1046,6 +1073,7 @@ class VisionMixer:
         self._apply_default_domain(updated)
         self.inputs[input_id] = updated
         self._renumber()
+        self._prune_audio()
         self.nmos.sync_from_rest(input_id)
         if updated.kind == InputKind.mxl_live and (
             "video" in patch or "audio" in patch or "kind" in patch
@@ -1069,6 +1097,7 @@ class VisionMixer:
             raise MixerError(f"unknown input {input_id}")
         del self.inputs[input_id]
         self._renumber()
+        self._prune_audio()
         self.nmos.reconcile_inputs()
         self._publish_tally()
 
@@ -1520,13 +1549,15 @@ class VisionMixer:
                 if (outputs := self.me_outputs.get(panel.id)) is not None
             ],
             "FLOWXER_ENGINE_AUDIO_CHANNELS": self.settings.audio_channels,
+            "FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS": self.settings.audio_max_delay_ms,
             "FLOWXER_ENGINE_LABEL": self.settings.node_label,
             "FLOWXER_ENGINE_GPU": self.settings.engine_gpu,
             "FLOWXER_ENGINE_HTTP_PORT": self.settings.engine_port,
         }
 
     def _on_engine_ready(self, client: EngineClient) -> None:
-        """Every (re)start of the engine: push routes, clip players, keyers and buses."""
+        """Every (re)start of the engine: push routes, clip players, keyers, buses and the audio
+        (delays and channel maps, masters and strips)."""
         with self.nmos.lock:
             # A new engine holds no T-bar transition: Program and the tied keyers stay where they were.
             for panel_id in self._positions:
@@ -1536,6 +1567,7 @@ class VisionMixer:
             for item in self.list_inputs():
                 if item.kind == InputKind.mxl_live:
                     self._push_route(item, client)
+                    self._push_input_audio(item, client)
                 elif item.kind == InputKind.clip_player:
                     self._push_player(item, client)
             for keyer in self.keyers:
@@ -1547,6 +1579,7 @@ class VisionMixer:
                 self._push_key_settings(keyer, client, box=keyer.dme.model_dump() if keyer.stage == KeyerStage.upstream else None)
             for panel in self.rendered_panels():
                 self._push_panel(panel, client)
+                self._push_panel_audio(panel, client=client)
             # A new engine holds no stinger.
             self._stinger_cued.clear()
             self._stinger_until.clear()
@@ -1772,7 +1805,13 @@ class VisionMixer:
 
     def shutdown(self) -> None:
         """SIGTERM: stop the engine (it releases the MXL readers and writers), deregister from
-        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set."""
+        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set. An audio
+        change still waiting to be saved is saved."""
+        with self._persist_lock:
+            pending, self._persist_timer = self._persist_timer, None
+        if pending is not None:
+            pending.cancel()
+            self.persist()
         try:
             self.stop()
         except Exception:
@@ -2367,6 +2406,237 @@ class VisionMixer:
         index = base + 100 * self._panel_number(self.get_panel(keyer.panel_id)) + same.index(keyer) + 1
         return index, keyer.receiver_label, on_air
 
+    # ── audio (P5, docs/engine-p5.md) ────────────────────────────────────────
+
+    def audio_channels(self) -> int:
+        """The PGM's channels: the engine's while it runs (an existing flow keeps its own), else
+        FLOWXER_AUDIO_CHANNELS."""
+        channels = ((self.engine_status() or {}).get("audio") or {}).get("channels")
+        return int(channels) if isinstance(channels, int) and channels > 0 else self.settings.audio_channels
+
+    def audio_strips(self, panel: MixerPanel) -> list[tuple[str, str, str]]:
+        """A rendering panel's strips in slot order, as (id, label, kind): its live inputs, clip
+        players, the Programs of higher rendering MEs (re-entry) and the stinger."""
+        strips = [(item.id, item.label, "input") for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        strips += [(item.id, item.label, "clip_player") for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        strips += [(other.id, other.label, "panel") for other in self.reentry_sources(panel)]
+        strips.append(("stinger", "Stinger", "stinger"))
+        return strips
+
+    def _audio_panel(self, panel_id: str) -> MixerPanel:
+        panel = self.get_panel(panel_id)
+        if not self._rendered(panel):
+            raise MixerError(f"{panel.label} does not render (FLOWXER_RENDER_MES): it has no audio")
+        return panel
+
+    def audio_state(self) -> dict[str, Any]:
+        """GET /audio: per live input its delay, channel map and its flow's channels; per rendering
+        panel its master and strips; the PGM's channels and the longest delay."""
+        engine_inputs = (self.engine_status() or {}).get("inputs") or []
+        inputs: dict[str, Any] = {}
+        for k, item in enumerate(item for item in self.list_inputs() if item.kind == InputKind.mxl_live):
+            audio = self.audio.inputs.get(item.id) or InputAudio()
+            flow = ((engine_inputs[k].get("audio") or {}).get("channels") if k < len(engine_inputs) else None) or None
+            inputs[item.id] = {
+                "label": item.label,
+                "delay_ms": audio.delay_ms,
+                "channel_map": list(audio.channel_map),
+                "channels": flow or (item.audio.channels if item.audio is not None else None),
+            }
+        panels: dict[str, Any] = {}
+        for panel in self.rendered_panels():
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            strips = {}
+            for strip_id, label, kind in self.audio_strips(panel):
+                strip = audio.strips.get(strip_id) or AudioStrip()
+                strips[strip_id] = {
+                    "label": label,
+                    "kind": kind,
+                    "fader_db": strip.fader_db,
+                    "mute": strip.mute,
+                    "afv": None if kind == "stinger" else strip.afv,
+                }
+            panels[panel.id] = {"label": panel.label, "master_db": audio.master_db, "strips": strips}
+        return {"channels": self.audio_channels(), "max_delay_ms": self.settings.audio_max_delay_ms, "inputs": inputs, "panels": panels}
+
+    def update_input_audio(self, input_id: str, payload: InputAudioUpdate) -> dict[str, Any]:
+        """A live input's delay (whole 48 kHz samples, 0 .. FLOWXER_AUDIO_MAX_DELAY_MS) and channel
+        map (one entry per PGM channel, 0 silent; [] is 1:1), for every ME. The engine crossfades
+        from the old reading to the new one over one grain."""
+        item = self.get_input(input_id)
+        if item.kind != InputKind.mxl_live:
+            raise MixerError(f"{item.label} is not a live input: a delay and a channel map are for live inputs")
+        current = self.audio.inputs.get(input_id) or InputAudio()
+        delay = current.delay_ms if payload.delay_ms is None else float(payload.delay_ms)
+        channel_map = list(current.channel_map) if payload.channel_map is None else list(payload.channel_map)
+        if delay > self.settings.audio_max_delay_ms:
+            raise MixerError(f"delay_ms must be 0..{self.settings.audio_max_delay_ms} (FLOWXER_AUDIO_MAX_DELAY_MS)")
+        channels = self.audio_channels()
+        if channel_map and len(channel_map) != channels:
+            raise MixerError(f"channel_map needs one entry per PGM channel ({channels}), or none for 1:1")
+        if any(value < 0 or value > 64 for value in channel_map):
+            raise MixerError("channel_map entries are input channels 1..64, or 0 for silence")
+        value = InputAudio(delay_ms=round(delay * AUDIO_SAMPLES_PER_MS) / AUDIO_SAMPLES_PER_MS, channel_map=channel_map)
+        if value == InputAudio():
+            self.audio.inputs.pop(input_id, None)
+        else:
+            self.audio.inputs[input_id] = value
+        self._push_input_audio(item)
+        return self.audio_state()["inputs"][input_id]
+
+    def update_panel_audio(self, panel_id: str, payload: PanelAudioUpdate) -> dict[str, Any]:
+        """A panel's master fader (ramps over one grain)."""
+        panel = self._audio_panel(panel_id)
+        audio = self.audio.panels.setdefault(panel.id, PanelAudio())
+        if payload.master_db is not None:
+            audio.master_db = payload.master_db
+        self._tidy_panel_audio(panel.id)
+        self._push_panel_audio(panel, {"master_db": audio.master_db})
+        return self.audio_state()["panels"][panel.id]
+
+    def update_audio_strip(self, panel_id: str, strip_id: str, payload: AudioStripUpdate) -> dict[str, Any]:
+        """A strip's fader, mute and AFV on one panel (each change ramps over one grain)."""
+        panel = self._audio_panel(panel_id)
+        if strip_id not in {sid for sid, _, _ in self.audio_strips(panel)}:
+            raise MixerError(f"unknown strip {strip_id} on {panel.label}")
+        patch = payload.model_dump(exclude_none=True)
+        if strip_id == "stinger" and "afv" in patch:
+            raise MixerError("the stinger strip has no afv")
+        audio = self.audio.panels.setdefault(panel.id, PanelAudio())
+        strip = (audio.strips.get(strip_id) or AudioStrip()).model_copy(update=patch)
+        audio.strips[strip_id] = strip
+        self._tidy_panel_audio(panel.id)
+        self._push_panel_audio(panel, {"strips": {self._engine_strip(strip_id): self._strip_body(strip_id, strip)}})
+        return self.audio_state()["panels"][panel.id]["strips"][strip_id]
+
+    def _tidy_panel_audio(self, panel_id: str) -> None:
+        """Only what is not at its default is kept (and saved)."""
+        audio = self.audio.panels.get(panel_id)
+        if audio is None:
+            return
+        for strip_id in [sid for sid, strip in audio.strips.items() if strip == AudioStrip()]:
+            del audio.strips[strip_id]
+        if audio == PanelAudio():
+            del self.audio.panels[panel_id]
+
+    def _engine_strip(self, strip_id: str) -> str:
+        """FlowXer's strip id → the engine's: in<k>, cp<k>, me<n>, stinger."""
+        return "stinger" if strip_id == "stinger" else self._engine_source(strip_id)
+
+    @staticmethod
+    def _strip_body(strip_id: str, strip: AudioStrip) -> dict[str, Any]:
+        body: dict[str, Any] = {"fader_db": strip.fader_db, "mute": strip.mute}
+        if strip_id != "stinger":
+            body["afv"] = strip.afv
+        return body
+
+    def _push_input_audio(self, item: LogicalInput, client: EngineClient | None = None) -> None:
+        if item.kind != InputKind.mxl_live:
+            return
+        audio = self.audio.inputs.get(item.id) or InputAudio()
+        self._engine_call(
+            "POST", f"/input/{self._engine_index(item)}/audio", {"delay_ms": audio.delay_ms, "map": list(audio.channel_map)}, client=client
+        )
+
+    def _push_panel_audio(self, panel: MixerPanel, body: dict[str, Any] | None = None, client: EngineClient | None = None) -> None:
+        """The panel's master and strips (all of them without `body`: after an engine start)."""
+        if not self._rendered(panel):
+            return
+        if body is None:
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            body = {
+                "master_db": audio.master_db,
+                "strips": {
+                    self._engine_strip(sid): self._strip_body(sid, audio.strips.get(sid) or AudioStrip()) for sid, _, _ in self.audio_strips(panel)
+                },
+            }
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio", body, client=client)
+
+    def audio_meters(self) -> dict[str, Any]:
+        """GET /audio/meters: the engine's last 100 ms block with FlowXer's ids (live inputs and clip
+        players by id, stinger players as stinger-<k>, panels by id with their strips). At most
+        100 ms old, one engine call however many viewers poll. Off-air (or in simulate) every
+        meter is silence (-120) and each strip shows what its settings and AFV give."""
+        with self._meters_lock:
+            now = time.monotonic()
+            if now - self._meters_at >= METERS_CACHE_S:
+                raw = None
+                if self.engine is not None and self.engine.ready:
+                    try:
+                        raw = self.engine.call("GET", "/audio/meters")
+                    except EngineError:
+                        raw = None
+                self._meters_raw, self._meters_at = raw if isinstance(raw, dict) else None, now
+            raw = self._meters_raw
+        return self._meters_view(raw)
+
+    def _meters_view(self, raw: dict[str, Any] | None) -> dict[str, Any]:
+        channels = self.audio_channels()
+        floor = [METER_FLOOR_DB] * channels
+        live = [item for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        players = [item for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        engine_sources = (raw or {}).get("sources") or {}
+        sources: dict[str, Any] = {}
+        for prefix, items in (("in", live), ("cp", players)):
+            for k, item in enumerate(items, 1):
+                entry = engine_sources.get(f"{prefix}{k}") or {}
+                sources[item.id] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        for k in range(1, self._stinger_players() + 1):
+            entry = engine_sources.get(f"st{k}") or {}
+            sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        engine_mes = (raw or {}).get("mes") or {}
+        panels: dict[str, Any] = {}
+        pairs = (channels + 1) // 2
+        for panel in self.rendered_panels():
+            entry = engine_mes.get(str(self._panel_number(panel))) or {}
+            engine_strips = entry.get("strips") or {}
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            strips = {}
+            for strip_id, _label, kind in self.audio_strips(panel):
+                measured = engine_strips.get(self._engine_strip(strip_id))
+                if measured is None:
+                    setting = audio.strips.get(strip_id) or AudioStrip()
+                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
+                    measured = {"gain_db": gain, "heard": gain > -90.0}
+                strips[strip_id] = measured
+            panels[panel.id] = {
+                "peak_dbfs": entry.get("peak_dbfs", floor),
+                "true_peak_dbtp": entry.get("true_peak_dbtp", floor),
+                "rms_dbfs": entry.get("rms_dbfs", floor),
+                "loudness": entry.get("loudness")
+                or [{"pair": p, "momentary": METER_FLOOR_DB, "short_term": METER_FLOOR_DB, "integrated": METER_FLOOR_DB} for p in range(1, pairs + 1)],
+                "overs": int(entry.get("overs") or 0),
+                "strips": strips,
+            }
+        return {"block": (raw or {}).get("block"), "channels": channels, "sources": sources, "panels": panels}
+
+    def reset_loudness(self, panel_id: str) -> dict[str, Any]:
+        """The panel's integrated loudness from now on (the engine's next 100 ms block)."""
+        panel = self._audio_panel(panel_id)
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio/loudness/reset", {})
+        with self._meters_lock:
+            self._meters_at = 0.0
+        return {"panel_id": panel.id, "loudness_reset": True}
+
+    def _prune_audio(self) -> None:
+        """When the structure changes: the audio of inputs that are no live input any more, of panels
+        that no longer render and of strips a panel no longer has is dropped (as keyers are)."""
+        live = {item.id for item in self.list_inputs() if item.kind == InputKind.mxl_live}
+        for input_id in [i for i in self.audio.inputs if i not in live]:
+            del self.audio.inputs[input_id]
+        rendered = {panel.id: panel for panel in self.rendered_panels()}
+        for panel_id in list(self.audio.panels):
+            panel = rendered.get(panel_id)
+            if panel is None:
+                del self.audio.panels[panel_id]
+                continue
+            valid = {sid for sid, _, _ in self.audio_strips(panel)}
+            strips = self.audio.panels[panel_id].strips
+            for strip_id in [s for s in strips if s not in valid]:
+                del strips[strip_id]
+            self._tidy_panel_audio(panel_id)
+
     # ── saved state and config export/import ─────────────────────────────────
 
     def export_state(self) -> dict:
@@ -2387,6 +2657,7 @@ class VisionMixer:
                 "stinger_slots": slots,
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
+                "audio": self.audio.model_dump(mode="json"),
             }
 
     def import_state(self, data: dict) -> dict:
@@ -2401,6 +2672,28 @@ class VisionMixer:
     def persist(self) -> None:
         with self.nmos.lock:
             self._store.save(self.export_state())
+        self._persist_at = time.monotonic()
+
+    def persist_soon(self) -> None:
+        """Audio changes (a moving fader sends up to 20 a second): saved at most once a second, the
+        last one within a second."""
+        with self._persist_lock:
+            if self._persist_timer is not None:
+                return
+            wait = self._persist_at + PERSIST_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                self._persist_timer = threading.Timer(wait, self._persist_pending)
+                self._persist_timer.daemon = True
+                self._persist_timer.start()
+                return
+        self.persist()
+
+    def _persist_pending(self) -> None:
+        with self._persist_lock:
+            if self._persist_timer is None:
+                return
+            self._persist_timer = None
+        self.persist()
 
     def _restore_state(self) -> None:
         saved = self._store.load()
@@ -2428,6 +2721,8 @@ class VisionMixer:
             slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])
+            # P5: missing (a P4 state) is the defaults.
+            audio = AudioConfig(**dict(data.get("audio") or {}))
             for item in inputs:
                 if item.library_item_id:
                     require_safe_id(item.library_item_id, what="library item id")
@@ -2461,6 +2756,7 @@ class VisionMixer:
             self.panels = panels
             self.keyers = keyers
             self.stinger_slots = slots
+            self.audio = audio
             main = panels[0] if panels else None
             self.program_input_id = main.program_input_id if main else None
             self.preview_input_id = main.preview_input_id if main else None
@@ -2468,6 +2764,7 @@ class VisionMixer:
             self._sync_panels()
             self._sync_keyers()
             self._sync_stinger_slots()
+            self._prune_audio()
             if self.panels:
                 self.program_input_id = self.panels[0].program_input_id
                 self.preview_input_id = self.panels[0].preview_input_id

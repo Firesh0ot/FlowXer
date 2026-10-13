@@ -595,11 +595,11 @@ TEST(recommended_latency_counts_what_delivers)
     auto status = nlohmann::json::parse(R"({
         "inputs": [
             {"input": 1, "state": "running", "arrival_ms": {"avg": 31.0, "max": 36.0, "peak": 55.0},
-             "audio": {"state": "running", "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 41.0}}},
+             "audio": {"state": "running", "heard": true, "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 41.0}}},
             {"input": 2, "state": "running", "arrival_ms": {"avg": 29.0, "max": 35.0, "peak": 50.0},
-             "audio": {"state": "no_signal", "lag_ms": {"avg": 800.0, "max": 1000.0, "peak": 1000.0}}},
+             "audio": {"state": "no_signal", "heard": true, "lag_ms": {"avg": 800.0, "max": 1000.0, "peak": 1000.0}}},
             {"input": 3, "state": "running", "arrival_ms": {"avg": 33.0, "max": 36.0, "peak": 52.0},
-             "audio": {"state": "running", "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 33.0}}},
+             "audio": {"state": "running", "heard": true, "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 33.0}}},
             {"input": 4, "state": "not_routed", "arrival_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0},
              "audio": {"state": "not_routed", "lag_ms": {"avg": 0.0, "max": 0.0, "peak": 540.0}}}
         ],
@@ -622,6 +622,10 @@ TEST(recommended_latency_counts_what_delivers)
     // Audio that runs counts too.
     status["inputs"][1]["audio"]["state"] = "running";
     CHECK_EQ(recommendedLatency(status, 20.0), 51);
+    // A delayed input's audio (P5) counts its lag minus its delay: 1000 − 960 = 40 ms, so the
+    // video's 70 ms decides.
+    status["inputs"][1]["audio"]["delay_ms"] = 960.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 5);
     // The last minute's maximum counts, not the peak since the route: input 1's audio adds 13 ms,
     // not 525 ms, so its video (55 ms) still sets L = 4.
     status["inputs"][1]["audio"]["state"] = "no_signal";
@@ -631,6 +635,34 @@ TEST(recommended_latency_counts_what_delivers)
     CHECK_EQ(recommendedLatency(status, 20.0), 4);
     // Nothing that delivers: 1.
     CHECK_EQ(recommendedLatency(nlohmann::json::object(), 20.0), 1);
+}
+
+TEST(recommended_latency_counts_heard_audio_only)
+{
+    // small: a browser source's bursty audio (533 ms behind, not on air) drove the recommendation
+    // to 28 grains. An input's audio counts only while some ME hears it (`audio.heard`: on air, in
+    // a transition, AFV off at a level); its video counts as before.
+    auto status = nlohmann::json::parse(R"({
+        "inputs": [
+            {"input": 1, "state": "running", "arrival_ms": {"avg": 31.0, "max": 36.0, "peak": 55.0, "recent": 55.0},
+             "audio": {"state": "running", "heard": true, "lag_ms": {"avg": 20.0, "max": 30.0, "peak": 41.0, "recent": 41.0}}},
+            {"input": 2, "state": "running", "arrival_ms": {"avg": 20.0, "max": 30.0, "peak": 40.0, "recent": 40.0},
+             "audio": {"state": "running", "heard": false, "lag_ms": {"avg": 300.0, "max": 533.0, "peak": 533.0, "recent": 533.0}}}
+        ]
+    })");
+    // Not heard: input 1's video (55 ms = 2.75 grains) sets L = 4.
+    CHECK_EQ(recommendedLatency(status, 20.0), 4);
+    // Heard (e.g. cut on air): 533 ms = 26.65 grains, L = 28.
+    status["inputs"][1]["audio"]["heard"] = true;
+    CHECK_EQ(recommendedLatency(status, 20.0), 28);
+    // Not heard again: its video still counts (90 ms = 4.5 grains, L = 6).
+    status["inputs"][1]["audio"]["heard"] = false;
+    status["inputs"][1]["arrival_ms"]["recent"] = 90.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 6);
+    // A status without `heard` (no audio mix) counts no audio.
+    status["inputs"][1]["audio"].erase("heard");
+    status["inputs"][1]["arrival_ms"]["recent"] = 40.0;
+    CHECK_EQ(recommendedLatency(status, 20.0), 4);
 }
 
 TEST(skip_on_late_never_slides)
@@ -672,6 +704,9 @@ TEST(config_defaults_and_errors)
     CHECK(cfg.httpBind == "127.0.0.1");
     CHECK(cfg.workFormat == "yuv16");
     CHECK_EQ(cfg.audioWaitMs, 8);
+    CHECK_EQ(cfg.audioMaxDelayMs, 1000);
+    CHECK_EQ(loadConfig({{"FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS", "5000"}}).audioMaxDelayMs, 5000);
+    CHECK(configThrows({{"FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS", "5001"}}));
     auto const other = loadConfig({{"FLOWXER_ENGINE_INPUTS", kInputs}, {"FLOWXER_ENGINE_FORMAT", "1080p5994"}, {"FLOWXER_ENGINE_MES", "2"},
         {"FLOWXER_ENGINE_PVW_OUTPUTS", "false"}, {"FLOWXER_ENGINE_LATENCY", "6"}});
     CHECK_EQ(other.rate.num, 60000);

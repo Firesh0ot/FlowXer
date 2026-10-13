@@ -16,12 +16,14 @@ find_package(Threads REQUIRED)
 find_package(nlohmann_json 3 REQUIRED)
 
 # Pure logic (no CUDA, no MXL): config, ME state, mosaic map, TAI arithmetic, v210 reference,
-# audio crossfade, wipe reference.
+# audio crossfade, the P5 audio mix (strips, delay lines, channel maps) and meters, wipe reference.
 add_library(fxeng-core STATIC
     src/core/audio.cpp
+    src/core/audiomix.cpp
     src/core/config.cpp
     src/core/dme.cpp
     src/core/keyframes.cpp
+    src/core/meter.cpp
     src/core/mixer.cpp
     src/core/mosaic_map.cpp
     src/core/playout.cpp
@@ -37,7 +39,7 @@ target_compile_options(fxeng-core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract
 
 if(FXENG_BUILD_TESTS)
     enable_testing()
-    add_executable(fxeng-tests tests/test_main.cpp tests/test_core.cpp tests/test_keyframes.cpp tests/test_logic.cpp tests/test_ties.cpp)
+    add_executable(fxeng-tests tests/test_main.cpp tests/test_audio.cpp tests/test_core.cpp tests/test_keyframes.cpp tests/test_logic.cpp tests/test_meter.cpp tests/test_ties.cpp)
     target_link_libraries(fxeng-tests PRIVATE fxeng-core)
     target_compile_definitions(fxeng-tests PRIVATE FXENG_WIPE_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/wipe-vectors.json"
         FXENG_DME_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/dme-vectors.json")

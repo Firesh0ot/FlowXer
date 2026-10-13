@@ -8,6 +8,8 @@
 
 #include <cstdio>
 #include <optional>
+#include <utility>
+#include <vector>
 
 namespace fxeng
 {
@@ -387,6 +389,147 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
     return error(404, "unknown action " + action);
 }
 
+// ME m's audio settings as the status shows them (docs/engine-p5.md §8).
+json meAudioJson(Engine& engine, int me)
+{
+    auto const all = json::parse(engine.audioJson(), nullptr, false);
+    if (all.is_discarded() || !all.contains("mes"))
+    {
+        return json::object();
+    }
+    for (auto const& item : all["mes"])
+    {
+        if (item.value("me", 0) == me)
+        {
+            return item;
+        }
+    }
+    return json::object();
+}
+
+// POST /me/{m}/audio {master_db, strips: {"in1": {fader_db, mute, afv}, …}}: any subset, all or
+// nothing; each change ramps over the next grain.
+HttpResponse meAudio(Engine& engine, int me, json const& body)
+{
+    auto& mix = engine.audioMix();
+    if (me < 1 || me > mix.mes())
+    {
+        return error(404, "no ME " + std::to_string(me));
+    }
+    auto const level = [](json const& value) { return value.is_number() && value.get<double>() >= kFaderOffDb && value.get<double>() <= kFaderMaxDb; };
+    std::optional<float> master;
+    if (body.contains("master_db"))
+    {
+        if (!level(body["master_db"]))
+        {
+            return error(400, "master_db must be a number -90..10");
+        }
+        master = body["master_db"].get<float>();
+    }
+    std::vector<std::pair<StripRef, StripSettings>> changes;
+    if (body.contains("strips"))
+    {
+        if (!body["strips"].is_object())
+        {
+            return error(400, "strips must be an object of strip ids (in<k>, cp<k>, me<n>, stinger)");
+        }
+        for (auto const& [name, item] : body["strips"].items())
+        {
+            auto const ref = parseStrip(name);
+            if (!ref || !mix.hasStrip(me, *ref))
+            {
+                return error(404, "ME " + std::to_string(me) + " has no strip " + name);
+            }
+            if (!item.is_object())
+            {
+                return error(400, "strip " + name + " must be an object {fader_db, mute, afv}");
+            }
+            auto set = mix.strip(me, *ref).value_or(StripSettings{});
+            if (item.contains("fader_db"))
+            {
+                if (!level(item["fader_db"]))
+                {
+                    return error(400, "fader_db must be a number -90..10");
+                }
+                set.faderDb = item["fader_db"].get<float>();
+            }
+            if (item.contains("mute"))
+            {
+                if (!item["mute"].is_boolean())
+                {
+                    return error(400, "mute must be true or false");
+                }
+                set.mute = item["mute"].get<bool>();
+            }
+            if (item.contains("afv"))
+            {
+                if (ref->kind == StripRef::Kind::Stinger)
+                {
+                    return error(400, "the stinger strip has no afv");
+                }
+                if (!item["afv"].is_boolean())
+                {
+                    return error(400, "afv must be true or false");
+                }
+                set.afv = item["afv"].get<bool>();
+            }
+            changes.emplace_back(*ref, set);
+        }
+    }
+    if (master)
+    {
+        mix.setMaster(me, *master);
+    }
+    for (auto const& [ref, set] : changes)
+    {
+        mix.setStrip(me, ref, set);
+    }
+    return reply(200, meAudioJson(engine, me));
+}
+
+// POST /input/{k}/audio {delay_ms, map}: the delay (ms, whole samples) and channel map (one entry
+// per PGM channel, 0 silent; [] the default 1:1).
+HttpResponse inputAudio(Engine& engine, int k, json const& body)
+{
+    std::optional<double> delay;
+    std::optional<std::vector<int>> map;
+    if (body.contains("delay_ms"))
+    {
+        if (!body["delay_ms"].is_number())
+        {
+            return error(400, "delay_ms must be a number");
+        }
+        delay = body["delay_ms"].get<double>();
+    }
+    if (body.contains("map"))
+    {
+        if (!body["map"].is_array())
+        {
+            return error(400, "map must be an array of input channels (1-based, 0 silent)");
+        }
+        map.emplace();
+        for (auto const& v : body["map"])
+        {
+            if (!v.is_number_integer())
+            {
+                return error(400, "map must be an array of input channels (1-based, 0 silent)");
+            }
+            map->push_back(v.get<int>());
+        }
+    }
+    auto const failed = engine.setInputAudio(k, delay, map);
+    if (!failed.empty())
+    {
+        return error(failed.rfind("no input", 0) == 0 ? 404 : 400, failed);
+    }
+    auto const all = json::parse(engine.audioJson(), nullptr, false);
+    if (!all.is_discarded() && all.contains("inputs") && k <= static_cast<int>(all["inputs"].size()))
+    {
+        return reply(200, all["inputs"][static_cast<std::size_t>(k - 1)]);
+    }
+    return reply(200, json{{"input", k}});
+}
+
 HttpResponse playerCommand(Engine& engine, int k, std::string const& action, json const& body)
 {
     PlayerCommand command;
@@ -457,6 +600,14 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "application/json", engine.mosaicMapJson()};
         }
+        if (request.path == "/audio")
+        {
+            return HttpResponse{200, "application/json", engine.audioJson()};
+        }
+        if (request.path == "/audio/meters")
+        {
+            return HttpResponse{200, "application/json", engine.metersJson()};
+        }
         if (request.path == "/livez")
         {
             return HttpResponse{200, "text/plain", "ok\n"};
@@ -505,7 +656,19 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     std::string rest;
     if (int const me = pathNumber(request.path, "/me/", rest); me > 0)
     {
+        if (rest == "audio")
+        {
+            return meAudio(engine, me, body);
+        }
+        if (rest == "audio/loudness/reset")
+        {
+            return engine.resetLoudness(me) ? reply(200, json{{"me", me}, {"loudness_reset", true}}) : error(404, "no ME " + std::to_string(me));
+        }
         return meCommand(engine, me, rest, body);
+    }
+    if (int const k = pathNumber(request.path, "/input/", rest); k > 0 && rest == "audio")
+    {
+        return inputAudio(engine, k, body);
     }
     if (int const k = pathNumber(request.path, "/input/", rest); k > 0 && rest.empty())
     {

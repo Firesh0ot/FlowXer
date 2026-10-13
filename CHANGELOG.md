@@ -5,6 +5,43 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: audio (P5)
+
+- Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
+  and the stinger, each with a fader (−90 = off … +10 dB), mute and AFV (audio follows video; off:
+  always in the mix), and a master per ME. A live input has a delay (0 …
+  `FLOWXER_AUDIO_MAX_DELAY_MS`, default 1000 ms) and a channel map for every ME. Every change ramps
+  over one grain (S-shaped, no click); a Cut now crossfades over its grain (equal power). With the defaults the sound is
+  P4's, except the Cut, the first grain of a new route (it fades in) and a 1-channel live input
+  (now on every PGM channel).
+- Meters: per source peak and RMS, per ME PGM sample peak, true peak, RMS, overs and EBU R 128
+  loudness (momentary, short-term, integrated with reset) per channel pair, every 100 ms.
+- API: `GET /audio`, `PATCH /audio/inputs/{id}`, `/audio/panels/{id}`,
+  `/audio/panels/{id}/strips/{strip}`, `POST /audio/panels/{id}/loudness/reset`,
+  `GET /audio/meters`; `GET /console` has `audio`. The saved state and the export have `audio`
+  (a P4 state loads with the defaults). New: `FLOWXER_AUDIO_MAX_DELAY_MS`.
+- The engine's audio runs on its own thread (`fx-audio`) and reads every routed input into a delay
+  line each grain; `audio.missing` counts every routed input. `recommended_latency_grains` counts a
+  delayed input's audio lag minus its delay, and an input's audio only while some ME hears it (on
+  air, in a transition, AFV off and not muted; `audio.heard` in the engine's `/status`): on small
+  a browser source's bursty audio (533 ms, not on air) drove it to 28 grains. The lag stays in
+  `/status` and the metrics.
+- GUI: AUDIO opens the active ME's audio strip (meters, faders, MUTE, AFV, ON AIR, the master with
+  the loudness and RESET); a live input's ⚙ has an Audio section (delay, channel map). New widget
+  `audio`: `/widget/audio?me=n[&faders=false]` (480 × 240). Grafana: an audio row.
+- Metrics: `flowxer_engine_audio_level_dbfs`, `flowxer_engine_pgm_audio_level_dbfs`,
+  `flowxer_engine_pgm_loudness_lufs`, `flowxer_engine_pgm_audio_overs_total`,
+  `flowxer_engine_audio_strip_heard`, `flowxer_engine_audio_ms`, `flowxer_engine_audio_wait_ms`,
+  `flowxer_engine_audio_jobs_dropped_total`.
+- Measured on the lab (`docs/engine-p5.md`, "M4 as built"): with the defaults every ME's PGM and a
+  Mix are P4's bit for bit; gains, delays (1 ms–1 s) and channel maps exact to the sample; changes
+  leave −114 dBFS above 5 kHz (no click); EBU Tech 3341 within ±0.1 LU and equal to an offline
+  reference of the same samples, true peak within 0.005 dB of the reference. The audio thread in
+  the running engine (4 MEs, 8 inputs): 0.03–0.04 cores at 2 channels, 0.13–0.14 at 16; the delay
+  lines 0.44 MB per stereo input, 3.5 MB per 16-channel input. The 2 h soak with audio changes
+  every few seconds next to transitions, stingers, FTB, boxes and grabs: 0 skipped, 0 late, 0
+  audio `missing`, memory flat, 0 API errors.
+
 ### Changed: linear DME boxes are 4 × cheaper
 
 - A linear box now resamples its key flow unpacked once per grain (float planes of the

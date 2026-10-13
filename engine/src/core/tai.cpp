@@ -49,20 +49,23 @@ std::uint64_t periodNs(Rate rate)
 int recommendedLatency(nlohmann::json const& status, double periodMs)
 {
     double worst = 0;
-    auto const take = [&](nlohmann::json const& item, char const* window) {
+    // `earlier`: a delayed input's audio is read that much earlier (P5), so its lag counts less.
+    auto const take = [&](nlohmann::json const& item, char const* window, double earlier = 0.0) {
         if (item.value("state", "") == "running" && item.contains(window))
         {
             // The last minute's maximum: a transient (a mirror catching up at a route) ages out.
             auto const& stat = item[window];
-            worst = std::max(worst, stat.value("recent", stat.value("peak", 0.0)));
+            worst = std::max(worst, stat.value("recent", stat.value("peak", 0.0)) - earlier);
         }
     };
     for (auto const& input : status.value("inputs", nlohmann::json::array()))
     {
         take(input, "arrival_ms");
-        if (input.contains("audio"))
+        // Its audio only while some ME hears it (on air, in a transition, AFV off at a level): a
+        // source's bursty audio that no PGM reads does not hold L up.
+        if (input.contains("audio") && input["audio"].value("heard", false))
         {
-            take(input["audio"], "lag_ms");
+            take(input["audio"], "lag_ms", input["audio"].value("delay_ms", 0.0));
         }
     }
     for (auto const& key : status.value("key_flows", nlohmann::json::array()))
