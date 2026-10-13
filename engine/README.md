@@ -157,7 +157,10 @@ of the library item for the current format) and drives the transport.
   plays on every channel.
 - A frame the decoder does not have in time (right after a load or cue) repeats the last
   picture and counts as `late`. `GET /status` → `players`: state, frame, frames, loop, play on
-  cut, frames decoded ahead, decode time, late frames, error.
+  cut, frames decoded ahead, decode time, late frames, error, and `end_index`: the output grain
+  of the clip's last frame while it plays without loop (or the grain it ended in).
+  `GET /players` has just these and the last grain planned (`index`): FlowXer reads it every
+  100 ms to time a clip player's end action (`docs/clip-end.md`).
 - GPU memory: 9 v210 pictures per player (50 MB at 1080p) from the start, plus about 170 MB
   for the NVDEC decoder while a clip is loaded (its surfaces and FFmpeg's frame pool, 4:4:4
   16-bit). NVDEC: one 1080p50 player at 40–60 Mbit/s takes about 4 % of the A16 GPU's
@@ -378,7 +381,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /me/{m}/preview` | `{"source": "in3"}` | the ME; 400 for a source the ME may not take, 409 during a Mix |
 | `POST /me/{m}/program` | `{"source": "me2"}` | same |
 | `POST /me/{m}/transition` | `{"type": "mix"\|"wipe"\|"stinger", "frames", "pattern", "reverse", "soft", "border", "border_color": "#rrggbb", "ties": [k, …]}` (each optional) | the ME's next transition (`transition` in the answer); a running one keeps its own; 400 for an unknown wipe code or a tie that is no upstream keyer of the ME |
-| `POST /me/{m}/take` | `{"source", "frames", "preview", "type", "stinger", "cut", "ties"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, or `stinger` without a player), mixed (`mix`, the default), wiped with the ME's wipe (`wipe`), or by the stinger on player `stinger` with its cut frame `cut` (`stinger`; 404 for no such player; a player without a stinger cuts); `ties: true` takes the ME's tied keyers along |
+| `POST /me/{m}/take` | `{"source", "frames", "preview", "type", "stinger", "cut", "ties", "at"}` | Program to the source with an optional new Preview: cut (0 frames, `cut`, or `stinger` without a player), mixed (`mix`, the default), wiped with the ME's wipe (`wipe`), or by the stinger on player `stinger` with its cut frame `cut` (`stinger`; 404 for no such player; a player without a stinger cuts); `ties: true` takes the ME's tied keyers along. With `at` (an output grain) the take is held and made right before that grain is planned (a grain already planned: the next one; one held take per ME, a newer one replaces it); any other command of the ME, or of a keyer, makes it first. `GET /status` → `mes[]` `deferred_at`, `deferred_made` |
 | `POST /me/{m}/cut` | – | the ME (the tied keyers cut; during a transition: its end) |
 | `POST /me/{m}/auto` | `{"frames": 25}` (1–1000, default the ME's rate) | the ME's next transition, or the rest of a held T-bar transition; 409 while one runs |
 | `POST /me/{m}/ftb`, `/me/{m}/ftb/auto` | `{"on": true}`, `{"frames": 30}` | Fade to Black of the ME's whole output (a black layer after the DSKs; the PGM audio fades with it); the buses stay |
@@ -400,6 +403,7 @@ POST and PUT are the same. Sources: `in<n>`, `cp<n>`, `black`, `me<n>` (re-entry
 | `POST /player/{k}/cue` | `{"frame": n}` | shows frame n and holds |
 | `POST /stinger/{p}/load` | `{"path", "alpha", "audio", "channels", "frames"}` | loads a stinger (colour, alpha and sound files; `alpha` "" is opaque, `audio` "" silent) and cues its first frame; `path` "" unloads; 409 with the reason for a file that is no mezzanine |
 | `POST /player/{k}/play`, `/pause`, `/stop` | – | transport |
+| `GET /players` | – | `{index, players}`: the last output grain planned and each clip player's status (with `end_index`) |
 | `POST /grab` | `{"source": "in3"\|"cp1"\|"me1", "bus": "pgm"\|"pvw", "path"}` | a frame grab of the next grain as raw v210 into `path` (`bus` for an ME); answers at once with its id and state; 409 with 8 in flight |
 | `GET /grab/{id}` | – | `{grab, source, bus, path, state, error, index, tai, source_index, ms}` (the last 32 grabs) |
 | `GET /status` | – | per-ME state and output flows (`existing` = taken over), timing (GPU ms per stage, lag), counters, inputs and keys (video and audio state, arrival lag; audio is `no_signal` when its head stood still for a second), `recommended_latency_grains` (the latest arrival in the last minute (`recent`; `peak` is since the route) of what runs: inputs' video and audio, key flows in use; the start-up window and 2 s after each (re)route are not counted), clip players, stinger players, keyers (mode, `fly`, the box of the last grain, keyframe count, `run`: running, fly, loop, start grain, step, keyframe, on the path at `u`; `tie`: the ME it is tied to), `mes[]` (`start`: the first grain of the running or last transition, `ties`, `tied`), `grabs`, `gpu_ms.dme` (per ME the resample of its boxes), CPU per thread, GPU/NVENC, `preview` (mode own/shared, publish state per stream), `audio` (as `GET /audio`, plus fx-audio's `ms_per_grain`, `wait_ms`, `jobs_dropped`); each input's `audio` also has its `delay_ms`, `map`, `channels`, `held_ms` and `heard` (some ME hears it in the last grain), and `recommended_latency_grains` counts an input's audio lag only while it is heard, minus its delay |

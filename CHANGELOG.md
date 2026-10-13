@@ -5,6 +5,25 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: clip end back to Preview
+
+- A clip player's `on_end` (`off`, `cut`, `auto`, `stinger`; `docs/clip-end.md`). When the player
+  plays to the end without loop on an ME's Program and Preview is another source, the ME takes
+  Preview:
+  - `cut`: on the grain after the last frame;
+  - `auto`: the ME's mix or wipe at its rate, ending on the last frame;
+  - `stinger`: the ME's stinger, with its cut point on the last frame.
+- A clip shorter than the transition starts it at once. A take or a stop before the end cancels
+  it. Several MEs with the clip on Program each act. Tied keyers, tally and AFV behave as with
+  Cut, Auto and a stinger.
+- Engine: `GET /players` (the last grain planned and each player's `end_index`); `POST
+  /me/{m}/take` with `at` holds the take until that output grain; `/status` shows `deferred_at`
+  and `deferred_made` per ME. The control plane reads `/players` every 100 ms while such a clip is
+  on Program and sends the take 3 grains early.
+- GUI: *At the end* in a clip player's ⚙ and an END mark on its tile. The saved state and the
+  export have `on_end` (an older state: `off`).
+- Lab: each action exact to the grain, 0 skipped and 0 late grains.
+
 ### Added: audio (P5)
 
 - Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
