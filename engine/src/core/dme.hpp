@@ -369,16 +369,13 @@ FXENG_HD inline void dmeUnpackPixel(DmeSource const& src, float* planes, int x, 
 {
     std::uint32_t const* words = dmeWords(src, row);
     std::uint8_t const* keyLine = dmeKeyLine(src, row);
-    for (int plane = 0; plane < 4; plane += 3)
-    {
-        dmePlanesLine(planes, src.width, src.height, plane, row)[x] = dmeFetchLinear(words, keyLine, plane, x);
-    }
+    dmePlanesLine(planes, src.width, src.height, 0, row)[x] = dmeFetchLinear(words, keyLine, 0, x);
+    dmePlanesLine(planes, src.width, src.height, 3, row)[x] = dmeFetchLinear(words, keyLine, 3, x);
     if (x % 2 == 0)
     {
-        for (int plane = 1; plane < 3; ++plane)
-        {
-            dmePlanesLine(planes, src.width, src.height, plane, row)[x / 2] = dmeFetchLinear(words, keyLine, plane, x / 2);
-        }
+        int const cx = x / 2;
+        dmePlanesLine(planes, src.width, src.height, 1, row)[cx] = dmeFetchLinear(words, keyLine, 1, cx);
+        dmePlanesLine(planes, src.width, src.height, 2, row)[cx] = dmeFetchLinear(words, keyLine, 2, cx);
     }
 }
 
