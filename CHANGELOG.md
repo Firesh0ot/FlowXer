@@ -5,6 +5,19 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: linear DME boxes are 4 × cheaper
+
+- A linear box now resamples its key flow unpacked once per grain (float planes of the
+  premultiplied fill and the key) instead of decoding the packed v210a at every tap. The planes
+  exist only for key flows that a linear box uses: 23.7 MiB each at 1080p, shared by all linear
+  boxes on that flow. The picture is the same bit for bit (unit test, GPU self-test, lab check on
+  the key grain from MXL).
+- Lab A16 (`docs/engine-p4.md`, "Linear boxes unpacked once"): a linear box at 1/4 costs 0.32 ms
+  instead of 1.33 ms; 8 linear boxes on one ME render in 8.64 ms instead of 16.77 ms (P3's worst
+  case: 5.70 ms), with no late grain. The unpack costs about 0.4–0.5 ms per key flow and grain.
+- Box limit at 1080p50 (A4000 estimate): a linear box counts as 1.5 instead of 4, and each key
+  flow with linear boxes 1.5 more for its unpack.
+
 ### Added: the boxes' GPU time (P4 M4)
 
 - `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes

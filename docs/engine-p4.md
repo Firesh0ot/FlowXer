@@ -7,9 +7,11 @@ editor, the `dme` widget) implemented in #91, with the details in
 [Implementation notes (M2)](#implementation-notes-m2). M3 (keyer ties, frame grab) implemented in
 #91, with the details in [Implementation notes (M3)](#implementation-notes-m3). M4 (budget, soak) done
 in #91: `dme_ms`, the worst case with boxes in the running engine, the recommended box limit and the
-2 h soak ([M4 as built](#m4-as-built)). P4 builds on P3 (transitions and keying, #89) and on P2
-(the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a prototype kernel on
-the lab host (A16 GPU 3) on 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
+2 h soak ([M4 as built](#m4-as-built)). Since #99 a linear box unpacks its key flow once per grain
+([Linear boxes unpacked once](#linear-boxes-unpacked-once-99)). P4 builds on P3 (transitions and
+keying, #89) and on P2 (the C++/CUDA engine is FlowXer's media path, #86). The numbers come from a
+prototype kernel on the lab host (A16 GPU 3) on 2026-10-12
+([Appendix](#appendix-lab-measurements-2026-10-12)).
 
 ## Decisions this design follows
 
@@ -478,7 +480,8 @@ phase (5 s windows):
   - a pip at 1/4: 0.22–0.23 ms (8 on one ME, 24 on four);
   - **a linear box at 1/4: about 1.33 ms, as much as 4 half-size pips** (the 32 boxes against the
     24 pips: 8 linear boxes more). It reads the packed v210a fill and key at every tap and
-    premultiplies there (`dmeFetchLinear`); a pip reads the unpacked work picture.
+    premultiplies there (`dmeFetchLinear`); a pip reads the unpacked work picture. Since #99 about
+    0.32 ms ([Linear boxes unpacked once](#linear-boxes-unpacked-once-99)).
 - **A moving box costs what a static one does** (fly32 against box32), as in M2.
 - **GPU memory:** 11.9 MiB (12.4 MB) per keyer whose box has been used, allocated when its box is
   first enabled and kept until the engine restarts (the second run kept 8, 14 and 26 buffers:
@@ -505,8 +508,10 @@ phase (5 s windows):
   cost per box), 2 ms below the target. Stingers on all 4 MEs at the same moment add about 0.8 ms
   (max 1.9, P3) and bring the maximum to the target.
 - **Boxes on one or two MEs:** up to 8 per ME (the same 16 in all; 8 on ME 1 measured: 10.4 / 12.1 ms).
-- **A linear box counts as 4** (measured at 1/4 size): with 4 MEs at full load, one linear box per ME
-  and no other box.
+- **A linear box counts as 1.5** (since #99; it counted as 4 before), and each key flow with linear
+  boxes 1.5 more for its unpack: with 4 MEs at full load, e.g. 2 linear boxes per ME on one key flow
+  (8 · 1.5 + 1.5 = 13.5 of 16), or 1 linear box and 2 pips per ME (4 · 1.5 + 1.5 + 8 = 15.5).
+  [Linear boxes unpacked once](#linear-boxes-unpacked-once-99) has the numbers.
 - **The defaults (2 per ME) fit with room** (10.9 / 12.0 ms). 6 per ME on 4 MEs is the edge
   (13.0 / 13.6 ms; late grains on the A16); 8 per ME on 4 MEs does not fit.
 - Less load (no held wipe on every ME, fewer keys) leaves room for more. FlowXer sets no hard
@@ -544,6 +549,82 @@ noise at 8 / 20 / 60, 5.2 MB for random samples (the worst case). A camera pictu
 | Grabs | 849: live inputs 381, ME PGM 191, ME PVW 186, clip player 91; 0 failed, 0 pending; 24.0 ms from request to file on average, max 418 ms (one grab at 1 h 47 min, the maximum before it 81 ms; no grain late, nothing in the host's journal) |
 | Grabs of the bars | 91 of 91 equal to the bars still bit for bit |
 | Library | every grab still left (47, with the M3 tests') has its FFV1 original and thumbnail; 0 failed conversions |
+
+### Linear boxes unpacked once (#99)
+
+**Before:** a linear box read the packed v210a fill + key at every Catmull-Rom tap
+(`dmeFetchLinear`): it decoded a v210 word and a key word and premultiplied, for up to 32 taps per
+output sample. Each source sample was decoded again for every output column and tile that used it.
+
+**Now:** once per grain the engine unpacks each key flow that a linear box uses into float planes
+(`gpu::dmeUnpack`, one thread per pixel, `core/dme.hpp` `dmeUnpackPixel`): Y, Cb and Cr
+premultiplied, then the key. The box resamples from them as a pip resamples its work picture.
+- All linear boxes on one key flow share the unpack. A key flow with no linear box has no planes and
+  no unpack (lazy).
+- **GPU memory:** 23.7 MiB per key flow at 1080p (3 floats per pixel). The control thread allocates
+  them when a linear box on that flow is first enabled, or when its keyer is routed to another flow.
+  They stay until the engine stops, as the box buffers do. If they are missing, the box reads the
+  packed grain as before.
+- **Why float planes:** the premultiplied sample, (Y − 64) · k / 1023, is not an integer. As a float
+  the planes hold exactly the value `dmeFetchLinear` computed in place. The engine builds without
+  fused multiply-add (`-fmad=false`), so the sums and the picture stay the same bit for bit. Planes
+  in int16 or half precision would round the sample and change the picture.
+- **Bit-exact:**
+  - unit test `dme_linear_unpacked_is_bit_exact`: unpacked against packed on the CPU, 5 sizes and
+    crops;
+  - the GPU self-test: 12 boxes, the 3 linear ones also through the unpack;
+  - lab (`fxp6-linear.py`, A16 GPU 0): in the running engine, a linear box on ME 1 Program against
+    the CPU reference (the packed read) on the key grain from MXL. 5 of 5 exact (1/4 and 1/2 with
+    sub-pixel position, border and shadow; 0.4137 with crop and soft edge; 1.0 at a sub-pixel
+    offset; 1.5). The key had 81 % partial values. The image before #99 gives the same 5 of 5.
+
+**Isolated bench** (`fxp6-dme`, A16 GPU 0, 1080p, Catmull-Rom, border and shadow, resample only,
+ms per box). The unpack alone: 0.228 ms.
+
+| Layout | pip | linear before (packed) | linear now (planes) | linear now + the unpack, shared |
+|---|---|---|---|---|
+| 1 × 1/2 | 0.188 | 0.730 | 0.310 | 0.556 |
+| 8 × 1/4 | 0.210 | 1.439 | 0.338 | 0.375 |
+| 1 × 1.0 | 0.200 | 0.612 | 0.349 | 0.602 |
+| 1 × 1.5 | 0.225 | 0.634 | 0.375 | 0.635 |
+| 1 × 0.1 | 0.245 | 4.616 | 0.419 | 0.679 |
+
+A linear box now costs about 1.6 × a pip of its size: it has a key plane more to resample (1.5 × the
+columns), read as floats.
+
+**Running engine** (`fxp6-worst.py`, the pattern of `fxp4-worst2.py`: P3's worst case as in M4,
+lab A16 GPU 0, 60 s per phase; before = `dev` 14.21.56, after = #99):
+
+| Phase (on top of P3's worst case) | Boxes | Render avg / max, before → after | Render + download avg / max, before → after | Skipped / late, before → after |
+|---|---|---|---|---|
+| P3's worst case | 0 | 5.73 / 6.49 → 5.70 / 6.44 | 12.62 / 14.08 → 12.59 / 14.30 | 0 / 0 → 0 / 0 |
+| 2 half pips on every ME (the defaults) | 8 | 8.25 / 9.08 → 8.24 / 9.10 | 15.49 / 16.83 → 15.47 / 16.85 | 0 / 0 → 0 / 0 |
+| 8 pips at 1/4 on ME 1 | 8 | 7.48 / 8.34 → 7.49 / 8.26 | 14.57 / 15.96 → 14.57 / 16.00 | 0 / 0 → 0 / 0 |
+| 6 pips at 1/4 on every ME | 24 | 11.33 / 12.34 → 11.34 / 12.17 | 19.20 / 20.30 → 19.20 / 20.16 | 0 / 938 → 0 / 1014 |
+| 8 boxes at 1/4 on every ME, 2 of them linear | 32 | **22.04 / 24.53 → 13.93 / 14.75** | 29.58 / 32.09 → 22.07 / 23.01 | 447 / 2588 → 0 / 3037 |
+| 8 linear boxes at 1/4 on ME 1 (one key flow) | 8 | **16.77 / 19.25 → 8.64 / 9.45** | 24.69 / 27.27 → 15.96 / 17.13 | 0 / 3037 → 0 / 0 |
+
+- **Per linear box at 1/4:** 1.34 ms before (32 boxes against 24 pips) and 1.38 ms (8 linear boxes
+  against none); now 0.32 ms and 0.37 ms, with its share of the unpack. A pip at 1/4: 0.22 ms.
+- **`dme_ms`:** the 8 linear boxes on ME 1 10.91 → 2.89 ms. With 32 boxes 3.98–4.05 ms per ME →
+  1.83 ms (MEs 1–3) and 2.54 ms (ME 4: it renders first and does the unpack). So the resample of a
+  linear box at 1/4 is about 0.31 ms, and the unpack in the running engine about 0.4–0.5 ms
+  (0.23 ms alone in the bench; in the engine it shares the memory with the grain's copies).
+- **GPU memory:** + 23.7 MiB with linear boxes on one key flow (32 boxes: + 403 MiB over the base,
+  before + 380 MiB). The other phases are the same as before.
+- **Pips do not change** (the same kernel): the rows without a linear box agree within the noise.
+
+**A4000 estimate** (render ÷ 2.24, the same download, as in M4): a linear box at 1/4 about 0.14 ms
+(before 0.6 ms), the unpack about 0.2 ms per key flow.
+
+| Case (on top of P3's worst case) | Boxes | A4000 render + download avg / max, before → after | Inside 15 ms |
+|---|---|---|---|
+| 8 boxes at 1/4 on every ME, 2 of them linear | 32 | 17.4 / 19.4 → 14.4 / 15.1 | no → the edge |
+| 8 linear boxes at 1/4 on ME 1 | 8 | 15.4 / 17.1 → 11.2 / 12.1 | no → yes |
+
+**Box limit:** the limits above stay (at most 4 boxes per ME at full load, 16 in all; up to 8 per ME
+on one or two MEs). A linear box now counts as 1.5 instead of 4, and each key flow with linear boxes
+counts 1.5 more for its unpack.
 
 ## 10. Milestones
 
