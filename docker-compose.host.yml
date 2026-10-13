@@ -1,6 +1,7 @@
 # Host-network Compose for a real MXL host (not the local bridge demo).
 # Both containers share the host network: GUI proxies to 127.0.0.1:9610.
-# Requires FLOWXER_API_TOKEN. Mount /Volumes/mxl must be writable by uid 1000.
+# Requires FLOWXER_API_TOKEN and an NVIDIA GPU (the media engine). Mount /Volumes/mxl must be
+# writable by uid 1000.
 name: flowxer-host
 
 services:
@@ -17,23 +18,28 @@ services:
       FLOWXER_MXL_ROOT: /Volumes/mxl
       FLOWXER_STORAGE_ROOT: /storage
       FLOWXER_GROUP_HINT: ${FLOWXER_GROUP_HINT:-FlowXer}
-      FLOWXER_GST_MODE: auto
+      FLOWXER_LATENCY: ${FLOWXER_LATENCY:-4}
       FLOWXER_NMOS_ENABLE: "true"
       FLOWXER_NMOS_DNS_SD: "false"
       FLOWXER_NMOS_PORT: "3252"
       FLOWXER_NMOS_REGISTRY_URL: ${FLOWXER_NMOS_REGISTRY_URL:-}
       FLOWXER_NMOS_HOST_IP: ${FLOWXER_NMOS_HOST_IP:-}
       FLOWXER_NMOS_SEED: ${FLOWXER_NMOS_SEED:-}
-      FLOWXER_WEBRTC_PUBLIC_IP: ${FLOWXER_WEBRTC_PUBLIC_IP:-}
-      FLOWXER_WEBRTC_UDP_PORT_MIN: "32600"
-      FLOWXER_WEBRTC_UDP_PORT_MAX: "32631"
-      FLOWXER_OVERLAY_URL: http://127.0.0.1:9610/graphics/lower-third.html
+      MEDIAMTX_PUBLIC_IP: ${MEDIAMTX_PUBLIC_IP:-}
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
       FLOWXER_API_TOKEN: ${FLOWXER_API_TOKEN:?set FLOWXER_API_TOKEN}
       FLOWXER_CORS_ORIGINS: ${FLOWXER_CORS_ORIGINS:-*}
     volumes:
       - /Volumes/mxl:/Volumes/mxl
       - ./storage:/storage
     shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute, video, utility]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9610/livez"]
       interval: 10s

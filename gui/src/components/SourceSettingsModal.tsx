@@ -1,12 +1,14 @@
 import { useState } from "react";
-import type { LibraryItem, LogicalInput, StingerSlot } from "../api";
+import type { AudioState, LibraryItem, LogicalInput, StingerSlot } from "../api";
 
-const KINDS = ["test", "black", "mxl_live", "file", "replay"] as const;
+const KINDS = ["mxl_live", "clip_player", "black"] as const;
 
 export function SourceSettingsModal({
   input,
-  clips,
-  libraryClips,
+  audio,
+  fps,
+  onAudio,
+  libraryItems,
   stingerSlots,
   pinnedBy,
   onClose,
@@ -14,8 +16,12 @@ export function SourceSettingsModal({
   onOpenLibrary,
 }: {
   input: LogicalInput;
-  clips: { name: string; library_item_id?: string | null; ready?: boolean }[];
-  libraryClips: LibraryItem[];
+  /** The audio settings (P5): a live input's delay and channel map are in its Audio section. */
+  audio?: AudioState;
+  fps: number;
+  onAudio: (payload: { delay_ms?: number; channel_map?: number[] }) => Promise<void>;
+  /** Ready clips and stills of the library. */
+  libraryItems: LibraryItem[];
   stingerSlots: StingerSlot[];
   /** Variables that set the inputs' ids, kinds and labels, when the environment does. */
   pinnedBy?: string;
@@ -29,12 +35,20 @@ export function SourceSettingsModal({
   const [videoFlow, setVideoFlow] = useState(input.video?.flow_id ?? "");
   const [audioFlow, setAudioFlow] = useState(input.audio?.flow_id ?? "");
   const [libraryItemId, setLibraryItemId] = useState(input.library_item_id ?? "");
-  const [filePath, setFilePath] = useState(input.file_path ?? "");
+  const [loop, setLoop] = useState(Boolean(input.loop));
+  const [playOnCut, setPlayOnCut] = useState(Boolean(input.play_on_cut));
   const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
-
-  const readyClips = libraryClips.filter((item) => item.ready);
-  const legacyClips = clips.filter((clip) => !clip.library_item_id);
+  const inputAudio = audio?.inputs[input.id];
+  const pgmChannels = audio?.channels ?? 2;
+  const flowChannels = inputAudio?.channels ?? input.audio?.channels ?? 2;
+  const [delayMs, setDelayMs] = useState(inputAudio?.delay_ms ?? 0);
+  // Per PGM channel the input channel (1-based, 0 silent); the default is 1:1.
+  const identity = Array.from({ length: pgmChannels }, (_, c) => (flowChannels === 1 ? 1 : c < flowChannels ? c + 1 : 0));
+  const [channelMap, setChannelMap] = useState<number[]>(inputAudio?.channel_map?.length ? inputAudio.channel_map : identity);
+  const frameMs = 1000 / fps;
+  const maxDelay = audio?.max_delay_ms ?? 1000;
+  const stepDelay = (ms: number) => setDelayMs((d) => Math.min(maxDelay, Math.max(0, Math.round((d + ms) * 48) / 48)));
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -79,47 +93,86 @@ export function SourceSettingsModal({
               Audio flow UUID
               <input value={audioFlow} onChange={(e) => setAudioFlow(e.target.value)} />
             </label>
+            {audio ? (
+              <fieldset className="audio-settings">
+                <legend>Audio</legend>
+                <label>
+                  Delay (ms; audio later than its video, 0–{maxDelay})
+                  <span className="delay-row">
+                    <button type="button" title="One frame less" onClick={() => stepDelay(-frameMs)}>
+                      −1 fr
+                    </button>
+                    <button type="button" title="1 ms less" onClick={() => stepDelay(-1)}>
+                      −1
+                    </button>
+                    <input
+                      type="number"
+                      min={0}
+                      max={maxDelay}
+                      step={0.1}
+                      value={Math.round(delayMs * 100) / 100}
+                      onChange={(e) => setDelayMs(Math.min(maxDelay, Math.max(0, Number(e.target.value) || 0)))}
+                    />
+                    <button type="button" title="1 ms more" onClick={() => stepDelay(1)}>
+                      +1
+                    </button>
+                    <button type="button" title="One frame more" onClick={() => stepDelay(frameMs)}>
+                      +1 fr
+                    </button>
+                  </span>
+                </label>
+                <div className="map-row">
+                  <span>Channels (PGM ← input; the flow has {flowChannels})</span>
+                  {channelMap.map((value, c) => (
+                    <label key={c}>
+                      {c + 1}
+                      <select
+                        value={value}
+                        onChange={(e) => setChannelMap((map) => map.map((v, k) => (k === c ? Number(e.target.value) : v)))}
+                      >
+                        <option value={0}>silent</option>
+                        {Array.from({ length: Math.max(flowChannels, 2) }, (_, k) => (
+                          <option key={k + 1} value={k + 1}>
+                            {k + 1}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ))}
+                  <button type="button" onClick={() => setChannelMap(identity)}>
+                    1:1
+                  </button>
+                  <button type="button" onClick={() => setChannelMap(channelMap.map(() => 1))}>
+                    Mono
+                  </button>
+                </div>
+              </fieldset>
+            ) : null}
           </>
         ) : null}
-        {kind === "file" || kind === "replay" ? (
+        {kind === "clip_player" ? (
           <>
             <label>
-              Library clip
-              <select
-                value={libraryItemId}
-                onChange={(e) => {
-                  setLibraryItemId(e.target.value);
-                  if (e.target.value) setFilePath("");
-                }}
-              >
-                <option value="">Select library clip</option>
-                {readyClips.map((item) => (
+              Clip or still
+              <select value={libraryItemId} onChange={(e) => setLibraryItemId(e.target.value)}>
+                <option value="">Empty (black)</option>
+                {libraryItems.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {item.name}
-                    {item.playback !== "unknown" ? ` (${item.playback})` : ""}
+                    {item.name} ({item.kind === "still" ? "still" : `${item.duration_s.toFixed(1)} s`})
                   </option>
                 ))}
               </select>
             </label>
-            <label>
-              Legacy file path
-              <select
-                value={filePath}
-                onChange={(e) => {
-                  setFilePath(e.target.value);
-                  if (e.target.value) setLibraryItemId("");
-                }}
-              >
-                <option value="">None</option>
-                {legacyClips.map((clip) => (
-                  <option key={clip.name} value={clip.name}>
-                    {clip.name}
-                  </option>
-                ))}
-              </select>
+            <label className="check">
+              <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} />
+              Loop
+            </label>
+            <label className="check">
+              <input type="checkbox" checked={playOnCut} onChange={(e) => setPlayOnCut(e.target.checked)} />
+              Play on cut (start when taken to Program)
             </label>
             <button type="button" className="ghost" onClick={onOpenLibrary}>
-              Open clip library…
+              Open clip and still library…
             </button>
           </>
         ) : null}
@@ -163,16 +216,20 @@ export function SourceSettingsModal({
                     payload.audio = audioFlow ? { flow_id: audioFlow } : null;
                   }
                 }
-                if (kind === "file" || kind === "replay") {
-                  if (libraryItemId) {
-                    payload.library_item_id = libraryItemId;
-                    payload.file_path = null;
-                  } else if (filePath) {
-                    payload.file_path = filePath;
-                    payload.library_item_id = null;
-                  }
+                if (kind === "clip_player") {
+                  payload.library_item_id = libraryItemId || null;
+                  payload.loop = loop;
+                  payload.play_on_cut = playOnCut;
                 }
                 await onSave(payload);
+                if (kind === "mxl_live" && audio) {
+                  const isIdentity = channelMap.every((v, c) => v === identity[c]);
+                  const map = isIdentity ? [] : channelMap;
+                  const before = inputAudio?.channel_map ?? [];
+                  if (delayMs !== (inputAudio?.delay_ms ?? 0) || map.join(",") !== before.join(",")) {
+                    await onAudio({ delay_ms: delayMs, channel_map: map });
+                  }
+                }
                 onClose();
               } catch (err) {
                 setError(err instanceof Error ? err.message : "Save failed");

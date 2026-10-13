@@ -8,6 +8,9 @@ import {
 
 type UploadMode = "video" | "zip" | "folder";
 
+/** Pictures upload as stills (a clip player holds one as a frame memory). */
+const STILL_FILE = /\.(png|jpe?g|tiff?|bmp|webp|dpx|exr)$/i;
+
 export function LibraryModal({
   kind,
   onClose,
@@ -29,7 +32,9 @@ export function LibraryModal({
   const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
-    const [nextItems, nextJobs] = await Promise.all([api.library(kind, query), api.jobs()]);
+    // The clip library holds the stills too.
+    const [listed, nextJobs] = await Promise.all([api.library(kind === "clip" ? undefined : kind, query), api.jobs()]);
+    const nextItems = kind === "clip" ? listed.filter((item) => item.kind !== "stinger") : listed;
     setItems(nextItems);
     setJobs(nextJobs.filter((job) => nextItems.some((item) => item.id === job.item_id)));
   };
@@ -55,9 +60,10 @@ export function LibraryModal({
     setProgress(0);
     try {
       if (kind === "stinger" && mode === "folder") {
-        const tga = files.filter((file) => file.name.toLowerCase().endsWith(".tga"));
-        if (!tga.length) throw new Error("Drop a folder of .tga frames");
-        await api.uploadSequence(tga[0].webkitRelativePath?.split("/")[0] || "sequence", tga, {
+        // TGA or PNG frames and one optional WAV (the stinger's sound).
+        const sequence = files.filter((file) => /\.(tga|png|wav)$/i.test(file.name));
+        if (!sequence.some((file) => /\.(tga|png)$/i.test(file.name))) throw new Error("Drop a folder of .tga or .png frames");
+        await api.uploadSequence(sequence[0].webkitRelativePath?.split("/")[0] || "sequence", sequence, {
           sequence_fps: sequenceFps,
           cut_frame: cutFrame,
           fit,
@@ -67,7 +73,7 @@ export function LibraryModal({
           const uploadMode = kind === "stinger" && mode === "zip" ? "zip" : "video";
           await uploadFileChunked(
             file,
-            kind,
+            kind === "clip" && STILL_FILE.test(file.name) ? "still" : kind,
             uploadMode,
             {
               fit,
@@ -97,7 +103,7 @@ export function LibraryModal({
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => void onDrop(event)}
       >
-        <h2>{kind === "clip" ? "Clip library" : "Stinger library"}</h2>
+        <h2>{kind === "clip" ? "Clip and still library" : "Stinger library"}</h2>
         <p className="hint">
           Upload converts in the background to an intra-frame mezzanine. Items show as converting
           until ready; the mixer is never blocked.
@@ -111,9 +117,9 @@ export function LibraryModal({
           />
           {kind === "stinger" ? (
             <select value={mode} onChange={(e) => setMode(e.target.value as UploadMode)}>
-              <option value="video">Video file</option>
-              <option value="folder">TGA folder</option>
-              <option value="zip">TGA zip</option>
+              <option value="video">Video file (with alpha)</option>
+              <option value="folder">TGA/PNG folder (+ WAV)</option>
+              <option value="zip">TGA/PNG zip (+ WAV)</option>
             </select>
           ) : null}
           <select value={fit} onChange={(e) => setFit(e.target.value)}>
@@ -151,7 +157,15 @@ export function LibraryModal({
               type="file"
               multiple={mode === "folder"}
               {...(mode === "folder" ? ({ webkitdirectory: "", directory: "" } as Record<string, string>) : {})}
-              accept={mode === "zip" ? ".zip" : mode === "folder" ? ".tga" : "video/*,.mov,.mxf,.mkv,.ts"}
+              accept={
+                mode === "zip"
+                  ? ".zip"
+                  : mode === "folder"
+                    ? ".tga,.png,.wav"
+                    : kind === "clip"
+                      ? "video/*,image/*,.mov,.mxf,.mkv,.ts,.dpx,.exr"
+                      : "video/*,.mov,.mxf,.mkv,.ts"
+              }
               disabled={busy}
               onChange={(e) => {
                 const list = e.target.files ? Array.from(e.target.files) : [];
@@ -197,9 +211,13 @@ export function LibraryModal({
               <div>
                 <strong>{item.name}</strong>
                 <p>
+                  {item.kind === "still" ? "still · " : ""}
                   {item.ready ? "ready" : item.status}
                   {item.playback !== "unknown" ? ` · ${item.playback}` : ""}
                   {item.frame_count ? ` · ${item.frame_count}f` : ""}
+                  {item.kind === "stinger"
+                    ? ` · ${item.has_alpha ? "alpha" : "opaque"}${item.has_sound ? " · sound" : ""} · cut ${item.cut_frame ?? 0}`
+                    : ""}
                   {item.in_use ? " · in use" : ""}
                 </p>
                 {item.error ? <p className="error">{item.error}</p> : null}

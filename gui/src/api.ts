@@ -1,4 +1,6 @@
-export type InputKind = "mxl_live" | "file" | "replay" | "test" | "black";
+import type { PreviewMap } from "./preview";
+
+export type InputKind = "mxl_live" | "clip_player" | "black";
 
 export interface LogicalInput {
   id: string;
@@ -7,10 +9,35 @@ export interface LogicalInput {
   slot: number;
   file_path?: string | null;
   library_item_id?: string | null;
+  /** Clip players: loop, and play when taken to Program. */
+  loop?: boolean;
+  play_on_cut?: boolean;
   group_hint?: string | null;
   stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;
   audio?: { flow_id?: string | null; media_type: string; channels: number } | null;
+}
+
+export type TransitionKind = "mix" | "wipe" | "stinger";
+
+/** An ME's next transition: what Auto runs. soft and border are 0..1 of the pattern's travel. */
+export interface PanelTransition {
+  type: TransitionKind;
+  rate_frames: number;
+  wipe: {
+    pattern: number;
+    reverse: boolean;
+    /** Flip-flop: reverse toggles after each wipe. */
+    alternate: boolean;
+    soft: number;
+    border: number;
+    border_color: string;
+  };
+  stinger_slot_id: string | null;
+  /** Keyer ties: the ME's upstream keyers (ids) that Cut, Auto and the T-bar turn on or off. */
+  ties: string[];
+  /** BKGD: the background transitions; false: only the tied keyers (key only). */
+  background: boolean;
 }
 
 export interface MixerPanel {
@@ -20,15 +47,90 @@ export interface MixerPanel {
   preview_input_id: string | null;
   wipe_armed?: boolean;
   last_transition?: string;
+  transition: PanelTransition;
+  /** Fade to Black: the whole output is black. */
+  ftb?: boolean;
 }
 
-export interface DownstreamKeyer {
+/** A keyer's box (docs/engine-p4.md §3): x, y the centre of the uncropped picture (fractions of
+ * the raster), size its scale; crop fractions of the source; border and shadow in raster pixels. */
+export interface Dme {
+  enabled: boolean;
+  x: number;
+  y: number;
+  size: number;
+  soft: number;
+  crop: { left: number; right: number; top: number; bottom: number };
+  border: { width: number; soft: number; color: string; opacity: number };
+  shadow: { dx: number; dy: number; blur: number; opacity: number };
+}
+
+export type Ease = "linear" | "ease" | "ease-in" | "ease-out" | "hold";
+export type DmeLoop = "off" | "wrap" | "pingpong";
+export type DmePresetName = "corner-tl" | "corner-tr" | "corner-bl" | "corner-br" | "split" | "quad" | "full";
+
+/** A keyframe: a box state (no `enabled`, no border colour) and the time from the keyframe before. */
+export interface DmeKeyframe {
+  frames: number;
+  ease: Ease;
+  x: number;
+  y: number;
+  size: number;
+  soft: number;
+  crop: Dme["crop"];
+  border: { width: number; soft: number; opacity: number };
+  shadow: Dme["shadow"];
+}
+
+/** The engine's run of a keyer's box (none off-air). */
+export interface KeyerRun {
+  running: boolean;
+  fly: boolean;
+  loop: DmeLoop;
+  /** The keyframe the box moves to, or (not running) the one it is at. */
+  keyframe: number | null;
+  step: number;
+}
+
+export interface DmePresetInfo {
+  name: DmePresetName;
+  title: string;
+  keyers: number;
+  description: string;
+}
+
+/** An upstream keyer or a DSK of one ME: linear (its v210a key input), luma (a source) or pip (a
+ * source in a box, upstream only). An upstream keyer's `dme` puts its key in a box; its keyframes
+ * animate the box, and with `fly` its Auto flies the box instead of fading it. */
+export interface Keyer {
   id: string;
   label: string;
+  panel_id: string;
+  stage: "upstream" | "downstream";
   enabled: boolean;
-  url: string;
-  title: string;
-  subtitle: string;
+  /** Duration of its Auto. */
+  rate_ms: number;
+  mode: "linear" | "luma" | "pip";
+  source_id: string | null;
+  clip: number;
+  soft: number;
+  gain: number;
+  invert: boolean;
+  dme: Dme;
+  fly: boolean;
+  keyframes: DmeKeyframe[];
+  run?: KeyerRun | null;
+}
+
+/** What the engine reports for an input (GET /console `sources`); clip players add the transport. */
+export interface SourceRuntime {
+  state?: string;
+  kind?: "clip" | "still" | "";
+  frame?: number;
+  frames?: number;
+  loop?: boolean;
+  play_on_cut?: boolean;
+  error?: string;
 }
 
 export interface StingerSlot {
@@ -46,13 +148,14 @@ export interface StingerSlot {
 
 export interface LibraryItem {
   id: string;
-  kind: "clip" | "stinger";
+  kind: "clip" | "still" | "stinger";
   name: string;
   tags: string[];
   status: string;
   ready: boolean;
   playback: string;
   has_alpha: boolean;
+  has_sound: boolean;
   cut_frame?: number | null;
   cut_ms?: number | null;
   frame_count: number;
@@ -91,7 +194,9 @@ export interface WorkspaceConfig {
   mixer_panel_count: number;
   stinger_mode: string;
   stinger_count: number;
-  downstream_keyer_count: number;
+  keyers_per_me: number;
+  dsks_per_me: number;
+  stinger_players: number;
   source_tile_aspect?: "16:9" | "9:16";
 }
 
@@ -105,7 +210,7 @@ export interface MixerStatus {
   frame_rate: string;
   video_format: string;
   stinger: { phase: string; id?: string | null };
-  webrtc_enabled: boolean;
+  webrtc_enabled?: boolean;
   wipe_armed?: boolean;
   last_transition?: string;
   error?: string | null;
@@ -178,16 +283,60 @@ export interface TallyConfig {
   presets: TallyPreset[];
 }
 
+/** P5 audio settings (GET /audio, GET /console `audio`). */
+export interface AudioStripSettings {
+  label: string;
+  kind: "input" | "clip_player" | "panel" | "stinger";
+  fader_db: number;
+  mute: boolean;
+  /** Audio follows video; null on the stinger strip. */
+  afv: boolean | null;
+}
+
+export interface AudioState {
+  /** The PGM's channels. */
+  channels: number;
+  max_delay_ms: number;
+  /** Per live input id: its delay, channel map (empty: 1:1) and its flow's channels. */
+  inputs: Record<string, { label: string; delay_ms: number; channel_map: number[]; channels: number | null }>;
+  /** Per rendering panel id: its master and its strips in slot order. */
+  panels: Record<string, { label: string; master_db: number; strips: Record<string, AudioStripSettings> }>;
+}
+
+export interface SourceMeter {
+  peak_dbfs: number[];
+  rms_dbfs: number[];
+}
+
+/** GET /audio/meters: the last 100 ms block (values below −120 dB are −120). */
+export interface AudioMeters {
+  block: number | null;
+  channels: number;
+  sources: Record<string, SourceMeter>;
+  panels: Record<
+    string,
+    SourceMeter & {
+      true_peak_dbtp: number[];
+      loudness: { pair: number; momentary: number; short_term: number; integrated: number }[];
+      overs: number;
+      strips: Record<string, { gain_db: number; heard: boolean }>;
+    }
+  >;
+}
+
 export interface ConsoleState {
   workspace: WorkspaceConfig;
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
   inputs: LogicalInput[];
   panels: MixerPanel[];
-  keyers: DownstreamKeyer[];
+  keyers: Keyer[];
   stinger_slots: StingerSlot[];
   mixer: MixerStatus;
   resources: ResourceInfo;
-  webrtc: { enabled: boolean; protocol: string };
+  /** The preview mosaic and its tile map. */
+  preview: PreviewMap;
+  /** Per input id what the engine reports (clip players: their transport). */
+  sources?: Record<string, SourceRuntime>;
   clips: { name: string; path: string; library_item_id?: string | null; ready?: boolean }[];
   stingers: StingerInfo[];
   library?: LibraryItem[];
@@ -196,6 +345,8 @@ export interface ConsoleState {
   nmos?: NmosStatus;
   /** Workspace fields set by the environment, with the variables that set them. */
   pinned?: Partial<Record<keyof WorkspaceConfig, string>>;
+  /** The audio settings (P5). */
+  audio?: AudioState;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -233,20 +384,36 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
-  fade: (panel_id: string) =>
-    fetch("/api/v1/mixer/fade", {
+  /** The ME's next transition (mix, wipe over its rate, or a stinger over its length). */
+  auto: (panel_id: string) =>
+    fetch("/api/v1/mixer/auto", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
     }).then((r) => parse(r)),
+  /** The T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it. */
+  position: (panel_id: string, position: number) =>
+    fetch("/api/v1/mixer/position", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ panel_id, position }),
+    }).then((r) => parse(r)),
+  transition: (panel_id: string, patch: Record<string, unknown>) =>
+    fetch(`/api/v1/panels/${panel_id}/transition`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(patch),
+    }).then((r) => parse<PanelTransition>(r)),
+  /** A frame grab of the next grain (an input or clip player id, a panel id for its Program,
+   * <panel id>:pvw for its Preview) as a library still; `player`: load it into that clip player. */
+  grab: (source: string, player?: string) =>
+    fetch("/api/v1/library/grab", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(player ? { source, player } : { source }),
+    }).then((r) => parse<LibraryItem>(r)),
   fadeToBlack: (panel_id: string) =>
     fetch("/api/v1/mixer/fade-to-black", {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({ panel_id }),
-    }).then((r) => parse(r)),
-  wipe: (panel_id: string) =>
-    fetch("/api/v1/mixer/wipe", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
@@ -263,12 +430,64 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload),
     }).then((r) => parse<LogicalInput>(r)),
+  keyerAuto: (id: string) =>
+    fetch(`/api/v1/keyers/${id}/auto`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) =>
+      parse<Keyer>(r),
+    ),
+  /** Clip player transport: cue (a frame, 0 = the first), play, pause, stop. */
+  player: (inputId: string, action: "cue" | "play" | "pause" | "stop", frame = 0) =>
+    fetch(`/api/v1/players/${inputId}/${action}`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(action === "cue" ? { frame } : {}),
+    }).then((r) => parse<LogicalInput>(r)),
   patchKeyer: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/keyers/${id}`, {
       method: "PATCH",
       headers: jsonHeaders,
       body: JSON.stringify(payload),
-    }).then((r) => parse<DownstreamKeyer>(r)),
+    }).then((r) => parse<Keyer>(r)),
+  /** The keyer's keyframes (up to 8); missing box fields take the keyer's box. */
+  keyframes: (id: string, keyframes: Partial<DmeKeyframe>[]) =>
+    fetch(`/api/v1/keyers/${id}/keyframes`, {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify(keyframes),
+    }).then((r) => parse<Keyer>(r)),
+  /** Run the box: to a keyframe, back (reverse), a loop, or a jump (frames 0). */
+  keyerRun: (id: string, body: { to?: number; reverse?: boolean; loop?: DmeLoop; frames?: 0 } = {}) =>
+    fetch(`/api/v1/keyers/${id}/run`, { method: "POST", headers: jsonHeaders, body: JSON.stringify(body) }).then((r) =>
+      parse<Keyer>(r),
+    ),
+  keyerStop: (id: string) =>
+    fetch(`/api/v1/keyers/${id}/stop`, { method: "POST", headers: jsonHeaders, body: "{}" }).then((r) => parse<Keyer>(r)),
+  keyerPreset: (id: string, name: DmePresetName) =>
+    fetch(`/api/v1/keyers/${id}/preset`, { method: "POST", headers: jsonHeaders, body: JSON.stringify({ name }) }).then((r) =>
+      parse<Keyer[]>(r),
+    ),
+  dmePresets: () => fetch("/api/v1/dme/presets").then((r) => parse<DmePresetInfo[]>(r)),
+  audio: () => fetch("/api/v1/audio").then((r) => parse<AudioState>(r)),
+  audioMeters: () => fetch("/api/v1/audio/meters").then((r) => parse<AudioMeters>(r)),
+  patchAudioInput: (id: string, payload: { delay_ms?: number; channel_map?: number[] }) =>
+    fetch(`/api/v1/audio/inputs/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  patchAudioPanel: (id: string, payload: { master_db: number }) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  patchAudioStrip: (panel: string, strip: string, payload: { fader_db?: number; mute?: boolean; afv?: boolean }) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(panel)}/strips/${encodeURIComponent(strip)}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse(r)),
+  resetLoudness: (panel: string) =>
+    fetch(`/api/v1/audio/panels/${encodeURIComponent(panel)}/loudness/reset`, { method: "POST" }).then((r) => parse(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",
@@ -301,7 +520,7 @@ export const api = {
     }).then((r) => parse<TallyConfig>(r)),
   tallyRefresh: () =>
     fetch("/api/v1/tally/refresh", { method: "POST" }).then((r) => parse<TallyConfig>(r)),
-  library: (kind?: "clip" | "stinger", q = "") => {
+  library: (kind?: "clip" | "still" | "stinger", q = "") => {
     const params = new URLSearchParams();
     if (kind) params.set("kind", kind);
     if (q) params.set("q", q);
@@ -325,7 +544,7 @@ export const api = {
   uploadInit: (payload: {
     name: string;
     size: number;
-    kind: "clip" | "stinger";
+    kind: "clip" | "still" | "stinger";
     mode: "video" | "image_sequence" | "zip";
     options?: Record<string, unknown>;
   }) =>
@@ -361,7 +580,7 @@ export const api = {
 
 export async function uploadFileChunked(
   file: File,
-  kind: "clip" | "stinger",
+  kind: "clip" | "still" | "stinger",
   mode: "video" | "zip",
   options: Record<string, unknown> = {},
   onProgress?: (ratio: number) => void,

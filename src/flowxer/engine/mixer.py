@@ -4,61 +4,68 @@ import logging
 import threading
 import time
 from pathlib import Path
-
+from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
 
 from flowxer import __version__
 from flowxer.api.schemas import (
+    AudioConfig,
     AudioEssence,
-    DownstreamKeyer,
+    AudioStrip,
+    AudioStripUpdate,
+    Dme,
+    DmeKeyframe,
+    DmeLoop,
+    DmePreset,
+    DmePresetInfo,
+    InputAudio,
+    InputAudioUpdate,
     InputKind,
+    Keyer,
+    KeyerRun,
+    KeyerStage,
+    KeyMode,
     LogicalInput,
     LogicalInputCreate,
     LogicalInputUpdate,
-    VideoEssence,
+    MeOutputs,
     MixerPanel,
     MixerStartRequest,
     MixerState,
     MixerStatus,
     OutputFlows,
-    OverlayStatus,
+    PanelAudio,
+    PanelAudioUpdate,
+    PanelTransition,
+    PanelTransitionUpdate,
     ProgramBus,
     StingerInfo,
     StingerSlot,
-    TransitionType,
-    WorkspaceConfig,
-    WorkspaceUpdate,
     StingerSlotUpdate,
     TallyReceiver,
     TallyReceiverStatus,
+    TransitionType,
+    VideoEssence,
+    WorkspaceConfig,
+    WorkspaceUpdate,
 )
 from flowxer.domain import nmos
 from flowxer.domain.mxl_domain import (
-    find_flow_domain,
     DomainError,
     ensure_output_domain,
+    find_flow_domain,
     flows_by_group_hint_in_root,
     list_flows_in_root,
     remove_output_domain,
     resolve_domain_path,
 )
-from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import format_by_id
-from flowxer.engine.gpu import MEDIA_PATH_CPU, NO_NVIDIA_DEVICE, MediaPath, select_media_path
-from flowxer.engine.gst_runtime import GstRuntime, try_start_gst
-from flowxer.engine.overlay import Html5Overlay
-from flowxer.engine.pipeline import PAD_KEYER, build_pipeline_description, stinger_bin_description
-from flowxer.engine.security import (
-    SecurityError,
-    assert_http_url,
-    contained_path,
-    require_safe_id,
-    resolve_under,
-)
+from flowxer.engine.runtime import EngineClient, EngineError, EngineRuntime
+from flowxer.engine.security import SecurityError, contained_path, require_safe_id
+from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.stinger import (
-    StingerPlayer,
     cut_frame_from_ms,
     cut_ms_from_frame,
     duration_ms_from_frames,
@@ -68,11 +75,9 @@ from flowxer.engine.stinger import (
     register_video_stinger,
     update_stinger_cut,
 )
-from flowxer.engine.state import STATE_FORMAT, StateStore
 from flowxer.engine.tally import TallyService
 from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
 from flowxer.engine.watchdog import ControlPlaneWatchdog
-from flowxer.engine.webrtc import webrtc_available
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
 from flowxer.settings import Settings, ensure_storage
@@ -89,10 +94,95 @@ DOMAIN_WATCH_S = 2.0
 # FLOWXER_PROGRAM_AUTOSTART tries again after these pauses (s) while Program does not start; the
 # last one repeats.
 AUTOSTART_BACKOFF_S = (2.0, 5.0, 10.0, 30.0)
+# Sources in slot order (the TSL INDEX): live inputs, clip players, then Black.
+KIND_ORDER = {InputKind.mxl_live: 0, InputKind.clip_player: 1, InputKind.black: 2}
+# The re-entered Program of ME n is the source "me-<n>" (TSL INDEX 1000 + n).
+REENTRY_INDEX = 1000
+# A stinger take that finds every stinger player busy waits this long for one to be free.
+STINGER_WAIT_S = 0.5
+# A frame grab is in the library within a few grains; the control plane waits at most this long.
+GRAB_TIMEOUT_S = 3.0
+# Audio delays are whole 48 kHz samples.
+AUDIO_SAMPLES_PER_MS = 48
+# A fader that moves sends up to 20 values a second: its changes are saved at most this often.
+PERSIST_INTERVAL_S = 1.0
+# GET /audio/meters: one engine call per 100 ms block, however many viewers poll.
+METERS_CACHE_S = 0.08
+# Meter values below this are this (silence).
+METER_FLOOR_DB = -120.0
 
 
 def _autostart_pause(attempt: int) -> float:
     return AUTOSTART_BACKOFF_S[min(attempt, len(AUTOSTART_BACKOFF_S)) - 1]
+
+
+def _frames(duration_ms: int, fps: float) -> int:
+    """A transition duration in grains (at least 1)."""
+    return max(1, int(round(duration_ms * fps / 1000.0)))
+
+
+def _merged(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """`base` with `patch` applied, nested objects merged (a keyer's box from a partial PATCH)."""
+    out = dict(base)
+    for name, value in patch.items():
+        out[name] = _merged(out[name], value) if isinstance(value, dict) and isinstance(out.get(name), dict) else value
+    return out
+
+
+def _box_state(box: dict[str, Any]) -> dict[str, Any]:
+    """The animated fields of a box (Dme, a keyframe or the engine's box): not `enabled`, not the
+    border colour."""
+    border = box.get("border") or {}
+    state = {name: box[name] for name in ("x", "y", "size", "soft", "crop", "shadow") if name in box}
+    state["border"] = {name: border[name] for name in ("width", "soft", "opacity") if name in border}
+    return state
+
+
+# DME presets (docs/engine-p4.md §5): keyframe 0 off screen on the near side, keyframe 1 on.
+DME_PRESETS = [
+    DmePresetInfo(name=DmePreset.corner_tl, title="Top left", keyers=1, description="1/3 size in the top left corner inside the 5 % action-safe margin, 4 px white border, soft shadow"),
+    DmePresetInfo(name=DmePreset.corner_tr, title="Top right", keyers=1, description="1/3 size in the top right corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.corner_bl, title="Bottom left", keyers=1, description="1/3 size in the bottom left corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.corner_br, title="Bottom right", keyers=1, description="1/3 size in the bottom right corner, as corner-tl"),
+    DmePresetInfo(name=DmePreset.split, title="Split", keyers=2, description="the ME's keyers 1 and 2: each source cropped to its centre half, full size, side by side"),
+    DmePresetInfo(name=DmePreset.quad, title="Quad", keyers=4, description="the ME's keyers 1 to 4 at 1/2 size, 2 x 2"),
+    DmePresetInfo(name=DmePreset.full, title="Full", keyers=1, description="size 1, centred: keyframe 0 is the box as it is, so the box flies to and from full screen"),
+]
+# Keyframe 0 of a preset: this far beyond the raster edge (fractions), border and shadow included.
+_OFF = 0.05
+_NO_CROP = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+_PLAIN = {"soft": 0.0, "border": {"width": 0.0, "soft": 0.0, "opacity": 1.0}, "shadow": {"dx": 0.0, "dy": 0.0, "blur": 0.0, "opacity": 0.0}}
+
+
+def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """(on, off) box fields of each keyer a preset writes (1, 2 or 4). `current`: the box of the
+    keyer it is applied to (keyframe 0 of `full`)."""
+    if name in (DmePreset.corner_tl, DmePreset.corner_tr, DmePreset.corner_bl, DmePreset.corner_br):
+        size, border = 1.0 / 3.0, 4.0
+        left = name in (DmePreset.corner_tl, DmePreset.corner_bl)
+        top = name in (DmePreset.corner_tl, DmePreset.corner_tr)
+        # The picture and its border inside the 5 % action-safe margin.
+        mx = (0.05 * width + border) / width + size / 2
+        my = (0.05 * height + border) / height + size / 2
+        on = {
+            "x": mx if left else 1.0 - mx, "y": my if top else 1.0 - my, "size": size, "soft": 0.0, "crop": _NO_CROP,
+            "border": {"width": border, "soft": 0.0, "opacity": 1.0, "color": "#ffffff"},
+            "shadow": {"dx": 8.0, "dy": 8.0, "blur": 16.0, "opacity": 0.5},
+        }
+        return [(on, {**on, "x": -size / 2 - _OFF if left else 1.0 + size / 2 + _OFF})]
+    if name == DmePreset.split:
+        crop = {"left": 0.25, "right": 0.25, "top": 0.0, "bottom": 0.0}
+        return [
+            ({"x": x, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN}, {"x": off, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN})
+            for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
+        ]
+    if name == DmePreset.quad:
+        return [
+            ({"x": x, "y": y, "size": 0.5, "crop": _NO_CROP, **_PLAIN}, {"x": off, "y": y, "size": 0.5, "crop": _NO_CROP, **_PLAIN})
+            for y in (0.25, 0.75)
+            for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
+        ]
+    return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
 
 
 class MixerError(RuntimeError):
@@ -104,20 +194,18 @@ class StingerNotReady(MixerError):
 
 
 class VisionMixer:
-    """Control-plane + media-plane orchestrator for the DMF vision mixer."""
+    """Control plane of the vision mixer: state, decisions, NMOS, tally, library. The media
+    engine (a child process) renders what this state says."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.library = LibraryService(settings)
         self.library.consumers_fn = self._library_consumers
         self.library.add_listener(self._on_library_job)
-        # FLOWXER_GPU, decided once at start; `on` without a working GPU raises
-        # GpuUnavailableError (exit 78).
-        self.media = self._select_media_path()
         self.inputs: dict[str, LogicalInput] = {}
         self.workspace = self._pinned(WorkspaceConfig())
         self.panels: list[MixerPanel] = []
-        self.keyers: list[DownstreamKeyer] = []
+        self.keyers: list[Keyer] = []
         self.stinger_slots: list[StingerSlot] = []
         self.started_at = time.time()
         self.state = MixerState.idle
@@ -126,51 +214,64 @@ class VisionMixer:
         self.preview_input_id: str | None = None
         self.last_live_input_id: str | None = None
         self.program_bus = ProgramBus.live
-        self.pipeline: str | None = None
         self.error: str | None = None
+        # ME 1 Program flows (kept for clients of the single-ME API) and every rendering ME's.
         self.outputs: OutputFlows | None = None
-        self.gst: GstRuntime | None = None
-        self.stinger_player: StingerPlayer | None = None
+        self.me_outputs: dict[str, MeOutputs] = {}
+        # The media engine while Program is on air (None in simulate mode and off-air).
+        self.engine: EngineRuntime | None = None
         self.last_transition: str = "cut"
-        # Program frames of earlier runs; frames_rendered adds the running pipeline's.
+        # Program frames of earlier runs; frames_rendered adds the running engine's.
         self._frames_before = 0
+        self._frames_dropped_before = 0
         # (frames_rendered, monotonic time) when Program last advanced; a stall is reported in status().
         self._frame_mark: tuple[int, float] = (0, 0.0)
         self._stall_logged = False
-        self.frames_dropped = 0
-        # Program buffers dropped because they went back in time (earlier runs), per essence.
-        self._program_dropped_before = {"video": 0, "audio": 0}
-        # MXL sources started again after they failed, per (input id, essence).
-        self.input_restarts: dict[tuple[str, str], int] = {}
         # Operations that need the control plane; /livez fails when one is stuck.
         self.watchdog = ControlPlaneWatchdog()
-        self.late_grains = 0
-        self.resyncs = 0
-        self.pipeline_errors = 0
-        self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "stinger": 0}
+        self.transition_counts: dict[str, int] = {"cut": 0, "mix": 0, "wipe": 0, "stinger": 0}
+        # Stinger takes that became cuts here: no mezzanine yet, or every stinger player busy.
+        self.stinger_fallbacks: dict[str, int] = {"not_ready": 0, "busy": 0}
         self._lock = threading.RLock()
-        # (input id, essence) -> MXL domain id of a route whose domain is missing; the source waits
-        # in the own output domain until it appears.
+        # (input id, essence) -> MXL domain id of a route whose domain is missing; routed once it
+        # appears.
         self._missing_domains: dict[tuple[str, str], str] = {}
+        # Keyer id -> (MXL domain id, flow id) of its key input (IS-05), flow None when not routed.
+        self._key_routes: dict[str, tuple[str | None, str | None]] = {}
+        # Keyer id -> monotonic time until which a keyer that fades or flies off is still on air
+        # (raw tally).
+        self._key_until: dict[str, float] = {}
         # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
         self._autostart_done = threading.Event()
-        self._stinger_clock: threading.Thread | None = None
         self.tally = TallyService()
         # FLOWXER_TALLY_TSL, started at the end of __init__.
         self.tally_export: TallyExport | None = None
-        # Panel id -> (outgoing, incoming, monotonic end) of its last mix, for the raw tally.
-        self._mixes: dict[str, tuple[str | None, str, float]] = {}
+        # Panel id -> (outgoing, incoming, monotonic end or None while a T-bar holds it) of its last
+        # mix or wipe, for the raw tally.
+        self._mixes: dict[str, tuple[str | None, str, float | None]] = {}
+        # Panel id -> (position, outgoing, incoming) of a transition the T-bar holds, and the keyers
+        # tied to it (on air while it is held; they change state when it completes).
+        self._positions: dict[str, tuple[float, str | None, str]] = {}
+        self._held_ties: dict[str, list[str]] = {}
+        # Stinger player -> the stinger it holds (its mezzanine), and the monotonic time until which
+        # it plays one; the last stinger taken (for the status).
+        self._stinger_cued: dict[int, str] = {}
+        self._stinger_until: dict[int, float] = {}
+        self._stinger_run: dict[str, Any] | None = None
+        # P5 audio: per live input its delay and channel map, per panel its master and strips.
+        self.audio = AudioConfig()
+        # Saves of audio changes, at most once a second (persist_soon).
+        self._persist_lock = threading.Lock()
+        self._persist_at = 0.0
+        self._persist_timer: threading.Timer | None = None
+        # The engine's last /audio/meters and when it was fetched.
+        self._meters_lock = threading.Lock()
+        self._meters_raw: dict[str, Any] | None = None
+        self._meters_at = 0.0
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
-        self.overlay = Html5Overlay(
-            url=settings.overlay_url,
-            cache_dir=settings.graphics_dir,
-            width=settings.width,
-            height=settings.height,
-        )
         ensure_storage(settings)
-        self.overlay.render_fallback_png()
         self._ensure_default_stinger()
         self._sync_sources()
         self._sync_panels()
@@ -183,21 +284,7 @@ class VisionMixer:
         if settings.tally_tsl_target is not None:
             self.tally_export = TallyExport(*settings.tally_tsl_target, self._tally_snapshot)
 
-    def _select_media_path(self) -> MediaPath:
-        if self.settings.simulate or self.settings.gst_mode == "simulate":
-            return MediaPath(MEDIA_PATH_CPU, "simulated media")
-        media = select_media_path(self.settings.gpu)
-        if media.gpu:
-            log.info("media path: gpu (%s)", media.reason)
-        elif self.settings.gpu == "auto":
-            # On a node without a GPU this is the normal case, elsewhere worth a look.
-            report = log.info if media.reason == NO_NVIDIA_DEVICE else log.warning
-            report("media path: cpu (FLOWXER_GPU=auto, the GPU path is not available: %s)", media.reason)
-        else:
-            log.info("media path: cpu (%s)", media.reason)
-        return media
-
-    # ── catalog ──────────────────────────────────────────────────────────────
+    # ── structure ────────────────────────────────────────────────────────────
 
     def _ensure_default_stinger(self) -> None:
         dest = self.settings.stingers_dir / self.settings.default_stinger
@@ -221,82 +308,92 @@ class VisionMixer:
         pinned = self.settings.pinned_workspace.get("logical_source_count")
         return pinned[1] if pinned else None
 
+    @staticmethod
+    def _new_input(input_id: str, label: str, kind: InputKind, slot: int, previous: LogicalInput | None = None) -> LogicalInput:
+        essences = {"video": VideoEssence(), "audio": AudioEssence()} if kind == InputKind.mxl_live else {}
+        return LogicalInput(
+            id=input_id,
+            label=label,
+            kind=kind,
+            slot=slot,
+            stinger_slot_id=previous.stinger_slot_id if previous else None,
+            **essences,
+        )
+
     def _pin_sources(self) -> None:
-        """The inputs the environment sets: live cam-1..N, test-1..M, Black, Replay. Ids,
-        kinds and labels come from the environment; routes, clips and auto-stingers of an
-        input with the same id and kind stay."""
+        """The inputs the environment sets: live cam-1..N, clip-1..C, Black. Ids, kinds and labels
+        come from the environment; routes, media and auto-stingers of an input with the same id
+        and kind stay."""
         plan = [
             (f"cam-{n}", label, InputKind.mxl_live)
             for n, label in enumerate(self.settings.live_input_labels, 1)
         ]
         plan += [
-            (f"test-{n}", f"Test {n}", InputKind.test)
-            for n in range(1, (self.settings.test_sources or 0) + 1)
+            (f"clip-{n}", f"Clip {n}", InputKind.clip_player)
+            for n in range(1, (self.settings.clip_players or 0) + 1)
         ]
-        plan += [("black", "Black", InputKind.black), ("replay", "Replay", InputKind.replay)]
+        plan.append(("black", "Black", InputKind.black))
         inputs: dict[str, LogicalInput] = {}
         for slot, (input_id, label, kind) in enumerate(plan):
             item = self.inputs.get(input_id)
             if item is None or item.kind != kind:
-                essences = (
-                    {"video": VideoEssence(), "audio": AudioEssence()}
-                    if kind == InputKind.mxl_live
-                    else {}
-                )
-                item = LogicalInput(
-                    id=input_id,
-                    label=label,
-                    kind=kind,
-                    slot=slot,
-                    stinger_slot_id=item.stinger_slot_id if item else None,
-                    **essences,
-                )
+                item = self._new_input(input_id, label, kind, slot, item)
                 self._apply_default_domain(item)
             item.label = label
             item.slot = slot
             inputs[input_id] = item
         self.inputs = inputs
-        # Buses on an input the environment removed start empty.
-        for name in ("program_input_id", "preview_input_id", "last_live_input_id"):
-            if getattr(self, name) not in inputs:
-                setattr(self, name, None)
-        for panel in self.panels:
-            if panel.program_input_id not in inputs:
-                panel.program_input_id = None
-            if panel.preview_input_id not in inputs:
-                panel.preview_input_id = None
+
+    def _renumber(self) -> None:
+        """Slots in source order: live inputs, clip players, Black (each kind in its order)."""
+        ordered = sorted(self.inputs.values(), key=lambda item: (KIND_ORDER[item.kind], item.slot))
+        for slot, item in enumerate(ordered):
+            item.slot = slot
 
     def _sync_sources(self) -> None:
         if self._inputs_pinned_by():
             self._pin_sources()
-        desired = self.workspace.logical_source_count
-        while len(self.inputs) > desired:
-            last = self.list_inputs()[-1]
-            if last.id in {self.program_input_id, self.preview_input_id}:
-                break
-            del self.inputs[last.id]
-        existing = {item.id for item in self.inputs.values()}
-        slot = len(self.inputs)
-        index = 1
-        while len(self.inputs) < desired:
-            source_id = f"cam-{index}"
-            index += 1
-            if source_id in existing:
-                continue
-            kind = InputKind.test
-            label = f"Camera {index - 1}"
-            remaining = desired - len(self.inputs)
-            if remaining == 2 and "black" not in existing:
-                source_id, label, kind = "black", "Black", InputKind.black
-            elif remaining == 1 and "replay" not in existing:
-                source_id, label, kind = "replay", "Replay", InputKind.replay
-            self.inputs[source_id] = LogicalInput(
-                id=source_id, label=label, kind=kind, slot=slot
-            )
-            existing.add(source_id)
-            slot += 1
-        for slot, item in enumerate(self.list_inputs()):
-            item.slot = slot
+        else:
+            desired = self.workspace.logical_source_count
+            while len(self.inputs) > desired:
+                # The last live input goes first, then the last clip player; Black stays.
+                removable = sorted(
+                    (
+                        item
+                        for item in self.inputs.values()
+                        if item.id not in {self.program_input_id, self.preview_input_id} and item.kind != InputKind.black
+                    ),
+                    key=lambda i: (i.kind == InputKind.mxl_live, i.slot),
+                )
+                if not removable:
+                    break
+                del self.inputs[removable[-1].id]
+            # A layout that grows gets Black and one clip player first (the colour bars, a clip),
+            # then live inputs.
+            if len(self.inputs) < desired and not any(item.kind == InputKind.black for item in self.inputs.values()):
+                self.inputs["black"] = self._new_input("black", "Black", InputKind.black, len(self.inputs))
+            if len(self.inputs) < desired and not any(item.kind == InputKind.clip_player for item in self.inputs.values()):
+                self.inputs["clip-1"] = self._new_input("clip-1", "Clip 1", InputKind.clip_player, len(self.inputs))
+            index = 1
+            while len(self.inputs) < desired:
+                source_id = f"cam-{index}"
+                index += 1
+                if source_id in self.inputs:
+                    continue
+                item = self._new_input(source_id, f"Camera {index - 1}", InputKind.mxl_live, len(self.inputs))
+                self._apply_default_domain(item)
+                # New live inputs come before the clip players and Black.
+                item.slot = -1
+                self.inputs[source_id] = item
+        self._renumber()
+        for name in ("program_input_id", "preview_input_id", "last_live_input_id"):
+            if getattr(self, name) not in self.inputs:
+                setattr(self, name, None)
+        for panel in self.panels:
+            if not self._source_known(panel, panel.program_input_id):
+                panel.program_input_id = None
+            if not self._source_known(panel, panel.preview_input_id):
+                panel.preview_input_id = None
         valid_slots = {item.id for item in self.stinger_slots}
         for item in self.inputs.values():
             if item.stinger_slot_id and item.stinger_slot_id not in valid_slots:
@@ -321,27 +418,37 @@ class VisionMixer:
             if self.preview_input_id:
                 self.panels[0].preview_input_id = self.preview_input_id
 
+    def _labels_pinned(self) -> bool:
+        pinned = self.settings.pinned_workspace
+        return "keyers_per_me" in pinned or "dsks_per_me" in pinned
+
     def _sync_keyers(self) -> None:
-        desired = self.workspace.downstream_keyer_count
-        while len(self.keyers) < desired:
-            n = len(self.keyers) + 1
-            self.keyers.append(
-                DownstreamKeyer(
-                    id=f"dsk-{n}",
-                    label=f"DSK {n}",
-                    url=self.settings.overlay_url,
-                    title=self.overlay.title,
-                    subtitle=self.overlay.subtitle,
-                    enabled=self.overlay.enabled if n == 1 else False,
-                )
-            )
-        self.keyers = self.keyers[:desired]
-        if self.keyers:
-            first = self.keyers[0]
-            self.overlay.url = first.url
-            self.overlay.title = first.title
-            self.overlay.subtitle = first.subtitle
-            self.overlay.enabled = first.enabled
+        """keyers_per_me upstream keyers (`me-n-key-k`, "ME n Key k") and dsks_per_me DSKs on every
+        rendering ME, in the engine's order. ME 1's DSKs keep P2's ids and labels (`dsk-k`,
+        "DSK k"), the other MEs' are `me-n-dsk-k` ("ME n DSK k"). A keyer keeps its state by id."""
+        previous = {keyer.id: keyer for keyer in self.keyers}
+        keyers: list[Keyer] = []
+        for n, panel in enumerate(self.rendered_panels(), 1):
+            wanted = [(f"me-{n}-key-{k}", f"ME {n} Key {k}", KeyerStage.upstream) for k in range(1, self.workspace.keyers_per_me + 1)]
+            wanted += [
+                (f"dsk-{k}", f"DSK {k}", KeyerStage.downstream) if n == 1 else (f"me-{n}-dsk-{k}", f"ME {n} DSK {k}", KeyerStage.downstream)
+                for k in range(1, self.workspace.dsks_per_me + 1)
+            ]
+            for keyer_id, label, stage in wanted:
+                keyer = previous.get(keyer_id) or Keyer(id=keyer_id, label=label)
+                keyer.panel_id, keyer.stage = panel.id, stage
+                if self._labels_pinned():
+                    keyer.label = label
+                keyers.append(keyer)
+        self.keyers = keyers
+        for keyer_id in list(self._key_routes):
+            if not any(keyer.id == keyer_id for keyer in self.keyers):
+                del self._key_routes[keyer_id]
+        # Keyer ties name the ME's upstream keyers (in their order); BKGD is on without a tie.
+        for panel in self.panels:
+            transition = panel.transition
+            transition.ties = [k.id for k in keyers if k.panel_id == panel.id and k.stage == KeyerStage.upstream and k.id in transition.ties]
+            transition.background = transition.background or not transition.ties
 
     def _sync_stinger_slots(self) -> None:
         previous = {slot.id: slot for slot in self.stinger_slots}
@@ -402,12 +509,30 @@ class VisionMixer:
         self._sync_keyers()
         self._sync_stinger_slots()
         if format_changed:
-            # Mixer is off-air here; re-convert library items for the new raster/rate.
+            # Off-air here; re-convert library items for the new raster/rate.
             self.library.set_format(self.workspace.format_id, fps=self.settings.fps)
+        self._prune_audio()
         self.nmos.reconcile_inputs()
         self._publish_tally()
         self.refresh_library_bindings()
         return self.workspace
+
+    @property
+    def render_count(self) -> int:
+        """The first n panels render (FLOWXER_RENDER_MES, default every panel)."""
+        if not self.panels:
+            return 0
+        wanted = self.settings.render_mes or len(self.panels)
+        return max(1, min(wanted, len(self.panels)))
+
+    def rendered_panels(self) -> list[MixerPanel]:
+        return list(self.panels[: self.render_count])
+
+    def _panel_number(self, panel: MixerPanel) -> int:
+        return self.panels.index(panel) + 1
+
+    def _rendered(self, panel: MixerPanel) -> bool:
+        return panel in self.rendered_panels()
 
     def get_panel(self, panel_id: str) -> MixerPanel:
         for panel in self.panels:
@@ -415,31 +540,366 @@ class VisionMixer:
                 return panel
         raise MixerError(f"unknown mixer panel {panel_id}")
 
-    def get_keyer(self, keyer_id: str) -> DownstreamKeyer:
+    def _reentry_panel(self, source_id: str | None) -> MixerPanel | None:
+        """The panel whose Program the source me-<n> re-enters, or None."""
+        for panel in self.panels:
+            if panel.id == source_id:
+                return panel
+        return None
+
+    def _source_known(self, panel: MixerPanel, source_id: str | None) -> bool:
+        if source_id is None:
+            return True
+        if source_id in self.inputs:
+            return True
+        reentered = self._reentry_panel(source_id)
+        return reentered is not None and self._reentry_allowed(panel, reentered)
+
+    def _reentry_allowed(self, panel: MixerPanel, reentered: MixerPanel) -> bool:
+        """ME m takes the Program of ME n when n > m and ME n renders (0-frame re-entry)."""
+        return (
+            reentered in self.rendered_panels()
+            and self._panel_number(reentered) > self._panel_number(panel)
+        )
+
+    def _check_source(self, panel: MixerPanel, source_id: str) -> None:
+        if source_id in self.inputs:
+            return
+        reentered = self._reentry_panel(source_id)
+        if reentered is None:
+            raise MixerError(f"unknown input {source_id}")
+        if not self._reentry_allowed(panel, reentered):
+            raise MixerError(
+                f"{panel.label} can take the Program of a higher rendering ME only (re-entry): not {reentered.label}"
+            )
+
+    def source_label(self, source_id: str | None) -> str:
+        if source_id is None:
+            return ""
+        if source_id in self.inputs:
+            return self.inputs[source_id].label
+        panel = self._reentry_panel(source_id)
+        return panel.label if panel else source_id
+
+    def reentry_sources(self, panel: MixerPanel) -> list[MixerPanel]:
+        """The rendering MEs whose Program this panel can take."""
+        return [other for other in self.rendered_panels() if self._reentry_allowed(panel, other)]
+
+    # ── keyers ───────────────────────────────────────────────────────────────
+
+    def get_keyer(self, keyer_id: str) -> Keyer:
         for keyer in self.keyers:
             if keyer.id == keyer_id:
                 return keyer
-        raise MixerError(f"unknown downstream keyer {keyer_id}")
+        raise MixerError(f"unknown keyer {keyer_id}")
 
-    def update_keyer(self, keyer_id: str, **kwargs) -> DownstreamKeyer:
-        if kwargs.get("url"):
-            try:
-                kwargs["url"] = assert_http_url(kwargs["url"], what="keyer URL")
-            except SecurityError as exc:
-                raise MixerError(str(exc)) from exc
-        keyer = self.get_keyer(keyer_id)
-        for field, value in kwargs.items():
-            if value is not None:
-                setattr(keyer, field, value)
-        if keyer.id == (self.keyers[0].id if self.keyers else ""):
-            self.overlay.update(
-                enabled=keyer.enabled,
-                url=keyer.url,
-                title=keyer.title,
-                subtitle=keyer.subtitle,
+    def _keyer_number(self, keyer: Keyer) -> int:
+        return self.keyers.index(keyer) + 1
+
+    def keyer_views(self) -> list[Keyer]:
+        """The keyers as the engine renders them: while a run moves a box, its `dme` is where the
+        engine's last status (once a second) had it; `run` is the engine's run (none off-air)."""
+        entries = (self.engine_status() or {}).get("keyers") or []
+        return [self._live_keyer(keyer, entries[n] if n < len(entries) else None) for n, keyer in enumerate(self.keyers)]
+
+    def _live_keyer(self, keyer: Keyer, entry: Any) -> Keyer:
+        run = entry.get("run") if isinstance(entry, dict) else None
+        if not isinstance(run, dict):
+            return keyer
+        update: dict[str, Any] = {
+            "run": KeyerRun(
+                running=bool(run.get("running")),
+                fly=bool(run.get("fly")),
+                loop=run.get("loop") if run.get("loop") in {loop.value for loop in DmeLoop} else DmeLoop.off,
+                keyframe=run.get("keyframe") if isinstance(run.get("keyframe"), int) else None,
+                step=int(run.get("step") or 0),
             )
-            self._apply_overlay_alpha()
+        }
+        if run.get("running") and keyer.stage == KeyerStage.upstream and isinstance(entry.get("dme"), dict):
+            update["dme"] = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(entry["dme"])))
+        return keyer.model_copy(update=update)
+
+    def _flies(self, keyer: Keyer) -> bool:
+        """Its Auto flies the box: fly, a box, at least 2 keyframes (else it fades)."""
+        return (
+            keyer.fly and keyer.stage == KeyerStage.upstream and (keyer.mode == KeyMode.pip or keyer.dme.enabled) and len(keyer.keyframes) >= 2
+        )
+
+    def _box_at(self, keyer: Keyer, keyframe: DmeKeyframe) -> Dme:
+        """The keyer's box in the state of `keyframe` (enabled and the border colour stay)."""
+        return Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(keyframe.model_dump())))
+
+    def _box_from_engine(self, keyer: Keyer, reply: Any) -> None:
+        """The box where the engine has it after a command (its reply), unless a run moves it."""
+        if not isinstance(reply, dict) or not isinstance(reply.get("dme"), dict) or (reply.get("run") or {}).get("running"):
+            return
+        keyer.dme = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(reply["dme"])))
+
+    def _with_run(self, keyer: Keyer, reply: Any) -> Keyer:
+        return self._live_keyer(keyer, reply)
+
+    def update_keyer(self, keyer_id: str, **changes: Any) -> Keyer:
+        """On or off (at the next frame), rate, label, and the key: mode, source (luma, pip),
+        clip, soft, gain, invert, fly, and the box (`dme`, merged into the current one; a change
+        of its position, size, crop, border or shadow stops a run there). A keyer that flies cuts
+        on at its last keyframe and off at keyframe 0."""
+        keyer = self.get_keyer(keyer_id)
+        label = changes.pop("label", None)
+        enabled = changes.pop("enabled", None)
+        box_patch = changes.get("dme")
+        if label is not None and label != keyer.label:
+            if self._labels_pinned():
+                raise MixerError("keyer labels are fixed while FLOWXER_KEYERS_PER_ME or FLOWXER_DSKS_PER_ME sets the keyers")
+            keyer.label = label
+            # Its key receiver carries the label.
+            self.nmos.mark_changed()
+        key = {name: value for name, value in changes.items() if name != "rate_ms" and value is not None}
+        if "dme" in key:
+            key["dme"] = _merged(keyer.dme.model_dump(), key["dme"])
+        if key:
+            try:
+                updated = Keyer.model_validate({**keyer.model_dump(), **key})
+            except ValidationError as exc:
+                raise MixerError(f"invalid key: {exc.errors()[0]['msg']}") from exc
+            if updated.mode in (KeyMode.luma, KeyMode.pip):
+                if not updated.source_id:
+                    raise MixerError(f"a {updated.mode.value} key needs a source")
+                self._check_source(self.get_panel(keyer.panel_id), updated.source_id)
+            if (updated.mode == KeyMode.pip or updated.dme.enabled) and updated.stage != KeyerStage.upstream:
+                raise MixerError("pip and dme only on upstream keyers")
+            if updated.mode == KeyMode.pip and isinstance(box_patch, dict) and box_patch.get("enabled") is False:
+                raise MixerError("a pip keyer is always a box (dme.enabled stays true)")
+            for name in key:
+                setattr(keyer, name, getattr(updated, name))
+            # A pip is always a box (the engine does the same).
+            keyer.dme.enabled = updated.dme.enabled
+            reply = self._push_key_settings(keyer, box=box_patch if "dme" in key else None)
+            self._box_from_engine(keyer, reply)
+        if changes.get("rate_ms") is not None:
+            keyer.rate_ms = changes["rate_ms"]
+        if enabled is not None:
+            keyer.enabled = enabled
+            self._key_until.pop(keyer.id, None)
+            if self._flies(keyer):
+                keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if enabled else 0])
+            self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
+        self._publish_tally()
         return keyer
+
+    def replace_keyer_box(self, keyer_id: str, box: Dme) -> Keyer:
+        """The whole box (PUT /keyers/{id}/dme; a pip's box stays enabled). Stops a run."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("pip and dme only on upstream keyers")
+        keyer.dme = box.model_copy(deep=True)
+        if keyer.mode == KeyMode.pip:
+            keyer.dme.enabled = True
+        self._box_from_engine(keyer, self._push_key_settings(keyer, box=keyer.dme.model_dump()))
+        return keyer
+
+    def set_keyframes(self, keyer_id: str, items: list[dict[str, Any]]) -> Keyer:
+        """Replaces the keyer's keyframes (up to 8, upstream keyers): each one's missing box fields
+        take the keyer's box. A run stops where the box is."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("keyframes only on upstream keyers")
+        if len(items) > 8:
+            raise MixerError("at most 8 keyframes")
+        state = _box_state(keyer.dme.model_dump())
+        try:
+            keyframes = [DmeKeyframe.model_validate(_merged(state, item)) for item in items]
+        except ValidationError as exc:
+            raise MixerError(f"invalid keyframe: {exc.errors()[0]['msg']}") from exc
+        keyer.keyframes = keyframes
+        self._box_from_engine(keyer, self._push_keyframes(keyer))
+        return keyer
+
+    def run_keyer(
+        self, keyer_id: str, *, to: int | None = None, reverse: bool = False, loop: DmeLoop = DmeLoop.off, frames: int | None = None
+    ) -> Keyer:
+        """A run of the box from where it is to keyframe `to` (the last; 0 with reverse), a loop,
+        or (frames 0) a jump. A run that ends leaves the box at its keyframe."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream or not (keyer.mode == KeyMode.pip or keyer.dme.enabled):
+            raise MixerError("the keyer has no box (dme)")
+        count = len(keyer.keyframes)
+        target = to if to is not None else (0 if reverse else count - 1)
+        if count == 0:
+            raise MixerError("the keyer has no keyframes")
+        if target >= count:
+            raise MixerError(f"no keyframe {target} (the keyer has {count})")
+        if loop != DmeLoop.off and count < 2:
+            raise MixerError("a loop needs 2 keyframes")
+        body: dict[str, Any] = {"reverse": reverse, "loop": loop.value}
+        if to is not None:
+            body["to"] = to
+        if frames is not None:
+            body["frames"] = frames
+        reply = self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/run", body)
+        if loop == DmeLoop.off:
+            keyer.dme = self._box_at(keyer, keyer.keyframes[target])
+        return self._with_run(keyer, reply)
+
+    def stop_keyer(self, keyer_id: str) -> Keyer:
+        """Stops a run: the box holds where it is (a keyer flying off stays on air)."""
+        keyer = self.get_keyer(keyer_id)
+        reply = self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/stop", {})
+        self._box_from_engine(keyer, reply)
+        if isinstance(reply, dict) and reply.get("on") is True and not keyer.enabled:
+            keyer.enabled = True
+            self._key_until.pop(keyer.id, None)
+            self._publish_tally()
+        return self._with_run(keyer, reply)
+
+    def dme_presets(self) -> list[DmePresetInfo]:
+        return list(DME_PRESETS)
+
+    def apply_preset(self, keyer_id: str, name: DmePreset) -> list[Keyer]:
+        """Writes a preset's box and keyframes (0 off screen, 1 on) into the keyer (split: the ME's
+        keyers 1 and 2, quad: 1 to 4), each with its own rate and ease. A keyer on air flies to
+        keyframe 1 from where its box is; one off air is there at once."""
+        keyer = self.get_keyer(keyer_id)
+        if keyer.stage != KeyerStage.upstream:
+            raise MixerError("presets only on upstream keyers")
+        boxes = _preset_boxes(name, self.settings.width, self.settings.height, keyer.dme.model_dump())
+        upstream = [k for k in self.keyers if k.panel_id == keyer.panel_id and k.stage == KeyerStage.upstream]
+        if len(boxes) > 1 and len(upstream) < len(boxes):
+            panel = self.get_panel(keyer.panel_id)
+            raise MixerError(f"{name.value} needs {len(boxes)} upstream keyers ({panel.label} has {len(upstream)})")
+        targets = upstream[: len(boxes)] if len(boxes) > 1 else [keyer]
+        for target, (on, off) in zip(targets, boxes):
+            frames = _frames(target.rate_ms, self.settings.fps)
+            on_box = Dme.model_validate(_merged(target.dme.model_dump(), {**on, "enabled": True}))
+            target.keyframes = [
+                DmeKeyframe.model_validate({**_box_state(_merged(on_box.model_dump(), off)), "frames": frames, "ease": "ease"}),
+                DmeKeyframe.model_validate({**_box_state(on_box.model_dump()), "frames": frames, "ease": "ease"}),
+            ]
+            self._push_keyframes(target)
+            if target.enabled:
+                # On air: the box flies there (enabled and the colour change at once).
+                patch = {"enabled": True, "border": {"color": on_box.border.color}}
+                target.dme = Dme.model_validate(_merged(target.dme.model_dump(), patch))
+                self._push_key_settings(target, box=patch)
+                self._engine_call("POST", f"/keyer/{self._keyer_number(target)}/run", {"to": 1, "reverse": False, "loop": "off"})
+                target.dme = on_box
+            else:
+                target.dme = on_box
+                self._box_from_engine(target, self._push_key_settings(target, box=on_box.model_dump()))
+        return targets
+
+    def keyer_auto(self, keyer_id: str, duration_ms: int | None = None) -> Keyer:
+        """Fade the keyer on (or off when it is on) over duration_ms (default: its rate); a keyer
+        that flies runs its box from keyframe 0 to the last (on) or back to 0 (off) instead."""
+        keyer = self.get_keyer(keyer_id)
+        keyer.enabled = not keyer.enabled
+        frames = _frames(duration_ms or keyer.rate_ms, self.settings.fps)
+        span = frames
+        if self._flies(keyer):
+            keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            span = sum(item.frames for item in keyer.keyframes[1:])
+        if keyer.enabled:
+            self._key_until.pop(keyer.id, None)
+        else:
+            # The raw tally keeps it on air until the fade or the fly has ended.
+            self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
+        self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
+        self._publish_tally()
+        return keyer
+
+    def _push_key_settings(self, keyer: Keyer, client: EngineClient | None = None, box: dict[str, Any] | None = None) -> Any:
+        """Mode, source, clip, soft, gain, invert, fly; `box`: the box fields to change (the whole
+        box when the engine starts). Returns the engine's reply (the keyer), or None."""
+        body: dict[str, Any] = {
+            "mode": keyer.mode.value, "clip": keyer.clip, "soft": keyer.soft, "gain": keyer.gain, "invert": keyer.invert, "fly": keyer.fly,
+        }
+        if keyer.mode in (KeyMode.luma, KeyMode.pip):
+            body["source"] = self._engine_source(keyer.source_id)
+        if box is not None and keyer.stage == KeyerStage.upstream:
+            body["dme"] = box
+        return self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
+
+    def _push_keyframes(self, keyer: Keyer, client: EngineClient | None = None) -> Any:
+        if keyer.stage != KeyerStage.upstream:
+            return None
+        body = {"keyframes": [item.model_dump(mode="json") for item in keyer.keyframes]}
+        return self._engine_call("PUT", f"/keyer/{self._keyer_number(keyer)}/keyframes", body, client=client)
+
+    def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
+        """IS-05 activation of a keyer's key receiver."""
+        keyer = self.get_keyer(keyer_id)
+        if flow_id:
+            try:
+                UUID(str(flow_id))
+            except ValueError as exc:
+                raise MixerError(f"invalid flow id {flow_id}") from exc
+        self._key_routes[keyer.id] = (domain_id or self.settings.resolved_output_domain_id, flow_id if enabled else None)
+        self._push_key(keyer)
+
+    def _key_route(self, keyer: Keyer) -> dict[str, str]:
+        domain_id, flow_id = self._key_routes.get(keyer.id, (None, None))
+        if not flow_id:
+            return {"domain": "", "flow": ""}
+        path = self._mxl_source_path(keyer.id, "key", domain_id, flow_id)
+        return {"domain": path or "", "flow": flow_id if path else ""}
+
+    def _push_key(self, keyer: Keyer, client: EngineClient | None = None) -> None:
+        self._engine_call("PUT", f"/key/{self._keyer_number(keyer)}", self._key_route(keyer), client=client)
+
+    # ── frame grab ───────────────────────────────────────────────────────────
+
+    def _grab_source(self, source: str) -> tuple[str, str, str]:
+        """(engine source, bus, label) of a grab source: a live input or clip player id, a panel id
+        (its Program, also <panel>:pgm) or <panel>:pvw (its Preview)."""
+        item = self.inputs.get(source)
+        if item is not None:
+            if item.kind == InputKind.black:
+                raise MixerError("Black has no picture to grab")
+            return self._engine_source(source), "pgm", item.label
+        panel_id, _, bus = source.partition(":")
+        panel = self._reentry_panel(panel_id)
+        if panel is None or bus not in {"", "pgm", "pvw"}:
+            raise MixerError(f"unknown grab source {source}: an input, a clip player, a panel (its Program) or <panel>:pvw")
+        if not self._rendered(panel):
+            raise MixerError(f"{panel.label} does not render (FLOWXER_RENDER_MES)")
+        bus = bus or "pgm"
+        return f"me{self._panel_number(panel)}", bus, f"{panel.label} {bus.upper()}"
+
+    def grab(self, source: str, *, player: str | None = None, name: str | None = None) -> LibraryItem:
+        """A frame grab (docs/engine-p4.md §6): the picture `source` has in the next output grain
+        (a live input's grain i - L as the MEs use it, a clip player's picture, an ME's Program or
+        Preview), copied by the engine without a stall, as a library still (kind still, source
+        grab, tag grab) in the production raster with no conversion. Named `name`, else
+        "Grab <source> <YYYY-MM-DD HH:MM:SS>" (local time). `player`: a clip player that loads the
+        still once it is there (the frame memory)."""
+        engine_source, bus, label = self._grab_source(source)
+        target = self.get_input(player) if player is not None else None
+        if target is not None and target.kind != InputKind.clip_player:
+            raise MixerError(f"input {player} is not a clip player")
+        if self.engine is None or not self.engine.ready:
+            raise MixerError("the mixer is off-air: there is nothing to grab")
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        fmt = self.workspace.format_id
+        item_id, path = self.library.grab_target(fmt)
+        try:
+            grab = self.engine.call("POST", "/grab", {"source": engine_source, "bus": bus, "path": str(path)}) or {}
+            deadline = time.monotonic() + GRAB_TIMEOUT_S
+            while grab.get("state") not in {"done", "failed"} and time.monotonic() < deadline:
+                time.sleep(0.01)
+                grab = self.engine.call("GET", f"/grab/{grab.get('grab')}") or {}
+        except EngineError as exc:
+            self.library.drop_grab(item_id)
+            raise MixerError(str(exc)) from exc
+        if grab.get("state") != "done" or not path.is_file():
+            self.library.drop_grab(item_id)
+            raise MixerError(f"the grab of {label} failed: {grab.get('error') or 'no picture in time'}")
+        info = {"source": source, "label": label, "index": grab.get("index"), "tai": grab.get("tai"), "source_index": grab.get("source_index")}
+        item = self.library.add_grab(item_id, fmt, name=name or f"Grab {label} {stamp}", grab=info)
+        log.info("grab of %s (grain %s) as library still %s", label, grab.get("index"), item.id)
+        if target is not None:
+            self.update_input(target.id, LogicalInputUpdate(library_item_id=item.id))
+        return item
+
+    # ── stingers (slots and playback) ────────────────────────────────────────
 
     def assign_stinger_slot(self, slot_id: str, stinger_id: str) -> StingerSlot:
         return self.configure_stinger_slot(slot_id, StingerSlotUpdate(stinger_id=stinger_id))
@@ -451,6 +911,11 @@ class VisionMixer:
         raise MixerError(f"unknown stinger slot {slot_id}")
 
     def configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
+        slot = self._configure_stinger_slot(slot_id, payload)
+        self._cue_stingers()
+        return slot
+
+    def _configure_stinger_slot(self, slot_id: str, payload: StingerSlotUpdate) -> StingerSlot:
         slot = self.get_stinger_slot(slot_id)
         kind = payload.kind or slot.kind or "sequence"
         if kind not in {"sequence", "video"}:
@@ -493,9 +958,7 @@ class VisionMixer:
             video = Path(payload.media_path)
             try:
                 if video.is_absolute():
-                    video = contained_path(
-                        video, self.settings.clips_dir, self.settings.stingers_dir
-                    )
+                    video = contained_path(video, self.settings.clips_dir, self.settings.stingers_dir)
                 else:
                     clip = self.settings.clips_dir / video.name
                     sting = self.settings.stingers_dir / video.name
@@ -505,9 +968,7 @@ class VisionMixer:
                         video = sting.resolve()
                     else:
                         raise MixerError(f"video not found: {payload.media_path}")
-                    contained_path(
-                        video, self.settings.clips_dir, self.settings.stingers_dir
-                    )
+                    contained_path(video, self.settings.clips_dir, self.settings.stingers_dir)
             except SecurityError as exc:
                 raise MixerError(str(exc)) from exc
             stinger_id = payload.stinger_id or slot.stinger_id or video.stem
@@ -568,62 +1029,22 @@ class VisionMixer:
             slot.media_path = info.media_path
         return slot
 
-    def _slot_for(self, direction: str) -> StingerSlot | None:
-        role = "in" if direction == "to_replay" else "out"
-        for slot in self.stinger_slots:
-            if slot.role in {role, "shared"}:
-                return slot
-        return self.stinger_slots[0] if self.stinger_slots else None
-
-    def _stinger_for(self, direction: str) -> str:
-        slot = self._slot_for(direction)
-        if slot is not None:
-            return slot.stinger_id
-        return self.settings.default_stinger
-
-    def _info_for_slot(self, slot: StingerSlot | None, stinger_id: str | None = None) -> StingerInfo:
-        if slot is not None and slot.library_item_id:
-            # Always the item as it is now (mezzanine, cut), never a snapshot taken at assignment.
-            info = self._bind_library_slot(slot)
-            if info is None or not slot.ready:
-                raise StingerNotReady(f"library stinger {slot.library_item_id} not ready")
-            return info
-        info = self.get_stinger(stinger_id or (slot.stinger_id if slot else self.settings.default_stinger))
-        if slot is None:
-            return info
-        fps = info.fps or self.settings.fps
-        cut_ms = slot.cut_ms if slot.cut_ms is not None else info.cut_ms
-        cut_frame = (
-            cut_frame_from_ms(cut_ms, fps, info.frame_count)
-            if slot.cut_ms is not None
-            else (slot.cut_frame if slot.cut_frame is not None else info.cut_frame)
-        )
-        if slot.cut_frame is not None and slot.cut_ms is None:
-            cut_frame = slot.cut_frame
-            cut_ms = cut_ms_from_frame(cut_frame, fps)
-        return info.model_copy(
-            update={
-                "kind": slot.kind or info.kind,
-                "media_path": slot.media_path or info.media_path,
-                "cut_ms": cut_ms,
-                "cut_frame": cut_frame,
-            }
-        )
-
-    def _seed_default_inputs(self) -> None:
-        self._sync_sources()
+    # ── inputs ───────────────────────────────────────────────────────────────
 
     def register_input(self, payload: LogicalInputCreate) -> LogicalInput:
         if pinned := self._inputs_pinned_by():
             raise MixerError(f"the input list is set by {pinned} (environment)")
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before adding inputs")
-        if payload.id in self.inputs:
+        if payload.id in self.inputs or self._reentry_panel(payload.id) is not None:
             raise MixerError(f"input {payload.id} already exists")
-        resolved = self._resolve_file_path(payload)
-        logical = LogicalInput(slot=len(self.inputs), **resolved.model_dump())
+        if payload.library_item_id:
+            self._check_player_media(payload.library_item_id)
+        logical = LogicalInput(slot=len(self.inputs), **payload.model_dump())
         self._apply_default_domain(logical)
         self.inputs[logical.id] = logical
+        self._renumber()
+        self._prune_audio()
         self.nmos.sync_from_rest(logical.id)
         self._publish_tally()
         return logical
@@ -637,47 +1058,34 @@ class VisionMixer:
             for field in ("label", "kind")
         ):
             raise MixerError(f"label and kind of {input_id} are set by {pinned} (environment)")
+        if self.state == MixerState.running and "kind" in patch and patch["kind"] != current.kind:
+            raise MixerError("stop the mixer before changing the kind of an input")
         if "stinger_slot_id" in patch:
             slot_id = patch["stinger_slot_id"] or None
             if slot_id:
                 self.get_stinger_slot(slot_id)
             patch["stinger_slot_id"] = slot_id
-        library_item_id = patch.get("library_item_id", None)
-        changing_media = payload.file_path is not None or (
-            "library_item_id" in patch and patch.get("library_item_id") is not None
-        )
-        if self.state == MixerState.running and not changing_media:
-            # Live metadata updates are allowed; topology changes are not.
-            data = current.model_dump()
-            for field in ("label", "kind", "video", "audio", "group_hint", "stinger_slot_id"):
-                if field in patch:
-                    data[field] = patch[field]
-            updated = LogicalInput(**data)
-            self._apply_default_domain(updated)
-            self.inputs[input_id] = updated
-            self.nmos.sync_from_rest(input_id)
-            self._publish_tally()
-            return updated
-        if self.state == MixerState.running and changing_media:
-            if current.kind not in {InputKind.file, InputKind.replay}:
-                raise MixerError("only file/replay inputs can change clip while on-air")
-            if library_item_id:
-                return self.load_library_clip(input_id, library_item_id)
-            return self.load_clip(input_id, payload.file_path or "")
-        if current.library_item_id and "library_item_id" in patch and not patch["library_item_id"]:
-            # Unbound from the library: the mezzanine path is not a clip under storage/clips.
-            patch["file_path"] = patch.get("file_path") or "_unassigned"
+        if patch.get("library_item_id"):
+            self._check_player_media(patch["library_item_id"])
         data = current.model_dump()
         data.update(patch)
         updated = LogicalInput(**data)
-        if updated.library_item_id:
-            updated = self._apply_library_clip(updated)
-        elif updated.kind in {InputKind.file, InputKind.replay} and updated.file_path not in {None, "_unassigned"}:
-            updated.file_path = self._resolve_clip(updated.file_path)
         self._apply_default_domain(updated)
         self.inputs[input_id] = updated
+        self._renumber()
+        self._prune_audio()
         self.nmos.sync_from_rest(input_id)
+        if updated.kind == InputKind.mxl_live and (
+            "video" in patch or "audio" in patch or "kind" in patch
+        ):
+            self._push_route(updated)
+        if updated.kind == InputKind.clip_player and (
+            {"library_item_id", "loop", "play_on_cut", "kind"} & set(patch)
+        ):
+            self._push_player(updated)
         self._publish_tally()
+        if "stinger_slot_id" in patch:
+            self._cue_stingers()
         return updated
 
     def delete_input(self, input_id: str) -> None:
@@ -688,8 +1096,8 @@ class VisionMixer:
         if input_id not in self.inputs:
             raise MixerError(f"unknown input {input_id}")
         del self.inputs[input_id]
-        for slot, item in enumerate(self.inputs.values()):
-            item.slot = slot
+        self._renumber()
+        self._prune_audio()
         self.nmos.reconcile_inputs()
         self._publish_tally()
 
@@ -719,7 +1127,7 @@ class VisionMixer:
         flow_id: str | None,
         enabled: bool,
     ) -> None:
-        """IS-05 activation → logical input essence. Must not stop Program."""
+        """IS-05 activation → logical input essence → the engine opens (or closes) the reader."""
         item = self.get_input(input_id)
         default_domain = self.settings.resolved_output_domain_id
         resolved_domain = domain_id or default_domain
@@ -729,97 +1137,182 @@ class VisionMixer:
                 parsed_flow = UUID(str(flow_id))
             except ValueError as exc:
                 raise MixerError(f"invalid flow id {flow_id}") from exc
+        current = item.video if role == "video" else item.audio
+        default_type = self.settings.video_media_type if role == "video" else self.settings.audio_media_type
+        data = current.model_dump() if current else {"media_type": default_type}
+        data["flow_id"] = parsed_flow if enabled else None
+        if not enabled:
+            # master_enable false: nothing is read (the IS-05 active parameters keep the flow).
+            data["flow_id"] = None
+        data["domain_id"] = resolved_domain
         if role == "video":
-            data = item.video.model_dump() if item.video else {"media_type": self.settings.video_media_type}
-            if enabled and parsed_flow:
-                data["flow_id"] = parsed_flow
-                data["domain_id"] = resolved_domain
-            elif not enabled:
-                data["flow_id"] = parsed_flow or data.get("flow_id")
-                data["domain_id"] = resolved_domain
-            else:
-                data["flow_id"] = None
-                data["domain_id"] = resolved_domain
             item.video = VideoEssence(**data)
         else:
-            data = item.audio.model_dump() if item.audio else {"media_type": self.settings.audio_media_type}
-            if enabled and parsed_flow:
-                data["flow_id"] = parsed_flow
-                data["domain_id"] = resolved_domain
-            elif not enabled:
-                data["flow_id"] = parsed_flow or data.get("flow_id")
-                data["domain_id"] = resolved_domain
-            else:
-                data["flow_id"] = None
-                data["domain_id"] = resolved_domain
             item.audio = AudioEssence(**data)
-        if self.gst is None:
+        self._push_route(item)
+
+    # ── routes to the engine ─────────────────────────────────────────────────
+
+    def _engine_source(self, source_id: str | None) -> str:
+        """FlowXer source id → engine source: in<k> (live), cp<k> (clip player), black, me<n>."""
+        if source_id is None:
+            return "black"
+        item = self.inputs.get(source_id)
+        if item is not None:
+            if item.kind == InputKind.black:
+                return "black"
+            same = [other for other in self.list_inputs() if other.kind == item.kind]
+            k = same.index(item) + 1
+            return f"in{k}" if item.kind == InputKind.mxl_live else f"cp{k}"
+        panel = self._reentry_panel(source_id)
+        if panel is not None:
+            return f"me{self._panel_number(panel)}"
+        return "black"
+
+    def _engine_index(self, item: LogicalInput) -> int:
+        return [other.id for other in self.list_inputs() if other.kind == item.kind].index(item.id) + 1
+
+    def _essence_route(self, item: LogicalInput, role: str) -> dict[str, str]:
+        essence = item.video if role == "video" else item.audio
+        if essence is None or not essence.flow_id:
+            self._missing_domains.pop((item.id, role), None)
+            return {"domain": "", "flow": ""}
+        flow_id = str(essence.flow_id)
+        path = self._mxl_source_path(item.id, role, essence.domain_id, flow_id)
+        return {"domain": path or "", "flow": flow_id if path else ""}
+
+    def _push_route(self, item: LogicalInput, client: EngineClient | None = None) -> None:
+        if item.kind != InputKind.mxl_live:
             return
-        src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
-        path = self._mxl_source_path(input_id, role, resolved_domain, str(parsed_flow) if parsed_flow else "")
-        target = str(parsed_flow) if enabled and parsed_flow is not None else None
-        try:
-            log.info("input %s (%s): %s reads %s in %s", input_id, role, src_name, target or "nothing (not routed)", path)
-            applied = self.gst.retarget_mxl_source(src_name, target, path, role)
-            if not applied and self.state == MixerState.running:
-                log.info(
-                    "input %s (%s): the running pipeline does not read it from MXL; the route applies at the next start",
-                    input_id,
-                    role,
-                )
-        except Exception as exc:
+        body = {"video": self._essence_route(item, "video"), "audio": self._essence_route(item, "audio")}
+        log.info(
+            "input %s: video %s, audio %s",
+            item.id,
+            body["video"]["flow"] or "not routed",
+            body["audio"]["flow"] or "not routed",
+        )
+        self._engine_call("PUT", f"/input/{self._engine_index(item)}", body, client=client)
+
+    def _mxl_source_path(self, input_id: str, role: str, domain_id: str | None, flow_id: str) -> str | None:
+        """Domain directory for a routed essence. A route that names no domain or the wrong one
+        (REST and IS-05 default it to the own output domain) still finds its flow: the named
+        domain when it holds the flow, else any domain below the root that does (local before
+        mirror), else the named domain, where the flow may still appear. None while the named
+        domain does not exist (a fabrics mirror after a node reboot): _watch_domains routes it
+        once the domain appears."""
+        self._missing_domains.pop((input_id, role), None)
+        root = self.settings.mxl_root
+        resolved = resolve_domain_path(root, str(domain_id)) if domain_id else None
+        if flow_id and (resolved is None or not (resolved / f"{flow_id}.mxl-flow").is_dir()):
+            holder = find_flow_domain(root, flow_id)
+            if holder is not None:
+                if domain_id and resolved != holder:
+                    log.info("MXL flow %s for %s %s is in %s, not in domain %s", flow_id, input_id, role, holder, domain_id)
+                return str(holder)
+        if not domain_id:
+            return None
+        if resolved is None:
             log.warning(
-                "on-air NMOS retarget of %s failed (program continues): %s",
-                src_name,
-                exc,
+                "MXL domain id %s for %s %s not found under %s; it waits for it (black and silence)",
+                domain_id,
+                input_id,
+                role,
+                root,
             )
-            self.error = f"input {input_id} ({role}): {exc}"
+            self._missing_domains[(input_id, role)] = str(domain_id)
+            return None
+        return str(resolved)
 
-    def _resolve_file_path(self, payload: LogicalInputCreate) -> LogicalInputCreate:
-        if payload.library_item_id:
-            item = self.library.get(payload.library_item_id)
-            if item is None or item.kind != LibraryKind.clip:
-                raise MixerError(f"unknown library clip {payload.library_item_id}")
-            mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
-            path = str(mezz) if mezz else "_unassigned"
-            return payload.model_copy(
-                update={"library_item_id": item.id, "file_path": path}
-            )
-        if payload.kind in {InputKind.file, InputKind.replay} and payload.file_path:
-            if payload.file_path != "_unassigned":
-                return payload.model_copy(update={"file_path": self._resolve_clip(payload.file_path)})
-        return payload
+    def _watch_domains(self, runtime: EngineRuntime) -> None:
+        """While `runtime` runs Program: routes that wait for a missing MXL domain are applied once
+        the domain (or the flow in another domain) appears."""
+        while self.engine is runtime:
+            time.sleep(DOMAIN_WATCH_S)
+            if self.engine is runtime and self._missing_domains:
+                self._attach_waiting_sources()
 
-    def _resolve_clip(self, file_path: str) -> str:
-        try:
-            candidate = resolve_under(self.settings.clips_dir, file_path)
-        except SecurityError as exc:
-            raise MixerError(str(exc)) from exc
-        if not candidate.exists():
-            raise MixerError(f"clip not found: {file_path}")
-        return str(candidate)
+    def _waiting_flow(self, owner: str, role: str) -> str | None:
+        if role == "key":
+            return self._key_routes.get(owner, (None, None))[1]
+        item = self.inputs.get(owner)
+        essence = getattr(item, role, None) if item is not None and item.kind == InputKind.mxl_live else None
+        return str(essence.flow_id) if essence is not None and essence.flow_id else None
 
-    def _apply_library_clip(self, item: LogicalInput) -> LogicalInput:
-        lib = self.library.get(item.library_item_id or "")
-        if lib is None or lib.kind != LibraryKind.clip:
-            raise MixerError(f"unknown library clip {item.library_item_id}")
-        mezz = self.library.mezzanine_path(lib.id, self.workspace.format_id)
-        item.library_item_id = lib.id
-        # Not converted yet: black until the conversion ends (refresh_library_bindings).
-        item.file_path = str(mezz) if mezz else "_unassigned"
+    def _attach_waiting_sources(self) -> None:
+        root = self.settings.mxl_root
+        for (owner, role), domain_id in list(self._missing_domains.items()):
+            # IS-05 activations change the route under this lock: check and route under it too.
+            with self.nmos.lock:
+                flow = self._waiting_flow(owner, role)
+                if flow is None:
+                    # Routed elsewhere or gone.
+                    self._missing_domains.pop((owner, role), None)
+                    continue
+                if resolve_domain_path(root, domain_id) is None and find_flow_domain(root, flow) is None:
+                    continue
+                log.info("MXL domain %s appeared: %s (%s) reads %s", domain_id, owner, role, flow)
+                keyer = next((k for k in self.keyers if k.id == owner), None)
+                if role == "key" and keyer is not None:
+                    self._push_key(keyer)
+                elif owner in self.inputs:
+                    self._push_route(self.inputs[owner])
+
+    # ── clip players ─────────────────────────────────────────────────────────
+
+    def _check_player_media(self, library_item_id: str) -> LibraryItem:
+        item = self.library.get(library_item_id)
+        if item is None or item.kind not in {LibraryKind.clip, LibraryKind.still}:
+            raise MixerError(f"unknown library clip or still {library_item_id}")
         return item
 
-    def load_library_clip(self, input_id: str, library_item_id: str) -> LogicalInput:
-        target = self.get_input(input_id)
-        if target.kind not in {InputKind.file, InputKind.replay}:
-            raise MixerError(f"input {input_id} cannot play files")
-        previous = target.library_item_id
-        target.library_item_id = library_item_id
+    def _player_media(self, item: LogicalInput) -> dict[str, Any]:
+        """What the engine loads for a clip player: its library item's files for the current
+        format (empty while it converts or without an item: the player shows black). A clip:
+        its HEVC 4:4:4 mezzanine, its sound file and frame count; a still: its v210 picture."""
+        lib = self.library.get(item.library_item_id or "")
+        if lib is None:
+            return {"path": "", "kind": "", "loop": item.loop, "play_on_cut": item.play_on_cut}
+        fmt = self.workspace.format_id
+        path = self.library.mezzanine_path(lib.id, fmt)
+        if lib.kind == LibraryKind.still:
+            return {"path": str(path) if path else "", "kind": "still", "loop": item.loop, "play_on_cut": item.play_on_cut}
+        conv = lib.conversion_for(fmt)
+        audio = self.library.audio_path(lib.id, fmt)
+        return {
+            "path": str(path) if path else "",
+            "kind": "clip",
+            "audio": str(audio) if audio else "",
+            "channels": conv.audio_channels,
+            "frames": conv.frames,
+            "loop": item.loop,
+            "play_on_cut": item.play_on_cut,
+        }
+
+    def _push_player(self, item: LogicalInput, client: EngineClient | None = None) -> None:
+        if item.kind != InputKind.clip_player:
+            return
+        self._engine_call("POST", f"/player/{self._engine_index(item)}/load", self._player_media(item), client=client)
+
+    def player_command(self, input_id: str, action: str, frame: int = 0) -> LogicalInput:
+        """Clip player transport: cue (a frame, 0 = the first), play, pause, stop (back to the
+        first frame and hold)."""
+        item = self.get_input(input_id)
+        if item.kind != InputKind.clip_player:
+            raise MixerError(f"input {input_id} is not a clip player")
+        if action not in {"cue", "play", "pause", "stop"}:
+            raise MixerError(f"unknown player action {action}")
+        if self.engine is None:
+            if self.settings.simulate and self.state == MixerState.running:
+                return item
+            raise MixerError("the mixer is off-air")
+        body = {"frame": frame} if action == "cue" else {}
         try:
-            return self._apply_library_clip(target)
-        except MixerError:
-            target.library_item_id = previous
-            raise
+            self.engine.call("POST", f"/player/{self._engine_index(item)}/{action}", body)
+        except EngineError as exc:
+            raise MixerError(str(exc)) from exc
+        return item
+
+    # ── library ──────────────────────────────────────────────────────────────
 
     def _library_consumers(self, item_id: str) -> list[str]:
         """Inputs and stinger slots that use a library item: derived from the mixer state,
@@ -844,16 +1337,17 @@ class VisionMixer:
         return info
 
     def refresh_library_bindings(self) -> None:
-        """Library inputs and slots follow their items: a conversion that ends (or a format
-        change) sets the mezzanine. A running pipeline picks a new clip up at its next start."""
+        """Clip players and stinger slots follow their library items: a conversion that ends (or
+        a format change) gives the player its media."""
         with self.nmos.lock:
-            for source in list(self.inputs.values()):
-                if source.library_item_id:
-                    mezz = self.library.mezzanine_path(source.library_item_id, self.workspace.format_id)
-                    source.file_path = str(mezz) if mezz else "_unassigned"
+            players = [item for item in self.inputs.values() if item.kind == InputKind.clip_player and item.library_item_id]
             for slot in list(self.stinger_slots):
                 if slot.library_item_id:
                     self._bind_library_slot(slot)
+        if self.engine is not None:
+            for item in players:
+                self._push_player(item)
+            self._cue_stingers()
 
     def _on_library_job(self, job) -> None:
         if job.state in {"done", "failed", "cancelled"} and job.format_id == self.workspace.format_id:
@@ -874,6 +1368,7 @@ class VisionMixer:
             ready=item.is_ready(fmt),
             playback=conv.playback,
             has_alpha=item.has_alpha or conv.has_alpha,
+            has_sound=bool(conv.audio),
             cut_frame=item.cut_frame if item.cut_frame is not None else conv.cut_frame,
             cut_ms=item.cut_ms if item.cut_ms is not None else conv.cut_ms,
             frame_count=conv.frames or int(item.original.get("frame_count") or 0),
@@ -927,28 +1422,21 @@ class VisionMixer:
     # ── storage ──────────────────────────────────────────────────────────────
 
     def list_clips(self) -> list[dict]:
+        """The library clips and stills a clip player can play (ready for the current format)."""
         clips = []
-        for path in sorted(self.settings.clips_dir.rglob("*")):
-            if path.is_file() and path.suffix.lower() in CLIP_SUFFIXES:
-                clips.append(
-                    {
-                        "name": path.name,
-                        "path": str(path),
-                        "size_bytes": path.stat().st_size,
-                        "suffix": path.suffix.lower(),
-                    }
-                )
-        # Also expose ready library clips for the console picker.
-        for item in self.library.list_items(kind=LibraryKind.clip):
+        for item in self.library.list_items():
+            if item.kind not in {LibraryKind.clip, LibraryKind.still}:
+                continue
             mezz = self.library.mezzanine_path(item.id, self.workspace.format_id)
             clips.append(
                 {
-                    "name": f"lib:{item.name}",
+                    "name": item.name,
                     "path": str(mezz) if mezz else "",
                     "size_bytes": mezz.stat().st_size if mezz else 0,
-                    "suffix": ".mov",
+                    "suffix": mezz.suffix if mezz else "",
                     "library_item_id": item.id,
                     "ready": bool(mezz),
+                    "kind": item.kind.value,
                 }
             )
         return clips
@@ -981,10 +1469,151 @@ class VisionMixer:
             return lib_info
         raise MixerError(f"unknown stinger {stinger_id}")
 
+    # ── engine ───────────────────────────────────────────────────────────────
+
+    def _engine_call(self, method: str, path: str, body: dict[str, Any], client: EngineClient | None = None) -> Any:
+        """A command to the engine, and its reply. While the engine is not up (off-air,
+        restarting) nothing is sent (None): its state is pushed when it is ready. A refused
+        command is logged."""
+        try:
+            if client is not None:
+                return client.request(method, path, body)
+            if self.engine is not None and self.engine.ready:
+                return self.engine.call(method, path, body)
+        except EngineError as exc:
+            log.warning("%s", exc)
+            self.error = str(exc)
+        return None
+
+    def _format_token(self) -> str:
+        return self.workspace.format_id.replace(".", "")
+
+    def _compute_outputs(self, group_hint: str) -> dict[str, MeOutputs]:
+        """The MXL flow ids of every rendering ME. ME 1 Program keeps FlowXer's ids from before the
+        engine, so downstream activations survive an upgrade."""
+
+        def flow(role: str) -> str:
+            return nmos.flow_uuid(
+                group_hint,
+                role,
+                seed=self.settings.resolved_nmos_seed,
+                width=self.settings.width,
+                height=self.settings.height,
+                frame_rate_num=self.settings.frame_rate_num,
+                frame_rate_den=self.settings.frame_rate_den,
+            )
+
+        outputs: dict[str, MeOutputs] = {}
+        for number, panel in enumerate(self.rendered_panels(), 1):
+            if number == 1:
+                video, audio = flow("video"), flow("audio")
+            else:
+                video, audio = flow(f"{panel.id}:pgm-video"), flow(f"{panel.id}:pgm-audio")
+            outputs[panel.id] = MeOutputs(
+                panel_id=panel.id,
+                pgm_video_flow_id=video,
+                pgm_audio_flow_id=audio,
+                pvw_video_flow_id=flow(f"{panel.id}:pvw-video") if self.settings.pvw_outputs else None,
+            )
+        return outputs
+
+    def _engine_config(self, group_hint: str) -> dict[str, Any]:
+        """The structure the engine starts with (its routes and buses follow on ready)."""
+        live = [item for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        players = [item for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        output_domain = str(self.settings.output_domain.resolve())
+        return {
+            "FLOWXER_ENGINE_FORMAT": self._format_token(),
+            "FLOWXER_ENGINE_LATENCY": self.settings.latency,
+            "FLOWXER_ENGINE_MES": self.render_count,
+            "FLOWXER_ENGINE_INPUTS": [{"label": item.label} for item in live],
+            "FLOWXER_ENGINE_PLAYERS": [{"label": item.label} for item in players],
+            "FLOWXER_ENGINE_KEYS": [
+                {"label": keyer.receiver_label, "me": self._panel_number(self.get_panel(keyer.panel_id)), "stage": keyer.stage.value}
+                for keyer in self.keyers
+            ],
+            "FLOWXER_ENGINE_STINGER_PLAYERS": self._stinger_players(),
+            "FLOWXER_ENGINE_PVW_OUTPUTS": self.settings.pvw_outputs,
+            "FLOWXER_ENGINE_OUTPUT_DOMAIN": output_domain,
+            "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": self.settings.resolved_output_domain_id,
+            "FLOWXER_ENGINE_OUTPUTS": [
+                {
+                    "me": number,
+                    "pgm_video": outputs.pgm_video_flow_id,
+                    "pgm_audio": outputs.pgm_audio_flow_id,
+                    "pvw_video": outputs.pvw_video_flow_id or "",
+                    "label": panel.label,
+                    "group": f"{group_hint} {panel.label}",
+                }
+                for number, panel in enumerate(self.rendered_panels(), 1)
+                if (outputs := self.me_outputs.get(panel.id)) is not None
+            ],
+            "FLOWXER_ENGINE_AUDIO_CHANNELS": self.settings.audio_channels,
+            "FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS": self.settings.audio_max_delay_ms,
+            "FLOWXER_ENGINE_LABEL": self.settings.node_label,
+            "FLOWXER_ENGINE_GPU": self.settings.engine_gpu,
+            "FLOWXER_ENGINE_HTTP_PORT": self.settings.engine_port,
+        }
+
+    def _on_engine_ready(self, client: EngineClient) -> None:
+        """Every (re)start of the engine: push routes, clip players, keyers, buses and the audio
+        (delays and channel maps, masters and strips)."""
+        with self.nmos.lock:
+            # A new engine holds no T-bar transition: Program and the tied keyers stay where they were.
+            for panel_id in self._positions:
+                self._mixes.pop(panel_id, None)
+            self._positions.clear()
+            self._held_ties.clear()
+            for item in self.list_inputs():
+                if item.kind == InputKind.mxl_live:
+                    self._push_route(item, client)
+                    self._push_input_audio(item, client)
+                elif item.kind == InputKind.clip_player:
+                    self._push_player(item, client)
+            for keyer in self.keyers:
+                # On before the settings: a new engine's keyer does not fly yet, so the box stays
+                # where it was (it would jump to a keyframe).
+                self._push_key(keyer, client)
+                self._push_keyframes(keyer, client)
+                self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": keyer.enabled}, client=client)
+                self._push_key_settings(keyer, client, box=keyer.dme.model_dump() if keyer.stage == KeyerStage.upstream else None)
+            for panel in self.rendered_panels():
+                self._push_panel(panel, client)
+                self._push_panel_audio(panel, client=client)
+            # A new engine holds no stinger.
+            self._stinger_cued.clear()
+            self._stinger_until.clear()
+            self._cue_stingers(client)
+
+    def _push_panel(self, panel: MixerPanel, client: EngineClient | None = None) -> None:
+        m = self._panel_number(panel)
+        self._engine_call("POST", f"/me/{m}/program", {"source": self._engine_source(panel.program_input_id)}, client=client)
+        self._engine_call("POST", f"/me/{m}/preview", {"source": self._engine_source(panel.preview_input_id)}, client=client)
+        self._engine_call("POST", f"/me/{m}/ftb", {"on": panel.ftb}, client=client)
+        self._push_transition(panel, client)
+
+    def _push_transition(self, panel: MixerPanel, client: EngineClient | None = None) -> None:
+        """The ME's next transition (its wipe is what a take with type wipe uses)."""
+        if not self._rendered(panel):
+            return
+        transition = panel.transition
+        wipe = transition.wipe
+        body = {
+            "type": transition.type.value,
+            "frames": transition.rate_frames,
+            "pattern": wipe.pattern,
+            "reverse": wipe.reverse,
+            "soft": wipe.soft,
+            "border": wipe.border,
+            "border_color": wipe.border_color,
+            "ties": [self._keyer_number(keyer) for keyer in self._tied(panel)],
+        }
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/transition", body, client=client)
+
     # ── mixer lifecycle ──────────────────────────────────────────────────────
 
     def start(self, request: MixerStartRequest | None = None) -> MixerStatus:
-        # The lock: an autostart attempt and an operator's start must not both build a pipeline.
+        # The lock: an autostart attempt and an operator's start must not both start an engine.
         with self._lock, self.watchdog.busy("Program start"):
             return self._start(request)
 
@@ -994,8 +1623,6 @@ class VisionMixer:
             raise MixerError("mixer is already running")
         if not self.inputs:
             raise MixerError("register at least one logical input")
-        self.refresh_library_bindings()
-
         output = self.settings.output_domain.resolve()
         if request.domain:
             requested = Path(request.domain).expanduser().resolve()
@@ -1011,122 +1638,74 @@ class VisionMixer:
             )
         except DomainError as exc:
             raise MixerError(str(exc)) from exc
-        if self.settings.read_offset_grains:
-            log.info(
-                "FLOWXER_READ_OFFSET_GRAINS=%s is ignored; gst-mxl-rs mxlsrc has no "
-                "read-offset property and reads at the live edge (about one grain behind head)",
-                self.settings.read_offset_grains,
-            )
         group_hint = request.group_hint or self.settings.group_hint
-        if request.overlay_url:
-            try:
-                self.overlay.url = assert_http_url(request.overlay_url, what="overlay URL")
-            except SecurityError as exc:
-                raise MixerError(str(exc)) from exc
-        if request.overlay_enabled:
-            self.overlay.enabled = True
-
         self._bind_group_hints()
-
-        video_id = nmos.flow_uuid(
-            group_hint,
-            "video",
-            seed=self.settings.resolved_nmos_seed,
-            width=self.settings.width,
-            height=self.settings.height,
-            frame_rate_num=self.settings.frame_rate_num,
-            frame_rate_den=self.settings.frame_rate_den,
-        )
-        audio_id = nmos.flow_uuid(
-            group_hint,
-            "audio",
-            seed=self.settings.resolved_nmos_seed,
-            width=self.settings.width,
-            height=self.settings.height,
-            frame_rate_num=self.settings.frame_rate_num,
-            frame_rate_den=self.settings.frame_rate_den,
-        )
-        self.outputs = OutputFlows(
-            video_flow_id=video_id,
-            audio_flow_id=audio_id,
-            group_hint=group_hint,
-            media_type_video=self.settings.video_media_type,
-            media_type_audio=self.settings.audio_media_type,
-            nmos_video=nmos.video_flow_def(
-                flow_id=video_id,
+        program = request.program_input_id or self._default_program_id()
+        preview = request.preview_input_id or program
+        for source in (program, preview):
+            if source is not None and self.panels:
+                self._check_source(self.panels[0], source)
+        self.program_input_id = program
+        self.preview_input_id = preview
+        if self.panels:
+            self.panels[0].program_input_id = program
+            self.panels[0].preview_input_id = preview
+        self.me_outputs = self._compute_outputs(group_hint)
+        first = next(iter(self.me_outputs.values()), None)
+        self.outputs = None
+        if first is not None:
+            self.outputs = OutputFlows(
+                video_flow_id=first.pgm_video_flow_id,
+                audio_flow_id=first.pgm_audio_flow_id,
                 group_hint=group_hint,
-                label=f"{group_hint} PGM video",
-                description="FlowXer program video (uncompressed v210 / VP210)",
-                width=self.settings.width,
-                height=self.settings.height,
-                frame_rate_num=self.settings.frame_rate_num,
-                frame_rate_den=self.settings.frame_rate_den,
-                media_type=self.settings.video_media_type,
-            ),
-            nmos_audio=nmos.audio_flow_def(
-                flow_id=audio_id,
-                group_hint=group_hint,
-                label=f"{group_hint} PGM audio",
-                description="FlowXer program audio (uncompressed float32)",
-                channels=self.settings.audio_channels,
-                sample_rate=self.settings.audio_rate,
-            ),
-        )
-
-        capabilities = probe_backend()
-        use_mxl = bool(capabilities["mxl_plugins"])
-        use_cef = bool(capabilities["cefsrc"])
-        description = build_pipeline_description(
-            settings=self.settings,
-            inputs=self.list_inputs(),
-            overlay_url=self.overlay.url,
-            overlay_enabled=self.overlay.enabled,
-            output_video_flow_id=video_id,
-            output_audio_flow_id=audio_id,
-            domain=str(output),
-            use_mxl_sink=use_mxl,
-            use_cefsrc=use_cef,
-            domain_paths=self._source_domain_paths(),
-            gpu=self.media.gpu,
-        )
-        self.pipeline = description
-
-        force_sim = self.settings.simulate or self.settings.gst_mode == "simulate"
-        self.gst = None
-        self.error = None
-        if not force_sim and capabilities["gstreamer"]:
-            self.gst, reason = try_start_gst(
-                description,
-                self._on_pipeline_error,
-                self.settings.audio_channels,
-                self.settings.width if self.media.gpu else None,
+                media_type_video=self.settings.video_media_type,
+                media_type_audio=self.settings.audio_media_type,
+                nmos_video=nmos.video_flow_def(
+                    flow_id=first.pgm_video_flow_id,
+                    group_hint=group_hint,
+                    label=f"{self.panels[0].label} PGM Video",
+                    description="FlowXer program video (uncompressed v210)",
+                    width=self.settings.width,
+                    height=self.settings.height,
+                    frame_rate_num=self.settings.frame_rate_num,
+                    frame_rate_den=self.settings.frame_rate_den,
+                    media_type=self.settings.video_media_type,
+                ),
+                nmos_audio=nmos.audio_flow_def(
+                    flow_id=first.pgm_audio_flow_id,
+                    group_hint=group_hint,
+                    label=f"{self.panels[0].label} PGM Audio",
+                    description="FlowXer program audio (uncompressed float32)",
+                    channels=self.settings.audio_channels,
+                    sample_rate=self.settings.audio_rate,
+                ),
             )
-            if self.gst is None:
-                # Never fall back to the simulator when GStreamer is installed: the
-                # API would report on-air while nothing reaches MXL.
+        self.error = None
+        if self.settings.simulate:
+            self.backend = "simulate"
+        else:
+            runtime = EngineRuntime(
+                binary=self.settings.engine_bin,
+                port=self.settings.engine_port,
+                state_dir=self.settings.state_dir,
+                on_ready=self._on_engine_ready,
+            )
+            try:
+                runtime.start(self._engine_config(group_hint))
+            except EngineError as exc:
                 self.state = MixerState.error
                 self.backend = "idle"
-                self.error = f"GStreamer pipeline failed: {reason}"
-                raise MixerError(self.error)
-
-        if self.gst is not None:
-            self.gst.watchdog = self.watchdog
-            self.gst.on_source_restart = self._on_source_restart
-            threading.Thread(target=self._watch_domains, args=(self.gst,), name="mxl-domain-watch", daemon=True).start()
-        self.backend = "gstreamer" if self.gst else "simulate"
+                self.error = str(exc)
+                raise MixerError(self.error) from exc
+            self.engine = runtime
+            self.backend = "engine"
+            threading.Thread(target=self._watch_domains, args=(runtime,), name="mxl-domain-watch", daemon=True).start()
         self.state = MixerState.running
         self._autostart_done.set()
         self._frame_mark = (self.frames_rendered, time.monotonic())
         self._stall_logged = False
-        self.program_input_id = request.program_input_id or self._default_program_id()
-        self.preview_input_id = request.preview_input_id or self.program_input_id
-        self.last_live_input_id = self.program_input_id
-        self.program_bus = ProgramBus.replay if self._is_replay(self.program_input_id) else ProgramBus.live
-        if self.panels:
-            self.panels[0].program_input_id = self.program_input_id
-            self.panels[0].preview_input_id = self.preview_input_id
-        self._apply_program()
-        self._apply_overlay_alpha()
+        self.last_live_input_id = program
+        self.program_bus = ProgramBus.live
         self.nmos.sync_senders_from_outputs()
         self._publish_tally()
         return self.status()
@@ -1135,16 +1714,14 @@ class VisionMixer:
         """FLOWXER_PROGRAM_AUTOSTART: ME 1 Program on the first live input (or the first
         input), Preview on the next one."""
         inputs = self.list_inputs()
-        ordered = [item for item in inputs if item.kind == InputKind.mxl_live]
-        ordered += [item for item in inputs if item.kind != InputKind.mxl_live]
-        program = ordered[0].id
-        preview = ordered[1].id if len(ordered) > 1 else program
+        program = inputs[0].id if inputs else None
+        preview = inputs[1].id if len(inputs) > 1 else program
         if not self._autostart_attempt(program, preview, 1):
             threading.Thread(
                 target=self._autostart_retry, args=(program, preview), name="program-autostart", daemon=True
             ).start()
 
-    def _autostart_retry(self, program: str, preview: str) -> None:
+    def _autostart_retry(self, program: str | None, preview: str | None) -> None:
         """Program did not start: try again after growing pauses until it runs, an operator
         starts or stops it, or the process ends."""
         attempt = 1
@@ -1153,7 +1730,7 @@ class VisionMixer:
             if self._autostart_attempt(program, preview, attempt):
                 return
 
-    def _autostart_attempt(self, program: str, preview: str, attempt: int) -> bool:
+    def _autostart_attempt(self, program: str | None, preview: str | None, attempt: int) -> bool:
         """One FLOWXER_PROGRAM_AUTOSTART start. True when Program runs (also when it already ran)."""
         try:
             self.start(MixerStartRequest(program_input_id=program, preview_input_id=preview))
@@ -1170,14 +1747,13 @@ class VisionMixer:
         log.info("FLOWXER_PROGRAM_AUTOSTART: Program on %s, Preview on %s (attempt %d)", program, preview, attempt)
         return True
 
-    def _on_pipeline_error(self, message: str) -> None:
-        """GStreamer bus error (GLib main-loop thread): keep it visible in the API and metrics."""
-        self.error = message
-        self.pipeline_errors += 1
+    def engine_status(self) -> dict[str, Any] | None:
+        """The engine's last /status (fetched once a second), or None."""
+        return self.engine.status if self.engine is not None else None
 
     def program_stalled_s(self) -> float | None:
-        """Seconds without a new Program frame while on air with GStreamer; None while frames flow."""
-        if self.state != MixerState.running or self.gst is None:
+        """Seconds without a new Program frame while on air with the engine; None while frames flow."""
+        if self.state != MixerState.running or self.engine is None or not self.engine.ready:
             return None
         frames = self.frames_rendered
         now = time.monotonic()
@@ -1190,26 +1766,22 @@ class VisionMixer:
             return None
         if not self._stall_logged:
             self._stall_logged = True
-            log.warning("Program renders no frames (%s so far, none for %.0f s); check the Program input's source", frames, idle)
+            log.warning("Program renders no frames (%s so far, none for %.0f s)", frames, idle)
         return idle
+
+    def _engine_output(self) -> dict[str, Any]:
+        status = self.engine_status() or {}
+        return status.get("output") or {}
 
     @property
     def frames_rendered(self) -> int:
-        """Frames that reached the Program video sink (none in simulate)."""
-        return self._frames_before + (self.gst.program_frames if self.gst is not None else 0)
-
-    def _on_source_restart(self, element_name: str, reason: str) -> None:
-        """A failed MXL source (vsrc_<input> / asrc_<input>) was started again."""
-        role = "video" if element_name.startswith("vsrc_") else "audio"
-        key = (element_name.split("_", 1)[1], role)
-        self.input_restarts[key] = self.input_restarts.get(key, 0) + 1
-        self.error = f"input {key[0]} {role}: the MXL source failed ({reason}) and was started again"
+        """Program grains the engine wrote (none in simulate)."""
+        return self._frames_before + int(self._engine_output().get("committed") or 0)
 
     @property
-    def program_dropped(self) -> dict[str, int]:
-        """Program buffers dropped because they went back in time, per essence."""
-        running = self.gst.program_dropped if self.gst is not None else {}
-        return {essence: count + running.get(essence, 0) for essence, count in self._program_dropped_before.items()}
+    def frames_dropped(self) -> int:
+        """Output grains skipped because the engine was late (it stays on the TAI grid)."""
+        return self._frames_dropped_before + int(self._engine_output().get("skipped") or 0)
 
     def stop(self) -> MixerStatus:
         with self.watchdog.busy("Program stop"):
@@ -1217,35 +1789,33 @@ class VisionMixer:
 
     def _stop(self) -> MixerStatus:
         self._autostart_done.set()
-        stopped = True
-        if self.gst is not None:
-            self._frames_before += self.gst.program_frames
-            for essence, count in self.gst.program_dropped.items():
-                self._program_dropped_before[essence] += count
-            stopped = self.gst.stop()
-            self.gst = None
-        if not stopped:
-            # The pipeline's threads are blocked; it is left behind. The watchdog fails /livez
-            # while the stop thread stays blocked, so the pod is restarted.
-            self.state = MixerState.error
-            self.backend = "idle"
-            self.error = "Program did not stop: the media pipeline is blocked"
-            self.stinger_player = None
-            self._publish_tally()
-            return self.status()
+        runtime = self.engine
+        if runtime is not None:
+            output = self._engine_output()
+            self._frames_before += int(output.get("committed") or 0)
+            self._frames_dropped_before += int(output.get("skipped") or 0)
+            self.engine = None
+            runtime.stop()
+        self._missing_domains.clear()
         self.state = MixerState.idle
         self.backend = "idle"
-        self.stinger_player = None
+        self._mixes.clear()
         self._publish_tally()
         return self.status()
 
     def shutdown(self) -> None:
-        """SIGTERM: stop media (releases the MXL readers and writers), deregister from
-        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set."""
+        """SIGTERM: stop the engine (it releases the MXL readers and writers), deregister from
+        the registry, then remove the own output domain when MXL_CLEANUP_ON_EXIT is set. An audio
+        change still waiting to be saved is saved."""
+        with self._persist_lock:
+            pending, self._persist_timer = self._persist_timer, None
+        if pending is not None:
+            pending.cancel()
+            self.persist()
         try:
             self.stop()
         except Exception:
-            log.exception("stopping the media pipeline failed")
+            log.exception("stopping the media engine failed")
         try:
             self.library.stop()
         except Exception:
@@ -1261,90 +1831,9 @@ class VisionMixer:
                 root=self.settings.mxl_root,
             )
 
-    def _default_program_id(self) -> str:
-        for item in self.list_inputs():
-            if item.kind in {InputKind.mxl_live, InputKind.test}:
-                return item.id
-        return next(iter(self.inputs))
-
-    def _source_domain_paths(self) -> dict[str, str]:
-        """Map `{input_id}:video|audio` to an mxlsrc `domain` filesystem path."""
-        output = str(self.settings.output_domain.resolve())
-        paths: dict[str, str] = {}
-        self._missing_domains.clear()
-        for item in self.list_inputs():
-            if item.kind != InputKind.mxl_live:
-                continue
-            for role, essence in (("video", item.video), ("audio", item.audio)):
-                domain_id = getattr(essence, "domain_id", None) if essence else None
-                flow_id = str(essence.flow_id) if essence is not None and essence.flow_id else ""
-                paths[f"{item.id}:{role}"] = self._mxl_source_path(item.id, role, domain_id, flow_id) or output
-        return paths
-
-    def _mxl_source_path(self, input_id: str, role: str, domain_id: str | None, flow_id: str) -> str | None:
-        """mxlsrc `domain` path for a routed essence. A route that names no domain or the wrong one
-        (REST and IS-05 default it to the own output domain) still finds its flow: the named domain
-        when it holds the flow, else any domain below the root that does (local before mirror),
-        else the named domain, where the flow may still appear. None without a domain.
-
-        A named domain that does not exist (yet: a fabrics mirror after a node reboot) made
-        mxlsrc fail at start, and Program did not start. The source waits in the own output
-        domain instead (the flow is not there: black and silence); _watch_domains moves it when
-        the domain appears."""
-        self._missing_domains.pop((input_id, role), None)
-        root = self.settings.mxl_root
-        resolved = resolve_domain_path(root, str(domain_id)) if domain_id else None
-        if flow_id and (resolved is None or not (resolved / f"{flow_id}.mxl-flow").is_dir()):
-            holder = find_flow_domain(root, flow_id)
-            if holder is not None:
-                if domain_id and resolved != holder:
-                    log.info("MXL flow %s for input %s %s is in %s, not in domain %s", flow_id, input_id, role, holder, domain_id)
-                return str(holder)
-        if not domain_id:
-            return None
-        if resolved is None:
-            log.warning(
-                "MXL domain id %s for input %s %s not found under %s; the input waits for it (black and silence)",
-                domain_id,
-                input_id,
-                role,
-                root,
-            )
-            self._missing_domains[(input_id, role)] = str(domain_id)
-            return str(self.settings.output_domain.resolve())
-        return str(resolved)
-
-    def _watch_domains(self, runtime: GstRuntime) -> None:
-        """While `runtime` runs Program: sources that wait for a missing MXL domain read their
-        flow once the domain (or the flow in another domain) appears."""
-        while self.gst is runtime:
-            time.sleep(DOMAIN_WATCH_S)
-            if self.gst is runtime and self._missing_domains:
-                self._attach_waiting_sources(runtime)
-
-    def _attach_waiting_sources(self, runtime: GstRuntime) -> None:
-        root = self.settings.mxl_root
-        for (input_id, role), domain_id in list(self._missing_domains.items()):
-            # IS-05 activations change the route and retarget under this lock: check and move
-            # the source under it too, or an activation in between was undone by the old route.
-            with self.nmos.lock:
-                item = self.inputs.get(input_id)
-                essence = getattr(item, role, None) if item is not None and item.kind == InputKind.mxl_live else None
-                if essence is None or str(essence.domain_id) != domain_id:
-                    # Routed elsewhere or no longer an MXL input.
-                    self._missing_domains.pop((input_id, role), None)
-                    continue
-                flow_id = str(essence.flow_id) if essence.flow_id else ""
-                if resolve_domain_path(root, domain_id) is None and not (flow_id and find_flow_domain(root, flow_id)):
-                    continue
-                path = self._mxl_source_path(input_id, role, domain_id, flow_id)
-                src_name = f"vsrc_{input_id}" if role == "video" else f"asrc_{input_id}"
-                log.info("MXL domain %s appeared: input %s (%s) reads %s in %s", domain_id, input_id, role, flow_id, path)
-                try:
-                    runtime.retarget_mxl_source(src_name, flow_id or None, path, role)
-                except Exception as exc:
-                    log.warning("input %s (%s): reading the appeared domain failed (program continues): %s", input_id, role, exc)
-                    self.error = f"input {input_id} ({role}): {exc}"
+    def _default_program_id(self) -> str | None:
+        inputs = self.list_inputs()
+        return inputs[0].id if inputs else None
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
@@ -1356,36 +1845,15 @@ class VisionMixer:
                 video["flow_id"] = matched["video"].id
                 if matched["video"].domain_id:
                     video["domain_id"] = matched["video"].domain_id
-                from flowxer.api.schemas import VideoEssence
-
                 item.video = VideoEssence(**video)
             if "audio" in matched and (item.audio is None or item.audio.flow_id is None):
                 audio = item.audio.model_dump() if item.audio else {}
                 audio["flow_id"] = matched["audio"].id
                 if matched["audio"].domain_id:
                     audio["domain_id"] = matched["audio"].domain_id
-                from flowxer.api.schemas import AudioEssence
-
                 item.audio = AudioEssence(**audio)
 
-    def _is_replay(self, input_id: str | None) -> bool:
-        if not input_id:
-            return False
-        return self.get_input(input_id).kind in {InputKind.replay, InputKind.file}
-
-    def _apply_program(self) -> None:
-        if self.program_input_id is None:
-            return
-        slot = self.get_input(self.program_input_id).slot
-        if self.gst is not None:
-            self.gst.set_program(slot)
-
-    def _apply_overlay_alpha(self) -> None:
-        if self.gst is not None:
-            self.gst.set_compositor_alpha(PAD_KEYER, 1.0 if self.overlay.enabled else 0.0)
-            self.gst.set_overlay_png(self.overlay.png_path)
-
-    # ── takes / replay / overlay ─────────────────────────────────────────────
+    # ── takes ────────────────────────────────────────────────────────────────
 
     def take(
         self,
@@ -1394,87 +1862,192 @@ class VisionMixer:
         stinger_id: str | None = None,
         panel_id: str = "me-1",
         duration_ms: int = 0,
+        frames: int | None = None,
     ) -> MixerStatus:
-        """Direct source → Program (source-tile right-click). Does not consume Wipe."""
+        """Direct source → Program (source-tile right-click). A wipe uses the ME's wipe settings
+        (and its rate without a duration). A stinger plays `stinger_id` (or the slot by
+        direction); a cut plays the source's auto-stinger. A stinger that cannot play is a cut."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest(program_input_id=input_id, preview_input_id=input_id))
-        target = self.get_input(input_id)
         panel = self.get_panel(panel_id)
-        if transition == TransitionType.stinger:
-            return self.play_stinger(stinger_id or self._stinger_for("to_replay"), input_id, panel_id=panel_id)
-        if transition == TransitionType.cut:
-            auto = self._auto_stinger_for(target.id)
-            if auto is not None:
-                return self.play_stinger(
-                    auto.stinger_id,
-                    input_id,
-                    direction="to_replay" if self._is_replay(input_id) else "to_live",
-                    panel_id=panel.id,
-                )
-        self._put_on_program(panel, target.id, TransitionType(transition), flip_flop=False, duration_ms=duration_ms)
+        self._check_source(panel, input_id)
+        if transition in (TransitionType.stinger, TransitionType.cut):
+            if transition == TransitionType.stinger:
+                slot = self._slot_for_stinger(stinger_id) or self._slot_for_target(input_id)
+            else:
+                slot, stinger_id = self._auto_stinger(input_id), None
+            if slot is not None and self._play_stinger_on(panel, slot, input_id, flip_flop=False, stinger_id=stinger_id):
+                return self.status()
+            transition = TransitionType.cut
+        if transition == TransitionType.wipe and not frames and not duration_ms:
+            frames = panel.transition.rate_frames
+        self._put_on_program(panel, input_id, transition, flip_flop=False, duration_ms=duration_ms, frames=frames or 0)
         return self.status()
 
     def cut(self, panel_id: str = "me-1") -> MixerStatus:
-        """Flip Preview onto Program. If Wipe is armed, play the TGA stinger instead."""
+        """Preview onto Program, Program onto Preview. The Preview source's auto-stinger plays,
+        else an armed Wipe plays the stinger slot by direction (and is used up), as in FlowXer 14."""
         panel = self._ensure_running_panel(panel_id)
+        if not panel.transition.background:
+            return self._keys_only(panel, auto=False)
         incoming = self._preview_id(panel)
-        auto = self._auto_stinger_for(incoming)
-        if auto is not None:
-            outgoing = panel.program_input_id
-            return self.play_stinger(
-                auto.stinger_id,
-                incoming,
-                direction="to_replay" if self._is_replay(incoming) else "to_live",
-                outgoing_input_id=outgoing,
-                flip_flop=True,
-                panel_id=panel.id,
-            )
-        if panel.wipe_armed:
-            outgoing = panel.program_input_id
-            stinger_id = self._stinger_for("to_replay" if self._is_replay(incoming) else "to_live")
-            status = self.play_stinger(
-                stinger_id,
-                incoming,
-                direction="to_replay" if self._is_replay(incoming) else "to_live",
-                outgoing_input_id=outgoing,
-                flip_flop=True,
-                panel_id=panel.id,
-            )
+        slot = self._auto_stinger(incoming)
+        if slot is None and panel.wipe_armed:
             panel.wipe_armed = False
-            return status
-        self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True)
+            slot = self._slot_for_target(incoming)
+        if slot is None or not self._play_stinger_on(panel, slot, incoming, flip_flop=True, ties=True):
+            self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True, ties=True)
         return self.status()
 
     def fade(self, panel_id: str = "me-1", duration_ms: int = 400) -> MixerStatus:
-        """Dissolve Preview onto Program. Does not consume an armed Wipe."""
+        """Dissolve Preview onto Program."""
         panel = self._ensure_running_panel(panel_id)
         incoming = self._preview_id(panel)
         self._put_on_program(panel, incoming, TransitionType.mix, flip_flop=True, duration_ms=duration_ms)
         return self.status()
 
     def fade_to_black(self, panel_id: str = "me-1", duration_ms: int = 600) -> MixerStatus:
-        """Fade Program to Black, or fade up from Black onto Preview."""
+        """Fade the ME's whole output (the DSKs and the sound too) to black, or back up. The
+        buses do not change; tally does not change."""
         panel = self._ensure_running_panel(panel_id)
-        if "black" not in self.inputs:
-            raise MixerError("no black input is registered")
-        if panel.program_input_id == "black":
-            target = self._preview_id(panel)
+        panel.ftb = not panel.ftb
+        if self._rendered(panel):
+            frames = _frames(duration_ms or 600, self.settings.fps)
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/ftb/auto", {"frames": frames})
+        return self.status()
+
+    def update_transition(self, panel_id: str, payload: PanelTransitionUpdate) -> PanelTransition:
+        """Change the ME's next transition (type, rate, wipe settings, stinger slot, keyer ties and
+        BKGD). Ties are the ME's upstream keyers (kept in their order); BKGD off needs a tie."""
+        panel = self.get_panel(panel_id)
+        data = panel.transition.model_dump()
+        update = payload.model_dump(exclude_unset=True)
+        data["wipe"].update(update.pop("wipe", None) or {})
+        data.update(update)
+        for name in ("ties", "background"):
+            if data.get(name) is None:
+                data[name] = getattr(panel.transition, name)
+        if data.get("stinger_slot_id") is not None:
+            self.get_stinger_slot(data["stinger_slot_id"])
+        upstream = [keyer.id for keyer in self.keyers if keyer.panel_id == panel.id and keyer.stage == KeyerStage.upstream]
+        others = [tie for tie in data["ties"] if tie not in upstream]
+        if others:
+            raise MixerError(f"ties must be upstream keyers of {panel.label}: not {', '.join(others)}")
+        data["ties"] = [keyer_id for keyer_id in upstream if keyer_id in data["ties"]]
+        if not data["background"] and not data["ties"]:
+            raise MixerError("BKGD off (key only) needs a tied keyer")
+        try:
+            panel.transition = PanelTransition(**data)
+        except ValidationError as exc:
+            raise MixerError(f"invalid transition: {exc.errors()[0]['msg']}") from exc
+        self._push_transition(panel)
+        self._cue_stingers()
+        return panel.transition
+
+    def auto(self, panel_id: str = "me-1", frames: int | None = None) -> MixerStatus:
+        """The ME's next transition from Preview to Program over its rate (or `frames`), then the
+        buses swap. A stinger plays the ME's stinger slot (or the slot by direction) over its own
+        length."""
+        panel = self._ensure_running_panel(panel_id)
+        held = self._positions.pop(panel.id, None)
+        if held is not None:
+            # From the held T-bar position: the engine runs the rest at the rate (with the keyers
+            # tied to it).
+            position, _outgoing, incoming = held
+            rate = frames or panel.transition.rate_frames
+            if self._rendered(panel):
+                self._engine_call("POST", f"/me/{self._panel_number(panel)}/auto", {"frames": rate})
+            rest = max(1, round(rate * (1 - position)))
+            swap = panel.preview_input_id == incoming
+            self._end_held_ties(panel, rest)
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=rest, send=False)
+            return self.status()
+        if not panel.transition.background:
+            return self._keys_only(panel, auto=True)
+        incoming = self._preview_id(panel)
+        transition = panel.transition.type
+        if transition == TransitionType.stinger:
+            if self._play_stinger_on(panel, self._transition_slot(panel, incoming), incoming, flip_flop=True, ties=True):
+                return self.status()
+            transition = TransitionType.cut
+        self._put_on_program(panel, incoming, transition, flip_flop=True, frames=frames or panel.transition.rate_frames, ties=True)
+        return self.status()
+
+    def _tied(self, panel: MixerPanel) -> list[Keyer]:
+        """The keyers tied to the ME's next transition."""
+        return [keyer for keyer in self.keyers if keyer.panel_id == panel.id and keyer.id in panel.transition.ties]
+
+    def _take_ties(self, keyers: list[Keyer], frames: int) -> None:
+        """Tied keyers go to their other state with the ME's transition, which the engine runs
+        (docs/engine-p4.md §5): a keyer that goes off stays on air (raw tally) for the `frames` of the
+        transition (0: a cut); a keyer that flies ends at its last keyframe (on) or keyframe 0 (off)."""
+        now = time.monotonic()
+        for keyer in keyers:
+            keyer.enabled = not keyer.enabled
+            if self._flies(keyer):
+                keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            if keyer.enabled or frames <= 0:
+                self._key_until.pop(keyer.id, None)
+            else:
+                self._key_until[keyer.id] = now + frames / self.settings.fps
+
+    def _end_held_ties(self, panel: MixerPanel, frames: int = 0) -> None:
+        """A T-bar transition that completes (now, or by an Auto over `frames`): its tied keyers
+        change state with it."""
+        held = self._held_ties.pop(panel.id, [])
+        self._take_ties([keyer for keyer in self.keyers if keyer.id in held], frames)
+
+    def _keys_only(self, panel: MixerPanel, *, auto: bool) -> MixerStatus:
+        """BKGD off (key only): Cut turns the tied keyers on or off at the next frame, Auto runs each
+        one's own Auto (its rate, or its fly)."""
+        for keyer in self._tied(panel):
+            if auto:
+                self.keyer_auto(keyer.id)
+            else:
+                self.update_keyer(keyer.id, enabled=not keyer.enabled)
+        return self.status()
+
+    def set_position(self, panel_id: str = "me-1", position: float = 0.0) -> MixerStatus:
+        """The T-bar (0..1): moving off 0 starts the ME's next transition from Preview to Program
+        and holds it there; 1 completes it (the buses swap); 0 ends it without the swap. Auto
+        runs the rest. A stinger does not scrub: moving off 0 runs it as an Auto."""
+        panel = self._ensure_running_panel(panel_id)
+        held = self._positions.get(panel.id)
+        if held is None:
+            if position <= 0:
+                return self.status()
+            if panel.transition.type == TransitionType.stinger or not panel.transition.background:
+                return self.auto(panel.id)
+            held = (position, panel.program_input_id, self._preview_id(panel))
+            # Tally: both sources (and the tied keyers) are on air while the T-bar holds the
+            # transition.
+            self._mixes[panel.id] = (held[1], held[2], None)
+            self._held_ties[panel.id] = list(panel.transition.ties)
+        if self._rendered(panel):
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/position", {"t": position})
+        _position, outgoing, incoming = held
+        if position >= 1:
+            del self._positions[panel.id]
+            swap = panel.preview_input_id == incoming
+            self._end_held_ties(panel)
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
+        elif position <= 0:
+            self._positions.pop(panel.id, None)
+            self._mixes.pop(panel.id, None)
+            self._held_ties.pop(panel.id, None)
+            self._publish_tally()
         else:
-            target = "black"
-        self._put_on_program(panel, target, TransitionType.mix, flip_flop=False, duration_ms=duration_ms)
+            self._positions[panel.id] = (position, outgoing, incoming)
+            self._publish_tally()
         return self.status()
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
-        """Arm (or toggle) Wipe so the next Cut plays the TGA stinger."""
+        """Arm (or toggle) Wipe: the next Cut plays the stinger slot by direction (FlowXer 14's
+        meaning, kept for its clients)."""
         panel = self._ensure_running_panel(panel_id)
         panel.wipe_armed = (not panel.wipe_armed) if armed is None else armed
+        self._cue_stingers()
         return self.status()
-
-    def _auto_stinger_for(self, input_id: str) -> StingerSlot | None:
-        source = self.get_input(input_id)
-        if not source.stinger_slot_id:
-            return None
-        return self.get_stinger_slot(source.stinger_slot_id)
 
     def _ensure_running_panel(self, panel_id: str) -> MixerPanel:
         if self.state != MixerState.running:
@@ -1485,79 +2058,90 @@ class VisionMixer:
         incoming = panel.preview_input_id
         if not incoming:
             raise MixerError("arm a source on Preview before cutting or fading")
-        self.get_input(incoming)
+        self._check_source(panel, incoming)
         return incoming
 
     def _put_on_program(
         self,
         panel: MixerPanel,
-        input_id: str,
+        source_id: str,
         transition: TransitionType,
         *,
         flip_flop: bool,
         duration_ms: int = 0,
+        frames: int = 0,
+        send: bool = True,
+        sting: dict[str, int] | None = None,
+        ties: bool = False,
     ) -> None:
-        target = self.get_input(input_id)
+        """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
+        default); `flip_flop` puts the old Program on Preview. `send=False`: the engine does it
+        already (the T-bar). A stinger: `sting` is its player and cut frame, `frames` its length.
+        `ties`: the ME's Cut or Auto, which take its tied keyers along."""
+        held = self._positions.pop(panel.id, None)
+        if held is not None:
+            # A held T-bar transition ends first, as if it had run to its end (as in the engine).
+            _position, _outgoing, incoming = held
+            swap = panel.preview_input_id == incoming
+            self._end_held_ties(panel)
+            self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
         outgoing = panel.program_input_id
-        panel.program_input_id = target.id
+        panel.program_input_id = source_id
         panel.last_transition = transition.value
         self.last_transition = transition.value
         kind = transition.value
         self.transition_counts[kind] = self.transition_counts.get(kind, 0) + 1
-        if flip_flop and outgoing and outgoing != target.id:
+        swapped = flip_flop and outgoing and outgoing != source_id
+        if swapped:
             panel.preview_input_id = outgoing
-        if transition == TransitionType.mix:
-            end = time.monotonic() + (duration_ms or DEFAULT_MIX_MS) / 1000
-            self._mixes[panel.id] = (outgoing, target.id, end)
+        if transition in (TransitionType.mix, TransitionType.wipe, TransitionType.stinger):
+            frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
+            # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
+            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + frames / self.settings.fps)
         else:
+            frames = 0
             self._mixes.pop(panel.id, None)
-        if panel.id == (self.panels[0].id if self.panels else panel.id):
-            self.program_input_id = target.id
-            if flip_flop and outgoing and outgoing != target.id:
+        if self.panels and panel.id == self.panels[0].id:
+            self.program_input_id = source_id
+            if swapped:
                 self.preview_input_id = outgoing
-            if target.kind not in {InputKind.replay, InputKind.file}:
-                self.last_live_input_id = target.id
-                self.program_bus = ProgramBus.live
-            else:
-                self.program_bus = ProgramBus.replay
-            if transition == TransitionType.mix and self.gst is not None:
-                self.gst.mix(target.slot, (duration_ms or DEFAULT_MIX_MS) * 1_000_000)
-            else:
-                self._apply_program()
+            if source_id in self.inputs and self.inputs[source_id].kind == InputKind.mxl_live:
+                self.last_live_input_id = source_id
+            self.program_bus = ProgramBus.live
+        tied = self._tied(panel) if ties else []
+        if send and self._rendered(panel):
+            body: dict[str, Any] = {"source": self._engine_source(source_id), "frames": 0 if sting else frames}
+            if transition == TransitionType.wipe or sting:
+                # Without a type the engine mixes (frames > 0) or cuts.
+                body["type"] = transition.value
+            if sting:
+                body.update(sting)
+            if swapped:
+                body["preview"] = self._engine_source(outgoing)
+            if tied:
+                body["ties"] = True
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/take", body)
+        self._take_ties(tied, frames)
+        wipe = panel.transition.wipe
+        if transition == TransitionType.wipe and wipe.alternate:
+            # Flip-flop: the next wipe runs back (this one keeps the direction it started with).
+            wipe.reverse = not wipe.reverse
+            self._push_transition(panel)
         self._publish_tally()
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
         if self.state != MixerState.running:
             self.start(MixerStartRequest(preview_input_id=input_id, program_input_id=self._default_program_id()))
-        self.get_input(input_id)
         panel = self.get_panel(panel_id)
+        self._check_source(panel, input_id)
         panel.preview_input_id = input_id
         if panel.id == self.panels[0].id:
             self.preview_input_id = input_id
+        if self._rendered(panel):
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/preview", {"source": self._engine_source(input_id)})
         self._publish_tally()
+        self._cue_stingers()
         return self.status()
-
-    def load_clip(self, input_id: str, file_path: str) -> LogicalInput:
-        target = self.get_input(input_id)
-        if target.kind not in {InputKind.file, InputKind.replay}:
-            raise MixerError(f"input {input_id} cannot play files")
-        resolved = self._resolve_clip(file_path)
-        target.library_item_id = None
-        target.file_path = resolved
-        return target
-
-    def take_replay(self, stinger_id: str, input_id: str | None = None) -> MixerStatus:
-        replay_id = input_id or self._replay_input_id()
-        replay = self.get_input(replay_id)
-        if replay.file_path in {None, "_unassigned"}:
-            raise MixerError("load a clip onto the replay input first")
-        if self.last_live_input_id is None:
-            self.last_live_input_id = self.program_input_id
-        return self.play_stinger(stinger_id or self._stinger_for("to_replay"), replay_id, direction="to_replay")
-
-    def return_live(self, stinger_id: str, input_id: str | None = None) -> MixerStatus:
-        live_id = input_id or self.last_live_input_id or self._default_program_id()
-        return self.play_stinger(stinger_id or self._stinger_for("to_live"), live_id, direction="to_live")
 
     def play_stinger(
         self,
@@ -1568,150 +2152,196 @@ class VisionMixer:
         flip_flop: bool = False,
         panel_id: str | None = None,
     ) -> MixerStatus:
+        """Plays `stinger_id` (its slot's cut, else the stinger's own) to the target on the GPU; a
+        stinger that cannot play (it still converts, every player busy) is a cut."""
         if self.state != MixerState.running:
             self.start(MixerStartRequest())
         panel = self.get_panel(panel_id or (self.panels[0].id if self.panels else "me-1"))
-        if panel.id != self.panels[0].id:
-            # Only ME 1 renders (one compositor, one stinger player): a stinger on another ME
-            # switches that ME at once and leaves ME 1's Program and running stinger alone.
-            self._put_on_program(panel, target_input_id, TransitionType.stinger, flip_flop=flip_flop)
-            return self.status()
-        if self.stinger_player and not self.stinger_player.done:
-            remaining = self.stinger_player.info.frame_count - self.stinger_player.frame + 1
-            self.advance_stinger(max(remaining, 1))
-        if direction is None:
-            direction = "to_replay" if self._is_replay(target_input_id) else "to_live"
-        slot = self._slot_for(direction)
-        if slot is not None and stinger_id and slot.stinger_id != stinger_id:
-            for item in self.stinger_slots:
-                if item.stinger_id == stinger_id:
-                    slot = item
-                    break
-        self.get_input(target_input_id)
-        try:
-            info = self._info_for_slot(slot, stinger_id)
-        except StingerNotReady as exc:
-            # Straight to Program: take() would pick the input's auto stinger again (recursion).
-            log.warning("stinger not ready — hard cut: %s", exc)
+        self._check_source(panel, target_input_id)
+        slot = self._slot_for_stinger(stinger_id) or self._slot_for_target(target_input_id, direction)
+        if not self._play_stinger_on(panel, slot, target_input_id, flip_flop=flip_flop, stinger_id=stinger_id):
             self._put_on_program(panel, target_input_id, TransitionType.cut, flip_flop=flip_flop)
-            return self.status()
-        outgoing = outgoing_input_id if outgoing_input_id is not None else panel.program_input_id
-        self.last_transition = "stinger"
-        panel.last_transition = "stinger"
-        self.transition_counts["stinger"] = self.transition_counts.get("stinger", 0) + 1
-        player = StingerPlayer(
-            info,
-            target_input_id,
-            direction,
-            outgoing_input_id=outgoing,
-            flip_flop=flip_flop,
-            panel_id=panel.id,
-        )
-        self.stinger_player = player
-        self._export_tally()
-        if self.gst is not None:
-            # Each frame that reaches the compositor advances the player, so Program
-            # cuts on the stinger's own cut frame.
-            self.gst.play_stinger(
-                stinger_bin_description(info.model_dump(), self.settings, gpu=self.media.gpu),
-                on_frame=lambda: self._stinger_frame(player),
-                on_end=lambda: self._stinger_ended(player),
-            )
-            return self.status()
-        # Advance to first frame so status reports "playing".
-        self.advance_stinger(1)
-        self._arm_stinger_clock()
         return self.status()
-
-    def _stinger_frame(self, player: StingerPlayer) -> None:
-        if self.stinger_player is player:
-            self.advance_stinger(1)
-
-    def _stinger_ended(self, player: StingerPlayer) -> None:
-        """The stinger media ended (or failed): finish the player, cut included."""
-        if self.stinger_player is player and not player.done:
-            self.advance_stinger(max(player.info.frame_count - player.frame, 1))
 
     def advance_stinger(self, frames: int = 1) -> MixerStatus:
-        """Advance the TGA stinger. Called by the GST pad probe or tests."""
-        if self.stinger_player is None:
-            return self.status()
-        snapshot = self.stinger_player.advance(frames)
-        if "cut" in snapshot["events"]:
-            target_id = self.stinger_player.target_input_id
-            panel = None
-            if self.stinger_player.panel_id:
-                try:
-                    panel = self.get_panel(self.stinger_player.panel_id)
-                except MixerError:
-                    panel = None
-            if panel is None and self.panels:
-                panel = self.panels[0]
-            if panel is not None:
-                outgoing = self.stinger_player.outgoing_input_id
-                panel.program_input_id = target_id
-                panel.last_transition = "stinger"
-                if self.stinger_player.flip_flop and outgoing and outgoing != target_id:
-                    panel.preview_input_id = outgoing
-            self.program_input_id = target_id
-            if self.stinger_player.flip_flop and self.stinger_player.outgoing_input_id:
-                self.preview_input_id = self.stinger_player.outgoing_input_id
-            if self.stinger_player.direction == "to_live":
-                self.last_live_input_id = self.program_input_id
-                self.program_bus = ProgramBus.live
-            else:
-                self.program_bus = ProgramBus.replay
-            self._apply_program()
-            self._publish_tally()
-        if "complete" in snapshot["events"]:
-            self.stinger_player = None
-            self._export_tally()
+        """The engine runs stingers on the grain clock (kept for the API)."""
         return self.status()
 
-    def _arm_stinger_clock(self) -> None:
-        """Advance the TGA FSM in simulate (and when no GST pad probe is ticking)."""
-        if not self.settings.stinger_auto_tick:
+    def _stinger_players(self) -> int:
+        """Stinger players of the engine: the workspace's, at most the rendering MEs."""
+        return min(self.workspace.stinger_players, self.render_count)
+
+    def _auto_stinger(self, input_id: str) -> StingerSlot | None:
+        """The auto-stinger slot of a source (played when it is cut or taken to Program)."""
+        source = self.inputs.get(input_id)
+        if source is None or not source.stinger_slot_id:
+            return None
+        return next((slot for slot in self.stinger_slots if slot.id == source.stinger_slot_id), None)
+
+    def _slot_for_target(self, target_input_id: str, direction: str | None = None) -> StingerSlot | None:
+        """The slot by direction: to a clip player (or "to_replay") an `in` slot, else `out`; a
+        shared slot serves both."""
+        if direction is None:
+            target = self.inputs.get(target_input_id)
+            direction = "to_replay" if target is not None and target.kind == InputKind.clip_player else "to_live"
+        role = "in" if direction == "to_replay" else "out"
+        for slot in self.stinger_slots:
+            if slot.role in {role, "shared"}:
+                return slot
+        return self.stinger_slots[0] if self.stinger_slots else None
+
+    def _slot_for_stinger(self, stinger_id: str | None) -> StingerSlot | None:
+        if not stinger_id:
+            return None
+        return next((slot for slot in self.stinger_slots if stinger_id in {slot.stinger_id, slot.library_item_id}), None)
+
+    def _transition_slot(self, panel: MixerPanel, incoming: str) -> StingerSlot | None:
+        """The slot of the ME's transition type stinger: its own, else the slot by direction."""
+        slot_id = panel.transition.stinger_slot_id
+        slot = next((slot for slot in self.stinger_slots if slot.id == slot_id), None) if slot_id else None
+        return slot or self._slot_for_target(incoming)
+
+    def _cue_slot(self, panel: MixerPanel) -> StingerSlot | None:
+        """The stinger the ME's next Cut or Auto plays: Preview's auto-stinger, an armed Wipe's
+        slot, or the slot of the transition type stinger."""
+        incoming = panel.preview_input_id
+        if not incoming:
+            return None
+        slot = self._auto_stinger(incoming)
+        if slot is None and panel.wipe_armed:
+            slot = self._slot_for_target(incoming)
+        if slot is None and panel.transition.type == TransitionType.stinger:
+            slot = self._transition_slot(panel, incoming)
+        return slot
+
+    def _stinger_media(self, slot: StingerSlot | None, stinger_id: str | None = None) -> tuple[dict[str, Any], int] | None:
+        """What a stinger player loads for the slot's stinger (or `stinger_id`), and its cut frame;
+        None while it has no mezzanine (it converts)."""
+        own = stinger_id is None or (slot is not None and stinger_id in {slot.stinger_id, slot.library_item_id})
+        if own and slot is not None and slot.library_item_id:
+            item = self.library.get(slot.library_item_id)
+        else:
+            name = stinger_id if not own else (slot.stinger_id if slot is not None else None)
+            item = self._find_library_stinger(name) if name else None
+        fmt = self.workspace.format_id
+        if item is None or item.kind != LibraryKind.stinger or not self.library.queue.ready_on_disk(item, fmt):
+            return None
+        conv = item.conversion_for(fmt)
+        cut = self._stinger_info_from_library(item).cut_frame
+        if own and slot is not None and not slot.library_item_id and slot.cut_ms is not None:
+            # A legacy stinger: its cut is the slot's (stinger.json), in ms of any rate.
+            cut = cut_frame_from_ms(slot.cut_ms, self.settings.fps, conv.frames)
+        alpha = self.library.alpha_path(item.id, fmt)
+        audio = self.library.audio_path(item.id, fmt)
+        body = {
+            "path": str(self.library.mezzanine_path(item.id, fmt)),
+            "alpha": str(alpha) if alpha else "",
+            "audio": str(audio) if audio else "",
+            "channels": conv.audio_channels,
+            "frames": conv.frames,
+        }
+        return body, cut
+
+    def _load_stinger(self, player: int, body: dict[str, Any], client: EngineClient | None = None) -> None:
+        if self._stinger_cued.get(player) != body["path"]:
+            self._engine_call("POST", f"/stinger/{player}/load", body, client=client)
+            self._stinger_cued[player] = body["path"]
+
+    def _cue_stingers(self, client: EngineClient | None = None) -> None:
+        """Stinger player k holds the stinger ME k's next Cut or Auto plays, so a take starts at
+        the next grain (a player that plays keeps its stinger)."""
+        if self.engine is None and client is None:
             return
-        if self._stinger_clock is not None and self._stinger_clock.is_alive():
-            return
+        now = time.monotonic()
+        for number, panel in enumerate(self.rendered_panels()[: self._stinger_players()], 1):
+            slot = self._cue_slot(panel)
+            media = self._stinger_media(slot) if slot is not None and self._stinger_until.get(number, 0.0) <= now else None
+            if media is not None:
+                self._load_stinger(number, media[0], client)
 
-        def tick() -> None:
-            delay = 1.0 / max(self.settings.fps, 1.0)
-            while True:
-                time.sleep(delay)
-                if self.stinger_player is None:
-                    return
-                self.advance_stinger(1)
-                if self.stinger_player is None:
-                    return
+    def _play_stinger_on(
+        self,
+        panel: MixerPanel,
+        slot: StingerSlot | None,
+        incoming: str,
+        *,
+        flip_flop: bool,
+        stinger_id: str | None = None,
+        ties: bool = False,
+    ) -> bool:
+        """Plays a stinger on the ME to `incoming`: on the player that holds it, else on a free one
+        (loaded now; the engine starts it when its first frame is decoded). With every player busy
+        it waits up to STINGER_WAIT_S for one. False when it cannot play (no mezzanine yet, no
+        player free in time): the caller cuts. `ties`: the ME's tied keyers cut at its cut point."""
+        media = self._stinger_media(slot, stinger_id)
+        if media is None or not self._rendered(panel):
+            log.warning("stinger %s is not ready: a cut", stinger_id or (slot.stinger_id if slot else None))
+            self.stinger_fallbacks["not_ready"] += 1
+            return False
+        body, cut = media
+        players = range(1, self._stinger_players() + 1)
+        now = time.monotonic()
+        free = [p for p in players if self._stinger_until.get(p, 0.0) <= now]
+        soonest = min((self._stinger_until.get(p, 0.0) for p in players), default=None)
+        if not free and soonest is not None and soonest - now <= STINGER_WAIT_S:
+            # A player is free again soon (for example right after its stinger): wait for it.
+            time.sleep(soonest - now)
+            now = time.monotonic()
+            free = [p for p in players if self._stinger_until.get(p, 0.0) <= now]
+        if not free:
+            log.warning("every stinger player plays a stinger: a cut")
+            self.stinger_fallbacks["busy"] += 1
+            return False
+        player = next((p for p in free if self._stinger_cued.get(p) == body["path"]), free[0])
+        cued = self._stinger_cued.get(player) == body["path"]
+        self._load_stinger(player, body)
+        frames = max(1, int(body["frames"]))
+        seconds = frames / self.settings.fps
+        # A stinger loaded now may wait for its first frame (the engine waits at most 50 grains).
+        self._stinger_until[player] = now + seconds + (0.1 if cued else 1.0)
+        self._put_on_program(
+            panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut}, ties=ties
+        )
+        self._stinger_run = {
+            "id": stinger_id or (slot.stinger_id if slot else None),
+            "panel_id": panel.id,
+            "player": player,
+            "frame_count": frames,
+            "cut_frame": cut,
+            "target_input_id": incoming,
+            "started": now,
+        }
+        # When it has played, the player cues the next stinger again.
+        timer = threading.Timer(self._stinger_until[player] - now + 0.1, self._cue_stingers)
+        timer.daemon = True
+        timer.start()
+        return True
 
-        self._stinger_clock = threading.Thread(target=tick, daemon=True, name="stinger-clock")
-        self._stinger_clock.start()
+    def _stinger_status(self) -> dict[str, Any]:
+        """The last stinger taken, by the control plane's clock."""
+        run = self._stinger_run
+        if run is None:
+            return {"id": None, "phase": "idle", "frame": 0, "frame_count": 0, "cut_frame": 0, "cut_fired": False, "done": True,
+                    "target_input_id": None, "direction": None, "events": []}
+        frame = min(run["frame_count"], int((time.monotonic() - run["started"]) * self.settings.fps))
+        done = frame >= run["frame_count"]
+        cut_fired = frame >= run["cut_frame"]
+        return {
+            "id": run["id"],
+            "phase": "complete" if done else "cut" if cut_fired else "playing",
+            "frame": frame,
+            "frame_count": run["frame_count"],
+            "cut_frame": run["cut_frame"],
+            "cut_fired": cut_fired,
+            "done": done,
+            "target_input_id": run["target_input_id"],
+            "direction": None,
+            "panel_id": run["panel_id"],
+            "player": run["player"],
+            "events": [],
+        }
 
-    def set_overlay(self, **kwargs) -> MixerStatus:
-        if kwargs.get("url"):
-            try:
-                kwargs["url"] = assert_http_url(kwargs["url"], what="overlay URL")
-            except SecurityError as exc:
-                raise MixerError(str(exc)) from exc
-        self.overlay.update(**kwargs)
-        if self.keyers:
-            if kwargs.get("enabled") is not None:
-                self.keyers[0].enabled = kwargs["enabled"]
-            if kwargs.get("url") is not None:
-                self.keyers[0].url = kwargs["url"]
-            if kwargs.get("title") is not None:
-                self.keyers[0].title = kwargs["title"]
-            if kwargs.get("subtitle") is not None:
-                self.keyers[0].subtitle = kwargs["subtitle"]
-        self._apply_overlay_alpha()
-        return self.status()
-
-    def _replay_input_id(self) -> str:
-        for item in self.list_inputs():
-            if item.kind == InputKind.replay:
-                return item.id
-        raise MixerError("no replay input is registered")
+    # ── tally ────────────────────────────────────────────────────────────────
 
     def _require_running(self) -> None:
         if self.state != MixerState.running:
@@ -1736,29 +2366,276 @@ class VisionMixer:
             return self.tally.status()
 
     def _export_tally(self) -> None:
-        """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it.
-        Called alone at the start and end of a stinger (no change for the API's receivers)."""
+        """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it."""
         if self.tally_export is not None:
             self.tally_export.changed()
 
     def _tally_snapshot(self) -> TallySnapshot:
-        """Program, Preview and the running mix or stinger of each ME (lamps off while Program
-        is stopped). Called by the export thread."""
+        """Program, Preview and the running mix of each ME, and the re-entry sources each ME can
+        take (lamps off while Program is stopped). Called by the export thread."""
         running = self.state == MixerState.running
-        player = self.stinger_player
         mes = []
         for panel in list(self.panels):
+            reentry = tuple(
+                (other.id, other.label, REENTRY_INDEX + self._panel_number(other))
+                for other in self.reentry_sources(panel)
+            )
             if not running:
-                mes.append(MeTally())
+                mes.append(MeTally(reentry=reentry))
                 continue
             transition = self._mixes.get(panel.id)
-            if player is not None and not player.done and player.panel_id == panel.id:
-                transition = (player.outgoing_input_id, player.target_input_id, None)
-            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition))
+            keyers = [keyer for keyer in self.keyers if keyer.panel_id == panel.id]
+            # A keyer is on air while it is on, fading off or flying off, or tied to a transition the
+            # T-bar holds.
+            now = time.monotonic()
+            held = self._held_ties.get(panel.id, [])
+            air = {k.id: k.enabled or now < self._key_until.get(k.id, 0.0) or k.id in held for k in keyers}
+            keyed = tuple(k.source_id for k in keyers if air[k.id] and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
+            keys = tuple(self._key_tally(keyer, air[keyer.id]) for keyer in keyers if keyer.mode == KeyMode.linear)
+            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
         return TallySnapshot(
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
         )
+
+    def _key_tally(self, keyer: Keyer, on_air: bool) -> tuple[int, str, bool]:
+        """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
+        ME n) or 3000 + 100·n + k (DSK k), its receiver label, on air."""
+        same = [k for k in self.keyers if k.panel_id == keyer.panel_id and k.stage == keyer.stage]
+        base = 2000 if keyer.stage == KeyerStage.upstream else 3000
+        index = base + 100 * self._panel_number(self.get_panel(keyer.panel_id)) + same.index(keyer) + 1
+        return index, keyer.receiver_label, on_air
+
+    # ── audio (P5, docs/engine-p5.md) ────────────────────────────────────────
+
+    def audio_channels(self) -> int:
+        """The PGM's channels: the engine's while it runs (an existing flow keeps its own), else
+        FLOWXER_AUDIO_CHANNELS."""
+        channels = ((self.engine_status() or {}).get("audio") or {}).get("channels")
+        return int(channels) if isinstance(channels, int) and channels > 0 else self.settings.audio_channels
+
+    def audio_strips(self, panel: MixerPanel) -> list[tuple[str, str, str]]:
+        """A rendering panel's strips in slot order, as (id, label, kind): its live inputs, clip
+        players, the Programs of higher rendering MEs (re-entry) and the stinger."""
+        strips = [(item.id, item.label, "input") for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        strips += [(item.id, item.label, "clip_player") for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        strips += [(other.id, other.label, "panel") for other in self.reentry_sources(panel)]
+        strips.append(("stinger", "Stinger", "stinger"))
+        return strips
+
+    def _audio_panel(self, panel_id: str) -> MixerPanel:
+        panel = self.get_panel(panel_id)
+        if not self._rendered(panel):
+            raise MixerError(f"{panel.label} does not render (FLOWXER_RENDER_MES): it has no audio")
+        return panel
+
+    def audio_state(self) -> dict[str, Any]:
+        """GET /audio: per live input its delay, channel map and its flow's channels; per rendering
+        panel its master and strips; the PGM's channels and the longest delay."""
+        engine_inputs = (self.engine_status() or {}).get("inputs") or []
+        inputs: dict[str, Any] = {}
+        for k, item in enumerate(item for item in self.list_inputs() if item.kind == InputKind.mxl_live):
+            audio = self.audio.inputs.get(item.id) or InputAudio()
+            flow = ((engine_inputs[k].get("audio") or {}).get("channels") if k < len(engine_inputs) else None) or None
+            inputs[item.id] = {
+                "label": item.label,
+                "delay_ms": audio.delay_ms,
+                "channel_map": list(audio.channel_map),
+                "channels": flow or (item.audio.channels if item.audio is not None else None),
+            }
+        panels: dict[str, Any] = {}
+        for panel in self.rendered_panels():
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            strips = {}
+            for strip_id, label, kind in self.audio_strips(panel):
+                strip = audio.strips.get(strip_id) or AudioStrip()
+                strips[strip_id] = {
+                    "label": label,
+                    "kind": kind,
+                    "fader_db": strip.fader_db,
+                    "mute": strip.mute,
+                    "afv": None if kind == "stinger" else strip.afv,
+                }
+            panels[panel.id] = {"label": panel.label, "master_db": audio.master_db, "strips": strips}
+        return {"channels": self.audio_channels(), "max_delay_ms": self.settings.audio_max_delay_ms, "inputs": inputs, "panels": panels}
+
+    def update_input_audio(self, input_id: str, payload: InputAudioUpdate) -> dict[str, Any]:
+        """A live input's delay (whole 48 kHz samples, 0 .. FLOWXER_AUDIO_MAX_DELAY_MS) and channel
+        map (one entry per PGM channel, 0 silent; [] is 1:1), for every ME. The engine crossfades
+        from the old reading to the new one over one grain."""
+        item = self.get_input(input_id)
+        if item.kind != InputKind.mxl_live:
+            raise MixerError(f"{item.label} is not a live input: a delay and a channel map are for live inputs")
+        current = self.audio.inputs.get(input_id) or InputAudio()
+        delay = current.delay_ms if payload.delay_ms is None else float(payload.delay_ms)
+        channel_map = list(current.channel_map) if payload.channel_map is None else list(payload.channel_map)
+        if delay > self.settings.audio_max_delay_ms:
+            raise MixerError(f"delay_ms must be 0..{self.settings.audio_max_delay_ms} (FLOWXER_AUDIO_MAX_DELAY_MS)")
+        channels = self.audio_channels()
+        if channel_map and len(channel_map) != channels:
+            raise MixerError(f"channel_map needs one entry per PGM channel ({channels}), or none for 1:1")
+        if any(value < 0 or value > 64 for value in channel_map):
+            raise MixerError("channel_map entries are input channels 1..64, or 0 for silence")
+        value = InputAudio(delay_ms=round(delay * AUDIO_SAMPLES_PER_MS) / AUDIO_SAMPLES_PER_MS, channel_map=channel_map)
+        if value == InputAudio():
+            self.audio.inputs.pop(input_id, None)
+        else:
+            self.audio.inputs[input_id] = value
+        self._push_input_audio(item)
+        return self.audio_state()["inputs"][input_id]
+
+    def update_panel_audio(self, panel_id: str, payload: PanelAudioUpdate) -> dict[str, Any]:
+        """A panel's master fader (ramps over one grain)."""
+        panel = self._audio_panel(panel_id)
+        audio = self.audio.panels.setdefault(panel.id, PanelAudio())
+        if payload.master_db is not None:
+            audio.master_db = payload.master_db
+        self._tidy_panel_audio(panel.id)
+        self._push_panel_audio(panel, {"master_db": audio.master_db})
+        return self.audio_state()["panels"][panel.id]
+
+    def update_audio_strip(self, panel_id: str, strip_id: str, payload: AudioStripUpdate) -> dict[str, Any]:
+        """A strip's fader, mute and AFV on one panel (each change ramps over one grain)."""
+        panel = self._audio_panel(panel_id)
+        if strip_id not in {sid for sid, _, _ in self.audio_strips(panel)}:
+            raise MixerError(f"unknown strip {strip_id} on {panel.label}")
+        patch = payload.model_dump(exclude_none=True)
+        if strip_id == "stinger" and "afv" in patch:
+            raise MixerError("the stinger strip has no afv")
+        audio = self.audio.panels.setdefault(panel.id, PanelAudio())
+        strip = (audio.strips.get(strip_id) or AudioStrip()).model_copy(update=patch)
+        audio.strips[strip_id] = strip
+        self._tidy_panel_audio(panel.id)
+        self._push_panel_audio(panel, {"strips": {self._engine_strip(strip_id): self._strip_body(strip_id, strip)}})
+        return self.audio_state()["panels"][panel.id]["strips"][strip_id]
+
+    def _tidy_panel_audio(self, panel_id: str) -> None:
+        """Only what is not at its default is kept (and saved)."""
+        audio = self.audio.panels.get(panel_id)
+        if audio is None:
+            return
+        for strip_id in [sid for sid, strip in audio.strips.items() if strip == AudioStrip()]:
+            del audio.strips[strip_id]
+        if audio == PanelAudio():
+            del self.audio.panels[panel_id]
+
+    def _engine_strip(self, strip_id: str) -> str:
+        """FlowXer's strip id → the engine's: in<k>, cp<k>, me<n>, stinger."""
+        return "stinger" if strip_id == "stinger" else self._engine_source(strip_id)
+
+    @staticmethod
+    def _strip_body(strip_id: str, strip: AudioStrip) -> dict[str, Any]:
+        body: dict[str, Any] = {"fader_db": strip.fader_db, "mute": strip.mute}
+        if strip_id != "stinger":
+            body["afv"] = strip.afv
+        return body
+
+    def _push_input_audio(self, item: LogicalInput, client: EngineClient | None = None) -> None:
+        if item.kind != InputKind.mxl_live:
+            return
+        audio = self.audio.inputs.get(item.id) or InputAudio()
+        self._engine_call(
+            "POST", f"/input/{self._engine_index(item)}/audio", {"delay_ms": audio.delay_ms, "map": list(audio.channel_map)}, client=client
+        )
+
+    def _push_panel_audio(self, panel: MixerPanel, body: dict[str, Any] | None = None, client: EngineClient | None = None) -> None:
+        """The panel's master and strips (all of them without `body`: after an engine start)."""
+        if not self._rendered(panel):
+            return
+        if body is None:
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            body = {
+                "master_db": audio.master_db,
+                "strips": {
+                    self._engine_strip(sid): self._strip_body(sid, audio.strips.get(sid) or AudioStrip()) for sid, _, _ in self.audio_strips(panel)
+                },
+            }
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio", body, client=client)
+
+    def audio_meters(self) -> dict[str, Any]:
+        """GET /audio/meters: the engine's last 100 ms block with FlowXer's ids (live inputs and clip
+        players by id, stinger players as stinger-<k>, panels by id with their strips). At most
+        100 ms old, one engine call however many viewers poll. Off-air (or in simulate) every
+        meter is silence (-120) and each strip shows what its settings and AFV give."""
+        with self._meters_lock:
+            now = time.monotonic()
+            if now - self._meters_at >= METERS_CACHE_S:
+                raw = None
+                if self.engine is not None and self.engine.ready:
+                    try:
+                        raw = self.engine.call("GET", "/audio/meters")
+                    except EngineError:
+                        raw = None
+                self._meters_raw, self._meters_at = raw if isinstance(raw, dict) else None, now
+            raw = self._meters_raw
+        return self._meters_view(raw)
+
+    def _meters_view(self, raw: dict[str, Any] | None) -> dict[str, Any]:
+        channels = self.audio_channels()
+        floor = [METER_FLOOR_DB] * channels
+        live = [item for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        players = [item for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        engine_sources = (raw or {}).get("sources") or {}
+        sources: dict[str, Any] = {}
+        for prefix, items in (("in", live), ("cp", players)):
+            for k, item in enumerate(items, 1):
+                entry = engine_sources.get(f"{prefix}{k}") or {}
+                sources[item.id] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        for k in range(1, self._stinger_players() + 1):
+            entry = engine_sources.get(f"st{k}") or {}
+            sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
+        engine_mes = (raw or {}).get("mes") or {}
+        panels: dict[str, Any] = {}
+        pairs = (channels + 1) // 2
+        for panel in self.rendered_panels():
+            entry = engine_mes.get(str(self._panel_number(panel))) or {}
+            engine_strips = entry.get("strips") or {}
+            audio = self.audio.panels.get(panel.id) or PanelAudio()
+            strips = {}
+            for strip_id, _label, kind in self.audio_strips(panel):
+                measured = engine_strips.get(self._engine_strip(strip_id))
+                if measured is None:
+                    setting = audio.strips.get(strip_id) or AudioStrip()
+                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
+                    measured = {"gain_db": gain, "heard": gain > -90.0}
+                strips[strip_id] = measured
+            panels[panel.id] = {
+                "peak_dbfs": entry.get("peak_dbfs", floor),
+                "true_peak_dbtp": entry.get("true_peak_dbtp", floor),
+                "rms_dbfs": entry.get("rms_dbfs", floor),
+                "loudness": entry.get("loudness")
+                or [{"pair": p, "momentary": METER_FLOOR_DB, "short_term": METER_FLOOR_DB, "integrated": METER_FLOOR_DB} for p in range(1, pairs + 1)],
+                "overs": int(entry.get("overs") or 0),
+                "strips": strips,
+            }
+        return {"block": (raw or {}).get("block"), "channels": channels, "sources": sources, "panels": panels}
+
+    def reset_loudness(self, panel_id: str) -> dict[str, Any]:
+        """The panel's integrated loudness from now on (the engine's next 100 ms block)."""
+        panel = self._audio_panel(panel_id)
+        self._engine_call("POST", f"/me/{self._panel_number(panel)}/audio/loudness/reset", {})
+        with self._meters_lock:
+            self._meters_at = 0.0
+        return {"panel_id": panel.id, "loudness_reset": True}
+
+    def _prune_audio(self) -> None:
+        """When the structure changes: the audio of inputs that are no live input any more, of panels
+        that no longer render and of strips a panel no longer has is dropped (as keyers are)."""
+        live = {item.id for item in self.list_inputs() if item.kind == InputKind.mxl_live}
+        for input_id in [i for i in self.audio.inputs if i not in live]:
+            del self.audio.inputs[input_id]
+        rendered = {panel.id: panel for panel in self.rendered_panels()}
+        for panel_id in list(self.audio.panels):
+            panel = rendered.get(panel_id)
+            if panel is None:
+                del self.audio.panels[panel_id]
+                continue
+            valid = {sid for sid, _, _ in self.audio_strips(panel)}
+            strips = self.audio.panels[panel_id].strips
+            for strip_id in [s for s in strips if s not in valid]:
+                del strips[strip_id]
+            self._tidy_panel_audio(panel_id)
 
     # ── saved state and config export/import ─────────────────────────────────
 
@@ -1766,12 +2643,6 @@ class VisionMixer:
         """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
         # The NMOS lock guards the state: IS-05 activations hold it when they persist.
         with self.nmos.lock:
-            # Library inputs and slots keep only library_item_id: the mezzanine path is
-            # resolved when the state is loaded.
-            inputs = [
-                item.model_dump(mode="json", exclude={"file_path"} if item.library_item_id else None)
-                for item in self.list_inputs()
-            ]
             slots = [
                 slot.model_dump(mode="json", exclude={"media_path", "ready"} if slot.library_item_id else None)
                 for slot in self.stinger_slots
@@ -1780,12 +2651,13 @@ class VisionMixer:
                 "format": STATE_FORMAT,
                 "flowxer_version": __version__,
                 "workspace": self.workspace.model_dump(mode="json"),
-                "inputs": inputs,
+                "inputs": [item.model_dump(mode="json") for item in self.list_inputs()],
                 "panels": [panel.model_dump(mode="json") for panel in self.panels],
-                "keyers": [keyer.model_dump(mode="json") for keyer in self.keyers],
+                "keyers": [keyer.model_dump(mode="json", exclude={"run"}) for keyer in self.keyers],
                 "stinger_slots": slots,
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
+                "audio": self.audio.model_dump(mode="json"),
             }
 
     def import_state(self, data: dict) -> dict:
@@ -1800,6 +2672,28 @@ class VisionMixer:
     def persist(self) -> None:
         with self.nmos.lock:
             self._store.save(self.export_state())
+        self._persist_at = time.monotonic()
+
+    def persist_soon(self) -> None:
+        """Audio changes (a moving fader sends up to 20 a second): saved at most once a second, the
+        last one within a second."""
+        with self._persist_lock:
+            if self._persist_timer is not None:
+                return
+            wait = self._persist_at + PERSIST_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                self._persist_timer = threading.Timer(wait, self._persist_pending)
+                self._persist_timer.daemon = True
+                self._persist_timer.start()
+                return
+        self.persist()
+
+    def _persist_pending(self) -> None:
+        with self._persist_lock:
+            if self._persist_timer is None:
+                return
+            self._persist_timer = None
+        self.persist()
 
     def _restore_state(self) -> None:
         saved = self._store.load()
@@ -1819,21 +2713,19 @@ class VisionMixer:
         if not isinstance(data, dict) or data.get("format") != STATE_FORMAT:
             raise MixerError(f"not a {STATE_FORMAT} document")
         try:
-            workspace = self._pinned(WorkspaceConfig(**(data.get("workspace") or {})))
+            workspace = self._pinned(WorkspaceConfig(**dict(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
-            keyers = [DownstreamKeyer(**item) for item in data.get("keyers") or []]
+            keyers = [Keyer(**item) for item in data.get("keyers") or []]
             slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])
+            # P5: missing (a P4 state) is the defaults.
+            audio = AudioConfig(**dict(data.get("audio") or {}))
             for item in inputs:
                 if item.library_item_id:
-                    # Set from the library after the swap (refresh_library_bindings).
                     require_safe_id(item.library_item_id, what="library item id")
-                    item.file_path = "_unassigned"
-                elif item.file_path and item.file_path != "_unassigned":
-                    item.file_path = str(resolve_under(self.settings.clips_dir, item.file_path))
             for slot in slots:
                 if slot.library_item_id:
                     require_safe_id(slot.library_item_id, what="library item id")
@@ -1843,10 +2735,6 @@ class VisionMixer:
                 require_safe_id(slot.stinger_id, what="stinger id")
                 if slot.media_path:
                     contained_path(slot.media_path, self.settings.clips_dir, self.settings.stingers_dir)
-            if checked:
-                for keyer in keyers:
-                    if keyer.url:
-                        assert_http_url(keyer.url, what="keyer URL")
         except (ValidationError, SecurityError, TypeError, ValueError) as exc:
             raise MixerError(f"invalid configuration: {exc}") from exc
         if len({item.id for item in inputs}) != len(inputs):
@@ -1868,13 +2756,18 @@ class VisionMixer:
             self.panels = panels
             self.keyers = keyers
             self.stinger_slots = slots
+            self.audio = audio
             main = panels[0] if panels else None
-            self.program_input_id = main.program_input_id if main and main.program_input_id in self.inputs else None
-            self.preview_input_id = main.preview_input_id if main and main.preview_input_id in self.inputs else None
+            self.program_input_id = main.program_input_id if main else None
+            self.preview_input_id = main.preview_input_id if main else None
             self._sync_sources()
             self._sync_panels()
             self._sync_keyers()
             self._sync_stinger_slots()
+            self._prune_audio()
+            if self.panels:
+                self.program_input_id = self.panels[0].program_input_id
+                self.preview_input_id = self.panels[0].preview_input_id
             self.refresh_library_bindings()
             for item in self.inputs.values():
                 if item.library_item_id and self.library.get(item.library_item_id) is None:
@@ -1885,25 +2778,9 @@ class VisionMixer:
             self.nmos.reconcile_inputs()
             self.nmos.import_routes(routes)
 
+    # ── status ───────────────────────────────────────────────────────────────
+
     def status(self) -> MixerStatus:
-        capabilities = probe_backend()
-        renderer = "cefsrc" if capabilities["cefsrc"] else "pillow-fallback"
-        stinger_state = (
-            self.stinger_player.snapshot()
-            if self.stinger_player
-            else {
-                "id": None,
-                "phase": "idle",
-                "frame": 0,
-                "frame_count": 0,
-                "cut_frame": 0,
-                "cut_fired": False,
-                "done": True,
-                "target_input_id": None,
-                "direction": None,
-                "events": [],
-            }
-        )
         return MixerStatus(
             state=self.state,
             backend=self.backend,
@@ -1911,31 +2788,24 @@ class VisionMixer:
             preview_input_id=self.preview_input_id,
             last_live_input_id=self.last_live_input_id,
             program_bus=self.program_bus,
-            overlay=OverlayStatus(
-                enabled=self.overlay.enabled,
-                url=self.overlay.url,
-                title=self.overlay.title,
-                subtitle=self.overlay.subtitle,
-                renderer=renderer,
-            ),
-            stinger=stinger_state,
+            stinger=self._stinger_status(),
             outputs=self.outputs,
+            me_outputs=list(self.me_outputs.values()),
+            render_mes=self.render_count,
+            latency_grains=self.settings.latency,
             raster=self.settings.raster,
             frame_rate=self.settings.frame_rate,
             video_format=self.settings.video_media_type,
             audio_format=self.settings.audio_media_type,
-            pipeline=self.pipeline,
             error=self._status_error(),
             workspace=self.workspace.model_dump(),
             panels=[panel.model_dump() for panel in self.panels],
             keyers=[keyer.model_dump() for keyer in self.keyers],
             stinger_slots=[slot.model_dump() for slot in self.stinger_slots],
-            webrtc_enabled=webrtc_available(),
             wipe_armed=bool(self.panels[0].wipe_armed) if self.panels else False,
             last_transition=self.last_transition,
             nmos=self.nmos.status(),
-            media_path=self.media.path,
-            media_path_reason=self.media.reason,
+            engine=self.engine.summary() if self.engine is not None else {"state": "simulate" if self.backend == "simulate" else "stopped"},
         )
 
     def _status_error(self) -> str | None:
@@ -1943,7 +2813,32 @@ class VisionMixer:
         stalled = self.program_stalled_s()
         if stalled is not None and self.error is None:
             return f"Program renders no frames (none for {stalled:.0f} s)"
+        if self.engine is not None and self.engine.state == "restarting":
+            return f"the media engine restarts ({self.engine.last_error or 'it exited'})"
         return self.error
+
+    def source_runtime(self) -> dict[str, dict[str, Any]]:
+        """Per input id what the engine reports (state, arrival lag, clip player state)."""
+        status = self.engine_status() or {}
+        live = [item for item in self.list_inputs() if item.kind == InputKind.mxl_live]
+        players = [item for item in self.list_inputs() if item.kind == InputKind.clip_player]
+        out: dict[str, dict[str, Any]] = {}
+        for item, entry in zip(live, status.get("inputs") or []):
+            audio = entry.get("audio") or {}
+            out[item.id] = {
+                "state": entry.get("state"),
+                "audio_state": audio.get("state"),
+                "arrival_ms": entry.get("arrival_ms"),
+                "audio_lag_ms": audio.get("lag_ms"),
+                "late": entry.get("late"),
+                "missing": entry.get("missing"),
+                "audio_missing": audio.get("missing"),
+            }
+        for item, entry in zip(players, status.get("players") or []):
+            out[item.id] = {key: value for key, value in entry.items() if key not in {"player", "label"}}
+        for keyer, entry in zip(self.keyers, status.get("keys") or []):
+            out[keyer.id] = {"state": entry.get("state"), "arrival_ms": entry.get("arrival_ms")}
+        return out
 
     def domain_flows(self):
         return list_flows_in_root(self.settings.mxl_root)

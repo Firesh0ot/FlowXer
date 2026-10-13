@@ -1,0 +1,28 @@
+flowxer-engine (FlowXer mix engine prototype)
+Licensed under the Apache License, Version 2.0, like the rest of FlowXer.
+
+Parts are adapted from MXL media functions by the same author (Adrian Hilber):
+
+mxl-multiviewer — https://github.com/LeeO86/mxl-multiviewer
+  Apache License 2.0
+  src/core/pixel.hpp, src/core/v210.cpp      v210 group layout, CPU pack/unpack (src/media/v210.cpp)
+  src/engine/gpu.cu                          v210 sample addressing on the GPU (src/media/cuda_compose.cu)
+  src/engine/hostmem.cpp                     page-locked MXL grain memory (HostMemory, src/media/cuda_compose.cu)
+  src/engine/engine.cpp                      MXL reader handling: resync on TOO_LATE, re-open on
+                                             FLOW_INVALID, writer grain handling (src/mxlio/engine.cpp)
+  src/engine/http.cpp                        HTTP server (src/ops/httpserver.cpp)
+
+mxl-webrtc-monitor — https://github.com/LeeO86/mxl-webrtc-monitor
+  MIT License, Copyright (c) 2026 Adrian Hilber
+  src/engine/mediamtx.cpp                    MediaMTX sidecar config (src/ops/mediamtx.cpp)
+  src/engine/encoder.cpp                     NVENC settings (CBR, p1, ultra-low-latency, no B-frames)
+
+Media eXchange Layer (MXL) — https://github.com/dmf-mxl/mxl
+  Apache License 2.0
+  src/core/tai.cpp                           grain index formulas (IndexConversion.hpp)
+
+The TAI playout rule follows mxl-replay (https://github.com/LeeO86/mxl-replay); no code was
+copied from it (mxl-replay is GPL-3.0).
+
+The image bundles MediaMTX (https://github.com/bluenviron/mediamtx, MIT) and FFmpeg (LGPL/GPL, Ubuntu packages) and links the CUDA runtime statically
+(NVIDIA CUDA EULA).

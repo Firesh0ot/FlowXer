@@ -32,10 +32,10 @@
       "targets": [{ "expr": "flowxer_nmos_registry_up", "refId": "A" }]
     },
     {
-      "title": "WebRTC peers",
+      "title": "Engine fps",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
-      "targets": [{ "expr": "flowxer_webrtc_peers", "refId": "A" }]
+      "targets": [{ "expr": "flowxer_engine_output_fps", "refId": "A" }]
     },
     {
       "title": "CPU %",
@@ -78,6 +78,108 @@
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "targets": [{ "expr": "increase(flowxer_tally_send_errors_total[5m])", "refId": "A" }]
+    },
+    {
+      "title": "Grains skipped, late, write failed",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "increase(flowxer_engine_output_grains_skipped_total[5m])", "legendFormat": "skipped", "refId": "A" },
+        { "expr": "increase(flowxer_engine_output_grains_late_total[5m])", "legendFormat": "late", "refId": "B" },
+        { "expr": "increase(flowxer_engine_output_write_failed_total[5m])", "legendFormat": "write failed", "refId": "C" }
+      ]
+    },
+    {
+      "title": "GPU ms per grain",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [{ "expr": "flowxer_engine_gpu_stage_ms{stage=~\"render|total\",stat=\"max\"}", "legendFormat": "{{stage}} max", "refId": "A" }]
+    },
+    {
+      "title": "GPU ms per grain: download, upload, per ME",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"download\",stat=\"max\"}", "legendFormat": "download max", "refId": "A" },
+        { "expr": "sum(flowxer_engine_input_upload_ms{stat=\"avg\"})", "legendFormat": "upload, inputs and key flows", "refId": "B" },
+        { "expr": "flowxer_engine_gpu_stage_ms{stage=\"me\",stat=\"max\"}", "legendFormat": "ME {{me}} max", "refId": "C" },
+        { "expr": "flowxer_engine_dme_ms{stat=\"max\"}", "legendFormat": "ME {{me}} boxes max", "refId": "D" }
+      ]
+    },
+    {
+      "title": "GPU memory (MB) and NVENC sessions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        { "expr": "flowxer_engine_gpu_device_used_mb", "legendFormat": "GPU used", "refId": "A" },
+        { "expr": "flowxer_engine_gpu_engine_allocated_mb", "legendFormat": "engine", "refId": "B" },
+        { "expr": "flowxer_engine_gpu_encoder_sessions", "legendFormat": "NVENC sessions", "refId": "C" }
+      ]
+    },
+    {
+      "title": "Stingers: played, waited grains, cuts",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "targets": [
+        { "expr": "increase(flowxer_engine_stingers_played_total[5m])", "legendFormat": "played", "refId": "A" },
+        { "expr": "increase(flowxer_engine_stinger_wait_grains_total[5m])", "legendFormat": "grains waited for a first frame", "refId": "B" },
+        { "expr": "increase(flowxer_engine_stinger_cuts_total[5m])", "legendFormat": "cuts (not ready)", "refId": "C" },
+        { "expr": "increase(flowxer_stinger_fallbacks_total[5m])", "legendFormat": "cuts in the control plane ({{reason}})", "refId": "E" },
+        { "expr": "increase(flowxer_engine_stinger_frames_late_total[5m])", "legendFormat": "late frames, player {{player}}", "refId": "D" }
+      ]
+    },
+    {
+      "title": "Stinger players",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [{ "expr": "flowxer_engine_stinger_player_state == 1", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "Keyers on air per ME",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "targets": [{ "expr": "sum by (me, stage) (flowxer_engine_keyer_on_air)", "legendFormat": "ME {{me}} {{stage}}", "refId": "A" }]
+    },
+    {
+      "title": "Linear keys without a key signal (NO KEY)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+      "targets": [{ "expr": "flowxer_engine_keyer_key_running{mode=\"linear\"} == 0", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "PGM loudness (LUFS, EBU R 128)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "none", "min": -60, "max": 0 } },
+      "targets": [
+        { "expr": "flowxer_engine_pgm_loudness_lufs{window=\"short_term\"}", "legendFormat": "ME {{me}} pair {{pair}} short-term", "refId": "A" },
+        { "expr": "flowxer_engine_pgm_loudness_lufs{window=\"integrated\"}", "legendFormat": "ME {{me}} pair {{pair}} integrated", "refId": "B" }
+      ]
+    },
+    {
+      "title": "PGM true peak (dBTP, max of the channels) and overs",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "none", "max": 3 } },
+      "targets": [
+        { "expr": "max by (me) (flowxer_engine_pgm_audio_level_dbfs{stat=\"true_peak\"})", "legendFormat": "ME {{me}} true peak", "refId": "A" },
+        { "expr": "increase(flowxer_engine_pgm_audio_overs_total[1m])", "legendFormat": "ME {{me}} overs / min", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Silent sources (peak below -90 dBFS on every channel)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "targets": [{ "expr": "max by (source) (flowxer_engine_audio_level_dbfs{stat=\"peak\"}) < -90", "format": "table", "refId": "A" }]
+    },
+    {
+      "title": "Audio thread (ms per grain) and strips heard",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "targets": [
+        { "expr": "flowxer_engine_audio_ms", "legendFormat": "fx-audio {{stat}}", "refId": "A" },
+        { "expr": "sum by (me) (flowxer_engine_audio_strip_heard)", "legendFormat": "ME {{me}} strips heard", "refId": "B" }
+      ]
     }
   ],
   "refresh": "5s",

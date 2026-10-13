@@ -1,0 +1,96 @@
+/* The bus widget (widget.tsx): the console's colours, three themes. */
+:root {
+  --bg: #07090f;
+  --panel: #10141d;
+  --line: #243044;
+  --text: #e8eef8;
+  --muted: #8ea0b8;
+  --button: #151b26;
+  --pgm: #e23b3b;
+  --pvw: #2ecf6a;
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+}
+:root[data-theme="light"] {
+  --bg: #f4f6fa;
+  --panel: #ffffff;
+  --line: #c4cedc;
+  --text: #0d1420;
+  --muted: #56667c;
+  --button: #e6ebf2;
+}
+:root[data-theme="transparent"] { --bg: transparent; --panel: transparent; }
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+.bus-widget {
+  position: relative; min-width: 480px; min-height: 150px; height: 100%;
+  display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; padding: 8px;
+  background: var(--panel);
+}
+.bus-rows { display: grid; grid-template-rows: auto 1fr 1fr; gap: 6px; min-width: 0; }
+.bus-title { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.bus-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 6px; align-items: stretch; min-height: 40px; }
+.row-label { display: grid; place-items: center; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; }
+.bus-row.pgm .row-label { color: var(--pgm); }
+.bus-row.pvw .row-label { color: var(--pvw); }
+.row-buttons { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 4px; align-content: stretch; }
+.row-buttons button, .bus-actions button {
+  font: inherit; color: var(--text); cursor: pointer;
+  background: var(--button); border: 1px solid var(--line); border-radius: 4px;
+}
+.row-buttons button { min-width: 0; padding: 4px 6px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bus-row.pgm button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+.bus-row.pvw button.on { background: var(--pvw); border-color: var(--pvw); color: #041018; }
+.bus-actions { display: grid; grid-template-rows: 1fr 1fr; gap: 6px; }
+.bus-actions.with-type { grid-template-rows: auto 1fr 1fr; }
+.bus-actions.with-ties { grid-template-rows: auto auto 1fr 1fr; }
+.tie-select { display: flex; flex-wrap: wrap; gap: 2px; }
+.bus-actions .tie-select button { flex: 1 0 22px; padding: 3px 0; font-size: 9px; letter-spacing: 0.02em; border-radius: 4px; }
+.bus-actions .tie-select button.on { background: #2a4a6a; border-color: #4a7ab0; color: #fff; }
+.type-select { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2px; }
+.bus-actions .type-select button { padding: 3px 0; font-size: 9px; letter-spacing: 0.02em; border-radius: 4px; }
+.bus-actions .type-select button.on { background: #2a4a6a; border-color: #4a7ab0; color: #fff; }
+.bus-actions button { font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; border-radius: 8px; }
+.bus-actions .cut { background: #3a1518; border-color: #6a2a30; color: #fff; }
+.bus-actions .auto { background: #15243a; border-color: #2a4a6a; color: #fff; }
+.bus-widget button:hover { filter: brightness(1.15); }
+.keys-widget {
+  position: relative; min-width: 240px; min-height: 150px; height: 100%;
+  display: grid; align-content: start; gap: 6px; padding: 8px; background: var(--panel);
+}
+.key-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px 64px; gap: 4px; align-items: stretch; min-height: 32px; }
+.key-label { display: flex; align-items: center; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.key-row button {
+  font: inherit; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text); cursor: pointer;
+  background: var(--button); border: 1px solid var(--line); border-radius: 4px;
+}
+.key-row button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+/* A linear keyer without a key signal (NO KEY): amber, so On does not look like a key on air. */
+.key-label.nokey { color: #e0b025; }
+.key-row button.on.nokey { background: #e0b025; border-color: #e0b025; color: #041018; }
+.keys-widget button:hover { filter: brightness(1.15); }
+.dme-widget {
+  position: relative; min-width: 320px; min-height: 120px; height: 100%;
+  display: grid; grid-template-rows: auto 1fr auto; gap: 6px; padding: 8px; background: var(--panel);
+}
+.dme-head { display: grid; grid-template-columns: minmax(0, 1fr) 64px 64px; gap: 4px; min-height: 30px; }
+.dme-run { display: grid; grid-template-columns: 1fr 64px 1fr; gap: 4px; min-height: 30px; }
+.dme-presets { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px; }
+.dme-widget button {
+  font: inherit; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text); cursor: pointer;
+  background: var(--button); border: 1px solid var(--line); border-radius: 4px; padding: 2px 4px; min-width: 0;
+}
+.dme-presets button { font-size: 10px; padding: 4px 0; }
+.dme-widget .dme-head button.on { background: var(--pgm); border-color: var(--pgm); color: #fff; }
+.dme-widget button:hover { filter: brightness(1.15); }
+.dme-flag { margin-left: 6px; padding: 0 4px; font-size: 10px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); }
+.dme-flag.running { color: #fff; background: #2a4a6a; border-color: #4a7ab0; }
+.audio-widget {
+  position: relative; min-width: 480px; min-height: 240px; height: 100%;
+  display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 4px; padding: 8px; background: var(--panel);
+}
+.audio-widget .audio-strip { padding: 0; min-height: 200px; }
+.empty { grid-column: 1 / -1; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+.widget-error {
+  position: absolute; left: 8px; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;
+  background: #3a1520; color: #fff; border-radius: 4px; cursor: pointer;
+}

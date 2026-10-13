@@ -1,58 +1,45 @@
-import { useEffect, useRef, useState } from "react";
-import { jpegUrl, connectWhep } from "../webrtc";
+import { useEffect, useRef, type MouseEvent, type ReactNode } from "react";
+import { tileCrop, usePreview } from "../preview";
 
+/** One picture of the preview mosaic (a source, or an ME's Program or Preview), cropped from the
+ * page's one stream; `children` are drawn over it (the box editor); `onMenu` is its context menu
+ * (GRAB). */
 export function Monitor({
-  streamId,
-  webrtc,
+  tileId,
   label,
   tally,
+  placeholder,
+  children,
+  onMenu,
 }: {
-  streamId: string;
-  webrtc: boolean;
+  tileId: string;
   label: string;
   tally?: "pgm" | "pvw" | "off";
+  /** Shown instead of a picture (e.g. Black); else the reason the mosaic has none. */
+  placeholder?: string;
+  children?: ReactNode;
+  onMenu?: (event: MouseEvent) => void;
 }) {
+  const preview = usePreview();
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [mode, setMode] = useState<"webrtc" | "jpeg">(webrtc ? "webrtc" : "jpeg");
+  const crop = placeholder ? null : tileCrop(preview.map, tileId);
 
   useEffect(() => {
-    if (!webrtc || !videoRef.current) {
-      setMode("jpeg");
-      return;
-    }
-    let closed = false;
-    let dispose: (() => void) | undefined;
-    connectWhep(videoRef.current, streamId)
-      .then((stop) => {
-        if (closed) stop();
-        else dispose = stop;
-      })
-      .catch(() => {
-        if (!closed) setMode("jpeg");
-      });
-    return () => {
-      closed = true;
-      dispose?.();
-    };
-  }, [streamId, webrtc]);
+    const video = videoRef.current;
+    if (video && video.srcObject !== preview.stream) video.srcObject = preview.stream;
+  });
 
   return (
-    <div className={`monitor tally-${tally ?? "off"}`}>
-      {mode === "webrtc" ? (
-        <video ref={videoRef} autoPlay playsInline muted />
+    <div className={`monitor tally-${tally ?? "off"}`} data-tile={tileId} onContextMenu={onMenu}>
+      {crop ? (
+        <div className="crop-box" style={crop.box}>
+          <video ref={videoRef} autoPlay playsInline muted style={crop.video} />
+        </div>
       ) : (
-        <JpegPump streamId={streamId} />
+        <div className="monitor-empty">{placeholder ?? preview.map?.reason ?? "No picture"}</div>
       )}
-      <div className="monitor-label">{label}</div>
+      {children}
+      {label ? <div className="monitor-label">{label}</div> : null}
     </div>
   );
-}
-
-function JpegPump({ streamId }: { streamId: string }) {
-  const [src, setSrc] = useState(jpegUrl(streamId));
-  useEffect(() => {
-    const timer = window.setInterval(() => setSrc(jpegUrl(streamId)), 120);
-    return () => window.clearInterval(timer);
-  }, [streamId]);
-  return <img src={src} alt={streamId} />;
 }

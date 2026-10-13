@@ -5,6 +5,255 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: audio (P5)
+
+- Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
+  and the stinger, each with a fader (−90 = off … +10 dB), mute and AFV (audio follows video; off:
+  always in the mix), and a master per ME. A live input has a delay (0 …
+  `FLOWXER_AUDIO_MAX_DELAY_MS`, default 1000 ms) and a channel map for every ME. Every change ramps
+  over one grain (S-shaped, no click); a Cut now crossfades over its grain (equal power). With the defaults the sound is
+  P4's, except the Cut, the first grain of a new route (it fades in) and a 1-channel live input
+  (now on every PGM channel).
+- Meters: per source peak and RMS, per ME PGM sample peak, true peak, RMS, overs and EBU R 128
+  loudness (momentary, short-term, integrated with reset) per channel pair, every 100 ms.
+- API: `GET /audio`, `PATCH /audio/inputs/{id}`, `/audio/panels/{id}`,
+  `/audio/panels/{id}/strips/{strip}`, `POST /audio/panels/{id}/loudness/reset`,
+  `GET /audio/meters`; `GET /console` has `audio`. The saved state and the export have `audio`
+  (a P4 state loads with the defaults). New: `FLOWXER_AUDIO_MAX_DELAY_MS`.
+- The engine's audio runs on its own thread (`fx-audio`) and reads every routed input into a delay
+  line each grain; `audio.missing` counts every routed input. `recommended_latency_grains` counts a
+  delayed input's audio lag minus its delay, and an input's audio only while some ME hears it (on
+  air, in a transition, AFV off and not muted; `audio.heard` in the engine's `/status`): on small
+  a browser source's bursty audio (533 ms, not on air) drove it to 28 grains. The lag stays in
+  `/status` and the metrics.
+- GUI: AUDIO opens the active ME's audio strip (meters, faders, MUTE, AFV, ON AIR, the master with
+  the loudness and RESET); a live input's ⚙ has an Audio section (delay, channel map). New widget
+  `audio`: `/widget/audio?me=n[&faders=false]` (480 × 240). Grafana: an audio row.
+- Metrics: `flowxer_engine_audio_level_dbfs`, `flowxer_engine_pgm_audio_level_dbfs`,
+  `flowxer_engine_pgm_loudness_lufs`, `flowxer_engine_pgm_audio_overs_total`,
+  `flowxer_engine_audio_strip_heard`, `flowxer_engine_audio_ms`, `flowxer_engine_audio_wait_ms`,
+  `flowxer_engine_audio_jobs_dropped_total`.
+- Measured on the lab (`docs/engine-p5.md`, "M4 as built"): with the defaults every ME's PGM and a
+  Mix are P4's bit for bit; gains, delays (1 ms–1 s) and channel maps exact to the sample; changes
+  leave −114 dBFS above 5 kHz (no click); EBU Tech 3341 within ±0.1 LU and equal to an offline
+  reference of the same samples, true peak within 0.005 dB of the reference. The audio thread in
+  the running engine (4 MEs, 8 inputs): 0.03–0.04 cores at 2 channels, 0.13–0.14 at 16; the delay
+  lines 0.44 MB per stereo input, 3.5 MB per 16-channel input. The 2 h soak with audio changes
+  every few seconds next to transitions, stingers, FTB, boxes and grabs: 0 skipped, 0 late, 0
+  audio `missing`, memory flat, 0 API errors.
+
+### Changed: linear DME boxes are 4 × cheaper
+
+- A linear box now resamples its key flow unpacked once per grain (float planes of the
+  premultiplied fill and the key) instead of decoding the packed v210a at every tap. The planes
+  exist only for key flows that a linear box uses: 23.7 MiB each at 1080p, shared by all linear
+  boxes on that flow. The picture is the same bit for bit (unit test, GPU self-test, lab check on
+  the key grain from MXL).
+- Lab A16 (`docs/engine-p4.md`, "Linear boxes unpacked once"): a linear box at 1/4 costs 0.32 ms
+  instead of 1.33 ms; 8 linear boxes on one ME render in 8.64 ms instead of 16.77 ms (P3's worst
+  case: 5.70 ms), with no late grain. The unpack costs about 0.4–0.5 ms per key flow and grain.
+- Box limit at 1080p50 (A4000 estimate): a linear box counts as 1.5 instead of 4, and each key
+  flow with linear boxes 1.5 more for its unpack.
+
+### Added: the boxes' GPU time (P4 M4)
+
+- `flowxer_engine_dme_ms{me,stat}` and `/status` `gpu_ms.dme`: per ME the resample of its boxes
+  (their box layers are part of the ME's time). Grafana shows it next to the ME times.
+- Measured with boxes on top of P3's worst case (`docs/engine-p4.md`, "M4 as built"): a half-size
+  box adds about 0.31–0.33 ms on the lab A16 (≈ 0.14 ms estimated on an RTX A4000).
+- Recommended at 1080p50 with 4 MEs at full load: at most 4 boxes per ME, up to 8 per ME on one or
+  two MEs; a linear box costs as much as 4 pips. The 2 h soak with flies, ties, stingers and 849
+  grabs: 0 skipped, 0 late, GPU memory flat, 0 failed grabs.
+
+### Added: keyer ties and frame grab (P4 M3)
+
+- Keyer ties: `PATCH /panels/{id}/transition` takes `ties` (the ME's upstream keyers) and
+  `background` (BKGD). Cut, Auto and the T-bar take the tied keyers along: a fading keyer fades
+  with the mix or wipe, a flying keyer flies its keyframes squeezed into the transition, with a
+  stinger they cut at its cut point. BKGD off is key only: Cut cuts the tied keyers, Auto runs
+  each one's own Auto. A tied keyer's tally follows it (on air while it goes off).
+- Frame grab: `POST /library/grab {source, player?, name?}` grabs a live input, a clip player, or
+  an ME's Program or Preview (`<panel>:pvw`) as it is in the next grain: a library still (source
+  `grab`, tag `grab`) named `Grab <source> <date time>`, ready at once in the production raster
+  with no conversion; `player` loads it into a clip player (the frame memory). Its lossless
+  original (FFV1 in Matroska) and thumbnail follow in the background. The engine copies the
+  picture with the grain's downloads (no stall) and writes it in its own thread.
+- GUI: BKGD, KEY 1 … and GRAB in the transition section; right click on a source tile or the
+  Preview or Program monitor grabs (also into a clip player); the `bus` widget has the tie buttons.
+- Metrics: `flowxer_engine_grabs_total{source}`, `flowxer_engine_grab_failed_total`,
+  `flowxer_engine_grab_ms`.
+
+### Fixed: P3 trial on small
+
+- `recommended_latency_grains` counts only what delivers: each input's video and audio while
+  they run and the key flows in use while they run. Unrouted inputs and keys, key flows without
+  grains, clip players and stinger players never count. An input's audio whose head stood still
+  for a second is `no_signal` (like video) and adds no lag (a left flow's growing distance held
+  the peak).
+- The arrival and audio lag statistics (and so `recommended_latency_grains`) skip a source's
+  start-up window and 2 s after it, at every (re)route: on small one 546 ms audio peak while the
+  routes were applied at an Up held the recommendation at 28 grains although the steady state
+  needs about 3.
+- Arrival and audio lag samples later than 10 s are ignored: they are no arrivals but grains the
+  clock cannot place (index 0 of a mirror flow that was just created showed 1.79e12 ms on small).
+- The audio lag statistics also skip 2 s after an input's audio head starts to move again after
+  standing still: on small (P4 trial) a mirror flow written only after the route's settle window
+  caught up with one 541 ms peak and held the recommendation at 28 grains again.
+- `recommended_latency_grains` covers the latest arrival of the last minute (`recent` in each
+  arrival and audio lag statistic; `peak` stays the maximum since the route): with
+  dev-14.21.55 small still showed one 525 ms audio peak of the mirrored cameras after an Up
+  (recommendation 27) although the head never stood still. A transient now ages out after a
+  minute; lateness that repeats within a minute still counts.
+- GUI: a linear keyer without a key signal shows NO KEY in amber, in the keys widget too, so
+  ON does not look like a key on air.
+
+### Added: DME keyframes, presets, box editor and the dme widget (P4 M2)
+
+- Keyframes: up to 8 per upstream keyer (`PUT /keyers/{id}/keyframes`): position, size (in log
+  space), crop, border and shadow, each with its time in frames and an ease (linear, ease,
+  ease-in, ease-out, hold). `POST /keyers/{id}/run` runs the box from where it is to a keyframe,
+  back (`reverse`), in a loop (`wrap`, `pingpong`) or jumps (`frames: 0`); `/stop` holds it. The
+  engine computes the box of every grain from the grain index: exact and reproducible.
+- `fly`: the keyer's Auto flies the box on (keyframe 0 to the last) and off; an Auto during a fly
+  turns back; cut on and off jump. The raw tally keeps a keyer on air while it fades or flies off.
+- Presets (`POST /keyers/{id}/preset`, `GET /dme/presets`): four corner PiPs, split (keyers 1
+  and 2), quad (keyers 1 to 4), full; on air the box flies there.
+- `PUT /keyers/{id}/dme` replaces a box (PATCH merges); a pip keyer is always a box.
+- GUI: the box editor over the active ME's Program (drag to move, corner handles to scale, ON AIR
+  while on air), the keyframe list with RUN, STOP, loops and the presets in the keyer panel.
+- Widget `dme` (`/widget/dme?me=<n>&keyer=<k>`): On/Off, Auto, Run back and forth, Stop, presets.
+- Box buffers are allocated when a box is first enabled, not by the render thread.
+
+### Added: DME boxes (P4 M1)
+
+- An upstream keyer can put its key in a box: `dme` with position, size, crop, soft edge, an
+  outer border (width, soft, colour, opacity) and a black rectangular shadow (offset, blur,
+  opacity). The keyer mode `pip` shows any source the ME may take (an input, a clip player, a
+  higher ME) opaque in a box. `PATCH /keyers/{id}` takes `mode: "pip"` and a partial `dme`;
+  the GUI's keyer panel has the box fields. DSKs have no DME.
+- Scaling is Catmull-Rom (anti-aliased when shrinking) with sub-pixel positions; chroma on its
+  own 4:2:2 grid; a linear box is scaled premultiplied. GPU and CPU reference agree bit for bit.
+- Tally: a pip's source lights LH while the keyer is on air, like a luma key's.
+- Cost on the lab A16: about 0.29 ms per half-size 1080p box (resample and box layer).
+
+### Added: metrics of P3 (M4)
+
+- Stingers: `flowxer_engine_stingers_played_total`, `_stinger_wait_grains_total`, `_stinger_cuts_total`;
+  per player `flowxer_engine_stinger_player_state{player,state}`, `_stinger_frames_decoded_total`,
+  `_stinger_frames_late_total`, `_stinger_decode_ms`. The engine's `/status` gains `stingers.played`.
+  Control plane: `flowxer_stinger_fallbacks_total{reason}` (`not_ready`, `busy`): takes it made a cut.
+- A stinger take that finds every stinger player busy waits up to 0.5 s for one, then plays (back-to-back
+  Autos both play); only then is it a cut.
+- Keyers: `flowxer_engine_keyer_on_air{keyer,me,stage,mode}` and `flowxer_engine_keyer_key_running`.
+- `flowxer_engine_input_upload_ms{input,stat}` for every input and key flow.
+- `flowxer_transitions_total` counts `wipe` too.
+- Grafana (`deploy/grafana/flowxer.json`): download, upload and per-ME GPU time, GPU memory and
+  NVENC sessions, stingers, keyers on air and linear keys without a key signal.
+
+### Changed: stingers play on the GPU (P3 M3)
+
+- Stingers play again, on the GPU with alpha and sound, over the upstream keys and under the
+  DSKs: an auto-stinger, an armed Wipe with a Cut, Auto with the transition type STING,
+  `/stinger/play` and a take with `transition: "stinger"`. The background switches at the cut
+  frame, its sound crossfades over 4 frames there, and the stinger's sound goes into PGM. Both
+  sources are red on the tally. A stinger that still converts is a cut; with every stinger player busy
+  a take waits up to 0.5 s for one (M4). The armed Wipe stays armed when a Cut plays Preview's auto-stinger (as in
+  FlowXer 14).
+- `FLOWXER_STINGER_PLAYERS` (0–4, default 1, at most the rendering MEs): stingers that can play
+  at once; pinned like the panels (workspace `stinger_players`).
+- Library: TGA or PNG sequences with one optional WAV (the sound), and video with alpha (ProRes
+  4444, QuickTime Animation, PNG/RGBA in MOV, FFV1, VP9 with alpha). The stinger mezzanine is
+  the clip mezzanine (colour), a lossless HEVC 4:2:0 alpha stream and the sound; stingers
+  converted before (ProRes 4444) are converted again at the next start, their originals stay.
+  Library items gain `has_sound`.
+
+### Removed
+
+- `FLOWXER_RAM_CLIP_MAX_S` and `FLOWXER_RAM_BUDGET_MB`: only the P2 stinger conversion used
+  them (stingers now decode ahead on the GPU like clips). They are no longer read; a platform
+  that sets them can drop them.
+
+### Changed: the engine replaces the GStreamer mixer (P2)
+
+FlowXer's media plane is its C++/CUDA engine (`engine/`), a child process of the
+control plane. One image, one code path; an NVIDIA GPU is required
+(`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`).
+
+- Every ME renders all the time: PGM video + audio and PVW video per ME, written
+  to MXL; `FLOWXER_RENDER_MES` (the first n MEs, default all panels),
+  `FLOWXER_PVW_OUTPUTS` (default true), `FLOWXER_LATENCY` (grains, default 4).
+- NMOS: senders `{ME} PGM Video`, `{ME} PGM Audio`, `{ME} PVW Video` per
+  rendering ME, each with its own flow (ME n no longer advertises ME 1's flow);
+  ME 1 PGM keeps its flow ids. Receiver `DSK 1 Key` (v210a). IS-05 opens and
+  closes the engine's readers at run time.
+- Sources in slot order (TSL INDEX): live inputs, clip players
+  (`FLOWXER_CLIP_PLAYERS`, replaces `FLOWXER_TEST_SOURCES`), Black. Test, file
+  and replay inputs become clip players (saved states and clients migrate).
+  Re-entry: an ME takes the Program of a higher ME (`me-<n>`, INDEX 1000 + n).
+- `GET /api/v1/engine` (timing, arrival lag per input, recommended latency),
+  `GET /api/v1/preview` (the mosaic stream and its tile map),
+  `POST /players/{id}/{action}`, `POST /keyers/{id}/auto`.
+- Clip players: a library clip plays from its mezzanine, decoded on the GPU
+  (NVDEC), with its sound in audio-follows-video; a still is uploaded once and
+  held (frame memory). Loop and play on cut (it starts when the player goes to
+  Program) on the input (`PATCH /inputs/{id}`); transport cue, play, pause,
+  stop. An empty player is black. The colour bars ship as a library still.
+- DSK 1 on ME 1: a linear key of the v210a flow routed to `DSK 1 Key`
+  (e.g. mxl-browser-source in `v210a` key mode; straight fill) over ME 1 PGM
+  only (keys have no preview: PVW shows only its source); on, off, auto. Its Auto rate is kept with the keyer (`PATCH /keyers/{id}`
+  `rate_ms`; `POST /keyers/{id}/auto` without a duration uses it).
+- GUI: every picture of the console (sources, each ME's Preview and Program) is
+  a crop of the engine's one preview mosaic: one WHEP session per page, each
+  picture a box of its tile's aspect ratio with the stream's video scaled and
+  moved inside it (CSS transform; every browser, no `object-view-box`). The
+  session connects again by itself, at once when no video came for a second:
+  about 2.4 s after a MediaMTX restart (the engine checks its built-in
+  MediaMTX every 200 ms and its publisher retries within 0.5 s). Clip players get their library
+  clip or still in the tile's header, the position and remaining time over the
+  picture and a transport bar (cue, play, pause, stop, loop, play on cut; a
+  still is a frame memory); DSK 1 gets Auto and its rate; the clip library
+  holds stills.
+  The per-source WebRTC and JPEG previews are gone.
+- Operator-screen widget `bus` (Program and Preview rows with Cut and Auto of
+  one ME), served by flowxer-gui: `GET /widgets` (from `GET /api/v1/widgets`)
+  and `GET /widget/bus?me=<n>[&theme=dark|light|transparent]`, framed only by
+  the origins in `WIDGET_FRAME_ANCESTORS` (gui container, default `'self'`),
+  with `widget-ready` and `widget-size` messages.
+- Library: a clip's mezzanine is HEVC 4:4:4 10-bit (a key frame every second,
+  no B-frames; NVDEC decodes no 4:2:2 HEVC) next to a raw float32 sound file,
+  instead of ProRes 422 HQ. NVENC encodes it with constant QP 8 (about 90
+  frames/s on air: a minute of clip in about 35 s); without NVENC x265 with
+  CRF 8 (7–10 frames/s), logged once. The 4:2:2 picture goes in with each
+  chroma sample repeated, so the engine gets the 4:2:2 picture back. At least
+  56 dB PSNR, about 200–400 MB per minute at 1080p50 (x265: 150–320 MB), up
+  to 2.4 GB with heavy grain (x265: 1.5 GB). Stills
+  (uploads, and pictures in the import dir) become one v210 picture. A clip
+  converted before is converted again at the next start (the original stays,
+  the ProRes mezzanine goes). A conversion uses the container's CPU limit less
+  two cores (8 threads without a limit): for decoding and scaling with NVENC,
+  for x265's workers otherwise (decoding and scaling then on one thread), and
+  numpy's OpenBLAS runs on one thread (`OPENBLAS_NUM_THREADS=1`): a conversion
+  that filled the limit got the container throttled and the engine skipped
+  grains.
+- Metrics for the engine, the inputs (arrival lag, late and missing grains
+  per FlowXer input), GPU time per stage and per ME, the clip players
+  (`flowxer_engine_player_frames_decoded_total`, `_decode_ms`), the mosaic and
+  its MediaMTX (`flowxer_engine_preview_mediamtx_running`, `_restarts_total`)
+  and the library (`flowxer_library_jobs`, `flowxer_library_conversions_total`,
+  `flowxer_library_last_conversion_seconds`, `flowxer_library_nvenc`); the list
+  is in the README (Metrics). `flowxer_webrtc_peers` is gone; the Grafana
+  dashboard shows the engine's fps, skipped and late grains and GPU time
+  instead.
+- Upgrade from 14.x with the same `/config`: ME 1 PGM keeps its flow ids, the
+  live inputs keep their IS-05 activations and tally INDEX; test sources become
+  empty clip players, the Replay input goes, DSK 1 needs a v210a key (README,
+  Upgrading from FlowXer 14).
+- Removed: GStreamer, CEF, aiortc; `FLOWXER_GPU`, `FLOWXER_GST_MODE`,
+  `FLOWXER_MONITOR_FPS`, `FLOWXER_WEBRTC_*`, `FLOWXER_OVERLAY_URL`; the routes
+  `/overlay`, `/replay/*`, `/stinger/tick`, `/preview/jpeg/*`,
+  `/webrtc/whep/*`; the `/graphics` sample page. Stingers come back in P3: a
+  stinger take, an auto-stinger and an armed Wipe cut.
+
 ### Added
 
 - `FLOWXER_TALLY_TSL=udp://host:port` (or `tcp://`): the raw tally of every ME
@@ -74,6 +323,19 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Changed
 
+- Test sources, Black and a Replay or file input without a clip are made
+  once and repeated live (`imagefreeze`); on the GPU path they are uploaded
+  once. Each of them drew every 1080p50 frame on the CPU (about half a core
+  on the platform) and uploaded it (12–19 % of the GL thread). The colour bars
+  no longer carry the running time. Their GUI monitor picture is taken once
+  a second.
+- GPU path: the HTML keyer's BGRA frames go up as RGBA bytes and its shader
+  swaps red and blue (no `glcolorconvert` pass: 7–9 % of the GL thread).
+- WebRTC previews send `FLOWXER_MONITOR_FPS` frames per second (the rate
+  the monitor pictures change) instead of aiortc's 30; every peer encoded
+  each picture three times.
+- `flowxer_frames_dropped_total` counts the Program frames the mixer skipped
+  because it was late (it was always 0).
 - A stinger (Wipe, auto-stinger, stinger take) on ME 2..4 switches that ME at
   once without playing the media. It used to play over ME 1 and switch ME 1's
   rendered Program at its cut (ME 1's panel and tally kept the old source),
@@ -102,6 +364,20 @@ in `docs/platform-integration-plan.md` §8.
 
 ### Fixed (platform)
 
+- Program fell behind real time on a busy node (platform vmix, 13.20.43, GPU
+  path): the mixer made 48.6–48.8 frames/s, its timestamps ran on without
+  gaps, and `mxlsink` wrote each frame at the MXL index of its timestamp, so
+  Program fell 1.4 grains per second further behind TAI (5–8 s after a few
+  minutes; the multiviewer froze). A stall had the same effect for good
+  (lab: 1.4–2.6 s behind after 10 WebRTC previews connected). The Program sink
+  now measures each frame's lateness (`qos=true`); a frame more than two
+  frames late makes the compositor skip to real time plus three frames, so
+  Program keeps to the TAI timeline with gaps and the compositor waits for
+  its inputs again. Skipped frames are counted in
+  `flowxer_frames_dropped_total` and logged once per burst. Program audio
+  was not late and is unchanged. GStreamer's own QoS (with or without
+  `max-lateness`) was tried first: after a 1 s stall it kept the compositor
+  at the edge of real time and Program at 1 to 33 frames/s.
 - Program did not start after a node reboot (platform vmix): the fabrics
   agent had not recreated its mirror domains yet, `mxlsrc` failed on the
   missing domain directory, the pipeline did not reach PLAYING and

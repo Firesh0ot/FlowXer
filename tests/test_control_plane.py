@@ -1,55 +1,60 @@
-"""The control plane never hangs on the media plane: bounded source restarts and stops, the
-/livez watchdog, and the unrouted flow id (platform 10.17.40: an IS-05 route hung the node)."""
+"""The control plane and the media engine: the /livez watchdog, the engine as a supervised child
+(start, state push, commands, restart after a crash, a start that fails), IS-05 routes reaching
+the engine."""
 
 from __future__ import annotations
 
-import threading
+import json
+import socket
+import sys
 import time
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from flowxer.engine import gst_runtime
-from flowxer.engine.gst_runtime import GstRuntime, SourceRestartTimeout, run_bounded
-from flowxer.engine.mixer import VisionMixer
-from flowxer.engine.pipeline import UNROUTED_FLOW
+from flowxer.api.schemas import MixerStartRequest
+from flowxer.engine import runtime as engine_runtime
+from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 
-
-class FakeElement:
-    """Enough of an mxlsrc for retarget_mxl_source: properties, state changes, no pads."""
-
-    def __init__(self, name: str, block: threading.Event | None = None) -> None:
-        self.name = name
-        self.properties: dict[str, str] = {}
-        self.states: list[str] = []
-        self.block = block
-
-    def get_name(self) -> str:
-        return self.name
-
-    def find_property(self, name: str):
-        return object() if name in {"video-flow-id", "audio-flow-id", "domain"} else None
-
-    def set_property(self, name: str, value) -> None:
-        self.properties[name] = value
-
-    def set_state(self, state) -> None:
-        if self.block is not None:
-            self.block.wait()
-        self.states.append(state)
-
-    def get_static_pad(self, _name: str):
-        return None
+FAKE_ENGINE = Path(__file__).with_name("fake_engine.py")
+FLOW = "11111111-1111-1111-1111-111111111111"
 
 
-def _runtime_with(element: FakeElement) -> GstRuntime:
-    runtime = GstRuntime()
-    runtime._gst = SimpleNamespace(State=SimpleNamespace(NULL="null", PLAYING="playing"))
-    runtime.pipeline = SimpleNamespace(get_by_name=lambda name: element if name == element.name else None)
-    runtime.watchdog = ControlPlaneWatchdog()
-    return runtime
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _commands(log: Path) -> list[dict]:
+    if not log.is_file():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _wait(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.fixture
+def engine_mixer(settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A mixer that runs the fake engine (tests/fake_engine.py) as its media engine."""
+    log = tmp_path / "engine-commands.jsonl"
+    monkeypatch.setenv("FAKE_ENGINE_LOG", str(log))
+    settings.simulate = False
+    settings.engine_bin = f'"{Path(sys.executable).as_posix()}" "{FAKE_ENGINE.as_posix()}"'
+    settings.engine_port = _free_port()
+    settings.nmos_enable = True
+    mixer = VisionMixer(settings)
+    yield mixer, log
+    mixer.stop()
 
 
 def test_watchdog_reports_an_operation_that_runs_too_long() -> None:
@@ -63,47 +68,7 @@ def test_watchdog_reports_an_operation_that_runs_too_long() -> None:
     assert watchdog.oldest() is None
 
 
-def test_run_bounded_gives_up_on_a_blocked_call_and_keeps_it_registered() -> None:
-    watchdog = ControlPlaneWatchdog()
-    release = threading.Event()
-    assert run_bounded(lambda: None, 1.0, "quick", watchdog)
-    assert not run_bounded(release.wait, 0.1, "blocked", watchdog)
-    # The blocked thread stays registered until it ends.
-    assert watchdog.oldest()[0] == "blocked"
-    release.set()
-    deadline = time.monotonic() + 2
-    while watchdog.oldest() is not None and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert watchdog.oldest() is None
-    with pytest.raises(ValueError):
-        run_bounded(lambda: int("x"), 1.0, "failing")
-
-
-def test_unrouting_gives_mxlsrc_the_unrouted_flow_id() -> None:
-    # An empty id is not a UUID and made mxlsrc fail at start.
-    element = FakeElement("asrc_cam-3")
-    runtime = _runtime_with(element)
-    assert runtime.retarget_mxl_source("asrc_cam-3", None, "/Volumes/mxl/b", "audio")
-    assert element.properties == {"audio-flow-id": UNROUTED_FLOW, "domain": "/Volumes/mxl/b"}
-    assert element.states == ["null", "playing"]
-    runtime.retarget_mxl_source("asrc_cam-3", "11111111-1111-1111-1111-111111111111", None, "audio")
-    assert element.properties["audio-flow-id"] == "11111111-1111-1111-1111-111111111111"
-
-
-def test_a_retarget_that_blocks_returns_after_the_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gst_runtime, "RESTART_TIMEOUT_S", 0.2)
-    release = threading.Event()
-    element = FakeElement("vsrc_cam-1", block=release)
-    runtime = _runtime_with(element)
-    started = time.monotonic()
-    with pytest.raises(SourceRestartTimeout):
-        runtime.retarget_mxl_source("vsrc_cam-1", "11111111-1111-1111-1111-111111111111", "/d", "video")
-    assert time.monotonic() - started < 1.0
-    assert runtime.watchdog.oldest()[0] == "retarget of vsrc_cam-1"
-    release.set()
-
-
-def _activate(mixer: VisionMixer, input_id: str, role: str, flow_id: str) -> None:
+def _activate(mixer: VisionMixer, input_id: str, role: str, flow_id: str | None, enable: bool = True) -> None:
     receiver = next(
         r for r in mixer.nmos.status()["receivers"] if r["input_id"] == input_id and r["role"] == role
     )
@@ -111,44 +76,11 @@ def _activate(mixer: VisionMixer, input_id: str, role: str, flow_id: str) -> Non
         receiver["receiver_id"],
         "receivers",
         {
-            "master_enable": True,
+            "master_enable": enable,
             "activation": {"mode": "activate_immediate"},
             "transport_params": [{"mxl_flow_id": flow_id}],
         },
     )
-
-
-def test_an_activation_that_cannot_retarget_releases_the_node(settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    # 10.17.40: the retarget blocked under the NMOS lock; GET /mixer, stop and every later route hung.
-    from flowxer.api.schemas import InputKind, LogicalInputUpdate
-
-    monkeypatch.setattr(gst_runtime, "RESTART_TIMEOUT_S", 0.2)
-    settings.nmos_enable = True
-    mixer = VisionMixer(settings)
-    mixer.update_input("cam-1", LogicalInputUpdate(kind=InputKind.mxl_live, group_hint="cam-1"))
-    release = threading.Event()
-    mixer.gst = _runtime_with(FakeElement("vsrc_cam-1", block=release))
-    mixer.gst.watchdog = mixer.watchdog
-    started = time.monotonic()
-    _activate(mixer, "cam-1", "video", "11111111-1111-1111-1111-111111111111")
-    assert time.monotonic() - started < 2
-    assert "did not restart" in mixer.error
-    # The NMOS lock is free again: status, routes and stop work.
-    assert mixer.nmos.lock.acquire(timeout=0.5)
-    mixer.nmos.lock.release()
-    mixer.nmos.status()
-    release.set()
-    mixer.gst = None
-
-
-def test_stop_that_does_not_finish_reports_an_error(settings) -> None:
-    mixer = VisionMixer(settings)
-    mixer.gst = SimpleNamespace(program_frames=5, program_dropped={"video": 1, "audio": 2}, stop=lambda: False)
-    status = mixer.stop()
-    assert status.state.value == "error"
-    assert "did not stop" in status.error
-    assert mixer.gst is None
-    assert mixer.program_dropped == {"video": 1, "audio": 2}
 
 
 def test_livez_fails_while_the_control_plane_is_stuck(client: TestClient, mixer: VisionMixer) -> None:
@@ -170,39 +102,103 @@ def test_livez_fails_while_the_control_plane_is_stuck(client: TestClient, mixer:
 
 
 def test_an_is05_activation_is_watched(settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    from flowxer.api.schemas import InputKind, LogicalInputUpdate
-
     settings.nmos_enable = True
     mixer = VisionMixer(settings)
     seen: list = []
     monkeypatch.setattr(mixer, "apply_nmos_receiver", lambda *a, **k: seen.append(mixer.watchdog.oldest()))
-    mixer.update_input("cam-1", LogicalInputUpdate(kind=InputKind.mxl_live, group_hint="cam-1"))
-    _activate(mixer, "cam-1", "video", "11111111-1111-1111-1111-111111111111")
+    _activate(mixer, "cam-1", "video", FLOW)
     assert seen and seen[0][0] == "IS-05 activation"
     assert mixer.watchdog.oldest() is None
 
 
-def test_a_failed_mxl_source_is_started_again(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Platform: gateway RX flows mark incomplete frames invalid, mxlsrc stops for good on one and
-    # the input froze. The source is started again after a pause.
-    element = FakeElement("vsrc_cam-3")
-    runtime = _runtime_with(element)
-    scheduled: list = []
-    runtime._glib = SimpleNamespace(timeout_add=lambda ms, fn: scheduled.append((ms, fn)))
-    restarted = threading.Event()
-    runtime.on_source_restart = lambda name, reason: restarted.set()
-    runtime._recover_source(element, "Internal data stream error.")
-    runtime._recover_source(element, "Internal data stream error.")  # the same failure, reported twice
-    assert [ms for ms, _ in scheduled] == [1000]
-    scheduled[0][1]()
-    assert restarted.wait(2)
-    assert element.states == ["null", "playing"]
-    # Failing again at once backs off.
-    deadline = time.monotonic() + 2
-    while "vsrc_cam-3" in runtime._recovering and time.monotonic() < deadline:
-        time.sleep(0.01)
-    runtime._recover_source(element, "Internal data stream error.")
-    assert scheduled[-1][0] == 2000
-    # Test sources are not restarted.
-    runtime._recover_source(FakeElement("comp"), "x")
-    assert len(scheduled) == 2
+def test_the_engine_starts_gets_the_state_and_the_commands(engine_mixer, settings) -> None:
+    mixer, log = engine_mixer
+    status = mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    assert status.state.value == "running" and status.backend == "engine"
+    assert mixer.engine is not None and mixer.engine.ready
+    config = json.loads(mixer.engine.config_path.read_text(encoding="utf-8"))
+    live = [item for item in mixer.list_inputs() if item.kind.value == "mxl_live"]
+    assert [entry["label"] for entry in config["FLOWXER_ENGINE_INPUTS"]] == [item.label for item in live]
+    assert config["FLOWXER_ENGINE_LATENCY"] == settings.latency
+    assert config["FLOWXER_ENGINE_MES"] == mixer.render_count
+    outputs = config["FLOWXER_ENGINE_OUTPUTS"][0]
+    assert outputs["pgm_video"] == mixer.outputs.video_flow_id and outputs["pgm_audio"] == mixer.outputs.audio_flow_id
+    commands = _commands(log)
+    # The state push on ready: every live input's route, ME 1's buses.
+    assert sum(1 for c in commands if c["path"].startswith("/input/") and not c["path"].endswith("/audio")) == len(live)
+    assert {"method": "POST", "path": "/me/1/program", "body": {"source": "in1"}} in [
+        {k: c[k] for k in ("method", "path", "body")} for c in commands
+    ]
+    assert any(c["path"] == "/me/1/preview" and c["body"] == {"source": "in2"} for c in commands)
+    # A cut: Program in2, Preview in1, at the next grain.
+    mixer.cut("me-1")
+    assert _commands(log)[-1]["path"] == "/me/1/take"
+    assert _commands(log)[-1]["body"] == {"source": "in2", "frames": 0, "preview": "in1"}
+    # A fade of 400 ms at 50p: 20 grains.
+    mixer.fade("me-1", duration_ms=400)
+    assert _commands(log)[-1]["body"] == {"source": "in1", "frames": 20, "preview": "in2"}
+    # Fade to Black: the whole output, the buses stay.
+    mixer.fade_to_black("me-1", duration_ms=600)
+    assert _commands(log)[-1] == {"method": "POST", "path": "/me/1/ftb/auto", "body": {"frames": 30}, "pid": _commands(log)[-1]["pid"]}
+    # Frames come from the engine's status.
+    assert _wait(lambda: mixer.frames_rendered > 0)
+    assert mixer.status().engine["state"] == "running"
+    # Per FlowXer input: arrival lag, missing and late grains.
+    from flowxer.api.metrics import render_prometheus
+
+    text = render_prometheus(mixer)
+    assert 'flowxer_input_late_total{input="cam-1"} 0' in text
+    assert 'flowxer_input_arrival_ms{input="cam-1",essence="video",stat="max"}' in text
+
+
+def test_an_is05_route_reaches_the_engine(engine_mixer, settings) -> None:
+    mixer, log = engine_mixer
+    domain = settings.mxl_root / "cams"
+    (domain / f"{FLOW}.mxl-flow").mkdir(parents=True)
+    (domain / "domain_def.json").write_text(json.dumps({"id": "c0ffee00-0000-4000-8000-000000000000"}), encoding="utf-8")
+    mixer.start()
+    _activate(mixer, "cam-2", "video", FLOW)
+    route = _commands(log)[-1]
+    assert route["path"] == "/input/2"
+    assert route["body"]["video"] == {"domain": str(domain.resolve()), "flow": FLOW}
+    assert route["body"]["audio"] == {"domain": "", "flow": ""}
+    # master_enable false closes the reader.
+    _activate(mixer, "cam-2", "video", FLOW, enable=False)
+    assert _commands(log)[-1]["body"]["video"] == {"domain": "", "flow": ""}
+
+
+def test_the_engine_is_restarted_and_gets_the_state_again(engine_mixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine_runtime, "RESTART_BACKOFF_S", (0.1,))
+    mixer, log = engine_mixer
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    mixer.cut("me-1")
+    first = mixer.engine._process.pid
+    mixer.engine._process.kill()
+    assert _wait(lambda: mixer.engine.restarts >= 1 and mixer.engine.ready and mixer.engine._process.pid != first)
+    # The new engine got the buses as they are now (after the cut).
+    pushed = [c for c in _commands(log) if c["pid"] != first]
+    assert {"path": "/me/1/program", "body": {"source": "in2"}} in [{k: c[k] for k in ("path", "body")} for c in pushed]
+    assert mixer.state.value == "running"
+
+
+def test_a_start_that_fails_reports_the_engine_error(engine_mixer, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_ENGINE_FAIL", "75")
+    mixer, _log = engine_mixer
+    with pytest.raises(MixerError) as failure:
+        mixer.start()
+    assert "no CUDA device" in str(failure.value)
+    assert mixer.state.value == "error"
+    assert mixer.engine is None
+
+
+def test_preview_tiles_name_the_console_pictures(engine_mixer) -> None:
+    from flowxer.engine.preview import preview_info
+
+    mixer, _log = engine_mixer
+    assert preview_info(mixer)["available"] is False
+    mixer.start()
+    info = preview_info(mixer)
+    assert info["available"] and info["whep_url"] is None and info["whep_port"] == 8989
+    ids = [tile["id"] for tile in info["tiles"]]
+    assert ids[0] == "source:cam-1"
+    assert "panel:me-1:pgm" in ids and "panel:me-1:pvw" in ids

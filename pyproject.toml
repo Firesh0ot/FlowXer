@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowxer"
-version = "14.21.46"
+version = "14.22.58"
 description = "DMF Vision Mixer microservice for uncompressed MXL (v210 + float32) workflows"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -27,9 +27,6 @@ dev = [
   "pytest>=8.3.0",
   "pytest-asyncio>=0.24.0",
 ]
-webrtc = [
-  "aiortc==1.9.0",
-]
 
 [project.scripts]
 flowxer = "flowxer.app:run"
@@ -38,7 +35,7 @@ flowxer = "flowxer.app:run"
 where = ["src"]
 
 [tool.setuptools.package-data]
-flowxer = ["static/*", "graphics/*"]
+flowxer = ["static/*", "library/colour-bars.mkv"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

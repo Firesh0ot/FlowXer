@@ -21,7 +21,6 @@ from flowxer.api.library_routes import router as library_router
 from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.api.routes import get_mixer, router as api_router
 from flowxer.domain.mxl_domain import DomainError
-from flowxer.engine.gpu import GpuUnavailableError
 from flowxer.engine.mixer import VisionMixer
 from flowxer.listen import bind_listener
 from flowxer.settings import Settings, get_settings
@@ -51,13 +50,13 @@ OPENAPI_TAGS = [
     {
         "name": "mixer",
         "description": (
-            "Start/stop the GStreamer vision mixer, arm Preview, take sources to Program, "
-            "and run Cut / Fade / Fade to Black / Wipe on a mixer panel (ME)."
+            "Take the mixer on and off air (the media engine), arm Preview, take sources to "
+            "Program, and run Cut / Fade / Fade to Black on a mixer panel (ME)."
         ),
     },
     {
-        "name": "overlay",
-        "description": "HTML5 graphics keyer (cefsrc when the plugin is in the image, Pillow fallback otherwise).",
+        "name": "keyers",
+        "description": "Downstream keyer on ME 1: a v210a fill + key input (e.g. mxl-browser-source), on, off or auto.",
     },
     {
         "name": "storage",
@@ -66,19 +65,23 @@ OPENAPI_TAGS = [
     {
         "name": "library",
         "description": (
-            "Media library: chunked upload, background conversion to intra-frame "
-            "mezzanine, RAM/decode-ahead playback metadata, and conversion jobs."
+            "Media library: chunked upload, background conversion of clips and stills for the "
+            "clip players, and conversion jobs."
         ),
-    },
-    {
-        "name": "replay",
-        "description": "Load a stored clip and stinger in/out of replay.",
     },
     {
         "name": "stinger",
         "description": (
-            "Play a TGA sequence or video stinger, cut Program at the chosen frame, "
-            "and configure per-slot media. flip_flop swaps Preview and Program like Cut."
+            "Stinger slots and their media (library stingers: TGA or PNG sequences with a WAV, or "
+            "video with alpha). Stingers play on the GPU with alpha and sound."
+        ),
+    },
+    {
+        "name": "audio",
+        "description": (
+            "PGM audio per ME (P5): a strip per live input, clip player, re-entered ME and the stinger with "
+            "a fader, mute and audio follow video; a master per ME; a delay and channel map per live "
+            "input; meters (peak, true peak, RMS, EBU R 128 loudness). No audio preview."
         ),
     },
     {
@@ -93,7 +96,7 @@ OPENAPI_TAGS = [
         "name": "gui",
         "description": (
             "Operator console snapshot, workspace layout (including source-tile aspect), "
-            "container resources for the status chip, JPEG/WebRTC monitors."
+            "container resources for the status chip, the preview mosaic."
         ),
     },
 ]
@@ -124,17 +127,17 @@ def create_app(
             "It is controlled entirely over HTTP, documents itself with OpenAPI, and "
             "exchanges uncompressed media on an MXL domain: **video/v210 (VP210)** plus "
             "**audio/float32** at 48 kHz.\n\n"
-            "The media plane is GStreamer. FastAPI is the control plane; "
-            "`mxlsrc`/`mxlsink` carry MXL when the plugin is present, with an HTML5 "
-            "keyer and a file player with storage access. "
-            "Clips and stingers go through a media library (upload → convert → mezzanine). "
-            "Stingers may also be TGA sequences or video files; Program cuts at a chosen frame. "
+            "This process is the control plane (state, decisions, NMOS, tally, library). The "
+            "media plane is FlowXer's engine (C++/CUDA, a child process on the GPU): it reads the "
+            "routed MXL inputs, renders every ME (Program and Preview) on the TAI grid, writes "
+            "them back to MXL and publishes one preview mosaic. "
+            "Clip players play clips and stills from the media library (upload → convert). "
             "The operator GUI on port 9620 is a thin client of this API. "
             "TSL UMD 5.0 carries Program/Preview tally and source labels to "
             "Companion, VSM, BFE, Riedel HI, and other listeners. "
             "When FLOWXER_NMOS_ENABLE is true, an IS-04/IS-05 node on "
-            "FLOWXER_NMOS_PORT (default 3252) advertises live-input receivers "
-            "and program senders for BCP-007-03 MXL routing."
+            "FLOWXER_NMOS_PORT (default 3252) advertises live-input and key receivers "
+            "and each rendering ME's PGM and PVW senders for BCP-007-03 MXL routing."
         ),
         openapi_tags=OPENAPI_TAGS,
         contact={"name": "FlowXer", "url": "https://github.com/Firesh0ot/FlowXer"},
@@ -155,7 +158,9 @@ def create_app(
             and request.url.path.startswith("/api/v1/")
             and response.status_code < 400
         ):
-            await run_in_threadpool(mixer.persist)
+            # A moving fader sends up to 20 changes a second: audio is saved at most once a second.
+            audio = request.url.path.startswith("/api/v1/audio/")
+            await run_in_threadpool(mixer.persist_soon if audio else mixer.persist)
         return response
 
     # Auth is inner; CORS is added last so it is outermost (preflight stays unauthenticated).
@@ -200,11 +205,8 @@ def create_app(
         )
 
     static_dir = Path(__file__).parent / "static"
-    graphics_dir = Path(__file__).parent / "graphics"
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
-    if graphics_dir.is_dir():
-        app.mount("/graphics", StaticFiles(directory=graphics_dir, html=True), name="graphics")
 
     @app.get("/", include_in_schema=False)
     def index() -> HTMLResponse:
@@ -260,9 +262,6 @@ def run() -> None:
         app = create_app(settings, nmos_listener=nmos_listener)
     except DomainError as exc:
         log.error("invalid MXL output domain: %s", exc)
-        sys.exit(EXIT_CONFIG)
-    except GpuUnavailableError as exc:
-        log.error("%s", exc)
         sys.exit(EXIT_CONFIG)
     log.info("FlowXer %s listening on %s:%s", __version__, settings.host, settings.port)
     # Open requests get half of SHUTDOWN_TIMEOUT_S; the rest is for stopping media,

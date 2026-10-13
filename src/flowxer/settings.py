@@ -5,7 +5,7 @@ import logging
 import socket
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlsplit
 
 from flowxer import __version__
@@ -15,8 +15,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 log = logging.getLogger(__name__)
 
-# 24 logical sources at most, Black and Replay included.
-MAX_PINNED_INPUTS = 22
+# 24 logical sources at most: live inputs and clip players, then Black.
+MAX_PINNED_INPUTS = 23
 
 
 def split_labels(value: str) -> list[str]:
@@ -65,8 +65,6 @@ class Settings(BaseSettings):
     )
     # Remove the own output domain directory on SIGTERM (never another function's).
     mxl_cleanup_on_exit: bool = Field(default=False, validation_alias=AliasChoices("MXL_CLEANUP_ON_EXIT", "FLOWXER_MXL_CLEANUP_ON_EXIT"))
-    # gst-mxl-rs mxlsrc has no offset property; kept for the platform env table.
-    read_offset_grains: int = Field(default=2, ge=0)
     nmos_seed: str = Field(default="", validation_alias=AliasChoices("NMOS_SEED", "FLOWXER_NMOS_SEED"))
     # Node label (and device label); empty: FLOWXER_TITLE.
     nmos_label: str = Field(default="", validation_alias=AliasChoices("NMOS_LABEL", "FLOWXER_NMOS_LABEL"))
@@ -92,8 +90,6 @@ class Settings(BaseSettings):
     # Optional watched drop folder for auto-ingest (empty disables).
     import_dir: Path | None = None
     convert_concurrency: int = Field(default=1, ge=1, le=8)
-    ram_clip_max_s: float = Field(default=20.0, ge=0.0, le=600.0)
-    ram_budget_mb: int = Field(default=4096, ge=64, le=262144)
     upload_limit_gb: float = Field(default=20.0, ge=0.1, le=500.0)
     # Set in the mixer image from ARG MXL_REF (io.dmf.mxl.revision).
     mxl_revision: str = ""
@@ -105,30 +101,34 @@ class Settings(BaseSettings):
     frame_rate_den: int = 1
     audio_rate: int = 48000
     audio_channels: int = 2
+    # The longest audio delay of a live input (P5): the engine's delay lines hold this much.
+    audio_max_delay_ms: int = Field(default=1000, ge=0, le=5000)
     video_media_type: str = "video/v210"
     audio_media_type: str = "audio/float32"
 
-    # "auto" uses GStreamer when mxlsrc/mxlsink (or a local fallback) is present.
-    gst_mode: str = "auto"
-    # Video on an NVIDIA GPU (OpenGL through EGL): "off" (default) the CPU path, "auto"
-    # the GPU path when it works at start, "on" the GPU path or exit 78 (flowxer.engine.gpu).
-    gpu: Literal["auto", "on", "off"] = "off"
+    # The control plane without the media engine (tests, the AMWA NMOS testing tool): the
+    # mixer state, NMOS and tally work, nothing is read or written on MXL.
     simulate: bool = False
 
-    overlay_url: str = "http://127.0.0.1:9610/graphics/lower-third.html"
+    # The media engine (C++/CUDA, a child process): its binary, its control API port (localhost
+    # only) and the CUDA device inside the container.
+    engine_bin: str = "flowxer-engine"
+    engine_port: int = Field(default=9630, ge=1, le=65535)
+    engine_gpu: int = Field(default=0, ge=0, le=63)
+    # Fixed processing latency in grains: output grain i is made from input grain i - L. It must
+    # cover how late the inputs arrive (GET /api/v1/engine: recommended_latency_grains).
+    latency: int = Field(default=4, ge=1, le=10)
+    # PVW video flows per ME; false: PVW is rendered for the previews only (saves PCIe).
+    pvw_outputs: bool = True
+    # CSP frame-ancestors of the operator-screen widgets (served by flowxer-gui).
+    widget_frame_ancestors: str = Field(default="'self'", validation_alias=AliasChoices("WIDGET_FRAME_ANCESTORS", "FLOWXER_WIDGET_FRAME_ANCESTORS"))
+
     default_stinger: str = "replay-wipe"
     stinger_frame_count: int = 24
-    stinger_auto_tick: bool = True
 
     # Empty = unauthenticated (local/dev). Staging must set FLOWXER_API_TOKEN.
     api_token: str = ""
     cors_origins: str = "*"
-    max_webrtc_peers: int = Field(default=16, ge=1, le=256)
-    # Rate of the GUI monitor pictures taken from the pipeline (0: generated cards).
-    monitor_fps: int = Field(default=10, ge=0, le=50)
-    webrtc_public_ip: str = ""
-    webrtc_udp_port_min: int = Field(default=32600, ge=1, le=65535)
-    webrtc_udp_port_max: int = Field(default=32631, ge=1, le=65535)
 
     # Production structure from the platform's designer (docs/platform-integration-plan.md
     # §3.10). Unset or empty: the saved state and the GUI decide, as before. Set: the
@@ -137,8 +137,16 @@ class Settings(BaseSettings):
     live_inputs: int | None = Field(default=None, ge=0, le=MAX_PINNED_INPUTS)
     # JSON array or comma-separated; the rest are "Camera n".
     input_labels: str = ""
-    test_sources: int | None = Field(default=None, ge=0, le=MAX_PINNED_INPUTS)
+    clip_players: int | None = Field(default=None, ge=0, le=MAX_PINNED_INPUTS)
     panels: int | None = Field(default=None, ge=1, le=4)
+    # The first n MEs render (PGM, PVW, senders and flows); empty: every panel. More than there
+    # are panels renders every panel.
+    render_mes: int | None = Field(default=None, ge=1, le=4)
+    # Upstream keyers (0-8) and DSKs (0-4) of every rendering ME; set: pinned like the panels.
+    keyers_per_me: int | None = Field(default=None, ge=0, le=8)
+    dsks_per_me: int | None = Field(default=None, ge=0, le=4)
+    # Stinger players (0-4, at most the rendering MEs; each plays one stinger at a time); set: pinned.
+    stinger_players: int | None = Field(default=None, ge=0, le=4)
     # Start Program after the state is restored: ME 1 on the first live input.
     program_autostart: bool = False
     # Raw tally per ME for the platform's tally calculator (flowxer.engine.tally_export):
@@ -147,7 +155,9 @@ class Settings(BaseSettings):
 
     mxl_domain_deprecated: bool = False
 
-    @field_validator("live_inputs", "test_sources", "panels", mode="before")
+    @field_validator(
+        "live_inputs", "clip_players", "panels", "render_mes", "keyers_per_me", "dsks_per_me", "stinger_players", mode="before"
+    )
     @classmethod
     def empty_is_unset(cls, value):
         # A Kubernetes value rendered as "" means "not set".
@@ -188,11 +198,6 @@ class Settings(BaseSettings):
                 raise ValueError("FLOWXER_TALLY_TSL must be udp://host:port or tcp://host:port")
         return value
 
-    @field_validator("gpu", mode="before")
-    @classmethod
-    def normalize_gpu(cls, value):
-        return value.strip().lower() if isinstance(value, str) else value
-
     @field_validator("api_token")
     @classmethod
     def validate_api_token(cls, value: str) -> str:
@@ -231,10 +236,10 @@ class Settings(BaseSettings):
                 f"FLOWXER_INPUT_LABELS has {len(labels)} labels for {live} live inputs "
                 "(FLOWXER_LIVE_INPUTS)"
             )
-        if live + (self.test_sources or 0) > MAX_PINNED_INPUTS:
+        if live + (self.clip_players or 0) > MAX_PINNED_INPUTS:
             raise ValueError(
-                f"FLOWXER_LIVE_INPUTS + FLOWXER_TEST_SOURCES must be at most {MAX_PINNED_INPUTS} "
-                "(with Black and Replay 24 sources)"
+                f"FLOWXER_LIVE_INPUTS + FLOWXER_CLIP_PLAYERS must be at most {MAX_PINNED_INPUTS} "
+                "(with Black 24 sources)"
             )
         if self.format:
             from flowxer.engine.formats import format_by_id
@@ -264,16 +269,22 @@ class Settings(BaseSettings):
             for name, is_set in (
                 ("FLOWXER_LIVE_INPUTS", self.live_inputs is not None),
                 ("FLOWXER_INPUT_LABELS", bool(split_labels(self.input_labels))),
-                ("FLOWXER_TEST_SOURCES", self.test_sources is not None),
+                ("FLOWXER_CLIP_PLAYERS", self.clip_players is not None),
             )
             if is_set
         ]
         if names:
-            # Live inputs, test sources, then Black and Replay.
-            count = (self.live_inputs or 0) + (self.test_sources or 0) + 2
+            # Live inputs, clip players, then Black.
+            count = (self.live_inputs or 0) + (self.clip_players or 0) + 1
             pinned["logical_source_count"] = (count, ", ".join(names))
         if self.panels is not None:
             pinned["mixer_panel_count"] = (self.panels, "FLOWXER_PANELS")
+        if self.keyers_per_me is not None:
+            pinned["keyers_per_me"] = (self.keyers_per_me, "FLOWXER_KEYERS_PER_ME")
+        if self.dsks_per_me is not None:
+            pinned["dsks_per_me"] = (self.dsks_per_me, "FLOWXER_DSKS_PER_ME")
+        if self.stinger_players is not None:
+            pinned["stinger_players"] = (self.stinger_players, "FLOWXER_STINGER_PLAYERS")
         return pinned
 
     @property
@@ -332,10 +343,6 @@ class Settings(BaseSettings):
         return self.storage_root / "stingers"
 
     @property
-    def graphics_dir(self) -> Path:
-        return self.storage_root / "graphics"
-
-    @property
     def resolved_library_dir(self) -> Path:
         if self.library_dir is not None:
             return Path(self.library_dir)
@@ -388,7 +395,6 @@ def ensure_storage(settings: Settings) -> Settings:
     for path in (
         settings.clips_dir,
         settings.stingers_dir,
-        settings.graphics_dir,
         settings.resolved_library_dir,
     ):
         path.mkdir(parents=True, exist_ok=True)

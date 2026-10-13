@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse, Response
 _OPEN_PATHS = frozenset(
     {"/api/v1/health", "/favicon.ico", "/", "/metrics", "/livez", "/readyz", "/api/v1/metrics"}
 )
-_OPEN_PREFIXES = ("/static/", "/graphics/")
+_OPEN_PREFIXES = ("/static/",)
 
 
 def extract_bearer_token(request: Request) -> str:

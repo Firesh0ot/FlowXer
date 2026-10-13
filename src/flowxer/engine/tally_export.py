@@ -1,11 +1,14 @@
 """Raw tally for the platform's tally calculator (FLOWXER_TALLY_TSL), TSL UMD 5.0.
 
-Each ME is one SCREEN (ME 1 = 1 .. ME 4 = 4), each input one display INDEX. LH tally is
-red while the input is on that ME's Program, and for both sources of a mix or stinger
-while it runs; RH tally is green while the input is on the ME's Preview. Text tally is
-off, TEXT is the input's label (UTF-16LE). Every send carries all inputs of every ME, on
-each change, when a mix ends and at least once a second. The calculator works out what
-is on air further down (path-aware tally).
+Each ME is one SCREEN (ME 1 = 1 .. ME 4 = 4), each input one display INDEX, and the Program
+of a higher ME that this ME can take (re-entry) INDEX 1000 + n. LH tally is red while the
+source is on that ME's Program, and for both sources of a mix while it runs; RH tally is
+green while the source is on the ME's Preview. Keys light LH only (keys have no preview): a
+luma key's source while the key is on air, and each linear keyer's key input as INDEX
+2000 + 100·n + k (upstream keyer k of ME n) or 3000 + 100·n + k (DSK k of ME n), TEXT its
+receiver label. Text tally is off, TEXT is the label (UTF-16LE). Every send carries all sources of every ME, on each change, when a mix ends and
+at least once a second. The calculator works out what is on air further down (path-aware
+tally).
 """
 
 from __future__ import annotations
@@ -39,6 +42,12 @@ class MeTally:
     # A mix or stinger that runs: outgoing input, incoming input, monotonic end (None: until
     # the mixer reports its end).
     transition: tuple[str | None, str, float | None] | None = None
+    # The Programs of higher MEs this ME can take: (source id, label, INDEX).
+    reentry: tuple[tuple[str, str, int], ...] = ()
+    # The sources of the luma keys on air.
+    keyed: tuple[str, ...] = ()
+    # The linear keyers' key inputs: (INDEX, receiver label, on air).
+    keys: tuple[tuple[int, str, bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,18 +67,20 @@ def assign_indexes(indexes: dict[str, int], snapshot: TallySnapshot) -> None:
 
 def me_messages(snapshot: TallySnapshot, me: MeTally, indexes: dict[str, int], now: float) -> list[DisplayMessage]:
     """One display message per input for one ME."""
-    on_air = {me.program}
+    on_air = {me.program, *me.keyed}
     if me.transition is not None and (me.transition[2] is None or now < me.transition[2]):
         on_air.update(me.transition[:2])
+    sources = [(input_id, label, indexes[input_id]) for input_id, label in snapshot.inputs]
+    sources += list(me.reentry)
     return [
         DisplayMessage(
-            index=indexes[input_id],
+            index=index,
             text=label,
-            lh=TALLY_RED if input_id in on_air else TALLY_OFF,
-            rh=TALLY_GREEN if input_id == me.preview else TALLY_OFF,
+            lh=TALLY_RED if source_id in on_air else TALLY_OFF,
+            rh=TALLY_GREEN if source_id == me.preview else TALLY_OFF,
         )
-        for input_id, label in snapshot.inputs
-    ]
+        for source_id, label, index in sources
+    ] + [DisplayMessage(index=index, text=label, lh=TALLY_RED if on else TALLY_OFF, rh=TALLY_OFF) for index, label, on in me.keys]
 
 
 class TallyExport:

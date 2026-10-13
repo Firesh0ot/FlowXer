@@ -38,12 +38,23 @@ def collect_resources(mixer) -> dict[str, Any]:
     if mixer.error:
         issues.append({"level": "error", "message": mixer.error})
     if mixer.backend == "simulate":
-        issues.append(
-            {
-                "level": "info",
-                "message": "GStreamer/MXL plugins not on-air — WebRTC monitors are generated previews",
-            }
-        )
+        issues.append({"level": "info", "message": "Simulated media (FLOWXER_SIMULATE): no engine, no pictures"})
+    engine = getattr(mixer, "engine", None)
+    status = engine.status if engine is not None else None
+    if status:
+        engine_info = status.get("engine") or {}
+        recommended = engine_info.get("recommended_latency_grains")
+        latency = engine_info.get("latency_grains")
+        if recommended and latency and recommended > latency:
+            issues.append(
+                {
+                    "level": "warning",
+                    "message": (
+                        f"Inputs arrive later than FLOWXER_LATENCY={latency} covers: "
+                        f"{recommended} grains recommended (GET /api/v1/engine)"
+                    ),
+                }
+            )
     domain = mixer.settings.output_domain
     if not (domain / "domain_def.json").exists():
         issues.append({"level": "warning", "message": f"MXL output domain missing at {domain}"})
@@ -57,9 +68,9 @@ def collect_resources(mixer) -> dict[str, Any]:
                     "message": f"Tally {receiver.label} ({receiver.host}:{receiver.port}): {receiver.last_error}",
                 }
             )
-    for keyer in getattr(mixer, "keyers", []):
-        if keyer.enabled and not keyer.url:
-            issues.append({"level": "warning", "message": f"{keyer.label} has no HTML URL"})
+    for keyer, entry in zip(getattr(mixer, "keyers", []), (status or {}).get("keys") or []):
+        if keyer.enabled and entry.get("state") not in {"running"}:
+            issues.append({"level": "warning", "message": f"{keyer.label} is on but its key input is {entry.get('state')}"})
 
     level = "ok"
     if any(item["level"] == "error" for item in issues):
