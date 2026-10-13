@@ -1,4 +1,5 @@
-"""TGA sequence validation and ZIP ingest (Zip-Slip / bomb hardened)."""
+"""Image sequence (TGA or PNG, with an optional WAV) validation and ZIP ingest (Zip-Slip / bomb
+hardened)."""
 
 from __future__ import annotations
 
@@ -9,7 +10,8 @@ from pathlib import Path
 
 from PIL import Image
 
-TGA_RE = re.compile(r"^(?P<stem>.*?)(?P<num>\d+)\.tga$", re.IGNORECASE)
+FRAME_RE = re.compile(r"^(?P<stem>.*?)(?P<num>\d+)\.(tga|png)$", re.IGNORECASE)
+FRAME_SUFFIXES = {".tga", ".png"}
 
 DEFAULT_MAX_ENTRIES = 10_000
 DEFAULT_MAX_UNPACKED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
@@ -33,6 +35,8 @@ class SequenceInfo:
     issues: list[SequenceIssue] = field(default_factory=list)
     # First frame number: ffmpeg's image2 input needs it as -start_number.
     start_number: int = 0
+    # The sequence's sound (one WAV next to the frames, aligned to frame 0), or None.
+    sound: Path | None = None
 
     @property
     def ok(self) -> bool:
@@ -40,14 +44,15 @@ class SequenceInfo:
 
 
 def natural_tga_sort_key(path: Path) -> tuple:
-    match = TGA_RE.match(path.name)
+    match = FRAME_RE.match(path.name)
     if not match:
         return (path.name.lower(), 0)
     return (match.group("stem").lower(), int(match.group("num")))
 
 
 def discover_tga_files(directory: Path) -> list[Path]:
-    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".tga"]
+    """The frames of a sequence: .tga or .png files."""
+    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in FRAME_SUFFIXES]
     return sorted(files, key=natural_tga_sort_key)
 
 
@@ -55,12 +60,12 @@ def infer_pattern(files: list[Path]) -> str:
     if not files:
         return "frame_%05d.tga"
     first = files[0].name
-    match = TGA_RE.match(first)
+    match = FRAME_RE.match(first)
     if not match:
         return first
     stem = match.group("stem")
     suffix = first[match.end("num"):]
-    widths = [len(m.group("num")) for m in (TGA_RE.match(f.name) for f in files) if m]
+    widths = [len(m.group("num")) for m in (FRAME_RE.match(f.name) for f in files) if m]
     # The smallest padding: %02d also matches 100. The extension keeps its case (.TGA).
     return f"{stem}%0{min(widths)}d{suffix}"
 
@@ -69,15 +74,18 @@ def validate_sequence(directory: Path) -> SequenceInfo:
     issues: list[SequenceIssue] = []
     files = discover_tga_files(directory)
     if not files:
-        issues.append(SequenceIssue("error", "no .tga frames found"))
+        issues.append(SequenceIssue("error", "no .tga or .png frames found"))
         return SequenceInfo([], "frame_%05d.tga", 0, 0, 0, False, issues)
+    sounds = sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".wav")
+    if len(sounds) > 1:
+        issues.append(SequenceIssue("error", f"more than one WAV: {', '.join(p.name for p in sounds[:4])}"))
 
     numbers: list[int] = []
     stems: set[str] = set()
     for path in files:
-        match = TGA_RE.match(path.name)
+        match = FRAME_RE.match(path.name)
         if not match:
-            issues.append(SequenceIssue("error", f"non-numeric TGA name: {path.name}"))
+            issues.append(SequenceIssue("error", f"non-numeric frame name: {path.name}"))
             continue
         stems.add(match.group("stem"))
         numbers.append(int(match.group("num")))
@@ -93,7 +101,7 @@ def validate_sequence(directory: Path) -> SequenceInfo:
     unpadded = sorted(
         path.name
         for path in files
-        if (m := TGA_RE.match(path.name)) and m.group("num") != f"{int(m.group('num')):0{pad}d}"
+        if (m := FRAME_RE.match(path.name)) and m.group("num") != f"{int(m.group('num')):0{pad}d}"
     )
     if unpadded:
         issues.append(SequenceIssue("error", f"inconsistent zero padding: {', '.join(unpadded[:4])}"))
@@ -139,6 +147,7 @@ def validate_sequence(directory: Path) -> SequenceInfo:
         has_alpha=has_alpha,
         issues=issues,
         start_number=min(numbers) if numbers else 0,
+        sound=sounds[0] if sounds else None,
     )
 
 
@@ -159,19 +168,20 @@ def _tga_members(
     max_unpacked_bytes: int,
     max_single_file: int,
 ) -> tuple[list[zipfile.ZipInfo], str]:
-    """Checks on the central directory only: the .tga members and their one root folder."""
+    """Checks on the central directory only: the frame members (.tga, .png), a WAV, and their one
+    root folder."""
     infos = [i for i in zf.infolist() if not i.is_dir()]
     tga_members = []
     for info in infos:
         name = info.filename.replace("\\", "/")
         if _is_ignored_zip_member(name):
             continue
-        if Path(name).suffix.lower() != ".tga":
+        if Path(name).suffix.lower() not in FRAME_SUFFIXES | {".wav"}:
             continue
         tga_members.append(info)
 
-    if not tga_members:
-        raise ValueError("zip contains no .tga files")
+    if not any(Path(info.filename).suffix.lower() in FRAME_SUFFIXES for info in tga_members):
+        raise ValueError("zip contains no .tga or .png frames")
     if len(tga_members) > max_entries:
         raise ValueError(f"too many entries ({len(tga_members)} > {max_entries})")
 
@@ -209,8 +219,8 @@ def inspect_tga_zip(
     max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES,
     max_single_file: int = DEFAULT_MAX_SINGLE_FILE,
 ) -> int:
-    """Validate a TGA ZIP without unpacking it (fast enough for an upload request).
-    Returns the number of .tga members."""
+    """Validate a sequence ZIP without unpacking it (fast enough for an upload request).
+    Returns the number of its members (frames and a WAV)."""
     if not zipfile.is_zipfile(zip_path):
         raise ValueError("not a zip archive")
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -231,7 +241,7 @@ def safe_extract_tga_zip(
     max_unpacked_bytes: int = DEFAULT_MAX_UNPACKED_BYTES,
     max_single_file: int = DEFAULT_MAX_SINGLE_FILE,
 ) -> Path:
-    """Extract only ``.tga`` files from a ZIP into ``dest``.
+    """Extract only the frames (``.tga``, ``.png``) and a ``.wav`` from a ZIP into ``dest``.
 
     Rejects Zip-Slip paths, symlinks, and oversized archives. Requires exactly
     one root folder inside the ZIP (or files at a single common root).

@@ -1,17 +1,27 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
 from flowxer.api.schemas import (
+    AudioStripUpdate,
+    AutoRequest,
     ConsoleState,
     ConvertJobOut,
+    Dme,
+    DmePresetInfo,
     DomainInfo,
-    DownstreamKeyer,
+    Keyer,
     ErrorBody,
     FlowDescriptor,
     HealthResponse,
+    InputAudioUpdate,
+    KeyerAutoRequest,
+    KeyerPresetRequest,
+    KeyerRunRequest,
     KeyerUpdate,
     LogicalInput,
     LogicalInputCreate,
@@ -20,12 +30,13 @@ from flowxer.api.schemas import (
     MixerStartRequest,
     MixerState,
     MixerStatus,
-    OverlayStatus,
-    OverlayUpdate,
+    PanelAudioUpdate,
+    PanelTransition,
     PanelTransitionRequest,
+    PanelTransitionUpdate,
+    PlayerCueRequest,
+    PositionRequest,
     PreviewRequest,
-    ReplayLoadRequest,
-    ReplayTransitionRequest,
     ResourceInfo,
     StingerInfo,
     StingerPlayRequest,
@@ -38,15 +49,14 @@ from flowxer.api.schemas import (
     WorkspaceConfig,
     WorkspaceUpdate,
 )
+from flowxer import __version__
 from flowxer.api.metrics import live_payload, ready_payload, render_prometheus
 from flowxer.domain.mxl_domain import load_domain_info, scan_domains
-from flowxer.engine.capabilities import probe_backend
 from flowxer.engine.formats import VIDEO_FORMATS
 from flowxer.engine.mixer import MixerError, VisionMixer
-from flowxer.engine.preview import UnknownStream, render_jpeg, resolve_stream
+from flowxer.engine.preview import preview_info
 from flowxer.engine.resources import collect_resources
 from flowxer.engine.tally import TALLY_PRESETS
-from flowxer.engine.webrtc import create_whep_answer, webrtc_available
 from flowxer.settings import Settings, get_settings
 
 router = APIRouter()
@@ -70,7 +80,6 @@ def health(
     mixer: VisionMixer = Depends(get_mixer),
     settings: Settings = Depends(get_settings),
 ) -> HealthResponse:
-    caps = probe_backend()
     return HealthResponse(
         status="ok",
         service="flowxer-vision-mixer",
@@ -78,9 +87,8 @@ def health(
         mxl_domain=str(settings.output_domain),
         mxl_root=str(settings.mxl_root),
         mxl_output_domain_id=settings.resolved_output_domain_id,
-        gstreamer=bool(caps["gstreamer"]),
-        mxl_plugins=bool(caps["mxl_plugins"]),
-        simulate=mixer.backend == "simulate" or settings.simulate,
+        simulate=settings.simulate,
+        engine=mixer.engine.state if mixer.engine is not None else ("simulate" if mixer.backend == "simulate" else "stopped"),
         mxl_revision=settings.resolved_mxl_revision,
     )
 
@@ -129,8 +137,95 @@ def config(settings: Settings = Depends(get_settings)) -> dict:
         "storage_root": str(settings.storage_root),
         "group_hint": settings.group_hint,
         "default_stinger": settings.default_stinger,
-        "overlay_url": settings.overlay_url,
+        "latency_grains": settings.latency,
+        "render_mes": settings.render_mes,
+        "pvw_outputs": settings.pvw_outputs,
     }
+
+
+@router.get(
+    "/engine",
+    tags=["system"],
+    summary="The media engine's status: timing per stage, per input arrival lag, clip players, outputs",
+    description=(
+        "The engine's own status (refreshed once a second while Program is on air). "
+        "`engine.recommended_latency_grains` is the latency that covers the latest input arrival "
+        "seen since each input was routed; compare it with FLOWXER_LATENCY."
+    ),
+)
+def engine_status(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    status_body = mixer.engine_status()
+    return {
+        "process": mixer.engine.summary() if mixer.engine is not None else {"state": mixer.backend},
+        "status": status_body,
+    }
+
+
+@router.get(
+    "/preview",
+    tags=["gui"],
+    summary="The preview mosaic stream (WebRTC WHEP / HLS) and where each picture is in it",
+    description=(
+        "One stream holds every picture of the console: the sources, and each rendering ME's "
+        "Program and Preview. `tiles` gives each picture's rectangle in the stream with its "
+        "id (`source:<input id>` or `panel:<panel id>:pgm|pvw`). With a shared MediaMTX "
+        "(PREVIEW_WHEP_URL) `whep_url` is absolute; with the built-in one the player uses "
+        "`whep_port` on the page's host."
+    ),
+)
+def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return preview_info(mixer)
+
+
+@router.get(
+    "/widgets",
+    tags=["gui"],
+    summary="The operator-screen widgets flowxer-gui serves at /widget/<id>, with their parameters",
+    description=(
+        "flowxer-gui serves this list at `/widgets` (with CORS for the origins in "
+        "WIDGET_FRAME_ANCESTORS) and the widget pages at `/widget/<id>?<params>[&theme=dark|light|"
+        "transparent]`, which only those origins may frame. `bus`: the Program and Preview rows, "
+        "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
+        "upstream keyers and DSKs with On/Off and Auto. `dme`: one upstream keyer's box: On/Off, "
+        "Auto, Run back and forth, and the presets. `audio`: one ME's audio strips (meter, MUTE, AFV, and the "
+        "fader unless `faders=false`) and its master meter with the loudness."
+    ),
+)
+def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
+    me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
+    transition = {"type": "boolean", "default": True, "title": "Transition type"}
+    faders = {"type": "boolean", "default": True, "title": "Faders"}
+    keyer = {"type": "integer", "minimum": 1, "maximum": max(1, mixer.workspace.keyers_per_me), "title": "Upstream keyer"}
+    return [
+        {
+            "id": "bus",
+            "title": "FlowXer bus",
+            "params": {"type": "object", "properties": {"me": me, "transition": transition}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 150},
+            "version": __version__,
+        },
+        {
+            "id": "keys",
+            "title": "FlowXer keys",
+            "params": {"type": "object", "properties": {"me": me}, "required": ["me"]},
+            "min_size": {"w": 240, "h": 150},
+            "version": __version__,
+        },
+        {
+            "id": "dme",
+            "title": "FlowXer DME",
+            "params": {"type": "object", "properties": {"me": me, "keyer": keyer}, "required": ["me", "keyer"]},
+            "min_size": {"w": 320, "h": 120},
+            "version": __version__,
+        },
+        {
+            "id": "audio",
+            "title": "FlowXer audio",
+            "params": {"type": "object", "properties": {"me": me, "faders": faders}, "required": ["me"]},
+            "min_size": {"w": 480, "h": 240},
+            "version": __version__,
+        },
+    ]
 
 
 @router.get(
@@ -214,7 +309,7 @@ def get_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Logical
     "/inputs/{input_id}",
     response_model=LogicalInput,
     tags=["inputs"],
-    summary="Update label, kind, essences, clip path, or auto-stinger on a logical input",
+    summary="Update label, kind, essences, the clip player's media, loop and play-on-cut, or auto-stinger",
 )
 def patch_input(
     input_id: str, payload: LogicalInputUpdate, mixer: VisionMixer = Depends(get_mixer)
@@ -251,7 +346,7 @@ def delete_input(input_id: str, mixer: VisionMixer = Depends(get_mixer)) -> None
     "/mixer",
     response_model=MixerStatus,
     tags=["mixer"],
-    summary="Program, preview, overlay, stinger and output flow status",
+    summary="Program, preview, every ME's output flows and the media engine's state",
 )
 def mixer_status(mixer: VisionMixer = Depends(get_mixer)) -> MixerStatus:
     return mixer.status()
@@ -261,7 +356,7 @@ def mixer_status(mixer: VisionMixer = Depends(get_mixer)) -> MixerStatus:
     "/mixer/start",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Start the GStreamer vision mixer and publish PGM v210 + float32 flows",
+    summary="Take the mixer on air: start the media engine, which writes every rendering ME's PGM (v210 + float32) and PVW flows",
 )
 def mixer_start(
     payload: MixerStartRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -277,7 +372,7 @@ def mixer_start(
     "/mixer/stop",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Stop the GStreamer pipeline and take the mixer off-air",
+    summary="Take the mixer off-air: stop the media engine",
 )
 def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     return MixerCommandResponse(status="stopped", mixer=mixer.stop())
@@ -287,14 +382,19 @@ def mixer_stop(mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     "/mixer/take",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Take a logical input to program (cut, mix or stinger)",
+    summary="Take a logical input (or me-<n>, re-entry) to Program: cut (the input's auto-stinger plays), mix, wipe or stinger",
 )
 def mixer_take(
     payload: TakeRequest, mixer: VisionMixer = Depends(get_mixer)
 ) -> MixerCommandResponse:
     try:
         body = mixer.take(
-            payload.input_id, payload.transition, payload.stinger_id, payload.panel_id, payload.duration_ms
+            payload.input_id,
+            payload.transition,
+            payload.stinger_id,
+            payload.panel_id,
+            payload.duration_ms,
+            payload.frames,
         )
     except MixerError as exc:
         raise _http(exc)
@@ -321,7 +421,7 @@ def mixer_preview(
     "/mixer/cut",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Cut Preview to Program. Auto-stinger on the Preview source, or an armed Wipe, plays a stinger instead.",
+    summary="Cut Preview to Program: Preview's auto-stinger plays, else an armed Wipe plays the stinger slot by direction",
 )
 def mixer_cut(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -332,6 +432,52 @@ def mixer_cut(
     except MixerError as exc:
         raise _http(exc)
     return MixerCommandResponse(status="cut", mixer=body)
+
+
+@router.post(
+    "/mixer/auto",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="Run the ME's next transition (mix, wipe or stinger) from Preview to Program",
+)
+def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    payload = payload or AutoRequest()
+    try:
+        body = mixer.auto(payload.panel_id, payload.frames)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="auto", mixer=body)
+
+
+@router.post(
+    "/mixer/position",
+    response_model=MixerCommandResponse,
+    tags=["mixer"],
+    summary="T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it without the swap",
+)
+def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
+    try:
+        body = mixer.set_position(payload.panel_id, payload.position)
+    except MixerError as exc:
+        raise _http(exc)
+    return MixerCommandResponse(status="position", mixer=body)
+
+
+@router.patch(
+    "/panels/{panel_id}/transition",
+    response_model=PanelTransition,
+    tags=["mixer"],
+    summary="The ME's next transition: type (mix, wipe, stinger), rate in frames, wipe pattern and edge, stinger slot",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_panel_transition(
+    panel_id: str, payload: PanelTransitionUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> PanelTransition:
+    try:
+        return mixer.update_transition(panel_id, payload)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise _http(exc, code)
 
 
 @router.post(
@@ -372,7 +518,7 @@ def mixer_fade_to_black(
     "/mixer/wipe",
     response_model=MixerCommandResponse,
     tags=["mixer"],
-    summary="Arm Wipe so the next Cut plays the default stinger (toggle if armed is omitted)",
+    summary="Arm Wipe (toggle if armed is omitted): the next Cut plays the stinger slot by direction (FlowXer 14)",
 )
 def mixer_wipe(
     payload: PanelTransitionRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
@@ -386,41 +532,10 @@ def mixer_wipe(
 
 
 @router.get(
-    "/overlay",
-    response_model=OverlayStatus,
-    tags=["overlay"],
-    summary="HTML5 graphics keyer status",
-)
-def overlay_status(mixer: VisionMixer = Depends(get_mixer)) -> OverlayStatus:
-    return mixer.status().overlay
-
-
-@router.post(
-    "/overlay",
-    response_model=MixerCommandResponse,
-    tags=["overlay"],
-    summary="Enable/disable the HTML5 overlay or change its URL and ident text",
-)
-def overlay_update(
-    payload: OverlayUpdate, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.set_overlay(
-            enabled=payload.enabled,
-            url=payload.url,
-            title=payload.title,
-            subtitle=payload.subtitle,
-        )
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="overlay", mixer=body)
-
-
-@router.get(
     "/storage/clips",
     response_model=list[StorageClip],
     tags=["storage"],
-    summary="List playable video files in mixer storage",
+    summary="List the library clips and stills a clip player can play",
 )
 def storage_clips(mixer: VisionMixer = Depends(get_mixer)) -> list[StorageClip]:
     return [StorageClip(**item) for item in mixer.list_clips()]
@@ -437,59 +552,10 @@ def storage_stingers(mixer: VisionMixer = Depends(get_mixer)) -> list[StingerInf
 
 
 @router.post(
-    "/replay/load",
-    response_model=LogicalInput,
-    tags=["replay"],
-    summary="Load a stored clip onto the replay logical input",
-)
-def replay_load(
-    payload: ReplayLoadRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> LogicalInput:
-    try:
-        if payload.library_item_id:
-            return mixer.load_library_clip(payload.input_id, payload.library_item_id)
-        return mixer.load_clip(payload.input_id, payload.file_path or "")
-    except MixerError as exc:
-        raise _http(exc, status.HTTP_404_NOT_FOUND if "not found" in str(exc) else status.HTTP_409_CONFLICT)
-
-
-@router.post(
-    "/replay/take",
-    response_model=MixerCommandResponse,
-    tags=["replay"],
-    summary="Stinger from live program into replay",
-)
-def replay_take(
-    payload: ReplayTransitionRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.take_replay(payload.stinger_id, payload.input_id)
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="to_replay", mixer=body)
-
-
-@router.post(
-    "/replay/return",
-    response_model=MixerCommandResponse,
-    tags=["replay"],
-    summary="Stinger from replay back to the previous live input",
-)
-def replay_return(
-    payload: ReplayTransitionRequest, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    try:
-        body = mixer.return_live(payload.stinger_id, payload.input_id)
-    except MixerError as exc:
-        raise _http(exc)
-    return MixerCommandResponse(status="to_live", mixer=body)
-
-
-@router.post(
     "/stinger/play",
     response_model=MixerCommandResponse,
     tags=["stinger"],
-    summary="Play a TGA or video stinger and cut Program at the cut frame; flip_flop swaps Preview/Program",
+    summary="Stinger take on the GPU (a cut while the stinger converts); flip_flop swaps Preview/Program",
 )
 def stinger_play(
     payload: StingerPlayRequest, mixer: VisionMixer = Depends(get_mixer)
@@ -508,22 +574,35 @@ def stinger_play(
 
 
 @router.post(
-    "/stinger/tick",
-    response_model=MixerCommandResponse,
-    tags=["stinger"],
-    summary="Advance the stinger by N frames (used by tests and the simulate backend)",
+    "/players/{input_id}/{action}",
+    response_model=LogicalInput,
+    tags=["inputs"],
+    summary="Clip player transport: cue, play, pause, stop",
+    description=(
+        "`cue` shows a frame and holds (body `{\"frame\": n}`, default the first); `play` plays "
+        "from there; `pause` holds the current frame; `stop` goes back to the first frame and "
+        "holds. Loop and play-on-cut are set on the input (`PATCH /inputs/{id}`)."
+    ),
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
 )
-def stinger_tick(
-    frames: int = 1, mixer: VisionMixer = Depends(get_mixer)
-) -> MixerCommandResponse:
-    return MixerCommandResponse(status="tick", mixer=mixer.advance_stinger(frames))
+def player_command(
+    input_id: str,
+    action: str,
+    payload: PlayerCueRequest | None = None,
+    mixer: VisionMixer = Depends(get_mixer),
+) -> LogicalInput:
+    try:
+        return mixer.player_command(input_id, action, (payload or PlayerCueRequest()).frame)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise _http(exc, code)
 
 
 @router.get(
     "/console",
     response_model=ConsoleState,
     tags=["gui"],
-    summary="One-shot operator console snapshot (workspace, buses, resources, WebRTC)",
+    summary="One-shot operator console snapshot (workspace, buses, resources, preview mosaic, per-source state)",
 )
 def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
     mixer_status = mixer.status()
@@ -541,17 +620,19 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         ],
         inputs=mixer.list_inputs(),
         panels=mixer.panels,
-        keyers=mixer.keyers,
+        keyers=mixer.keyer_views(),
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
         resources=ResourceInfo.model_validate(collect_resources(mixer)),
-        webrtc={"enabled": webrtc_available(), "protocol": "WHEP"},
+        preview=preview_info(mixer),
+        sources=mixer.source_runtime(),
         clips=[StorageClip(**item) for item in mixer.list_clips()],
         stingers=mixer.list_stingers(),
         library=[mixer.library_item_out(item) for item in mixer.library.list_items()],
         jobs=[ConvertJobOut(**job.model_dump()) for job in mixer.library.queue.list_jobs()],
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
+        audio=mixer.audio_state(),
         pinned={
             field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
         },
@@ -657,15 +738,25 @@ def resources(mixer: VisionMixer = Depends(get_mixer)) -> ResourceInfo:
     return ResourceInfo.model_validate(collect_resources(mixer))
 
 
+@router.get(
+    "/keyers",
+    response_model=list[Keyer],
+    tags=["keyers"],
+    summary="The upstream keyers and DSKs of every rendering ME, in order",
+)
+def list_keyers(mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
+    return mixer.keyer_views()
+
+
 @router.patch(
     "/keyers/{keyer_id}",
-    response_model=DownstreamKeyer,
-    tags=["overlay"],
-    summary="Configure a downstream keyer (HTML5 graphics)",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Keyer on or off (at the next frame), its rate and label, and its key: mode (linear, luma, pip), source, clip, soft, gain, invert, box (dme)",
 )
 def patch_keyer(
     keyer_id: str, payload: KeyerUpdate, mixer: VisionMixer = Depends(get_mixer)
-) -> DownstreamKeyer:
+) -> Keyer:
     try:
         return mixer.update_keyer(keyer_id, **payload.model_dump(exclude_unset=True))
     except MixerError as exc:
@@ -675,6 +766,207 @@ def patch_keyer(
             else status.HTTP_409_CONFLICT
         )
         raise _http(exc, code)
+
+
+@router.post(
+    "/keyers/{keyer_id}/auto",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Fade the keyer on (or off when it is on); with fly, fly its box from keyframe 0 to the last (or back)",
+)
+def keyer_auto(
+    keyer_id: str, payload: KeyerAutoRequest | None = None, mixer: VisionMixer = Depends(get_mixer)
+) -> Keyer:
+    try:
+        return mixer.keyer_auto(keyer_id, (payload or KeyerAutoRequest()).duration_ms)
+    except MixerError as exc:
+        raise _http(exc, status.HTTP_404_NOT_FOUND)
+
+
+def _keyer_error(exc: MixerError) -> HTTPException:
+    return _http(exc, status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT)
+
+
+@router.put(
+    "/keyers/{keyer_id}/dme",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Replace the keyer's box (missing fields: defaults; PATCH /keyers/{id} merges); stops a run",
+)
+def put_keyer_dme(keyer_id: str, payload: Dme, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    try:
+        return mixer.replace_keyer_box(keyer_id, payload)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.put(
+    "/keyers/{keyer_id}/keyframes",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Replace the keyer's keyframes (up to 8): box fields (missing: the keyer's box), frames and ease each",
+    description=(
+        "Each keyframe is a box state (see DmeKeyframe: x, y, size, soft, crop, border width, soft "
+        "and opacity, shadow) with `frames` (1..1000: the time from the keyframe before) and `ease` "
+        "(linear, ease, ease-in, ease-out, hold). Size is interpolated in log space. A run stops "
+        "where the box is."
+    ),
+)
+def put_keyer_keyframes(
+    keyer_id: str, payload: list[dict[str, Any]] = Body(...), mixer: VisionMixer = Depends(get_mixer)
+) -> Keyer:
+    try:
+        return mixer.set_keyframes(keyer_id, payload)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/run",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Run the box from where it is to a keyframe (default the last; 0 with reverse), loop (wrap, pingpong), or jump (frames 0)",
+)
+def run_keyer(keyer_id: str, payload: KeyerRunRequest | None = None, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    request = payload or KeyerRunRequest()
+    try:
+        return mixer.run_keyer(keyer_id, to=request.to, reverse=request.reverse, loop=request.loop, frames=request.frames)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/stop",
+    response_model=Keyer,
+    tags=["keyers"],
+    summary="Stop the box's run: it holds where it is",
+)
+def stop_keyer(keyer_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Keyer:
+    try:
+        return mixer.stop_keyer(keyer_id)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.post(
+    "/keyers/{keyer_id}/preset",
+    response_model=list[Keyer],
+    tags=["keyers"],
+    summary="Write a DME preset (box and keyframes) into the keyer (split and quad: the ME's keyers 1-2 and 1-4); returns the keyers written",
+)
+def keyer_preset(keyer_id: str, payload: KeyerPresetRequest, mixer: VisionMixer = Depends(get_mixer)) -> list[Keyer]:
+    try:
+        return mixer.apply_preset(keyer_id, payload.name)
+    except MixerError as exc:
+        raise _keyer_error(exc)
+
+
+@router.get(
+    "/dme/presets",
+    response_model=list[DmePresetInfo],
+    tags=["keyers"],
+    summary="The DME presets: corner PiPs, split, quad, full",
+)
+def dme_presets(mixer: VisionMixer = Depends(get_mixer)) -> list[DmePresetInfo]:
+    return mixer.dme_presets()
+
+
+def _audio_error(exc: MixerError) -> HTTPException:
+    """Unknown input, panel or strip: 404; a panel that does not render: 409; a bad value: 422."""
+    text = str(exc)
+    if text.startswith("unknown"):
+        return _http(exc, status.HTTP_404_NOT_FOUND)
+    return _http(exc, status.HTTP_409_CONFLICT if "does not render" in text else 422)
+
+
+@router.get(
+    "/audio",
+    tags=["audio"],
+    summary="Every audio setting: per live input its delay and channel map, per ME its master and strips",
+    description=(
+        "`inputs`: per live input id its `delay_ms` (audio later than its video), `channel_map` (per PGM "
+        "channel the input channel, 1-based, 0 silent; empty 1:1) and its flow's `channels`. `panels`: per "
+        "rendering ME (panel id) its `master_db` and its `strips` in slot order (live inputs, clip players, "
+        "the Programs of higher MEs, `stinger`), each with `fader_db` (-90 off .. +10), `mute` and `afv` "
+        "(audio follows video; none on the stinger). `channels`: the PGM's; `max_delay_ms`: "
+        "FLOWXER_AUDIO_MAX_DELAY_MS."
+    ),
+)
+def get_audio(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_state()
+
+
+@router.patch(
+    "/audio/inputs/{input_id}",
+    tags=["audio"],
+    summary="A live input's audio delay (ms, whole samples) and channel map, for every ME",
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_input(input_id: str, payload: InputAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_input_audio(input_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}",
+    tags=["audio"],
+    summary="An ME's master fader (-90 off .. +10 dB); it ramps over one frame",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_audio_panel(panel_id: str, payload: PanelAudioUpdate, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.update_panel_audio(panel_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.patch(
+    "/audio/panels/{panel_id}/strips/{strip_id}",
+    tags=["audio"],
+    summary="A strip of an ME's mix: fader, mute, AFV (strip: an input or clip player id, a higher panel id, or stinger)",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def patch_audio_strip(
+    panel_id: str, strip_id: str, payload: AudioStripUpdate, mixer: VisionMixer = Depends(get_mixer)
+) -> dict:
+    try:
+        return mixer.update_audio_strip(panel_id, strip_id, payload)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.post(
+    "/audio/panels/{panel_id}/loudness/reset",
+    tags=["audio"],
+    summary="The ME's integrated loudness (EBU R 128) from now on",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def reset_audio_loudness(panel_id: str, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.reset_loudness(panel_id)
+    except MixerError as exc:
+        raise _audio_error(exc)
+
+
+@router.get(
+    "/audio/meters",
+    tags=["audio"],
+    summary="The meters of the last 100 ms block: per source peak and RMS, per ME PGM also true peak, loudness, overs and its strips",
+    description=(
+        "`sources`: live inputs (after their delay and channel map, before the fader) and clip players by id, "
+        "stinger players as `stinger-<k>`: `peak_dbfs` and `rms_dbfs` per channel. `panels`: per rendering ME "
+        "its PGM (what goes to MXL): `peak_dbfs`, `true_peak_dbtp` (BS.1770-4, 4x), `rms_dbfs` per channel, "
+        "`loudness` per channel pair (`momentary` 400 ms, `short_term` 3 s, `integrated` since the start or the "
+        "last reset; LUFS, EBU R 128), `overs` (samples at or above 0 dBFS since the engine started) and "
+        "`strips`: per strip its `gain_db` in PGM now and whether it is `heard`. `block`: the 100 ms block's "
+        "number (its first 48 kHz sample index / 4800); null off-air. Values below -120 dB are -120. Poll at "
+        "10 Hz at most: the answer changes every 100 ms."
+    ),
+)
+def get_audio_meters(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.audio_meters()
 
 
 @router.patch(
@@ -690,48 +982,3 @@ def patch_stinger_slot(
         return mixer.configure_stinger_slot(slot_id, payload)
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND)
-
-
-@router.get(
-    "/preview/jpeg/{stream_id:path}",
-    tags=["gui"],
-    summary="JPEG snapshot of a source or ME bus (WebRTC fallback)",
-    description=(
-        "`stream_id` is `source:<input id>` or `panel:<panel id>:pgm|pvw`; any other name is 404."
-    ),
-    responses={404: {"model": ErrorBody}},
-)
-def preview_jpeg(stream_id: str, mixer: VisionMixer = Depends(get_mixer)) -> Response:
-    try:
-        resolve_stream(mixer, stream_id)
-    except UnknownStream as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    payload = render_jpeg(mixer, stream_id)
-    return Response(content=payload, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
-
-
-@router.post(
-    "/webrtc/whep/{stream_id:path}",
-    tags=["gui"],
-    summary="WHEP: browser sends SDP offer, mixer answers with a WebRTC video preview",
-)
-async def webrtc_whep(
-    stream_id: str, request: Request, mixer: VisionMixer = Depends(get_mixer)
-) -> Response:
-    if not webrtc_available():
-        raise HTTPException(
-            status_code=501,
-            detail="WebRTC preview requires aiortc. JPEG fallback is at /api/v1/preview/jpeg/{stream_id}",
-        )
-    offer = (await request.body()).decode("utf-8")
-    if not offer.strip():
-        raise HTTPException(status_code=400, detail="SDP offer required")
-    try:
-        answer = await create_whep_answer(mixer, stream_id, offer)
-    except RuntimeError as exc:
-        if "too many WebRTC" in str(exc):
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
-    return Response(content=answer, media_type="application/sdp")

@@ -20,7 +20,6 @@
     <nav>
       <a href="/docs" target="_blank" rel="noreferrer">OpenAPI</a>
       <a href="/redoc" target="_blank" rel="noreferrer">ReDoc</a>
-      <a href="/graphics/lower-third.html" target="_blank" rel="noreferrer">HTML5 graphics</a>
     </nav>
     <div id="health" class="pill">…</div>
   </header>
@@ -37,12 +36,12 @@
         <div id="pvw" class="bus">—</div>
       </article>
       <article>
-        <h2>Stinger</h2>
-        <div id="stinger">idle</div>
+        <h2>Engine</h2>
+        <div id="engine">stopped</div>
       </article>
       <article>
-        <h2>Overlay</h2>
-        <div id="overlay">off</div>
+        <h2>DSK 1</h2>
+        <div id="dsk">off</div>
       </article>
     </section>
 
@@ -57,28 +56,10 @@
       <div id="inputs" class="inputs"></div>
     </section>
 
-    <section class="split">
-      <div>
-        <h2>HTML5 overlay</h2>
-        <label>Title <input id="title" value="FLOWXER" /></label>
-        <label>Subtitle <input id="subtitle" value="DMF Vision Mixer" /></label>
-        <label>URL <input id="url" /></label>
-        <div class="actions">
-          <button id="key-on">Key ON</button>
-          <button id="key-off" class="ghost">Key OFF</button>
-        </div>
-      </div>
-      <div>
-        <h2>Replay</h2>
-        <label>Clip
-          <select id="clips"></select>
-        </label>
-        <div class="actions">
-          <button id="load">Load clip</button>
-          <button id="to-replay">Stinger → Replay</button>
-          <button id="to-live" class="ghost">Stinger → Live</button>
-        </div>
-        <p class="muted">TGA sequence <code>replay-wipe</code> covers the cut at its opaque frame.</p>
+    <section>
+      <div class="actions">
+        <button id="key-on">DSK 1 ON</button>
+        <button id="key-off" class="ghost">DSK 1 OFF</button>
       </div>
     </section>
   </main>

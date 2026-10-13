@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 class LibraryKind(str, Enum):
     clip = "clip"
+    # A still image: a clip player shows it as a frame memory.
+    still = "still"
     stinger = "stinger"
 
 
@@ -42,6 +44,8 @@ class ConversionInfo(BaseModel):
     audio_samples: int = 0
     audio_channels: int = 0
     mezz: str | None = None
+    # A clip's sound next to its mezzanine: raw float32, interleaved, exactly the clip's frames.
+    audio: str | None = None
     has_alpha: bool = False
     duration_s: float = 0.0
     error: str | None = None
@@ -77,7 +81,7 @@ class LibraryItem(BaseModel):
     cut_frame: int | None = None
     cut_ms: int | None = None
     has_alpha: bool = False
-    source: Literal["upload", "legacy_clip", "legacy_stinger", "import"] = "upload"
+    source: Literal["upload", "legacy_clip", "legacy_stinger", "import", "grab"] = "upload"
     legacy_path: str | None = None
 
     def conversion_for(self, format_id: str) -> ConversionInfo:

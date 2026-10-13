@@ -1,0 +1,56 @@
+name: Test image
+
+# Test images for a deployment before promotion: push a dev commit to the branch `test-image`
+# (git push --force origin <sha>:test-image). Tags dev-<VERSION> and git-<sha>; never latest or a
+# release version (those come from main.yml only).
+
+on:
+  push:
+    branches: [test-image]
+
+concurrency:
+  group: test-image
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Image prefix
+        id: image
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Build and push mixer
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          cache-from: type=gha,scope=mixer
+          build-args: |
+            FLOWXER_VERSION=dev-${{ steps.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/flowxer-vision-mixer:dev-${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.image.outputs.owner }}/flowxer-vision-mixer:git-${{ github.sha }}
+      - name: Build and push GUI
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gui/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/flowxer-gui:dev-${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.image.outputs.owner }}/flowxer-gui:git-${{ github.sha }}

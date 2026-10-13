@@ -12,10 +12,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from flowxer.engine.formats import format_by_id
 from flowxer.engine.security import SecurityError
 from flowxer.library.convert import ConversionQueue
 from flowxer.library.legacy import import_legacy_clips, import_legacy_stingers
 from flowxer.library.models import (
+    ConversionInfo,
     ConversionStatus,
     ConvertJob,
     ConvertOptions,
@@ -35,6 +37,13 @@ log = logging.getLogger(__name__)
 _LEGACY_DELETED = "_legacy_deleted.json"
 # Import-dir files ingested (or failed) while the dir could not be written: name|size|mtime.
 _IMPORT_SEEN = "_import_seen.json"
+# What the library was seeded with once (an item deleted afterwards is not seeded again).
+_SEEDED = "_seeded.json"
+# The colour bars still (SMPTE RP 219 HD bars, 1920x1080 10-bit 4:2:2, FFV1) that ships with
+# FlowXer; the library converts it like any still.
+COLOUR_BARS = Path(__file__).with_name("colour-bars.mkv")
+# Files of the import dir that become stills (everything else but a ZIP is a clip).
+STILL_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".dpx", ".exr"}
 
 
 def _safe_suffix(name: str) -> str:
@@ -80,8 +89,6 @@ class LibraryService:
         self.queue = ConversionQueue(
             self.store,
             concurrency=settings.convert_concurrency,
-            ram_clip_max_s=settings.ram_clip_max_s,
-            ram_budget_mb=settings.ram_budget_mb,
             on_update=self._job_update,
         )
         # Set by the mixer: the inputs/slots that use an item (derived from the mixer state,
@@ -105,6 +112,7 @@ class LibraryService:
         self._stop.clear()
         self.queue.start()
         self._resume_pending()
+        self._seed_colour_bars()
         # Legacy storage is imported after start: the API must answer (liveness probe) first.
         self._legacy_thread = threading.Thread(target=self._legacy_loop, name="flowxer-legacy-import", daemon=True)
         self._legacy_thread.start()
@@ -129,11 +137,33 @@ class LibraryService:
                 log.exception("library listener failed")
 
     def _resume_pending(self) -> None:
-        """Conversions cut short by a restart are queued again."""
+        """Conversions cut short by a restart are queued again, and a ready item whose files are
+        missing (deleted, or a clip with the ProRes mezzanine of before the engine) is
+        converted again from its original."""
         for item in self.store.list_items():
             status = item.conversion_for(self._format_id).status
             if status in {ConversionStatus.queued, ConversionStatus.converting}:
                 self.queue.enqueue(item.id, self._format_id, low_priority=item.source != "upload")
+            elif status == ConversionStatus.ready and not self.queue.ready_on_disk(item, self._format_id):
+                log.info("library item %s: its %s files are missing, converting it again", item.id, self._format_id)
+                self.queue.enqueue(item.id, self._format_id, low_priority=True)
+            elif item.source == "grab" and not (self.store.item_dir(item.id) / str(item.original.get("path") or "")).is_file():
+                # A grab whose original was not made before the restart.
+                self.queue.enqueue(item.id, self._format_id, low_priority=True)
+
+    def _seed_colour_bars(self) -> None:
+        """The colour bars still, added once (the first start with this library)."""
+        if "colour-bars" in self._remembered(_SEEDED) or not COLOUR_BARS.is_file():
+            return
+        try:
+            item = self.ingest_path(
+                COLOUR_BARS, kind=LibraryKind.still, name="Colour bars", options=ConvertOptions(tags=["bars"])
+            )
+        except Exception:
+            log.exception("cannot add the colour bars to the library")
+            return
+        self._remember(_SEEDED, "colour-bars")
+        log.info("colour bars added to the library as %s", item.id)
 
     def set_format(self, format_id: str, fps: float | None = None) -> list[ConvertJob]:
         """Re-convert all items when the mixer format changes (caller ensures off-air)."""
@@ -142,8 +172,7 @@ class LibraryService:
             self._fps = fps
         jobs: list[ConvertJob] = []
         for item in self.store.list_items():
-            conv = item.conversion_for(format_id)
-            if conv.status == ConversionStatus.ready and self.store.mezz_path(item.id, format_id).is_file():
+            if self.queue.ready_on_disk(item, format_id):
                 continue
             jobs.append(self.queue.enqueue(item.id, format_id))
         return jobs
@@ -228,7 +257,26 @@ class LibraryService:
         item = self.get(item_id)
         if item is None or not item.is_ready(fmt):
             return None
-        path = self.store.mezz_path(item_id, fmt)
+        path = self.store.mezz_path(item_id, fmt, item.kind)
+        return path if path.is_file() else None
+
+    def audio_path(self, item_id: str, format_id: str | None = None) -> Path | None:
+        """A ready clip's or stinger's sound file (raw float32, interleaved); None for a silent
+        stinger."""
+        fmt = format_id or self._format_id
+        item = self.get(item_id)
+        if item is None or item.kind == LibraryKind.still or not item.is_ready(fmt):
+            return None
+        path = self.store.audio_path(item_id, fmt)
+        return path if path.is_file() else None
+
+    def alpha_path(self, item_id: str, format_id: str | None = None) -> Path | None:
+        """A ready stinger's alpha stream; None for an opaque stinger."""
+        fmt = format_id or self._format_id
+        item = self.get(item_id)
+        if item is None or item.kind != LibraryKind.stinger or not item.is_ready(fmt) or not item.conversion_for(fmt).has_alpha:
+            return None
+        path = self.store.alpha_path(item_id, fmt)
         return path if path.is_file() else None
 
     def playback_mode(self, item_id: str, format_id: str | None = None) -> str:
@@ -253,6 +301,49 @@ class LibraryService:
             tmp = path.with_name(f"{name}.tmp")
             tmp.write_text(json.dumps(sorted(values)), encoding="utf-8")
             os.replace(tmp, path)
+
+    # ── frame grabs ──────────────────────────────────────────────────────────
+
+    def grab_target(self, format_id: str) -> tuple[str, Path]:
+        """A new item directory for a frame grab and the file the engine writes: the still's
+        mezzanine of `format_id` (raw v210)."""
+        item_id = new_item_id()
+        self.store.item_dir(item_id).mkdir(parents=True)
+        return item_id, self.store.mezz_path(item_id, format_id, LibraryKind.still)
+
+    def drop_grab(self, item_id: str) -> None:
+        """A grab that failed: its directory goes (no item.json was written)."""
+        shutil.rmtree(self.store.item_dir(item_id), ignore_errors=True)
+
+    def add_grab(self, item_id: str, format_id: str, *, name: str, grab: dict) -> LibraryItem:
+        """A frame grab (written by the engine into grab_target) as a still, ready at once: its v210
+        picture is the mezzanine of `format_id` as it is (no conversion). The lossless original
+        (FFV1 in Matroska) and the thumbnail follow in a background job."""
+        fmt = format_by_id(format_id)
+        picture = self.store.mezz_path(item_id, format_id, LibraryKind.still)
+        now = time.time()
+        item = LibraryItem(
+            id=item_id,
+            kind=LibraryKind.still,
+            name=name,
+            tags=["grab"],
+            created_at=now,
+            updated_at=now,
+            original={
+                "path": "original.mkv",
+                "source_kind": "grab",
+                "format_id": format_id,
+                "width": fmt.width,
+                "height": fmt.height,
+                "grab": grab,
+            },
+            options=ConvertOptions(tags=["grab"]),
+            conversions={format_id: ConversionInfo(status=ConversionStatus.ready, frames=1, mezz=picture.name, playback="ram")},
+            source="grab",
+        )
+        self.store.save(item)
+        self.queue.enqueue(item_id, format_id, low_priority=True)
+        return item
 
     # ── upload / ingest ──────────────────────────────────────────────────────
 
@@ -301,8 +392,9 @@ class LibraryService:
         options: ConvertOptions | None = None,
         move: bool = False,
     ) -> LibraryItem:
-        """Make a library item from a file or TGA folder. Only quick checks run here (a ZIP
-        is unpacked by its conversion job). On any error no item directory is left."""
+        """Make a library item from a file or an image sequence folder (TGA or PNG, a WAV). Only
+        quick checks run here (a ZIP is unpacked by its conversion job). On any error no item
+        directory is left."""
         options = options or ConvertOptions()
         display_name = name or path.name
         zipped = path.is_file() and (
@@ -310,7 +402,7 @@ class LibraryService:
             or (path.suffix.lower() == ".zip" and (kind == LibraryKind.stinger or mode == UploadMode.image_sequence))
         )
         if (zipped or mode != UploadMode.video) and kind != LibraryKind.stinger:
-            raise ValueError("TGA sequences and ZIPs are stingers")
+            raise ValueError("image sequences and ZIPs are stingers")
         item_id = new_item_id()
         directory = self.store.item_dir(item_id)
         directory.mkdir(parents=True)
@@ -357,7 +449,8 @@ class LibraryService:
         return item
 
     def ingest_sequence_dir(self, stage: Path, *, name: str, options: ConvertOptions | None = None) -> LibraryItem:
-        """A TGA folder written by POST /uploads/sequence (moved, not copied)."""
+        """A sequence folder (TGA or PNG frames, a WAV) written by POST /uploads/sequence (moved,
+        not copied)."""
         return self.ingest_path(
             stage,
             kind=LibraryKind.stinger,
@@ -448,7 +541,12 @@ class LibraryService:
 
     def _import_one(self, import_dir: Path, path: Path, remembered: str) -> None:
         zipped = path.suffix.lower() == ".zip"
-        kind = LibraryKind.stinger if zipped else LibraryKind.clip
+        if zipped:
+            kind = LibraryKind.stinger
+        elif path.suffix.lower() in STILL_SUFFIXES:
+            kind = LibraryKind.still
+        else:
+            kind = LibraryKind.clip
         mode = UploadMode.zip if zipped else UploadMode.video
         claimed = import_dir / ".processing" / path.name
         try:

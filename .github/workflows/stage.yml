@@ -100,6 +100,8 @@ jobs:
           context: .
           file: Dockerfile
           push: false
+          # The engine stages (CUDA toolkit, vcpkg, MXL) change rarely.
+          cache-from: type=gha,scope=mixer
           tags: flowxer-vision-mixer:stage
       - name: Build GUI (no push)
         uses: docker/build-push-action@v6

@@ -1,0 +1,8 @@
+{
+  "dependencies": [
+    { "name": "stduuid", "features": ["system-gen", "gsl-span"] },
+    "spdlog",
+    "fmt",
+    "picojson"
+  ]
+}

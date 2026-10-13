@@ -1,14 +1,24 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import { api, type ConsoleState, type LogicalInput, type StingerSlot, type TallyReceiver, type WorkspaceConfig } from "./api";
+import { AudioStrip, useAudioMeters } from "./components/AudioStrip";
 import { LibraryModal } from "./components/LibraryModal";
+import { BoxEditor } from "./components/BoxEditor";
 import { Monitor } from "./components/Monitor";
+import { KeyerControl } from "./components/KeyerControl";
+import { previewSession } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
 import { StatusChip } from "./components/StatusChip";
 import { TallySettingsModal } from "./components/TallySettingsModal";
-import { TransitionBank } from "./components/TransitionBank";
+import { TransitionSection } from "./components/TransitionSection";
+
+/** Frames per second of a frame rate such as "50/1" or "60000/1001". */
+function framesPerSecond(rate: string | undefined): number {
+  const [num, den] = (rate ?? "50/1").split("/").map(Number);
+  return num > 0 ? num / (den > 0 ? den : 1) : 50;
+}
 
 /** Landscape: 2 | 2×2 | 3+3 | 4+4. Portrait: one row so 9:16 tiles stay readable. */
 function sourceStripColumns(count: number, aspect: string = "16:9"): number {
@@ -29,10 +39,32 @@ export default function App() {
   const [libraryKind, setLibraryKind] = useState<"clip" | "stinger" | null>(null);
   const [activePanel, setActivePanel] = useState("me-1");
   const [menu, setMenu] = useState<string | null>(null);
+  // A picture's context menu (GRAB) at the mouse, and the toast that names a new still.
+  const [grabMenu, setGrabMenu] = useState<{ source: string; label: string; x: number; y: number } | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // The AUDIO strip of the active ME, open or closed (remembered in the browser).
+  const [audioOpen, setAudioOpen] = useState(() => {
+    try {
+      return localStorage.getItem("flowxer.audioOpen") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const meters = useAudioMeters(audioOpen);
+  const toggleAudio = () =>
+    setAudioOpen((open) => {
+      try {
+        localStorage.setItem("flowxer.audioOpen", open ? "0" : "1");
+      } catch {
+        // Not remembered.
+      }
+      return !open;
+    });
 
   const refresh = async () => {
     try {
       const next = await api.console();
+      previewSession.setMap(next.preview);
       setSnapshot(next);
       setError(null);
       setActivePanel((current) =>
@@ -53,6 +85,12 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
     void refresh();
     const stinging =
       snapshot?.mixer.stinger.phase === "playing" || snapshot?.mixer.stinger.phase === "cut";
@@ -65,10 +103,33 @@ export default function App() {
   }
 
   const panel = snapshot.panels.find((item) => item.id === activePanel) ?? snapshot.panels[0];
-  const webrtc = snapshot.webrtc.enabled;
+  const format = snapshot.formats.find((item) => item.id === snapshot.workspace.format_id);
+  const fps = framesPerSecond(format?.frame_rate);
+  // The active ME's boxes (upstream keyers with a box), for the box editor over its Program.
+  const boxes = snapshot.keyers.filter(
+    (keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream" && (keyer.mode === "pip" || keyer.dme.enabled),
+  );
+  // A luma key may key any source the ME may take: the inputs and the Programs of higher MEs.
+  const keySources = [
+    ...snapshot.inputs.map((item) => ({ id: item.id, label: item.label })),
+    ...snapshot.panels.slice(snapshot.panels.indexOf(panel) + 1).map((item) => ({ id: item.id, label: item.label })),
+  ];
+  const playable = (snapshot.library ?? []).filter((item) => item.ready && (item.kind === "clip" || item.kind === "still"));
+  const players = snapshot.inputs.filter((item) => item.kind === "clip_player");
+  // A frame grab (the next grain) into the library, optionally into a clip player (frame memory).
+  const grab = (source: string, player?: string) =>
+    void command(async () => {
+      const item = await api.grab(source, player);
+      const into = players.find((entry) => entry.id === player);
+      setNotice(`${item.name}${into ? ` → ${into.label}` : ""}`);
+    });
+  const openGrab = (source: string, label: string) => (event: MouseEvent) => {
+    event.preventDefault();
+    setGrabMenu({ source, label, x: event.clientX, y: event.clientY });
+  };
 
   return (
-    <div className="console">
+    <div className={`console ${audioOpen && snapshot.audio ? "with-audio" : ""}`}>
       <header className="menu-bar">
         <div className="brand">
           <span className="mark">FX</span>
@@ -96,7 +157,7 @@ export default function App() {
                           setMenu(null);
                         }}
                       >
-                        Clip library…
+                        Clip and still library…
                       </button>
                       <button
                         onClick={() => {
@@ -169,32 +230,46 @@ export default function App() {
           <div className="bus-column">
             <h2>Preview</h2>
             <Monitor
-              streamId={`panel:${panel.id}:pvw`}
-              webrtc={webrtc}
+              tileId={`panel:${panel.id}:pvw`}
               label={panel.preview_input_id ?? "NO SRC"}
               tally="pvw"
+              onMenu={openGrab(`${panel.id}:pvw`, `${panel.label} PVW`)}
             />
           </div>
           <div className="bus-column">
             <h2>Program</h2>
             <Monitor
-              streamId={`panel:${panel.id}:pgm`}
-              webrtc={webrtc}
+              tileId={`panel:${panel.id}:pgm`}
               label={panel.program_input_id ?? "NO SRC"}
               tally="pgm"
-            />
+              onMenu={openGrab(panel.id, `${panel.label} PGM`)}
+            >
+              {boxes.length > 0 && format ? (
+                <BoxEditor
+                  keyers={boxes}
+                  width={format.width}
+                  height={format.height}
+                  onDone={() => void refresh()}
+                  onError={setError}
+                />
+              ) : null}
+            </Monitor>
           </div>
         </div>
         <div className="aux-row">
-          {snapshot.keyers.map((keyer) => (
-            <button
-              key={keyer.id}
-              className={keyer.enabled ? "on" : ""}
-              onClick={() => void api.patchKeyer(keyer.id, { enabled: !keyer.enabled }).then(refresh)}
-            >
-              {keyer.label} {keyer.enabled ? "ON" : "OFF"}
-            </button>
-          ))}
+          {/* The active ME's upstream keyers, then its DSKs (keys show on its Program only). */}
+          {snapshot.keyers
+            .filter((keyer) => keyer.panel_id === panel.id)
+            .map((keyer) => (
+              <KeyerControl
+                key={keyer.id}
+                keyer={keyer}
+                keyState={snapshot.sources?.[keyer.id]?.state}
+                sources={keySources}
+                fps={fps}
+                onCommand={(fn) => void command(fn)}
+              />
+            ))}
           {snapshot.stinger_slots.map((slot) => (
             <div key={slot.id} className="stinger-chip">
               <button
@@ -202,7 +277,7 @@ export default function App() {
                 onClick={() => {
                   const target = panel.preview_input_id;
                   if (!target) return;
-                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "replay"
+                  const direction = snapshot.inputs.find((item) => item.id === target)?.kind === "clip_player"
                     ? "to_replay"
                     : "to_live";
                   void command(() =>
@@ -220,6 +295,11 @@ export default function App() {
               </button>
             </div>
           ))}
+          {snapshot.audio ? (
+            <button className={`audio-toggle ${audioOpen ? "on" : ""}`} title="The active ME's audio strip" onClick={toggleAudio}>
+              AUDIO
+            </button>
+          ) : null}
         </div>
       </section>
 
@@ -239,23 +319,70 @@ export default function App() {
               key={input.id}
               input={input}
               panel={panel}
-              webrtc={webrtc}
+              runtime={snapshot.sources?.[input.id]}
+              library={playable}
+              fps={fps}
               onPreview={() => void command(() => api.preview(input.id, panel.id))}
               onProgram={() => void command(() => api.take(input.id, panel.id))}
               onSettings={() => setSourceEdit(input)}
+              onPlayer={(fn) => void command(fn)}
+              onGrab={openGrab(input.id, input.label)}
             />
           ))}
         </div>
-        <TransitionBank
+        <TransitionSection
           panel={panel}
-          stingerPhase={snapshot.mixer.stinger.phase}
+          keyers={snapshot.keyers.filter((keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream")}
+          stingerSlots={snapshot.stinger_slots}
+          fps={fps}
+          onPosition={(position) => void api.position(panel.id, position).catch((err: Error) => setError(err.message))}
+          onChange={(patch) => void command(() => api.transition(panel.id, patch))}
           onCut={() => void command(() => api.cut(panel.id))}
-          onFade={() => void command(() => api.fade(panel.id))}
+          onAuto={() => void command(() => api.auto(panel.id))}
           onFadeToBlack={() => void command(() => api.fadeToBlack(panel.id))}
-          onWipe={() => void command(() => api.wipe(panel.id))}
+          onGrab={() => grab(panel.id)}
         />
       </section>
 
+      {audioOpen && snapshot.audio ? (
+        <section className="audio-section">
+          <AudioStrip panelId={panel.id} audio={snapshot.audio} meters={meters} onChanged={() => void refresh()} onError={setError} />
+        </section>
+      ) : null}
+
+      {grabMenu ? (
+        <>
+          <div className="grab-menu-backdrop" onClick={() => setGrabMenu(null)} onContextMenu={(event) => {
+            event.preventDefault();
+            setGrabMenu(null);
+          }} />
+          <div className="grab-menu" role="menu" style={{ left: grabMenu.x, top: grabMenu.y }}>
+            <div className="title">{grabMenu.label}</div>
+            <button
+              role="menuitem"
+              onClick={() => {
+                grab(grabMenu.source);
+                setGrabMenu(null);
+              }}
+            >
+              Grab still
+            </button>
+            {players.map((player) => (
+              <button
+                key={player.id}
+                role="menuitem"
+                onClick={() => {
+                  grab(grabMenu.source, player.id);
+                  setGrabMenu(null);
+                }}
+              >
+                Grab to {player.label}
+              </button>
+            ))}
+          </div>
+        </>
+      ) : null}
+      {notice ? <div className="toast notice">{notice}</div> : null}
       {error ? <div className="toast">{error}</div> : null}
 
       {settingsOpen ? (
@@ -280,8 +407,12 @@ export default function App() {
       {sourceEdit ? (
         <SourceSettingsModal
           input={sourceEdit}
-          clips={snapshot.clips}
-          libraryClips={(snapshot.library ?? []).filter((item) => item.kind === "clip")}
+          audio={snapshot.audio}
+          fps={fps}
+          onAudio={async (payload) => {
+            await api.patchAudioInput(sourceEdit.id, payload);
+          }}
+          libraryItems={playable}
           stingerSlots={snapshot.stinger_slots}
           pinnedBy={snapshot.pinned?.logical_source_count}
           onClose={() => setSourceEdit(null)}

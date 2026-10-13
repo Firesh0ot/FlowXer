@@ -9,3 +9,4 @@ storage/stingers/**
 !storage/clips/.gitkeep
 !storage/stingers/.gitkeep
 data
+engine/build

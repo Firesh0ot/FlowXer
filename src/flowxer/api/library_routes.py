@@ -11,20 +11,21 @@ from starlette.concurrency import run_in_threadpool
 from flowxer.api.schemas import (
     ConvertJobOut,
     ConvertOptionsIn,
+    GrabRequest,
     LibraryItemOut,
     LibraryItemPatch,
     ReconvertRequest,
     UploadInitRequest,
     UploadInitResponse,
 )
-from flowxer.engine.mixer import VisionMixer
+from flowxer.engine.mixer import MixerError, VisionMixer
 from flowxer.library.models import ConvertOptions, FitMode, FpsMode, LibraryKind, UploadMode
 from flowxer.library.multipart import receive_files
 from flowxer.library.uploads import UploadBusy, UploadError, UploadNoSpace, UploadTooLarge
 
 router = APIRouter(tags=["library"])
 
-# Frames of one TGA folder upload.
+# Files of one sequence folder upload (frames and a WAV).
 MAX_SEQUENCE_FILES = 10_000
 
 
@@ -84,8 +85,25 @@ def list_library(
         try:
             parsed = LibraryKind(kind)
         except ValueError as exc:
-            raise HTTPException(422, detail="kind must be clip or stinger") from exc
+            raise HTTPException(422, detail="kind must be clip, still or stinger") from exc
     return [_item_out(mixer, item) for item in mixer.library.list_items(kind=parsed, query=q)]
+
+
+@router.post(
+    "/library/grab",
+    response_model=LibraryItemOut,
+    summary=(
+        "Frame grab: the next grain of an input, a clip player, or an ME's Program or Preview as a still "
+        "(production raster, no conversion), optionally loaded into a clip player"
+    ),
+)
+def grab_still(payload: GrabRequest, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
+    try:
+        item = mixer.grab(payload.source, player=payload.player, name=payload.name)
+    except MixerError as exc:
+        code = status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT
+        raise HTTPException(code, detail=str(exc)) from exc
+    return _item_out(mixer, item)
 
 
 @router.get(
@@ -269,7 +287,7 @@ def upload_complete(upload_id: str, mixer: VisionMixer = Depends(get_mixer)) -> 
     "/uploads/sequence",
     response_model=LibraryItemOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Upload a TGA folder (multipart: name, sequence_fps, cut_frame, fit, files) as a stinger",
+    summary="Upload a sequence folder (multipart: name, sequence_fps, cut_frame, fit, files: TGA or PNG frames and a WAV) as a stinger",
 )
 async def upload_sequence(request: Request, mixer: VisionMixer = Depends(get_mixer)) -> LibraryItemOut:
     library = mixer.library
@@ -282,10 +300,10 @@ async def upload_sequence(request: Request, mixer: VisionMixer = Depends(get_mix
             stage,
             max_bytes=library.uploads.upload_limit_bytes,
             max_files=MAX_SEQUENCE_FILES,
-            keep=lambda name: name.lower().endswith(".tga"),
+            keep=lambda name: name.lower().endswith((".tga", ".png", ".wav")),
         )
         if not files:
-            raise UploadError("no .tga files in the upload")
+            raise UploadError("no .tga or .png files in the upload")
         fit = fields.get("fit", "fit")
         options = ConvertOptions(
             fit=FitMode(fit) if fit in FitMode._value2member_map_ else FitMode.fit,

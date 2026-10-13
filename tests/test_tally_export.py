@@ -36,9 +36,15 @@ def lit(mixer: VisionMixer, screen: int = 1, now: float | None = None) -> tuple[
     snapshot = mixer._tally_snapshot()
     indexes: dict[str, int] = {}
     assign_indexes(indexes, snapshot)
+    me = snapshot.mes[screen - 1]
     ids = {index: input_id for input_id, index in indexes.items()}
-    messages = me_messages(snapshot, snapshot.mes[screen - 1], indexes, time.monotonic() if now is None else now)
-    assert [message.text for message in messages] == [item.label for item in mixer.list_inputs()]
+    ids.update({index: source_id for source_id, _label, index in me.reentry})
+    ids.update({index: str(index) for index, _label, _on in me.keys})
+    messages = me_messages(snapshot, me, indexes, time.monotonic() if now is None else now)
+    # Every input, the Programs of the higher MEs this ME can take (re-entry), the linear keys.
+    assert [message.text for message in messages] == (
+        [item.label for item in mixer.list_inputs()] + [label for _id, label, _index in me.reentry] + [label for _i, label, _on in me.keys]
+    )
     assert all(message.txt == TALLY_OFF and message.brightness == 3 for message in messages)
     assert {message.lh for message in messages} <= {TALLY_OFF, TALLY_RED}
     assert {message.rh for message in messages} <= {TALLY_OFF, TALLY_GREEN}
@@ -64,13 +70,51 @@ def test_program_lh_red_preview_rh_green(mixer: VisionMixer) -> None:
     assert lit(mixer) == (set(), set())
 
 
-def test_keyer_and_stinger_media_light_nothing(mixer: VisionMixer) -> None:
-    # The downstream keyers are HTML (CEF) graphics; no key takes its fill from an input.
+def test_keys_light_their_key_inputs_and_luma_sources(mixer: VisionMixer) -> None:
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # Each linear keyer's key input is an INDEX of its own: 2000/3000 + 100·n + k.
+    keys = mixer._tally_snapshot().mes[1].keys
+    assert keys == ((2201, "ME 2 Key 1", False), (2202, "ME 2 Key 2", False), (3201, "ME 2 DSK 1 Key", False))
+    assert mixer._tally_snapshot().mes[0].keys[2] == (3101, "DSK 1 Key", False)
+    # DSK 1 on: its key input red (LH only), the buses as before.
     mixer.update_keyer("dsk-1", enabled=True)
-    mixer.set_overlay(enabled=True)
-    assert lit(mixer) == ({"cam-1"}, {"cam-2"})
+    assert lit(mixer) == ({"cam-1", "3101"}, {"cam-2"})
+    # A luma key of cam-3 on ME 1's upstream keyer 1: cam-3 red while it is on air.
+    mixer.update_keyer("me-1-key-1", mode="luma", source_id="cam-3")
+    assert lit(mixer) == ({"cam-1", "3101"}, {"cam-2"})
+    mixer.keyer_auto("me-1-key-1")
+    assert lit(mixer) == ({"cam-1", "3101", "cam-3"}, {"cam-2"})
+    # A luma key of ME 2's Program lights its re-entry INDEX 1002.
+    mixer.update_keyer("me-1-key-1", source_id="me-2")
+    assert lit(mixer)[0] == {"cam-1", "3101", "me-2"}
+    # A pip lights its source like a luma key (LH, while on air); a linear box keeps its key INDEX.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4")
+    assert lit(mixer)[0] == {"cam-1", "3101", "cam-4"}
+    mixer.update_keyer("me-1-key-1", enabled=False)
+    assert lit(mixer)[0] == {"cam-1", "3101"}
+    mixer.update_keyer("me-1-key-2", dme={"enabled": True}, enabled=True)
+    assert lit(mixer)[0] == {"cam-1", "3101", "2102"}
     assert len(mixer._tally_snapshot().inputs) == len(mixer.inputs)
+
+def test_a_key_stays_on_air_while_it_fades_or_flies_off(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # A pip that flies (2 keyframes, 50 frames: 1 s): its source stays lit until the fly off ends.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4", fly=True)
+    mixer.set_keyframes("me-1-key-1", [{"x": -0.3}, {"x": 0.5, "frames": 50}])
+    mixer.keyer_auto("me-1-key-1")
+    assert "cam-4" in lit(mixer)[0]
+    mixer.keyer_auto("me-1-key-1")
+    assert not mixer.get_keyer("me-1-key-1").enabled and "cam-4" in lit(mixer)[0]
+    assert 0.9 < mixer._key_until["me-1-key-1"] - time.monotonic() <= 1.0
+    mixer._key_until["me-1-key-1"] = time.monotonic() - 0.01
+    assert "cam-4" not in lit(mixer)[0]
+    # A linear key fading off keeps its INDEX lit for its rate; a cut ends it at once.
+    mixer.update_keyer("dsk-1", enabled=True)
+    mixer.keyer_auto("dsk-1")
+    assert "3101" in lit(mixer)[0]
+    mixer.update_keyer("dsk-1", enabled=False)
+    assert "3101" not in lit(mixer)[0]
 
 
 def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
@@ -82,23 +126,21 @@ def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
     assert lit(mixer)[0] == {"cam-2", "cam-3"}
     mixer.cut()
     assert lit(mixer) == ({"cam-1"}, {"cam-3"})
+    # Fade to Black lights nothing new: the buses stay.
     mixer.fade_to_black(duration_ms=600)
-    assert lit(mixer)[0] == {"cam-1", "black"}
-    assert lit(mixer, now=time.monotonic() + 0.7)[0] == {"black"}
+    assert lit(mixer) == ({"cam-1"}, {"cam-3"})
 
 
-def test_stinger_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
+def test_reentry_is_index_1000_plus_the_me(mixer: VisionMixer) -> None:
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=3))
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
-    mixer.set_wipe(armed=True)
+    snapshot = mixer._tally_snapshot()
+    assert snapshot.mes[0].reentry == (("me-2", "ME 2", 1002), ("me-3", "ME 3", 1003))
+    assert snapshot.mes[1].reentry == (("me-3", "ME 3", 1003),)
+    assert snapshot.mes[2].reentry == ()
+    mixer.set_preview("me-3")
     mixer.cut()
-    frames = 0
-    while mixer.stinger_player is not None:
-        assert lit(mixer)[0] == {"cam-1", "cam-2"}
-        mixer.advance_stinger(1)
-        frames += 1
-    assert frames > 1
-    assert lit(mixer) == ({"cam-2"}, {"cam-1"})
-
+    assert lit(mixer) == ({"me-3"}, {"cam-1"})
 
 def test_each_me_is_its_own_screen(mixer: VisionMixer) -> None:
     mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
@@ -120,14 +162,15 @@ def test_indexes_stay_when_an_input_is_removed(mixer: VisionMixer) -> None:
     assert indexes == {item.id: item.slot for item in mixer.list_inputs()}
     assert indexes["cam-4"] == 3
     mixer.delete_input("cam-3")
-    mixer.register_input(LogicalInputCreate(id="clip-1", label="Clip 1", kind=InputKind.test))
+    mixer.register_input(LogicalInputCreate(id="clip-2", label="Clip 2", kind=InputKind.clip_player))
     snapshot = mixer._tally_snapshot()
     assign_indexes(indexes, snapshot)
     assert mixer.get_input("cam-4").slot == 2
     assert indexes["cam-4"] == 3
-    assert indexes["clip-1"] == 8
+    assert indexes["clip-2"] == 8
     messages = me_messages(snapshot, snapshot.mes[0], indexes, time.monotonic())
-    assert [message.index for message in messages] == [0, 1, 3, 4, 5, 6, 7, 8]
+    # Slot order (live, clip players, Black); the numbers stay with their inputs.
+    assert [message.index for message in messages] == [0, 1, 3, 4, 5, 6, 8, 7]
 
 
 # Encoder: byte vectors from the platform's reference codec (mxl-poc-platform, tally
@@ -230,16 +273,16 @@ def test_export_over_udp(settings: Settings, monkeypatch: pytest.MonkeyPatch) ->
     settings.tally_tsl = f"udp://127.0.0.1:{receiver.getsockname()[1]}"
     mixer = VisionMixer(settings)
     try:
-        # Every ME, every input (designer order), all off before Program starts.
-        for screen in (1, 2):
+        # Every ME, every input (designer order) and the re-entry of the higher MEs, all off before
+        # Program starts.
+        for screen, extra in ((1, [(1002, "ME 2", TALLY_OFF, TALLY_OFF)]), (2, [])):
             _, decoded = _receive(receiver, screen)
             assert decoded["flags"] == FLAG_UTF16
             assert [(item["index"], item["text"], item["lh"], item["rh"]) for item in decoded["messages"]] == [
                 (0, "Kamera Süd", TALLY_OFF, TALLY_OFF),
                 (1, "Cam 2", TALLY_OFF, TALLY_OFF),
                 (2, "Black", TALLY_OFF, TALLY_OFF),
-                (3, "Replay", TALLY_OFF, TALLY_OFF),
-            ]
+            ] + extra
         mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
         _receive(receiver, 1, lambda lamps: lamps["Kamera Süd"] == (TALLY_RED, TALLY_OFF) and lamps["Cam 2"] == (TALLY_OFF, TALLY_GREEN))
 

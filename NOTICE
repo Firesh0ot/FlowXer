@@ -15,27 +15,31 @@ Third-party components
 ======================
 
 Apache-2.0
-  Media eXchange Layer (MXL) v1.1.0 — https://github.com/dmf-mxl/mxl
-    Built into the mixer image (libmxl, mxlsrc, mxlsink).
+  Media eXchange Layer (MXL) — https://github.com/dmf-mxl/mxl
+    Built into the mixer image (libmxl, used by the media engine).
   FastAPI, Starlette, Pydantic, Uvicorn
+  The media engine (engine/) adapts parts of mxl-multiviewer
+  (https://github.com/LeeO86/mxl-multiviewer, Apache-2.0); see engine/NOTICE.
 
 MIT
   React, React DOM, Vite (operator GUI)
+  MediaMTX — https://github.com/bluenviron/mediamtx (bundled in the mixer image)
+  mxl-webrtc-monitor — https://github.com/LeeO86/mxl-webrtc-monitor
+    Copyright (c) 2026 Adrian Hilber (MIT): the engine's MediaMTX and NVENC settings.
   Concepts and conversion/loop-conform semantics adapted from
   mxl-test-player — https://github.com/LeeO86/mxl-test-player
   Copyright (c) 2026 Adrian Hilber (MIT). FlowXer reimplements the
-  ideas in Python/GStreamer; no C++ sources were copied.
+  ideas; no C++ sources were copied.
 
-BSD
-  Chromium Embedded Framework (CEF), bundled with gstcefsrc in the mixer image
+LGPL-2.1+ / GPL-2.0+
+  FFmpeg / libav via the Ubuntu ffmpeg packages (mixer image). Ubuntu builds them with
+  GPL parts such as libx264 and libx265; the media library runs those through the
+  separate ffmpeg program (the x265 fallback of the clip conversion).
 
-LGPL-2.1+
-  GStreamer and gst-plugins-base / gst-plugins-good (runtime in the mixer image)
-  gstcefsrc — https://github.com/centricular/gstcefsrc
-  FFmpeg / libav via Ubuntu packages ffmpeg and gstreamer1.0-libav
+NVIDIA CUDA EULA
+  The CUDA runtime, linked statically into the media engine
 
-Other / mixed
-  gst-plugins-bad — mixed licenses; see the Ubuntu package copyright files
+Other
   nginx (gui image) — 2-clause BSD
 
 Source for the packaged libraries is available from the Ubuntu archive and from

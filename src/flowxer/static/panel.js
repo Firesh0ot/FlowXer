@@ -11,22 +11,15 @@ const api = (path, options = {}) =>
 const $ = (id) => document.getElementById(id);
 
 async function refresh() {
-  const [health, mixer, inputs, clips, config] = await Promise.all([
-    api("/health"),
-    api("/mixer"),
-    api("/inputs"),
-    api("/storage/clips"),
-    api("/config"),
-  ]);
+  const [health, mixer, inputs] = await Promise.all([api("/health"), api("/mixer"), api("/inputs")]);
   $("health").textContent = `${health.status} · ${mixer.backend} · ${mixer.video_format}`;
   $("pgm").textContent = mixer.program_input_id || "idle";
   $("pvw").textContent = mixer.preview_input_id || "—";
   $("bus").textContent = mixer.program_bus || "";
-  $("stinger").textContent = mixer.stinger.phase === "idle"
-    ? "idle"
-    : `${mixer.stinger.id} ${mixer.stinger.phase} ${mixer.stinger.frame}/${mixer.stinger.frame_count}`;
-  $("overlay").textContent = mixer.overlay.enabled ? `KEY ON · ${mixer.overlay.renderer}` : "KEY OFF";
-  if (!$("url").value) $("url").value = mixer.overlay.url || config.overlay_url;
+  const engine = mixer.engine || {};
+  $("engine").textContent = engine.fps != null ? `${engine.state} · ${engine.fps} fps · L ${engine.latency_grains}` : engine.state || "stopped";
+  const dsk = (mixer.keyers || [])[0];
+  $("dsk").textContent = dsk ? (dsk.enabled ? "ON" : "OFF") : "none";
 
   $("inputs").innerHTML = inputs
     .map((input) => {
@@ -46,41 +39,14 @@ async function refresh() {
       body: JSON.stringify({ input_id: button.dataset.id, transition: "cut" }),
     }).then(refresh).catch(alert);
   });
-
-  const selected = $("clips").value;
-  $("clips").innerHTML = clips.length
-    ? clips.map((clip) => `<option value="${clip.name}">${clip.name}</option>`).join("")
-    : `<option value="">No clips in storage/clips</option>`;
-  if (selected) $("clips").value = selected;
 }
 
 $("start").onclick = () => api("/mixer/start", { method: "POST", body: "{}" }).then(refresh).catch(alert);
 $("stop").onclick = () => api("/mixer/stop", { method: "POST" }).then(refresh).catch(alert);
-$("key-on").onclick = () => api("/overlay", {
-  method: "POST",
-  body: JSON.stringify({
-    enabled: true,
-    title: $("title").value,
-    subtitle: $("subtitle").value,
-    url: $("url").value,
-  }),
-}).then(refresh).catch(alert);
-$("key-off").onclick = () => api("/overlay", {
-  method: "POST",
-  body: JSON.stringify({ enabled: false }),
-}).then(refresh).catch(alert);
-$("load").onclick = () => api("/replay/load", {
-  method: "POST",
-  body: JSON.stringify({ file_path: $("clips").value, input_id: "replay" }),
-}).then(refresh).catch(alert);
-$("to-replay").onclick = () => api("/replay/take", {
-  method: "POST",
-  body: JSON.stringify({ stinger_id: "replay-wipe" }),
-}).then(refresh).catch(alert);
-$("to-live").onclick = () => api("/replay/return", {
-  method: "POST",
-  body: JSON.stringify({ stinger_id: "replay-wipe" }),
-}).then(refresh).catch(alert);
+const dsk = (enabled) =>
+  api("/keyers/dsk-1", { method: "PATCH", body: JSON.stringify({ enabled }) }).then(refresh).catch(alert);
+$("key-on").onclick = () => dsk(true);
+$("key-off").onclick = () => dsk(false);
 
 refresh().catch((error) => {
   $("health").textContent = error.message;

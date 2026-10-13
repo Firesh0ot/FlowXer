@@ -1,0 +1,162 @@
+// Pixel maths shared by the CUDA kernels and the CPU reference (unit tests).
+// The v210 group layout follows mxl-multiviewer src/media/v210.cpp (Apache-2.0, same author).
+#pragma once
+
+#include <cstdint>
+
+#if defined(__CUDACC__)
+#define FXENG_HD __host__ __device__
+#else
+#define FXENG_HD
+#endif
+
+namespace fxeng
+{
+// Bytes per v210 line: 48 pixels in 128 bytes, lines padded to whole 128-byte blocks.
+FXENG_HD constexpr int v210RowBytes(int width)
+{
+    return ((width + 47) / 48) * 128;
+}
+
+// Bytes per line of the key plane of v210a (after the fill): three 10-bit samples per 32-bit
+// little-endian word (bits 0-9, 10-19, 20-29), lines padded to whole words (MXL Architecture.md).
+FXENG_HD constexpr int keyPlaneRowBytes(int width)
+{
+    return ((width + 2) / 3) * 4;
+}
+
+FXENG_HD inline std::uint16_t clamp10(float v)
+{
+    if (v < 0.f)
+    {
+        v = 0.f;
+    }
+    if (v > 1023.f)
+    {
+        v = 1023.f;
+    }
+    return static_cast<std::uint16_t>(v + 0.5f);
+}
+
+// One v210 group: 4 little-endian words hold 6 Y, 3 Cb and 3 Cr samples.
+FXENG_HD inline void unpackGroup(std::uint32_t const w[4], std::uint16_t y[6], std::uint16_t cb[3], std::uint16_t cr[3])
+{
+    cb[0] = static_cast<std::uint16_t>(w[0] & 0x3ffu);
+    y[0] = static_cast<std::uint16_t>((w[0] >> 10) & 0x3ffu);
+    cr[0] = static_cast<std::uint16_t>((w[0] >> 20) & 0x3ffu);
+    y[1] = static_cast<std::uint16_t>(w[1] & 0x3ffu);
+    cb[1] = static_cast<std::uint16_t>((w[1] >> 10) & 0x3ffu);
+    y[2] = static_cast<std::uint16_t>((w[1] >> 20) & 0x3ffu);
+    cr[1] = static_cast<std::uint16_t>(w[2] & 0x3ffu);
+    y[3] = static_cast<std::uint16_t>((w[2] >> 10) & 0x3ffu);
+    cb[2] = static_cast<std::uint16_t>((w[2] >> 20) & 0x3ffu);
+    y[4] = static_cast<std::uint16_t>(w[3] & 0x3ffu);
+    cr[2] = static_cast<std::uint16_t>((w[3] >> 10) & 0x3ffu);
+    y[5] = static_cast<std::uint16_t>((w[3] >> 20) & 0x3ffu);
+}
+
+FXENG_HD inline void packGroup(std::uint16_t const y[6], std::uint16_t const cb[3], std::uint16_t const cr[3], std::uint32_t w[4])
+{
+    w[0] = (cb[0] & 0x3ffu) | (static_cast<std::uint32_t>(y[0] & 0x3ffu) << 10) | (static_cast<std::uint32_t>(cr[0] & 0x3ffu) << 20);
+    w[1] = (y[1] & 0x3ffu) | (static_cast<std::uint32_t>(cb[1] & 0x3ffu) << 10) | (static_cast<std::uint32_t>(y[2] & 0x3ffu) << 20);
+    w[2] = (cr[1] & 0x3ffu) | (static_cast<std::uint32_t>(y[3] & 0x3ffu) << 10) | (static_cast<std::uint32_t>(cb[2] & 0x3ffu) << 20);
+    w[3] = (y[4] & 0x3ffu) | (static_cast<std::uint32_t>(cr[2] & 0x3ffu) << 10) | (static_cast<std::uint32_t>(y[5] & 0x3ffu) << 20);
+}
+
+// One sample read in place from a packed v210 line (x in pixels for luma, in chroma pairs for Cb
+// and Cr).
+FXENG_HD inline unsigned v210Luma(std::uint32_t const* words, int x)
+{
+    int const i = x % 6;
+    int const word = (x / 6) * 4 + (i == 0 ? 0 : i <= 2 ? 1 : i == 3 ? 2 : 3);
+    int const shift = (i == 1 || i == 4) ? 0 : (i == 0 || i == 3) ? 10 : 20;
+    return (words[word] >> shift) & 0x3ffu;
+}
+
+FXENG_HD inline unsigned v210Cb(std::uint32_t const* words, int cx)
+{
+    int const j = cx % 3;
+    return (words[(cx / 3) * 4 + j] >> (j * 10)) & 0x3ffu;
+}
+
+FXENG_HD inline unsigned v210Cr(std::uint32_t const* words, int cx)
+{
+    int const j = cx % 3;
+    int const word = (cx / 3) * 4 + (j == 0 ? 0 : j + 1);
+    int const shift = j == 0 ? 20 : j == 1 ? 0 : 10;
+    return (words[word] >> shift) & 0x3ffu;
+}
+
+// Dissolve of one 10-bit sample: t = 0 gives a, t = 1 gives b.
+FXENG_HD inline std::uint16_t mix10(std::uint16_t a, std::uint16_t b, float t)
+{
+    float const fa = static_cast<float>(a);
+    return clamp10(fa + (static_cast<float>(b) - fa) * t);
+}
+
+// The 10-bit key of pixel x on a v210a key line.
+FXENG_HD inline unsigned keyAt(std::uint8_t const* keyLine, int x)
+{
+    std::uint32_t const word = reinterpret_cast<std::uint32_t const*>(keyLine)[x / 3];
+    return (word >> ((x % 3) * 10)) & 0x3ffu;
+}
+
+// A linear key's alpha: the key (0..1023, full range) times the keyer's gain. The keyed
+// sample is mix10(background, fill, alpha) (straight fill); chroma takes the mean alpha of its
+// pixel pair.
+FXENG_HD inline float keyAlpha(unsigned key, float gain)
+{
+    return static_cast<float>(key) * (gain / 1023.f);
+}
+
+FXENG_HD inline float clamp01(float v)
+{
+    return v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+}
+
+// A luma key's alpha from a 10-bit Y: clamp(((Y − 64) / 876 − clip) / soft) (with no softness:
+// 1 above the clip, else 0), inverted, times the gain. The keyed sample is mix10(background,
+// source, alpha); chroma takes the mean alpha of its pixel pair.
+FXENG_HD inline float lumaAlpha(unsigned y, float clip, float soft, bool invert, float gain)
+{
+    float const v = (static_cast<float>(y) - 64.f) / 876.f - clip;
+    float a = soft > 0.f ? clamp01(v / soft) : (v > 0.f ? 1.f : 0.f);
+    if (invert)
+    {
+        a = 1.f - a;
+    }
+    return a * gain;
+}
+
+// BT.709 limited range, 10-bit Y'CbCr <-> non-linear R'G'B' in 0..1. Values outside
+// 0..1 (sub-black, super-white, out-of-gamut test patterns) are kept, not clipped.
+struct Rgb
+{
+    float r;
+    float g;
+    float b;
+};
+
+FXENG_HD inline Rgb ycbcrToRgb(std::uint16_t y, std::uint16_t cb, std::uint16_t cr)
+{
+    float const yn = (static_cast<float>(y) - 64.f) / 876.f;
+    float const pb = (static_cast<float>(cb) - 512.f) / 896.f;
+    float const pr = (static_cast<float>(cr) - 512.f) / 896.f;
+    return Rgb{yn + 1.5748f * pr, yn - 0.187324f * pb - 0.468124f * pr, yn + 1.8556f * pb};
+}
+
+FXENG_HD inline void rgbToYcbcr(Rgb c, std::uint16_t& y, std::uint16_t& cb, std::uint16_t& cr)
+{
+    float const yn = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+    y = clamp10(64.f + 876.f * yn);
+    cb = clamp10(512.f + 896.f * (c.b - yn) / 1.8556f);
+    cr = clamp10(512.f + 896.f * (c.r - yn) / 1.5748f);
+}
+
+// 10-bit video level to 8-bit (NV12 preview).
+FXENG_HD inline std::uint8_t to8(std::uint32_t v10)
+{
+    std::uint32_t const v = (v10 + 2u) >> 2;
+    return static_cast<std::uint8_t>(v > 255u ? 255u : v);
+}
+} // namespace fxeng

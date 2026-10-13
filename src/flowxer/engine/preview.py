@@ -1,191 +1,67 @@
+"""The operator previews: one mosaic stream from the engine (NVENC once, MediaMTX, WHEP/HLS).
+
+Every picture of the console (the sources, each ME's Program and Preview) is a tile of that
+one stream; the GUI crops each tile out of the same <video> stream. GET /api/v1/preview says
+where the stream is and where each picture is in it, with FlowXer's ids.
+"""
+
 from __future__ import annotations
 
-import io
-from collections import OrderedDict
-
-from PIL import Image, ImageDraw, ImageFont
-
-from flowxer.api.schemas import InputKind
-from flowxer.engine.formats import SOURCE_COLORS
-from flowxer.engine.pipeline import MONITOR_PREFIX, MONITOR_PROGRAM
-
-_FRAME_CACHE: OrderedDict[str, Image.Image] = OrderedDict()
-_CACHE_LIMIT = 48
-
-SMPTE_BARS = (
-    (192, 192, 192),
-    (192, 192, 0),
-    (0, 192, 192),
-    (0, 192, 0),
-    (192, 0, 192),
-    (192, 0, 0),
-    (0, 0, 192),
-)
+from typing import Any
 
 
-def _font(size: int) -> ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size)
-    except OSError:
-        return ImageFont.load_default()
+def _join(base: str, path: str, tail: str) -> str:
+    return f"{base.rstrip('/')}/{path.strip('/')}/{tail}"
 
 
-def _color_for(name: str) -> tuple[int, int, int]:
-    acc = sum(ord(ch) for ch in name)
-    return SOURCE_COLORS[acc % len(SOURCE_COLORS)]
-
-
-def _cache_get(key: str, factory) -> Image.Image:
-    hit = _FRAME_CACHE.get(key)
-    if hit is not None:
-        _FRAME_CACHE.move_to_end(key)
-        return hit
-    image = factory()
-    _FRAME_CACHE[key] = image
-    while len(_FRAME_CACHE) > _CACHE_LIMIT:
-        _FRAME_CACHE.popitem(last=False)
-    return image
-
-
-def _is_black_source(source) -> bool:
-    if source is None:
-        return False
-    if source.kind == InputKind.black:
-        return True
-    if source.kind in {InputKind.file, InputKind.replay}:
-        path = source.file_path or ""
-        return path in {"", "_unassigned"} or path.endswith("_unassigned")
-    return False
-
-
-def _paint_label(draw: ImageDraw.ImageDraw, width: int, height: int, title: str, meta: str) -> None:
-    title_font = _font(max(22, height // 10))
-    meta_font = _font(max(14, height // 18))
-    draw.text((16, height // 2 - 28), title, fill=(255, 255, 255), font=title_font)
-    if meta:
-        draw.text((16, height // 2 + 16), meta, fill=(220, 230, 255), font=meta_font)
-
-
-def _draw_source(source, width: int, height: int) -> Image.Image:
-    """Picture for one logical source — identical on SRC, PVW and PGM."""
-    if _is_black_source(source):
-        return Image.new("RGB", (width, height), (0, 0, 0))
-
-    kind = source.kind.value
-    if kind == "test":
-        image = Image.new("RGB", (width, height), (0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        bar_h = height * 3 // 4
-        for index, color in enumerate(SMPTE_BARS):
-            x0 = int(index * width / 7)
-            x1 = int((index + 1) * width / 7)
-            draw.rectangle([x0, 0, x1, bar_h], fill=color)
-        chip = _color_for(source.id)
-        draw.rectangle([0, bar_h, width, height], fill=chip)
-        _paint_label(draw, width, height, source.label, "TEST")
-        return image
-
-    color = _color_for(source.id)
-    image = Image.new("RGB", (width, height), color)
-    draw = ImageDraw.Draw(image)
-    meta = "MXL" if kind == "mxl_live" else kind.upper()
-    if kind in {"file", "replay"} and source.file_path:
-        meta = source.file_path.split("/")[-1]
-    _paint_label(draw, width, height, source.label, meta)
-    return image
-
-
-def _draw_missing(width: int, height: int, title: str) -> Image.Image:
-    image = Image.new("RGB", (width, height), (8, 10, 14))
-    draw = ImageDraw.Draw(image)
-    _paint_label(draw, width, height, title, "NO SIGNAL")
-    return image
-
-
-def render_monitor(
-    mixer,
-    stream_id: str,
-    *,
-    width: int = 640,
-    height: int = 360,
-) -> Image.Image:
-    """Picture of the logical source on this monitor (same essence on SRC/PVW/PGM).
-
-    While the pipeline runs this is the picture it produced: the source, or for
-    the main panel's Program the mixed output. Otherwise a generated card."""
-    live = _live_picture(mixer, stream_id, width, height)
-    if live is not None:
-        return live
-    try:
-        input_id, _tally, _badge = resolve_stream(mixer, stream_id)
-        source = mixer.get_input(input_id) if input_id else None
-    except Exception:
-        # A WebRTC monitor whose input or panel was removed keeps running.
-        input_id, source = stream_id, None
-    if source is None:
-        return _draw_missing(width, height, input_id or "NO SIGNAL")
-    key = f"{source.id}:{source.kind.value}:{source.label}:{source.file_path}:{width}x{height}"
-    return _cache_get(key, lambda: _draw_source(source, width, height))
-
-
-def _live_picture(mixer, stream_id: str, width: int, height: int) -> Image.Image | None:
-    gst = getattr(mixer, "gst", None)
-    if gst is None:
-        return None
-    main_program = bool(mixer.panels) and stream_id == f"panel:{mixer.panels[0].id}:pgm"
-    if main_program:
-        name = MONITOR_PROGRAM
-    else:
-        try:
-            input_id, _tally, _badge = resolve_stream(mixer, stream_id)
-        except Exception:
-            return None
-        name = f"{MONITOR_PREFIX}{input_id}"
-    picture = gst.monitors.get(name)
-    if picture is None:
-        return None
-    picture_width, picture_height, data = picture
-    image = Image.frombytes("RGB", (picture_width, picture_height), data)
-    if (picture_width, picture_height) != (width, height):
-        image = image.resize((width, height))
-    return image
-
-
-def render_jpeg(mixer, stream_id: str, *, width: int = 640, height: int = 360, quality: int = 70) -> bytes:
-    image = render_monitor(mixer, stream_id, width=width, height=height)
-    buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=quality)
-    return buf.getvalue()
-
-
-class UnknownStream(LookupError):
-    """A monitor name that is not `source:<input id>` or `panel:<panel id>:pgm|pvw`."""
-
-
-def resolve_stream(mixer, stream_id: str) -> tuple[str | None, str, str]:
-    """Return (input_id, tally, badge). Tally is GUI chrome only — not burned into the picture.
-
-    Raises UnknownStream for a malformed name or an input or panel that does not exist."""
-    kind, _, rest = stream_id.partition(":")
-    if kind == "source" and rest in mixer.inputs:
-        tally = "off"
-        if any(p.program_input_id == rest for p in mixer.panels):
-            tally = "pgm"
-        elif any(p.preview_input_id == rest for p in mixer.panels):
-            tally = "pvw"
-        return rest, tally, "SRC"
-    if kind == "panel":
-        panel_id, _, bus = rest.partition(":")
-        for panel in mixer.panels:
-            if panel.id != panel_id:
+def preview_info(mixer) -> dict[str, Any]:
+    """The mosaic stream and its tile map, or why there is none (off-air, simulate)."""
+    engine = getattr(mixer, "engine", None)
+    if engine is None or not engine.ready or not engine.mosaic_map:
+        reason = "simulated media: no pictures" if mixer.backend == "simulate" else "the mixer is off-air"
+        return {"available": False, "reason": reason, "tiles": []}
+    mosaic = engine.mosaic_map
+    if not mosaic.get("enabled", True):
+        return {"available": False, "reason": "the preview mosaic is off", "tiles": []}
+    live = [item for item in mixer.list_inputs() if item.kind.value == "mxl_live"]
+    players = [item for item in mixer.list_inputs() if item.kind.value == "clip_player"]
+    panels = list(mixer.panels)
+    tiles = []
+    for tile in mosaic.get("tiles") or []:
+        kind = tile.get("kind")
+        source = str(tile.get("source") or "")
+        number = int(source[2:]) if source[2:].isdigit() else 0
+        entry = {key: tile.get(key) for key in ("x", "y", "w", "h")}
+        if kind in {"input", "player"}:
+            items = live if kind == "input" else players
+            if not 1 <= number <= len(items):
                 continue
-            if bus == "pgm":
-                return panel.program_input_id, "pgm", f"{panel.label} PGM"
-            if bus == "pvw":
-                return panel.preview_input_id, "pvw", f"{panel.label} PVW"
-    if stream_id in mixer.inputs:
-        # A bare input id, as before.
-        return stream_id, "off", stream_id
-    raise UnknownStream(
-        f"unknown monitor {stream_id!r}: use source:<input id> or panel:<panel id>:pgm|pvw"
-    )
+            item = items[number - 1]
+            entry.update(id=f"source:{item.id}", input_id=item.id, kind=kind, label=item.label)
+        elif kind in {"program", "preview"}:
+            if not 1 <= number <= len(panels):
+                continue
+            panel = panels[number - 1]
+            bus = "pgm" if kind == "program" else "pvw"
+            entry.update(id=f"panel:{panel.id}:{bus}", panel_id=panel.id, kind=kind, label=f"{panel.label} {bus.upper()}")
+        else:
+            continue
+        tiles.append(entry)
+    path = str(mosaic.get("path") or "")
+    whep_base = str(mosaic.get("whep_base") or "")
+    hls_base = str(mosaic.get("hls_base") or "")
+    return {
+        "available": True,
+        "width": mosaic.get("width"),
+        "height": mosaic.get("height"),
+        "fps": mosaic.get("fps"),
+        "mode": mosaic.get("mode"),
+        "path": path,
+        # Shared MediaMTX (the preview contract): absolute URLs. Own MediaMTX: the GUI plays from
+        # the page's host on these ports.
+        "whep_url": _join(whep_base, path, "whep") if whep_base else None,
+        "hls_url": _join(hls_base, path, "index.m3u8") if hls_base else None,
+        "whep_port": None if whep_base else mosaic.get("whep_port"),
+        "hls_port": None if hls_base else mosaic.get("hls_port"),
+        "tiles": tiles,
+    }
