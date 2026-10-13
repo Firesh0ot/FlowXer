@@ -254,9 +254,14 @@ class MixerStartRequest(BaseModel):
     group_hint: str | None = None
     program_input_id: str | None = Field(
         default=None,
-        description="Logical input placed on ME 1 Program at start. Defaults to the first live input.",
+        description=(
+            "Logical input placed on ME 1 Program at start. Default: the saved one (while ME 1 can take it), "
+            "else the first input. A start-up snapshot with Program/on-air wins over it."
+        ),
     )
-    preview_input_id: str | None = None
+    preview_input_id: str | None = Field(
+        default=None, description="ME 1 Preview at start. Default: the saved one, else Program. A start-up snapshot wins over it."
+    )
 
 
 class TakeRequest(BaseModel):
@@ -811,6 +816,119 @@ class AudioConfig(BaseModel):
     panels: dict[str, PanelAudio] = Field(default_factory=dict)
 
 
+# ── snapshots (docs/snapshots.md) ──────────────────────────────────────────
+
+SNAPSHOT_ALL = "all"
+SNAPSHOT_MAX = 99
+
+
+class SnapshotOptions(BaseModel):
+    """What a recall takes besides each ME's Preview, its transition and the settings of its keyers
+    that are off air."""
+
+    program: bool = Field(
+        default=False,
+        description=(
+            "Program/on-air: also Program (a cut), the keyers' and DSKs' on or off (cuts), the settings of "
+            "keyers on air and FTB (a cut). Off: none of these changes"
+        ),
+    )
+    audio: bool = Field(default=False, description="Also the ME's audio: its strips and master (each ramps over one grain)")
+
+
+class SnapshotOptionsUpdate(BaseModel):
+    program: bool | None = None
+    audio: bool | None = None
+
+
+class SnapshotKeyer(BaseModel):
+    """A keyer in a snapshot: on air or not, its rate, its key and its box (a Keyer without its id,
+    label, ME, stage and run)."""
+
+    enabled: bool = False
+    rate_ms: int = Field(default=500, ge=1, le=10000)
+    mode: KeyMode = Field(default=KeyMode.linear)
+    source_id: str | None = None
+    clip: float = Field(default=0.5, ge=0.0, le=1.0)
+    soft: float = Field(default=0.1, ge=0.0, le=1.0)
+    gain: float = Field(default=1.0, ge=0.0, le=1.0)
+    invert: bool = False
+    dme: Dme = Field(default_factory=Dme)
+    fly: bool = False
+    keyframes: list[DmeKeyframe] = Field(default_factory=list, max_length=8)
+
+
+class MeSnapshot(BaseModel):
+    """One ME in a snapshot."""
+
+    program_input_id: str | None = None
+    preview_input_id: str | None = None
+    ftb: bool = False
+    transition: PanelTransition = Field(default_factory=PanelTransition)
+    keyers: dict[str, SnapshotKeyer] = Field(default_factory=dict, description="Its upstream keyers and DSKs, by keyer id")
+    audio: PanelAudio | None = Field(
+        default=None, description="Its master and the strips not at their defaults; none for an ME that did not render"
+    )
+
+
+class SnapshotInfo(BaseModel):
+    number: int = Field(ge=1, le=SNAPSHOT_MAX, description="1..99, the snapshot's id (one number space for all)")
+    name: str = Field(min_length=1, max_length=40)
+    panel_id: str = Field(description="me-<n>: that ME; all: every ME")
+    options: SnapshotOptions = Field(default_factory=SnapshotOptions, description="The defaults of its recall")
+    stored_at: str = Field(default="", description="When it was stored (UTC, ISO 8601)")
+
+
+class Snapshot(SnapshotInfo):
+    """A named memory of one ME or of all MEs (docs/snapshots.md)."""
+
+    mes: dict[str, MeSnapshot] = Field(default_factory=dict, description="By panel id")
+
+
+class SnapshotConfig(BaseModel):
+    """The saved snapshots (the state file's and the export's `snapshots`). Missing: none."""
+
+    startup: int | None = Field(default=None, ge=1, le=SNAPSHOT_MAX, description="Recalled with its options when the mixer starts")
+    items: list[Snapshot] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _numbers(self) -> "SnapshotConfig":
+        numbers = [item.number for item in self.items]
+        if len(set(numbers)) != len(numbers):
+            raise ValueError("duplicate snapshot numbers")
+        if self.startup is not None and self.startup not in numbers:
+            raise ValueError(f"the start-up snapshot {self.startup} does not exist")
+        self.items.sort(key=lambda item: item.number)
+        return self
+
+
+class SnapshotStore(BaseModel):
+    panel_id: str = Field(description="me-<n>: that ME; all: every ME")
+    number: int | None = Field(
+        default=None, ge=1, le=SNAPSHOT_MAX, description="Default: the lowest free number. A used number is stored over"
+    )
+    name: str | None = Field(default=None, max_length=40, description="Default: the old name, else '<ME> #<number>' or 'All MEs #<number>'")
+    options: SnapshotOptionsUpdate | None = Field(default=None, description="The recall's defaults (default: the old ones, else off)")
+
+
+class SnapshotUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=40)
+    options: SnapshotOptionsUpdate | None = None
+
+
+class SnapshotStartup(BaseModel):
+    number: int | None = Field(default=None, ge=1, le=SNAPSHOT_MAX, description="None: no start-up snapshot")
+
+
+class SnapshotRecallResult(BaseModel):
+    snapshot: SnapshotInfo
+    options: SnapshotOptions = Field(description="The options this recall used")
+    skipped: list[str] = Field(
+        default_factory=list,
+        description="What it did not change, and why: a source, ME, keyer or stinger slot that is gone, a keyer on air, a held T-bar",
+    )
+
+
 class StingerSlotUpdate(BaseModel):
     stinger_id: str | None = None
     library_item_id: str | None = Field(
@@ -942,6 +1060,9 @@ class ConsoleState(BaseModel):
     audio: dict[str, Any] = Field(
         default_factory=dict,
         description="The audio settings, as GET /audio (not the meters: GET /audio/meters)",
+    )
+    snapshots: dict[str, Any] = Field(
+        default_factory=dict, description="The snapshots without their contents and the start-up snapshot, as GET /snapshots"
     )
     pinned: dict[str, str] = Field(
         default_factory=dict,
