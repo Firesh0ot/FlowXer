@@ -82,6 +82,9 @@ public:
     bool resetLoudness(int me);
 
     [[nodiscard]] std::string statusJson() const;
+    // The last output grain planned and every clip player's state, frame and end_index (GET
+    // /players: what the control plane polls to time a clip player's end action).
+    [[nodiscard]] std::string playersJson() const;
     [[nodiscard]] std::string metricsText() const;
     [[nodiscard]] std::string mosaicMapJson() const;
 

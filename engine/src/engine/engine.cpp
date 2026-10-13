@@ -3652,6 +3652,16 @@ std::string Engine::statusJson() const
     return impl_->status().dump(2);
 }
 
+std::string Engine::playersJson() const
+{
+    json list = json::array();
+    for (auto const& player : impl_->players)
+    {
+        list.push_back(json::parse(player->statusJson()));
+    }
+    return json{{"index", impl_->lastIndex.load()}, {"players", list}}.dump();
+}
+
 std::string Engine::metricsText() const
 {
     auto const s = impl_->status();

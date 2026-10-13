@@ -974,6 +974,8 @@ std::string ClipPlayer::statusJson() const
     nlohmann::json out{{"player", s.setup.number}, {"label", s.setup.label}, {"state", stateName(s.playout.state())}, {"frame", s.playout.position()},
         {"frames", s.playout.frames()}, {"loop", s.playout.loop()}, {"play_on_cut", s.playout.playOnCut()}, {"ahead", s.queue.size()},
         {"late", s.late}, {"decoded", s.decoded}, {"decode_ms", s.decodeMs}};
+    auto const end = s.playout.endIndex();
+    out["end_index"] = end ? nlohmann::json(*end) : nlohmann::json(nullptr);
     out["kind"] = s.media != nullptr ? s.media->kind : "";
     out["file"] = s.media != nullptr ? s.media->id.path : "";
     if (s.setup.keyRowBytes > 0)

@@ -15,6 +15,7 @@ from flowxer.api.schemas import (
     AudioEssence,
     AudioStrip,
     AudioStripUpdate,
+    ClipEnd,
     Dme,
     DmeKeyframe,
     DmeLoop,
@@ -110,6 +111,14 @@ PERSIST_INTERVAL_S = 1.0
 METERS_CACHE_S = 0.08
 # Meter values below this are this (silence).
 METER_FLOOR_DB = -120.0
+# A clip player's end action (docs/clip-end.md): the engine's players are read this often while
+# a clip player with one is on a rendering ME's Program; within CLIP_END_HORIZON grains of its
+# start a timer sends the take CLIP_END_LEAD grains early, held by the engine for its grain. An end
+# found up to CLIP_END_LATE grains late still acts (at once).
+CLIP_END_POLL_S = 0.1
+CLIP_END_HORIZON = 12
+CLIP_END_LEAD = 3
+CLIP_END_LATE = 50
 
 
 def _autostart_pause(attempt: int) -> float:
@@ -264,6 +273,13 @@ class VisionMixer:
         self._persist_lock = threading.Lock()
         self._persist_at = 0.0
         self._persist_timer: threading.Timer | None = None
+        # Clip players' end actions: per panel the timer of the next one (player id, start grain,
+        # timer), the last one done (player id, end grain), the engine's last /players (render
+        # index, monotonic time) and the stinger cues asked for.
+        self._clip_end_timers: dict[str, tuple[str, int, threading.Timer]] = {}
+        self._clip_end_done: dict[str, tuple[str, int]] = {}
+        self._players_seen: tuple[int, float] | None = None
+        self._clip_end_cued: set[tuple[str, str]] = set()
         # The engine's last /audio/meters and when it was fetched.
         self._meters_lock = threading.Lock()
         self._meters_raw: dict[str, Any] | None = None
@@ -1306,6 +1322,8 @@ class VisionMixer:
                 return item
             raise MixerError("the mixer is off-air")
         body = {"frame": frame} if action == "cue" else {}
+        # A stop, pause or cue before the end cancels its end action (a play times it again).
+        self._cancel_clip_end(player_id=input_id)
         try:
             self.engine.call("POST", f"/player/{self._engine_index(item)}/{action}", body)
         except EngineError as exc:
@@ -1700,6 +1718,7 @@ class VisionMixer:
             self.engine = runtime
             self.backend = "engine"
             threading.Thread(target=self._watch_domains, args=(runtime,), name="mxl-domain-watch", daemon=True).start()
+            threading.Thread(target=self._watch_clip_ends, args=(runtime,), name="clip-end-watch", daemon=True).start()
         self.state = MixerState.running
         self._autostart_done.set()
         self._frame_mark = (self.frames_rendered, time.monotonic())
@@ -1797,6 +1816,8 @@ class VisionMixer:
             self.engine = None
             runtime.stop()
         self._missing_domains.clear()
+        self._cancel_clip_end()
+        self._players_seen = None
         self.state = MixerState.idle
         self.backend = "idle"
         self._mixes.clear()
@@ -2073,11 +2094,16 @@ class VisionMixer:
         send: bool = True,
         sting: dict[str, int] | None = None,
         ties: bool = False,
+        at: int | None = None,
     ) -> None:
         """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
         default); `flip_flop` puts the old Program on Preview. `send=False`: the engine does it
         already (the T-bar). A stinger: `sting` is its player and cut frame, `frames` its length.
-        `ties`: the ME's Cut or Auto, which take its tied keyers along."""
+        `ties`: the ME's Cut or Auto, which take its tied keyers along. `at`: the engine holds the
+        take for that output grain (a clip player's end action, a few grains ahead)."""
+        self._cancel_clip_end(panel.id)
+        # Seconds until the engine makes it (the tally of a mix ends that much later).
+        wait = self._grains_until(at) / self.settings.fps
         held = self._positions.pop(panel.id, None)
         if held is not None:
             # A held T-bar transition ends first, as if it had run to its end (as in the engine).
@@ -2097,7 +2123,7 @@ class VisionMixer:
         if transition in (TransitionType.mix, TransitionType.wipe, TransitionType.stinger):
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
-            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + frames / self.settings.fps)
+            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2120,6 +2146,8 @@ class VisionMixer:
                 body["preview"] = self._engine_source(outgoing)
             if tied:
                 body["ties"] = True
+            if at is not None:
+                body["at"] = at
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/take", body)
         self._take_ties(tied, frames)
         wipe = panel.transition.wipe
@@ -2212,6 +2240,9 @@ class VisionMixer:
             slot = self._slot_for_target(incoming)
         if slot is None and panel.transition.type == TransitionType.stinger:
             slot = self._transition_slot(panel, incoming)
+        if slot is None and self._clip_end_action(panel) == ClipEnd.stinger:
+            # The end action of the clip on Program.
+            slot = self._transition_slot(panel, incoming)
         return slot
 
     def _stinger_media(self, slot: StingerSlot | None, stinger_id: str | None = None) -> tuple[dict[str, Any], int] | None:
@@ -2268,6 +2299,7 @@ class VisionMixer:
         flip_flop: bool,
         stinger_id: str | None = None,
         ties: bool = False,
+        at: int | None = None,
     ) -> bool:
         """Plays a stinger on the ME to `incoming`: on the player that holds it, else on a free one
         (loaded now; the engine starts it when its first frame is decoded). With every player busy
@@ -2298,9 +2330,9 @@ class VisionMixer:
         frames = max(1, int(body["frames"]))
         seconds = frames / self.settings.fps
         # A stinger loaded now may wait for its first frame (the engine waits at most 50 grains).
-        self._stinger_until[player] = now + seconds + (0.1 if cued else 1.0)
+        self._stinger_until[player] = now + self._grains_until(at) / self.settings.fps + seconds + (0.1 if cued else 1.0)
         self._put_on_program(
-            panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut}, ties=ties
+            panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut}, ties=ties, at=at
         )
         self._stinger_run = {
             "id": stinger_id or (slot.stinger_id if slot else None),
@@ -2340,6 +2372,133 @@ class VisionMixer:
             "player": run["player"],
             "events": [],
         }
+
+    # ── a clip player's end action (docs/clip-end.md) ───────────────────────
+
+    def _clip_end_action(self, panel: MixerPanel) -> ClipEnd:
+        """What the ME does at the end of the clip on its Program: its clip player's on_end while
+        it does not loop and Preview is another source; else off."""
+        item = self.inputs.get(panel.program_input_id or "")
+        if item is None or item.kind != InputKind.clip_player or item.loop or not self._rendered(panel):
+            return ClipEnd.off
+        if not panel.preview_input_id or panel.preview_input_id == item.id:
+            return ClipEnd.off
+        return item.on_end
+
+    def _clip_end_start(self, panel: MixerPanel, end: int) -> int:
+        """The output grain the ME's end action starts in, for a clip whose last frame is in grain
+        `end`: a cut on the grain after it; an auto `rate` grains before, so its last grain (the
+        target in full) is the clip's last frame; a stinger so that its cut point is there (a
+        stinger that cannot play cuts on the grain after it)."""
+        action = self._clip_end_action(panel)
+        if action == ClipEnd.auto:
+            return end - panel.transition.rate_frames + 1
+        if action == ClipEnd.stinger:
+            media = self._stinger_media(self._transition_slot(panel, panel.preview_input_id or ""))
+            if media is not None:
+                return end - media[1]
+        return end + 1
+
+    def _grains_until(self, at: int | None) -> float:
+        """Grains from now to output grain `at` (0 without one or when it is past), from the
+        engine's last /players."""
+        if at is None or self._players_seen is None:
+            return 0.0
+        index, seen = self._players_seen
+        return max(0.0, at - index - (time.monotonic() - seen) * self.settings.fps)
+
+    def _watch_clip_ends(self, runtime: EngineRuntime) -> None:
+        """While `runtime` runs Program: reads the engine's clip players (GET /players) while a clip
+        player with an end action is on a rendering ME's Program."""
+        while self.engine is runtime:
+            time.sleep(CLIP_END_POLL_S)
+            if self.engine is not runtime or not runtime.ready:
+                continue
+            if not any(self._clip_end_action(panel) != ClipEnd.off for panel in self.rendered_panels()):
+                continue
+            try:
+                reply = runtime.call("GET", "/players")
+            except EngineError:
+                continue
+            if isinstance(reply, dict):
+                self._clip_end_tick(reply, time.monotonic())
+
+    def _clip_end_tick(self, reply: dict[str, Any], seen: float) -> None:
+        """One read of the engine's players (`index`: the last grain planned, `players`: each one's
+        state and end_index) at monotonic time `seen`: a timer for each ME whose end action starts
+        within CLIP_END_HORIZON grains, to send it CLIP_END_LEAD grains early."""
+        index = int(reply.get("index") or 0)
+        players = reply.get("players") or []
+        self._players_seen = (index, seen)
+        for panel in self.rendered_panels():
+            action = self._clip_end_action(panel)
+            if action == ClipEnd.off:
+                continue
+            item = self.inputs[panel.program_input_id or ""]
+            if action == ClipEnd.stinger and (panel.id, item.id) not in self._clip_end_cued:
+                # Cue the stinger early, so it starts on its grain.
+                self._clip_end_cued.add((panel.id, item.id))
+                self._cue_stingers()
+            k = self._engine_index(item)
+            entry = players[k - 1] if k <= len(players) and isinstance(players[k - 1], dict) else {}
+            end = entry.get("end_index")
+            if not isinstance(end, int) or end < index - CLIP_END_LATE or self._clip_end_done.get(panel.id) == (item.id, end):
+                continue
+            start = self._clip_end_start(panel, end)
+            if start - index > CLIP_END_HORIZON:
+                continue
+            pending = self._clip_end_timers.get(panel.id)
+            if pending is not None and pending[:2] == (item.id, start):
+                continue
+            if pending is not None:
+                pending[2].cancel()
+            delay = max(0.0, (start - CLIP_END_LEAD - index) / self.settings.fps - (time.monotonic() - seen))
+            timer = threading.Timer(delay, self._clip_end_fire, args=(panel.id, item.id, end, start))
+            timer.daemon = True
+            self._clip_end_timers[panel.id] = (item.id, start, timer)
+            timer.start()
+
+    def _cancel_clip_end(self, panel_id: str | None = None, player_id: str | None = None) -> None:
+        """Cancels the end actions not sent yet: of one panel, of one clip player, or all."""
+        for key, (item_id, _start, timer) in list(self._clip_end_timers.items()):
+            if (panel_id is None or key == panel_id) and (player_id is None or item_id == player_id):
+                timer.cancel()
+                self._clip_end_timers.pop(key, None)
+        if panel_id is None and player_id is None:
+            self._clip_end_cued.clear()
+
+    def _clip_end_fire(self, panel_id: str, item_id: str, end: int, start: int) -> None:
+        """The ME's end action, through the paths of a Cut, an Auto and a stinger (tally, tied
+        keyers, audio follow): held by the engine for grain `start`, or at once when that is past.
+        Nothing when the clip is no longer on Program, Preview is the same, a transition runs on
+        the ME or this end was done."""
+        with self._lock:
+            pending = self._clip_end_timers.get(panel_id)
+            if pending is None or pending[:2] != (item_id, start):
+                return
+            del self._clip_end_timers[panel_id]
+            if self.state != MixerState.running or self.engine is None:
+                return
+            panel = self.get_panel(panel_id)
+            action = self._clip_end_action(panel)
+            mix = self._mixes.get(panel.id)
+            busy = panel.id in self._positions or (mix is not None and (mix[2] is None or mix[2] > time.monotonic()))
+            if action == ClipEnd.off or panel.program_input_id != item_id or busy:
+                return
+            self._clip_end_done[panel.id] = (item_id, end)
+            incoming = panel.preview_input_id or ""
+            at = start if self._grains_until(start) >= 1 else None
+            log.info("%s: %s at the end of %s (grain %s)", panel.label, action.value, item_id, start)
+            if action == ClipEnd.auto:
+                kind = panel.transition.type if panel.transition.type in (TransitionType.mix, TransitionType.wipe) else TransitionType.mix
+                self._put_on_program(panel, incoming, kind, flip_flop=True, frames=panel.transition.rate_frames, ties=True, at=at)
+            elif action != ClipEnd.stinger or not self._play_stinger_on(
+                panel, self._transition_slot(panel, incoming), incoming, flip_flop=True, ties=True, at=at
+            ):
+                cut_at = end + 1 if self._grains_until(end + 1) >= 1 else None
+                self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True, ties=True, at=cut_at)
+            self._clip_end_cued.discard((panel.id, item_id))
+            self.persist()
 
     # ── tally ────────────────────────────────────────────────────────────────
 

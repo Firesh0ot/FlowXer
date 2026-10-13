@@ -1,6 +1,6 @@
 """A stand-in for flowxer-engine in the tests: the control API on the configured port, no media.
 
-It reads FLOWXER_ENGINE_CONFIG like the engine, answers /livez, /status, /metrics and
+It reads FLOWXER_ENGINE_CONFIG like the engine, answers /livez, /status, /metrics, /players and
 /mosaic/map, keeps the buses it is told, and appends every command (method, path, body) as one
 JSON line to FAKE_ENGINE_LOG. FAKE_ENGINE_FAIL=<code> makes it log an error and exit at once.
 """
@@ -104,6 +104,11 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, mosaic_map())
         elif self.path == "/audio/meters":
             self._reply(200, audio_meters())
+        elif self.path == "/players":
+            with lock:
+                index = state["committed"]
+            self._reply(200, {"index": index, "players": [{"player": k, "label": p.get("label"), "state": "empty", "end_index": None}
+                                                         for k, p in enumerate(players, 1)]})
         else:
             self._reply(404, {"error": "not found"})
 

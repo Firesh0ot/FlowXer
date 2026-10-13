@@ -177,6 +177,16 @@ class AudioEssence(BaseModel):
         return value
 
 
+class ClipEnd(str, Enum):
+    """What an ME does when a clip player on its Program reaches the end of its clip
+    (docs/clip-end.md)."""
+
+    off = "off"
+    cut = "cut"
+    auto = "auto"
+    stinger = "stinger"
+
+
 class LogicalInputCreate(BaseModel):
     """Register a logical mixer input: a live input (video + audio essences on MXL), a clip
     player (a clip or a still from the library) or Black."""
@@ -193,6 +203,15 @@ class LogicalInputCreate(BaseModel):
     loop: bool = Field(default=False, description="Clip player: start the clip again at its end.")
     play_on_cut: bool = Field(
         default=False, description="Clip player: play when the player is taken to an ME's Program."
+    )
+    on_end: ClipEnd = Field(
+        default=ClipEnd.off,
+        description=(
+            "Clip player: at the end of its clip (not looping), each ME with it on Program takes its "
+            "Preview (another source): cut (on the grain after the last frame), auto (the ME's mix or "
+            "wipe at its rate, ending on the last frame), stinger (the ME's stinger slot, its cut point "
+            "on the last frame), or off"
+        ),
     )
     group_hint: str | None = Field(
         default=None,
@@ -234,6 +253,7 @@ class LogicalInputUpdate(BaseModel):
     library_item_id: str | None = None
     loop: bool | None = None
     play_on_cut: bool | None = None
+    on_end: ClipEnd | None = None
     group_hint: str | None = None
     stinger_slot_id: str | None = Field(
         default=None,
