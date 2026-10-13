@@ -397,6 +397,8 @@ sources. No new senders or receivers.
     the weight table: + 12.4 × renderMes × keyersPerMe at most (+100 MB with the defaults, +400 MB at
     4 × 8). A frame grab uses page-locked host memory (5.5 MB per grab in flight, at most 8), no GPU
     memory.
+  - Since #99, + 24.9 MB (23.7 MiB) per key flow that a linear box uses (its unpacked planes),
+    at most one per key flow.
 - **PCIe:** none added. A grab copies 5.5 MB once over the download link (also for an ME's PVW, which
   is packed every grain).
 
