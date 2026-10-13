@@ -125,3 +125,22 @@ parameter answers 400.
 - Size: a snapshot of one ME with two keyers and a DSK is about 3.5 kB in `state.json`; a keyer with 8
   keyframes adds about 5 kB. The state is written after every API change.
 - Rollback: an older FlowXer ignores the `snapshots` key (the snapshots are lost when it saves).
+
+## Checked
+
+- pytest (`tests/test_snapshots.py`):
+  - store, list, rename, delete and the 99 numbers;
+  - recall without and with Program/on-air (the engine commands and their order), with audio, and with options overridden;
+  - an all-MEs snapshot;
+  - what is gone being skipped;
+  - an off-air recall and the start-up snapshot;
+  - start keeping the saved buses;
+  - the saved state, export and import, including an older state;
+  - a recall with the fake engine.
+- GUI and widget in headless Edge (19 of 19): SNAP, both STOREs, RECALL with and without PGM, ⋯ recalls, the start-up mark, rename, delete with its question; the widget framed (`widget-ready`, `widget-size`), with `all=false`, without `me`.
+- Lab (A16 GPU 3, 2 MEs, 4 routed cameras, 2026-10-13), from the engine's `/status`:
+  - Without Program/on-air, Program stays.
+  - With it, Program cuts and the keys cut.
+  - The all-MEs recall works, as do the start with saved buses and the start-up look.
+  - **0 skipped and 0 late grains** through 100 recalls in a row.
+  - A start has at times 1 late grain in its first seconds, with or without a start-up snapshot (engine warm-up).
