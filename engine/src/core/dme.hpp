@@ -262,13 +262,15 @@ struct DmeTable
 };
 
 // The box's source: an opaque picture (yuv16 planes: Y W × H, Cb and Cr W/2 × H) or, for a
-// linear box, a v210a fill + key (the key plane after the fill), read premultiplied.
+// linear box, a v210a fill + key (the key plane after the fill), read premultiplied, or that
+// fill + key unpacked once (`planes`: dmeUnpackPixel).
 struct DmeSource
 {
     std::uint16_t const* plane[3] = {nullptr, nullptr, nullptr};
     std::uint8_t const* v210a = nullptr;
     int rowBytes = 0;
     int keyRowBytes = 0;
+    float const* planes = nullptr;
     int width = 0;
     int height = 0;
 };
@@ -288,6 +290,23 @@ FXENG_HD inline float dmeFetchLinear(std::uint32_t const* words, std::uint8_t co
     unsigned const c = plane == 1 ? v210Cb(words, j) : v210Cr(words, j);
     unsigned const k = keyAt(keyLine, 2 * j) + keyAt(keyLine, 2 * j + 1);
     return (static_cast<float>(c) - 512.f) * (static_cast<float>(k) * (1.f / 2046.f));
+}
+
+// A linear source unpacked: float planes Y (W × H), Cb and Cr (W/2 × H), premultiplied as
+// dmeFetchLinear reads them, then the key (W × H). The resample reads them as an opaque source:
+// the same values, so the same sums (no fused multiply-add: CMakeLists.txt).
+inline std::size_t dmePlanesFloats(int width, int height)
+{
+    return static_cast<std::size_t>(3) * static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+}
+
+template <typename T>
+FXENG_HD inline T* dmePlanesLine(T* planes, int width, int height, int plane, int row)
+{
+    std::size_t const area = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    std::size_t const offset = plane == 0 ? 0 : (plane == 1 ? area : (plane == 2 ? area + area / 2 : 2 * area));
+    int const w = plane == 1 || plane == 2 ? width / 2 : width;
+    return planes + offset + static_cast<std::size_t>(row) * static_cast<std::size_t>(w);
 }
 
 // The horizontal pass keeps 16 × the value as int16 (signed: a premultiplied fill).
@@ -344,9 +363,28 @@ FXENG_HD inline std::uint8_t const* dmeKeyLine(DmeSource const& src, int row)
            static_cast<std::size_t>(row) * static_cast<std::size_t>(src.keyRowBytes);
 }
 
-// One horizontal-pass sample of an opaque source line.
-template <int N>
-FXENG_HD inline std::int16_t dmeHSampleOpaque(std::uint16_t const* line, float const (&w)[N], int const (&j)[N])
+// Pixel x of source row `row` of a linear source unpacked into `planes` (dmePlanesLine): its Y
+// and key, and at an even x its pair's Cb and Cr.
+FXENG_HD inline void dmeUnpackPixel(DmeSource const& src, float* planes, int x, int row)
+{
+    std::uint32_t const* words = dmeWords(src, row);
+    std::uint8_t const* keyLine = dmeKeyLine(src, row);
+    for (int plane = 0; plane < 4; plane += 3)
+    {
+        dmePlanesLine(planes, src.width, src.height, plane, row)[x] = dmeFetchLinear(words, keyLine, plane, x);
+    }
+    if (x % 2 == 0)
+    {
+        for (int plane = 1; plane < 3; ++plane)
+        {
+            dmePlanesLine(planes, src.width, src.height, plane, row)[x / 2] = dmeFetchLinear(words, keyLine, plane, x / 2);
+        }
+    }
+}
+
+// One horizontal-pass sample of an opaque source line (yuv16, or unpacked linear planes).
+template <int N, typename T>
+FXENG_HD inline std::int16_t dmeHSampleOpaque(T const* line, float const (&w)[N], int const (&j)[N])
 {
     float acc = 0.f;
     FXENG_UNROLL
@@ -374,6 +412,10 @@ FXENG_HD inline std::int16_t dmeHSampleLinear(std::uint32_t const* words, std::u
 template <int N>
 FXENG_HD inline std::int16_t dmeHSample(DmeSource const& src, int plane, int row, float const (&w)[N], int const (&j)[N])
 {
+    if (src.planes != nullptr)
+    {
+        return dmeHSampleOpaque<N>(dmePlanesLine(src.planes, src.width, src.height, plane, row), w, j);
+    }
     if (src.v210a == nullptr)
     {
         return dmeHSampleOpaque<N>(dmeLine(src, plane, row), w, j);
@@ -632,5 +674,7 @@ DmeBox makeDmeBox(DmeSettings const& set, DmeKind kind, int width, int height);
 // and its layer over a picture (in place). The GPU self-test and the unit tests compare with it.
 void dmeTableCpu(DmeBox const& b, std::vector<int>& start, std::vector<float>& w);
 void dmeResampleCpu(DmeBox const& b, DmeSource const& src, std::vector<std::int16_t>& buffer);
+// A linear source (v210a) unpacked into `planes` (dmePlanesFloats), as the GPU's dmeUnpack.
+void dmeUnpackCpu(DmeSource const& src, std::vector<float>& planes);
 void dmeLayerCpu(DmeDraw const& d, Planar422& picture);
 } // namespace fxeng

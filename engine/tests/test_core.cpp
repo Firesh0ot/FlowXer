@@ -606,3 +606,68 @@ TEST(dme_linear_premultiplied)
     CHECK(inRange);
     CHECK(out.y[static_cast<std::size_t>(row) * w + 700] == 200 && out.y[static_cast<std::size_t>(row) * w + 1200] == 940);
 }
+
+TEST(dme_linear_unpacked_is_bit_exact)
+{
+    // A linear box resampled from its key flow unpacked once (dmeUnpackCpu, the GPU's dmeUnpack)
+    // is the box resampled from the packed v210a: bit for bit, at every size.
+    int const w = 1920;
+    int const h = 1080;
+    int const rowBytes = v210RowBytes(w);
+    int const keyRow = keyPlaneRowBytes(w);
+    Planar422 const fill = dmePattern();
+    std::vector<std::uint8_t> v210a(static_cast<std::size_t>(rowBytes) * h + static_cast<std::size_t>(keyRow) * h, 0);
+    packV210(fill, v210a.data(), rowBytes);
+    for (int y = 0; y < h; ++y)
+    {
+        auto* k = reinterpret_cast<std::uint32_t*>(v210a.data() + static_cast<std::size_t>(rowBytes) * h + static_cast<std::size_t>(y) * keyRow);
+        for (int x = 0; x < w; ++x)
+        {
+            k[x / 3] |= static_cast<std::uint32_t>((x * 7 + y * 13) % 1024) << ((x % 3) * 10);
+        }
+    }
+    DmeSource packed;
+    packed.width = w;
+    packed.height = h;
+    packed.v210a = v210a.data();
+    packed.rowBytes = rowBytes;
+    packed.keyRowBytes = keyRow;
+    std::vector<float> planes;
+    dmeUnpackCpu(packed, planes);
+    CHECK(planes.size() == dmePlanesFloats(w, h));
+    // Pixel (101, 7): Y and the key; its pair (100, 101): Cb premultiplied by the pair's mean key.
+    std::size_t const area = static_cast<std::size_t>(w) * h;
+    unsigned const k100 = (100 * 7 + 7 * 13) % 1024;
+    unsigned const k101 = (101 * 7 + 7 * 13) % 1024;
+    float const y101 = (static_cast<float>(fill.y[7 * w + 101]) - 64.f) * (static_cast<float>(k101) * (1.f / 1023.f));
+    float const cb50 = (static_cast<float>(fill.cb[7 * (w / 2) + 50]) - 512.f) * (static_cast<float>(k100 + k101) * (1.f / 2046.f));
+    CHECK(planes[7 * w + 101] == y101 && planes[2 * area + 7 * w + 101] == static_cast<float>(k101));
+    CHECK(planes[area + 7 * (w / 2) + 50] == cb50);
+    DmeSource unpacked;
+    unpacked.width = w;
+    unpacked.height = h;
+    unpacked.planes = planes.data();
+    struct Case
+    {
+        float size;
+        float x;
+        float y;
+        float crop;
+    };
+    for (Case const c : {Case{0.25f, 0.13f, 0.31f, 0.f}, Case{0.5f, 0.72f, 0.28f, 0.1f}, Case{1.f, 0.5f, 0.5f, 0.f}, Case{1.5f, 0.5f, 0.5f, 0.f},
+             Case{0.1f, 0.5f, 0.5f, 0.2f}})
+    {
+        DmeSettings set;
+        set.size = c.size;
+        set.x = c.x + 0.37f / w;
+        set.y = c.y + 0.61f / h;
+        set.cropLeft = c.crop;
+        set.cropBottom = c.crop / 2.f;
+        DmeBox const b = makeDmeBox(set, DmeKind::Linear, w, h);
+        std::vector<std::int16_t> want;
+        std::vector<std::int16_t> got;
+        dmeResampleCpu(b, packed, want);
+        dmeResampleCpu(b, unpacked, got);
+        CHECK(!want.empty() && want == got);
+    }
+}
