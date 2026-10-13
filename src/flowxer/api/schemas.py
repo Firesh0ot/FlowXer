@@ -254,9 +254,14 @@ class MixerStartRequest(BaseModel):
     group_hint: str | None = None
     program_input_id: str | None = Field(
         default=None,
-        description="Logical input placed on ME 1 Program at start. Defaults to the first live input.",
+        description=(
+            "Logical input placed on ME 1 Program at start. Default: the saved one (while ME 1 can take it), "
+            "else the first input. A start-up snapshot with Program/on-air wins over it."
+        ),
     )
-    preview_input_id: str | None = None
+    preview_input_id: str | None = Field(
+        default=None, description="ME 1 Preview at start. Default: the saved one, else Program. A start-up snapshot wins over it."
+    )
 
 
 class TakeRequest(BaseModel):

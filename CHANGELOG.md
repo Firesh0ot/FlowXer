@@ -5,6 +5,31 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: snapshots
+
+- Named memories (1–99) of one ME or of all MEs (`docs/snapshots.md`): per ME Program and Preview,
+  FTB, the transition (type, rate, wipe, stinger slot, ties, BKGD), the keyers and DSKs (on air,
+  key, box, keyframes, fly) and the audio (master, strips). Not the structure, inputs, clip
+  players' media, NMOS routes, library, input delays or channel maps.
+- A recall sets Preview, the transition and the settings of keyers off air. With Program/on-air
+  (default off) also Program, the keys' on or off and FTB, as cuts, and the settings of keyers on
+  air; with audio (default off) the strips and masters, which ramp over one grain. The options are
+  stored per snapshot and can be overridden per recall. What no longer fits the console is skipped
+  and reported.
+- A start-up snapshot, recalled with its options whenever the mixer starts.
+- API `/snapshots` (list, store, get, rename and options, delete, recall, start-up); `GET /console`
+  has `snapshots`; the saved state and the export have `snapshots` (an older state loads with none).
+- GUI: SNAP in the keyer row (the active ME's and the all-MEs snapshots: store, recall, options,
+  rename, store over, start-up, delete). New widget `snapshots`:
+  `/widget/snapshots[?me=n][&all=false]` (240 × 120).
+
+### Fixed: start keeps ME 1's buses
+
+- `POST /mixer/start` without buses (the GUI sends `{}`) put the first input on ME 1 Program and
+  Preview instead of keeping the restored ones; the other MEs kept theirs. Now a start keeps ME 1's
+  saved Program and Preview (while ME 1 can take them), and Preview off-air starts with the saved
+  Program. `FLOWXER_PROGRAM_AUTOSTART` is unchanged.
+
 ### Added: audio (P5)
 
 - Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
