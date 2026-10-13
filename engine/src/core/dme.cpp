@@ -141,6 +141,18 @@ void dmeResampleCpu(DmeBox const& b, DmeSource const& src, std::vector<std::int1
     });
 }
 
+void dmeUnpackCpu(DmeSource const& src, std::vector<float>& planes)
+{
+    planes.assign(dmePlanesFloats(src.width, src.height), 0.f);
+    for (int row = 0; row < src.height; ++row)
+    {
+        for (int x = 0; x < src.width; ++x)
+        {
+            dmeUnpackPixel(src, planes.data(), x, row);
+        }
+    }
+}
+
 void dmeLayerCpu(DmeDraw const& d, Planar422& picture)
 {
     DmeBox const& b = d.box;

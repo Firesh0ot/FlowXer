@@ -588,6 +588,10 @@ struct Engine::Impl
     std::vector<std::unique_ptr<Input>> keys;
     mutable std::mutex keyMu;
     std::vector<int> keySlot;
+    // A key flow's fill + key unpacked for its linear boxes (gpu::dmeUnpack, once per grain), by
+    // slot: allocated by the control thread when a linear box on it is first enabled
+    // (prepareBox), kept until the engine stops; under keyMu.
+    std::vector<float*> keyPlanes;
     int keyPoolSize = 0;
     std::vector<std::unique_ptr<ClipPlayer>> players;
     // Stinger players: clip players with v210a pictures (alpha) and sound.
@@ -765,6 +769,10 @@ struct Engine::Impl
         {
             return;
         }
+        if (!key.settings.luma && !key.settings.pip)
+        {
+            prepareKeyPlanes(k);
+        }
         std::lock_guard lock{boxMu};
         auto& buffer = boxBuffers[static_cast<std::size_t>(k - 1)];
         if (buffer != nullptr)
@@ -780,6 +788,27 @@ struct Engine::Impl
             return;
         }
         buffer = static_cast<std::int16_t*>(data);
+        allocated += bytes;
+    }
+
+    // The unpacked planes of the key flow keyer k reads (its linear box), if it has none yet.
+    void prepareKeyPlanes(int k)
+    {
+        std::lock_guard lock{keyMu};
+        int const s = keySlot[static_cast<std::size_t>(k - 1)];
+        if (s < 0 || s >= static_cast<int>(keyPlanes.size()) || keyPlanes[static_cast<std::size_t>(s)] != nullptr)
+        {
+            return;
+        }
+        std::size_t const bytes = gpu::dmePlanesBytes(cfg.width, cfg.height);
+        void* data = nullptr;
+        cudaSetDevice(cfg.gpu);
+        if (cudaMallocAsync(&data, bytes, downloadStream) != cudaSuccess || cudaStreamSynchronize(downloadStream) != cudaSuccess)
+        {
+            logError("key planes", {{"keyer", k}, {"mb", bytes / 1048576}});
+            return;
+        }
+        keyPlanes[static_cast<std::size_t>(s)] = static_cast<float*>(data);
         allocated += bytes;
     }
 
@@ -927,6 +956,7 @@ struct Engine::Impl
         }
         keyPoolSize = poolSize;
         keySlot.assign(cfg.keys.size(), -1);
+        keyPlanes.assign(cfg.keys.size(), nullptr);
         for (std::size_t s = 0; s < cfg.keys.size(); ++s)
         {
             keys.push_back(makeInput(static_cast<int>(s) + 1, "key" + std::to_string(s + 1), "", true, keyBytes, 0));
@@ -1751,10 +1781,14 @@ struct Engine::Impl
         // The key flows the linear keyers on air need now (grain i - L, like the inputs), each
         // once.
         std::vector<int> slots;
+        std::vector<float*> planes;
         {
             std::lock_guard lock{keyMu};
             slots = keySlot;
+            planes = keyPlanes;
         }
+        // A key flow's planes, unpacked at its first linear box of this grain.
+        std::vector<bool> unpacked(keys.size());
         std::vector<std::shared_ptr<DevFrame>> keyFrames(keys.size());
         for (auto const& key : plan.keys)
         {
@@ -1835,6 +1869,15 @@ struct Engine::Impl
                                 continue;
                             }
                             source = gpu::dmeSource(frame->data, cfg.width, cfg.height, rowBytes, keyRowBytes);
+                            if (float* const unpackTo = planes[static_cast<std::size_t>(s)]; unpackTo != nullptr)
+                            {
+                                if (!unpacked[static_cast<std::size_t>(s)])
+                                {
+                                    gpu::dmeUnpack(st, source, unpackTo);
+                                    unpacked[static_cast<std::size_t>(s)] = true;
+                                }
+                                source = gpu::dmeSource(unpackTo, cfg.width, cfg.height);
+                            }
                         }
                         else
                         {
@@ -3008,6 +3051,14 @@ struct Engine::Impl
             }
         }
         boxBuffers.clear();
+        for (auto* p : keyPlanes)
+        {
+            if (p != nullptr)
+            {
+                cudaFree(p);
+            }
+        }
+        keyPlanes.clear();
         for (auto& slot : slots)
         {
             for (auto* out : slot.out)
@@ -3518,7 +3569,10 @@ bool Engine::routeInput(int k, Route const& video, Route const& audio)
 
 bool Engine::routeKey(int k, Route const& route)
 {
-    return impl_->routeKeyer(k, route);
+    bool const ok = impl_->routeKeyer(k, route);
+    // A linear box on another key flow: that flow's planes.
+    impl_->prepareBox(k);
+    return ok;
 }
 
 void Engine::prepareBox(int k)

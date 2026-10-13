@@ -93,9 +93,15 @@ std::size_t dmeBufferBytes(int width, int height);
 // then one kernel that runs the horizontal pass into shared memory and the vertical pass from
 // there, per tile of box rows. Nothing for a box that is not on the raster.
 cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer);
-// A box's source: a work picture (yuv16), or a v210a fill + key.
+// A box's source: a work picture (yuv16), a v210a fill + key, or that fill + key unpacked.
 DmeSource dmeSource(WorkBuffer const& work);
 DmeSource dmeSource(std::uint8_t const* v210a, int width, int height, int rowBytes, int keyRowBytes);
+DmeSource dmeSource(float const* planes, int width, int height);
+// A linear box's v210a fill + key unpacked into float planes (core/dme.hpp dmeUnpackPixel), once
+// per grain for all the linear boxes on that key flow: the resample then reads it as a pip reads
+// its work picture. Bytes of the planes on a W × H raster.
+cudaError_t dmeUnpack(cudaStream_t stream, DmeSource const& packed, float* planes);
+std::size_t dmePlanesBytes(int width, int height);
 
 // One ME's Program in one pass (docs/engine-p3.md §2): the background (A; the dissolve of A to B
 // at t; or the wipe of A to B), then the key layers in order, written once. In yuv16 one fused
