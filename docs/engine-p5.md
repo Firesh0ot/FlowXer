@@ -4,7 +4,8 @@ Status: the user answered the 11 open questions "all as suggested" on 2026-10-12
 ([§14](#14-open-questions-for-the-user)). M1 (the mix), M2 (meters) and M3 (the AUDIO strip, the
 source's Audio section, the `audio` widget) are implemented in #97, with the details in
 [Implementation notes (M1)](#implementation-notes-m1), [(M2)](#implementation-notes-m2) and
-[(M3)](#implementation-notes-m3). P5 builds on P2 (the C++/CUDA engine is
+[(M3)](#implementation-notes-m3); the lab checks of M1–M3, the CPU in the running engine and the
+2 h soak are in [M4 as built](#m4-as-built). P5 builds on P2 (the C++/CUDA engine is
 FlowXer's media path, #86), P3 (transitions and keying, #89) and P4 (DME boxes and frame grab, #91).
 The numbers come from a CPU prototype of the audio path on the lab host (Xeon Gold 6136) on
 2026-10-12 ([Appendix](#appendix-lab-measurements-2026-10-12)).
@@ -204,7 +205,8 @@ Every change ramps; nothing jumps.
 - The loudness filter is an IIR, serial per channel: a poor fit for the GPU.
 - **Measured** on the lab CPU ([Appendix](#appendix-lab-measurements-2026-10-12)): the whole P5
   audio path takes 0.16–0.33 ms per grain at 2 channels and 1.4–2.3 ms at 16 channels on one
-  core, which is 1–11 % of a core.
+  core, which is 1–11 % of a core. In the running engine (M4, with the MXL reads and writes):
+  0.5–0.8 ms and 2.6–2.8 ms, 3–4 % and 13–14 % of a core ([M4 as built](#m4-as-built)).
 
 ### The audio thread
 
@@ -528,6 +530,10 @@ No changes. P5 adds no GPU work and no GPU memory.
   the platform's i9-9900K clocks higher and should be faster per core, not measured).
 - **Host memory:** the delay lines, up to 3.4 MB per live input with 16 channels and a 1 s
   maximum (27.5 MB for 8 inputs), or 0.43 MB per stereo input.
+- **As built (M4, measured in the running engine):** fx-audio 0.03–0.04 cores at 2 channels and
+  0.13–0.14 cores at 16 channels (4 MEs, 8 inputs, 2 clip players); the delay lines 0.44 MB per
+  stereo input and 3.5 MB per 16-channel input (L + 3 grains), 28 MB for 8 inputs of 16 channels
+  ([M4 as built](#m4-as-built)).
 
 ### Backward compatibility (P4 → P5)
 
@@ -586,6 +592,92 @@ Per item, ms per grain, at 16 channels (2 channels in brackets):
     for 8 inputs of 16 channels, 126 MB at the 5 s maximum;
   - meters and buffers: under 1 MB;
   - no GPU memory.
+
+### M4 as built
+
+**Lab checks of M1–M3** (image `fxp5:m1b` / `fxp5-gui:m1b`: this branch at f55741a; lab A16 GPU 3,
+L = 4, 1080p50; through FlowXer's API, the GUI over DevTools and the MXL flows only; tools in
+`~/mxl-lab/fxp5/` on the lab host):
+- **M1, 25 of 25** (`fxp5-functional-m1.py`, against the signals of `fxp5-writer` rebuilt by sample
+  index and the engine's float32 maths): with the defaults ME 1 and ME 2 PGM are their Program's
+  input L grains later bit for bit, and a Mix is P4's equal-power crossfade bit for bit; a fader at
+  −6.02 dB is one grain of the S-shaped ramp, then x · g exactly; delays of 1 ms, 20 ms, 500 ms
+  and 1 s (and back to 0) are one grain of crossfade, then L grains + d exactly, without a gap;
+  the channel maps [2, 1], [1, 1], [0, 2] and 1:1 sample-exact; AFV off (also through a Mix), the
+  Cut's equal-power grain, FTB over the AFV-off strip, re-entry with ME 2's master and the stinger
+  strip at −90, −6 and 0 dB every sample as the reference; the residual above 5 kHz through fader
+  moves, mutes, AFV, Cuts, delays and master moves −113.9 dBFS (a hard Cut: −13.6 dBFS); 0 skipped
+  and 0 late grains. fx-audio 0.22 ms per grain (max 0.48) with 2 MEs and 4 inputs.
+- **M2, 13 of 13** (`fxp5-functional-m2.py`): source peak and RMS per block against the generator
+  ±0.01 dB; EBU Tech 3341 cases 1–5 (integrated −23.08, −33.08, −23.02, −23.02, −23.00 LUFS, each
+  equal to the offline reference of the same MXL samples), case 9 (short-term) and the momentary
+  case within 0.010 and 0.040 LU of −23 (0.004 and 0.000 LU of the reference); true peak of sines
+  at 12, 8, 6 kHz and 997 Hz within +0.2 / −0.4 dB of the expected value and 0.001–0.005 dB of the
+  reference.
+- **M3:** the AUDIO strip 16 of 16 (`m3/cdp-audio-lab.py`: columns, fader drag, MUTE, AFV, the
+  master with double click, meters at about 10 Hz only while open, the ⚙ Audio section's delay
+  and Mono reach the mixer, no console errors); the `audio` widget 9 of 9 (`m3/cdp-widget-lab.py`:
+  strips, MUTE, `faders=false`, an unknown ME, framed with `widget-ready` and `widget-size`).
+
+**The CPU in the running engine** (`fxp5-cpu.py`, `fxp5:m1b`, `docker --cpus 6`, Xeon Gold 6136,
+2026-10-13): 4 MEs with PVW, 8 live inputs on the lab's pattern flows with `fxp5-writer`'s noise as
+audio (2 channels: 4 stereo flows; 16 channels: one 16-channel flow for every input), 2 clip players
+with the bars, the stinger with sound; `FLOWXER_AUDIO_CHANNELS` 2, then 16 (the mixer stopped and
+its output domain deleted in between: a PGM flow that exists keeps its channels). The bench's
+scenarios ([§11](#11-cost)) through FlowXer's API: **typical** (per ME Program and one AFV-off
+strip at −12 dB), **busy** (Autos of 90 frames back to back on every ME, faders moving every 50 ms
+on MEs 1 and 2, a stinger with sound on ME 1 every 4 s), **worst** (busy, plus every input and clip
+player AFV off on every ME and every higher ME re-entered). 40 s per scenario; the engine's 1 s
+windows read every 2 s:
+
+| Channels | Scenario | fx-audio ms per grain avg (max) | Bench (§11) | fx-audio, % of a core avg (max) | Engine process, % of a core | Skipped / late |
+|---|---|---|---|---|---|---|
+| 2 | typical | 0.51 (1.65) | 0.16 | 2.6 (4.0) | 18 | 0 / 0 |
+| 2 | busy | 0.78 (1.72) | 0.24 | 3.7 (7.0) | 23 | 0 / 0 |
+| 2 | worst | 0.63 (1.32) | 0.33 (0.74) | 2.9 (4.0) | 23 | 0 / 0 |
+| 16 | typical | 2.80 (5.51) | 1.41 | 14.1 (16.9) | 30 | 0 / 0 |
+| 16 | busy | 2.59 (5.67) | 1.59 | 13.1 (15.0) | 33 | 0 / 0 |
+| 16 | worst | 2.62 (6.67) | 2.28 (3.54) | 13.2 (16.0) | 32 | 0 / 0 |
+
+- No wait for late input audio, no dropped job, no API error in any scenario.
+- **The running engine takes 1.2–3 × the bench**, and its three scenarios differ little: the part
+  that is the same every grain dominates, not the strips. `audio.ms_per_grain` is fx-audio's whole
+  grain: besides the bench's DSP it opens and measures every routed input's MXL audio ring (the
+  lag), copies the new samples out of the ring (one ring per channel) and writes and commits every
+  ME's PGM flow; the thread is not pinned and shares the lab host. Not split further.
+- **CPU:** fx-audio 0.03–0.04 cores at 2 channels and 0.13–0.14 cores at 16 channels (the design:
+  0.008–0.016 and 0.07–0.11); the largest 1 s window 0.07 and 0.17 cores. The slowest grain took
+  6.7 ms of the 20 ms. The platform's i9-9900K clocks higher (not measured).
+- **Host memory:** the delay lines hold the longest delay + L + 3 grains (`held_ms` 1140 ms at 1 s,
+  L = 4, 50p): 0.44 MB per stereo input and 3.50 MB per 16-channel input, 3.5 MB for the 8 stereo
+  inputs and 28.0 MB for 8 inputs of 16 channels (the design: 0.43, 3.4 and 27.5 MB with L + 2).
+  The engine's RSS at the end of each run: 1136 MiB (2 channels) and 1177 MiB (16 channels); of the
+  41 MiB more, the delay lines are 23 MiB, the rest the 16-channel MXL rings and buffers (not split
+  further). No GPU memory.
+
+**2 h soak** (`fxp5-soak.py`, `fxp5:m1b`, A16 GPU 3, `docker --cpus 6`, L = 4, 2 channels;
+2026-10-13, 09:05 to 11:05; started detached with `fxp5-soak-run.sh`, which removed the containers
+and the domains at the end):
+- 2 MEs with PVW, 4 live inputs on the lab's pattern flows with `fxp5-writer`'s audio (cam 1 and 3
+  noise, cam 2 a 440 Hz tone at −20 dBFS, cam 4 a 997 Hz tone at −12 dBFS), clip-2 the bars, a
+  stinger with sound; P4's soak keyers (ME 1: a fading pip and a flying pip, both tied; ME 2: a pip
+  flown by the presets and one flown by its own Auto). Cam 3 an AFV-off strip on ME 1 at −12 dB.
+  ME 2 keeps cam 4 on Program throughout: its meters must stay where the tone puts them.
+- Every 1.5–4 s one of: a fader drag on ME 1 (10 values 50 ms apart), a mute and unmute, an AFV
+  toggle, a delay (0–500 ms) or a channel map (swap, mono, silent + 2, 1:1) on cams 1–3, a master
+  move, a loudness reset; a tied Auto on ME 1 (mix or wipe), a Cut, a T-bar sweep, a preset, ME 2
+  key 2's fly, a grab, an FTB of ME 1 and back; every 60 s a tied stinger with sound. Every 10 s
+  one sample of the engine's `/status` and `GET /audio/meters`: 721 samples.
+
+| | Result |
+|---|---|
+| Operator | 386 fader drags, 208 mutes, 177 AFV toggles, 159 delays, 81 channel maps, 98 master moves, 79 loudness resets; 251 tied Autos, 147 Cuts, 94 T-bar sweeps, 116 tied stingers, 107 FTBs and back, 96 presets, 83 flies, 103 grabs; 0 API errors |
+| Output, every ME | 0 skipped and 0 late grains in 2 h; lag 4.0 grains (L) in every sample |
+| Input audio | about 360 165 blocks per input (every grain), 0 `missing`; PGM audio writes failed: 0 |
+| fx-audio | 0.25 ms per grain on average (10 s windows 0.13–0.80, max 2.94 ms), 1.4 % of a core (max 5.0); no wait, 0 dropped jobs |
+| Meters | every value a number in −120 … +20 dB in every sample; the block counter moved between every two samples; ME 2 (the steady tone) momentary −12.0 LUFS and true peak −11.99 dBTP in all 721 samples; ME 1 momentary −39.6 … −11.3 LUFS (430 different values), true peak at most −7.84 dBTP, 0 overs |
+| Host memory | engine RSS 628 MiB at the start, 729.8 MiB from the first stinger (minute 1) to the end |
+| GPU | engine buffers 594.4 MiB from start to end; engine process 767 MiB, from the first stinger to the end 1043 MiB (the stinger player's decoders, as in P3 and P4); render + download 6.06 ms (max 7.87) |
 
 ## 12. Milestones
 

@@ -96,8 +96,9 @@ Design and answers: `docs/engine-p5.md`.
   stinger crossfades the background over its frames cut − 2 … cut + 1 and adds its sound, scaled
   by the ME's stinger strip. A **Cut** crossfades on the same curve over its grain (P4 switched
   hard). Fade to Black takes the ME's whole sound, AFV-off strips included.
-- **Every change ramps** over one grain, linearly in amplitude: fader, mute, AFV, master; a
-  delay or channel map change crossfades from the old reading to the new one.
+- **Every change ramps** over one grain on an S-shaped curve, g0 + (g1 − g0) · w(s) with
+  w(s) = 0.5 − 0.5 · cos(π (s + 1) / n) (no corners, so no click): fader, mute, AFV, master; a
+  delay or channel map change crossfades from the old reading to the new one on the same curve.
 - **Order:** the strips' sum, plus the stinger's sound, then the master, then FTB, then MXL (and
   the re-entry into lower MEs).
 - **Per live input** (for every ME): a delay of 0 … `FLOWXER_ENGINE_AUDIO_MAX_DELAY_MS` (whole
@@ -123,7 +124,10 @@ Design and answers: `docs/engine-p5.md`.
     `POST /me/{m}/audio/loudness/reset`);
   - `GET /audio/meters` answers the last block; the metrics take the last second. Values below
     −120 dB are −120.
-- CPU only (`fx-audio`); its time per grain is `/status` `audio.ms_per_grain`.
+- CPU only (`fx-audio`); its time per grain is `/status` `audio.ms_per_grain` (measured: 0.5–0.8
+  ms at 2 channels, 2.6–2.8 ms at 16, with 4 MEs and 8 inputs; [below](#p5-m4-audio-cpu-and-soak-lab-2026-10-13)).
+  Host memory: the delay lines, channels × (the longest delay + L + 3 grains) × 192 kB/s per
+  input (0.44 MB stereo, 3.5 MB with 16 channels at 1 s and L = 4).
 
 ### Clip players
 
@@ -846,3 +850,19 @@ The tables are in `docs/engine-p4.md` ("M4 as built"). In short, on A16 GPU 3 (P
 - **2 h soak** (2 MEs, 4 pips fading, flying and tied; tied Autos, Cuts, T-bar, stingers, 849
   grabs): 0 skipped, 0 late, lag 4, render + download 6.01 ms (max 7.78), engine GPU memory flat at
   594 MiB, 0 failed grabs, 91 of 91 grabs of the bars exact, 0 API errors.
+
+## P5 M4: audio CPU and soak (lab, 2026-10-13)
+
+The tables are in `docs/engine-p5.md` ("M4 as built"). In short, on the lab host (Xeon Gold 6136,
+A16 GPU 3):
+
+- **fx-audio in the running engine** (4 MEs, 8 inputs, 2 clip players, the stinger; typical, busy
+  and worst as the bench): 0.51–0.78 ms per grain at 2 channels (max 1.72), 2.59–2.80 ms at 16
+  channels (max 6.67): 0.03–0.04 and 0.13–0.14 cores, 1.2–3 × the isolated bench (it adds the MXL
+  reads and writes); 0 skipped, 0 late, no wait, no dropped job.
+- **Host memory:** the delay lines 3.5 MB for 8 stereo inputs, 28.0 MB for 8 inputs of 16 channels.
+- **2 h soak** (2 MEs, 4 inputs, 2 channels; every 1.5–4 s a fader drag, mute, AFV, delay, channel
+  map, master move or loudness reset next to P3's and P4's tied Autos, Cuts, T-bar, stingers, FTB,
+  boxes and grabs; 2185 actions): 0 skipped, 0 late, lag 4, 0 audio `missing`, fx-audio 0.25 ms per
+  grain (max 2.94), the meters sane (a steady tone on ME 2 at −12.0 LUFS in all 721 samples), host
+  and GPU memory flat after the first stinger, 0 API errors.

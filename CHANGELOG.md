@@ -5,7 +5,7 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
-### Added: audio (P5 M1–M3)
+### Added: audio (P5)
 
 - Per ME a PGM mix of strips (`docs/engine-p5.md`): one per live input, clip player, re-entered ME
   and the stinger, each with a fader (−90 = off … +10 dB), mute and AFV (audio follows video; off:
@@ -33,6 +33,14 @@ in `docs/platform-integration-plan.md` §8.
   `flowxer_engine_pgm_loudness_lufs`, `flowxer_engine_pgm_audio_overs_total`,
   `flowxer_engine_audio_strip_heard`, `flowxer_engine_audio_ms`, `flowxer_engine_audio_wait_ms`,
   `flowxer_engine_audio_jobs_dropped_total`.
+- Measured on the lab (`docs/engine-p5.md`, "M4 as built"): with the defaults every ME's PGM and a
+  Mix are P4's bit for bit; gains, delays (1 ms–1 s) and channel maps exact to the sample; changes
+  leave −114 dBFS above 5 kHz (no click); EBU Tech 3341 within ±0.1 LU and equal to an offline
+  reference of the same samples, true peak within 0.005 dB of the reference. The audio thread in
+  the running engine (4 MEs, 8 inputs): 0.03–0.04 cores at 2 channels, 0.13–0.14 at 16; the delay
+  lines 0.44 MB per stereo input, 3.5 MB per 16-channel input. The 2 h soak with audio changes
+  every few seconds next to transitions, stingers, FTB, boxes and grabs: 0 skipped, 0 late, 0
+  audio `missing`, memory flat, 0 API errors.
 
 ### Added: the boxes' GPU time (P4 M4)
 
