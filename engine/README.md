@@ -168,7 +168,10 @@ fused compose: the background, the upstream keyers, the DSKs, Fade to Black.
   widened by 1 / size when shrinking, at most 32 taps; the horizontal pass into shared memory per
   tile of box rows, then the vertical pass), into the keyer's box buffer (12.4 MB at 1080p,
   allocated by the control thread when the box is first enabled, so the render thread never
-  allocates). The fused compose draws it as a `box` layer: a black
+  allocates). A linear box resamples its key flow unpacked once per grain (#99, `gpu::dmeUnpack`):
+  float planes of the premultiplied Y, Cb, Cr and the key (23.7 MiB at 1080p per key flow that a
+  linear box uses, allocated by the control thread with the box, shared by all linear boxes on that
+  flow). The fused compose draws it as a `box` layer: a black
   rectangular shadow (smoothstep edges), the outer border, then the picture (anti-aliased or soft
   edges), each rounded to 10 bits; the keyer's gain scales all three. A linear box limits its
   premultiplied fill to what its key allows, so the cubic's ringing at a hard key edge leaves no
@@ -441,7 +444,7 @@ picture, dissolve within 1 code. P3 adds every wipe code (5 positions, 4 soft/bo
 directions: 920 cases) bit for bit against the CPU reference, and the fused compose (a wipe and two
 key layers) exact. P4 adds 9 DME boxes (pip, luma and linear; sizes 0.1–1.5, crops, sub-pixel
 positions, soft edges, borders, shadows, partly off the raster): box buffers and composed pictures
-bit for bit.
+bit for bit; since #99 the 3 linear boxes also through the unpack (12 cases).
 
 DME cost on the lab (A16 GPU 3, 1080p, border + shadow, resample + box layer, CUDA events over
 300 runs): corner PiP 1/3 0.26 ms, half-size PiP 0.29 ms, split 2 × 1/2 0.31 ms per box, quad
@@ -798,11 +801,29 @@ The tables are in `docs/engine-p4.md` ("M4 as built"). In short, on A16 GPU 3 (P
   6 pips at 1/4 on every ME (24) 19.23 ms: late grains; 32 boxes at 1/4 render in 22 ms (> 20 ms:
   skipped grains).
 - **Per box:** a half-size pip 0.31–0.33 ms, a pip at 1/4 0.22–0.23 ms, a linear box at 1/4 about
-  1.33 ms (it resamples the packed v210a fill and key); `flowxer_engine_dme_ms` shows each ME's
-  resample; a moving box costs what a static one does; 12.4 MB of GPU memory per keyer with a box.
+  1.33 ms (it resamples the packed v210a fill and key; since #99 0.32 ms, see below);
+  `flowxer_engine_dme_ms` shows each ME's resample; a moving box costs what a static one does;
+  12.4 MB of GPU memory per keyer with a box.
 - **A4000 estimate:** the defaults 10.9 ms (max 12.0), 24 pips 13.0 ms (max 13.6). Recommended at
   1080p50 with 4 MEs at full load: at most 4 boxes per ME (16 in all, about 12 ms); up to 8 per ME
-  on one or two MEs; a linear box counts as 4.
+  on one or two MEs; a linear box counts as 1.5 since #99 (4 before), and each key flow with linear
+  boxes 1.5 more for its unpack.
 - **2 h soak** (2 MEs, 4 pips fading, flying and tied; tied Autos, Cuts, T-bar, stingers, 849
   grabs): 0 skipped, 0 late, lag 4, render + download 6.01 ms (max 7.78), engine GPU memory flat at
   594 MiB, 0 failed grabs, 91 of 91 grabs of the bars exact, 0 API errors.
+
+## Linear boxes unpacked once (#99, lab 2026-10-13)
+
+The tables are in `docs/engine-p4.md` ("Linear boxes unpacked once"). In short, on A16 GPU 0:
+
+- **Per linear box at 1/4:** 0.32 ms in the running engine instead of 1.33 ms (a pip at 1/4:
+  0.22 ms); the resample alone 0.31 ms. The unpack of its key flow: 0.23 ms in the isolated bench,
+  about 0.4–0.5 ms in the running engine, once per key flow and grain.
+- **On top of P3's worst case:** 8 linear boxes on ME 1 render in 8.64 ms (max 9.45) instead of
+  16.77 ms (max 19.25): 0 late grains instead of every grain late. 32 boxes at 1/4 (8 of them
+  linear) render in 13.93 ms instead of 22.04 ms: 0 skipped. Pips cost what they cost before.
+- **GPU memory:** + 23.7 MiB per key flow with a linear box.
+- **Bit-exact:** the running engine's linear box against the CPU reference on the key grain from
+  MXL, 5 of 5 exact (sizes 1/4 to 1.5, crop, soft edge, border, shadow); GPU self-test 12 boxes exact.
+- **A4000 estimate:** a linear box at 1/4 about 0.14 ms (before 0.6 ms). Box limit: a linear box
+  counts as 1.5 instead of 4, and each key flow with linear boxes 1.5 more for its unpack.

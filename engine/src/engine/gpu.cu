@@ -652,7 +652,16 @@ int dmeTileRows(DmeBox const& b)
     return std::max(1, std::min({rows, 64, kDmeTileTaps / b.taps}));
 }
 
-template <int N, bool Linear>
+// How the resample reads its source: yuv16 planes, a v210a fill + key, or that fill + key
+// unpacked (dmeUnpack).
+enum class DmeRead
+{
+    Yuv16,
+    Packed,
+    Planes,
+};
+
+template <int N, DmeRead Read>
 __global__ void __launch_bounds__(128) dmeResampleKernel(DmeBox b, DmeSource src, DmeTable t, int tileRows, std::int16_t* out)
 {
     __shared__ std::int16_t mid[kDmeTileRows][128];
@@ -687,9 +696,13 @@ __global__ void __launch_bounds__(128) dmeResampleKernel(DmeBox b, DmeSource src
         for (int r = 0; r < n; ++r)
         {
             int const row = b.r0 + first + r;
-            if constexpr (Linear)
+            if constexpr (Read == DmeRead::Packed)
             {
                 mid[r][threadIdx.x] = dmeHSampleLinear<N>(dmeWords(src, row), dmeKeyLine(src, row), plane, w, j);
+            }
+            else if constexpr (Read == DmeRead::Planes)
+            {
+                mid[r][threadIdx.x] = dmeHSampleOpaque<N>(dmePlanesLine(src.planes, src.width, src.height, plane, row), w, j);
             }
             else
             {
@@ -713,6 +726,16 @@ __global__ void __launch_bounds__(128) dmeResampleKernel(DmeBox b, DmeSource src
             acc += rowW[k0 + i] * static_cast<float>(mid[rowR[k0 + i]][threadIdx.x]);
         }
         out[static_cast<std::size_t>(oy) * static_cast<std::size_t>(b.cols) + static_cast<std::size_t>(e)] = dmeToBox(acc, premultiplied);
+    }
+}
+
+// A linear source unpacked: one thread per pixel of a row.
+__global__ void dmeUnpackKernel(DmeSource src, float* planes)
+{
+    int const x = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (x < src.width)
+    {
+        dmeUnpackPixel(src, planes, x, static_cast<int>(blockIdx.y));
     }
 }
 } // namespace
@@ -773,6 +796,27 @@ DmeSource dmeSource(std::uint8_t const* v210a, int width, int height, int rowByt
     return s;
 }
 
+DmeSource dmeSource(float const* planes, int width, int height)
+{
+    DmeSource s;
+    s.width = width;
+    s.height = height;
+    s.planes = planes;
+    return s;
+}
+
+std::size_t dmePlanesBytes(int width, int height)
+{
+    return dmePlanesFloats(width, height) * sizeof(float);
+}
+
+cudaError_t dmeUnpack(cudaStream_t stream, DmeSource const& packed, float* planes)
+{
+    dim3 const grid(static_cast<unsigned>((packed.width + 127) / 128), static_cast<unsigned>(packed.height));
+    dmeUnpackKernel<<<grid, 128, 0, stream>>>(packed, planes);
+    return cudaGetLastError();
+}
+
 cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const& source, DmeScratch& scratch, std::int16_t* buffer)
 {
     if (box.bw == 0 || box.bh == 0)
@@ -786,13 +830,17 @@ cudaError_t dmeResample(cudaStream_t stream, DmeBox const& box, DmeSource const&
     dim3 const grid(static_cast<unsigned>((box.cols + 127) / 128), static_cast<unsigned>((box.bh + tileRows - 1) / tileRows));
     dmeDispatch(box.taps, [&](auto n) {
         constexpr int N = decltype(n)::value;
-        if (source.v210a != nullptr)
+        if (source.planes != nullptr)
         {
-            dmeResampleKernel<N, true><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
+            dmeResampleKernel<N, DmeRead::Planes><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
+        }
+        else if (source.v210a != nullptr)
+        {
+            dmeResampleKernel<N, DmeRead::Packed><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
         }
         else
         {
-            dmeResampleKernel<N, false><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
+            dmeResampleKernel<N, DmeRead::Yuv16><<<grid, 128, 0, stream>>>(box, source, table, tileRows, buffer);
         }
     });
     return cudaGetLastError();
@@ -1073,10 +1121,11 @@ bool dmeSelfTest(Planar422 const& pa, Planar422 const& pb, std::uint8_t const* v
     DmeScratch scratch;
     std::size_t const bufBytes = dmeBufferBytes(w, h);
     DeviceBytes bufs(bufBytes * 3);
+    DeviceBytes planes(dmePlanesBytes(w, h));
     WorkBuffer wa;
     WorkBuffer wb;
     WorkBuffer wo;
-    if (dkey.get() == nullptr || dout.get() == nullptr || bufs.get() == nullptr || allocDmeScratch(scratch, w, h) != cudaSuccess ||
+    if (dkey.get() == nullptr || dout.get() == nullptr || bufs.get() == nullptr || planes.get() == nullptr || allocDmeScratch(scratch, w, h) != cudaSuccess ||
         allocWork(wa, WorkFormat::Yuv16, w, h) != cudaSuccess || allocWork(wb, WorkFormat::Yuv16, w, h) != cudaSuccess ||
         allocWork(wo, WorkFormat::Yuv16, w, h) != cudaSuccess)
     {
@@ -1222,6 +1271,25 @@ bool dmeSelfTest(Planar422 const& pa, Planar422 const& pb, std::uint8_t const* v
             if ((err != cudaSuccess || bufDiff != 0) && failed.empty())
             {
                 failed = "dme box " + std::to_string(k) + " resample: max error " + std::to_string(bufDiff) + " (" + cudaGetErrorString(err) + ")";
+            }
+            if (c.kind == DmeKind::Linear)
+            {
+                // The engine's path: the fill + key unpacked once, the box resampled from there.
+                auto* fp = reinterpret_cast<float*>(planes.get());
+                dmeUnpack(nullptr, src, fp);
+                dmeResample(nullptr, d.box, dmeSource(fp, w, h), scratch, buf);
+                cudaError_t const err2 = cudaDeviceSynchronize();
+                cudaMemcpy(got.data(), buf, got.size() * sizeof(std::int16_t), cudaMemcpyDeviceToHost);
+                int diff = 0;
+                for (std::size_t i = 0; i < ref.size(); ++i)
+                {
+                    diff = std::max(diff, std::abs(int(ref[i]) - int(got[i])));
+                }
+                ++cases;
+                if ((err2 != cudaSuccess || diff != 0) && failed.empty())
+                {
+                    failed = "dme box " + std::to_string(k) + " unpacked resample: max error " + std::to_string(diff) + " (" + cudaGetErrorString(err2) + ")";
+                }
             }
             DmeDraw cpuDraw = d;
             std::vector<std::int16_t>& kept = refs[slot];
