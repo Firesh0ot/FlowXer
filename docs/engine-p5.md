@@ -308,7 +308,7 @@ As built in #97 (`core/audiomix`, `engine/engine.cpp` fx-audio, `engine/api.cpp`
 - **The delay line** is the longest delay + L + 3 grains long, allocated when the input's flow
   opens with the flow's channels. A delayed read is the window of grain i − L, d samples earlier
   (`delayedSamples`); what the line does not hold is silence. A delay or map change crossfades
-  linearly from the old reading to the new one over one grain.
+  from the old reading to the new one over one grain (S-shaped, w(s) above).
 - **Counters:** every routed input is read every grain, so `audio.blocks`, `missing` and
   `startup` count every routed input (P4: only Program's sources). Before a route's first sample
   (its delay at the start) and in the start-up window: `startup`.
