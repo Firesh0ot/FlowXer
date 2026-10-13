@@ -923,3 +923,94 @@ TEST(playout_loop_skips_and_play_on_cut)
     CHECK(s.frame == 2 && s.seq == 2 && !s.playing && r.state() == Playout::State::Ended);
     CHECK(std::string(stateName(Playout::State::Paused)) == "paused");
 }
+
+// ---- a clip player's end action (docs/clip-end.md) ------------------------------------------
+
+TEST(playout_end_index)
+{
+    Playout p;
+    p.load(10, false, false);
+    CHECK(!p.endIndex());
+    p.play();
+    // Not before its first frame is shown.
+    CHECK(!p.endIndex());
+    p.advance(100, false);
+    CHECK(p.endIndex() && *p.endIndex() == 109);
+    p.advance(101, false);
+    // Grains skipped by the render thread keep it on the TAI timeline.
+    p.advance(105, false);
+    CHECK(*p.endIndex() == 109);
+    p.pause();
+    CHECK(!p.endIndex());
+    // A grain held while paused moves the end by one.
+    p.advance(106, false);
+    p.play();
+    p.advance(107, false);
+    p.advance(108, false);
+    CHECK(*p.endIndex() == 110);
+    p.advance(109, false);
+    auto s = p.advance(110, false);
+    // Ended there: it keeps that grain.
+    CHECK(s.frame == 9 && p.state() == Playout::State::Ended && *p.endIndex() == 110);
+    p.advance(111, false);
+    CHECK(*p.endIndex() == 110);
+    p.stop();
+    CHECK(!p.endIndex());
+    // A loop has no end.
+    p.setLoop(true);
+    p.play();
+    p.advance(120, false);
+    CHECK(!p.endIndex());
+    // A skip past the end: the grain its last frame was due in.
+    Playout r;
+    r.load(5, false, false);
+    r.play();
+    r.advance(200, false);
+    CHECK(*r.endIndex() == 204);
+    r.advance(210, false);
+    CHECK(r.state() == Playout::State::Ended && *r.endIndex() == 204);
+}
+
+TEST(take_held_until_its_grain)
+{
+    Mixer mixer(2, 8, 2);
+    // A cut held for grain 10: grain 9 still shows Program, grain 10 the target.
+    CHECK(mixer.takeAt(10, 1, Source{Source::Kind::Player, 1}, 0, in(1), Transition::Cut) == MixResult::Ok);
+    CHECK(mixer.takeAt(10, 1, in(9), 0, std::nullopt) == MixResult::BadSource);
+    CHECK(mixer.takeAt(10, 3, in(1), 0, std::nullopt) == MixResult::BadMe);
+    CHECK(mixer.view()[0].deferred && *mixer.view()[0].deferred == 10);
+    auto p = mixer.frame(9).mes;
+    CHECK(p[1].me == 1 && p[1].a == in(1));
+    p = mixer.frame(10).mes;
+    CHECK(p[1].a == (Source{Source::Kind::Player, 1}) && !mixer.view()[0].deferred && mixer.view()[0].deferredMade == 10);
+    // A Mix held for grain 20 over 4 grains: t 0.25 at grain 20, the target in full at grain 23.
+    CHECK(mixer.takeAt(20, 1, in(2), 4, Source{Source::Kind::Player, 1}, Transition::Mix) == MixResult::Ok);
+    p = mixer.frame(19).mes;
+    CHECK(!p[1].mixing);
+    p = mixer.frame(20).mes;
+    CHECK(p[1].mixing && p[1].t == 0.25f && p[1].b == in(2));
+    p = mixer.frame(23).mes;
+    CHECK(p[1].mixing && p[1].t == 1.f);
+    p = mixer.frame(24).mes;
+    CHECK(!p[1].mixing && p[1].a == in(2) && p[1].preview == (Source{Source::Kind::Player, 1}));
+    // A grain already planned: the next one.
+    CHECK(mixer.takeAt(5, 1, in(3), 0, std::nullopt, Transition::Cut) == MixResult::Ok);
+    p = mixer.frame(25).mes;
+    CHECK(p[1].a == in(3));
+    // A newer held take replaces the older; another command of the ME makes it at once.
+    CHECK(mixer.takeAt(40, 1, in(4), 0, std::nullopt, Transition::Cut) == MixResult::Ok);
+    CHECK(mixer.takeAt(41, 1, in(5), 0, std::nullopt, Transition::Cut) == MixResult::Ok);
+    mixer.runDeferred(2);
+    CHECK(mixer.view()[0].deferred && *mixer.view()[0].deferred == 41);
+    mixer.runDeferred(1);
+    p = mixer.frame(30).mes;
+    CHECK(p[1].a == in(5) && !mixer.view()[0].deferred && mixer.view()[0].deferredMade == 0);
+    // A held stinger starts at its grain (its player ready): its cut point there + cut.
+    CHECK(mixer.takeAt(50, 1, in(6), 0, std::nullopt, Transition::Stinger, Sting{1, 10, 4}) == MixResult::Ok);
+    p = mixer.frame(49, {true}).mes;
+    CHECK(p[1].stinger == 0);
+    p = mixer.frame(50, {true}).mes;
+    CHECK(p[1].stinger == 1 && p[1].stingerFrame == 0 && !p[1].cutDone);
+    p = mixer.frame(54, {true}).mes;
+    CHECK(p[1].stingerFrame == 4 && p[1].cutDone && p[1].background() == in(6));
+}

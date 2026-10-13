@@ -282,6 +282,9 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
 }
 .player-bar button:nth-child(5) { margin-left: auto; }
 .player-bar button.on { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A clip player's end action (docs/clip-end.md); dim while it loops. */
+.player-bar .end-mark { align-self: center; padding: 1px 4px; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; color: #9cc6f0; border: 1px solid #4a7ab0; border-radius: 3px; white-space: nowrap; }
+.player-bar .end-mark.idle { opacity: 0.45; }
 /* A downstream keyer: on/off, Auto and its rate. */
 .dsk-control { display: flex; align-items: stretch; }
 .aux-row .dsk-control button { border-radius: 0; }

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AudioState, LibraryItem, LogicalInput, StingerSlot } from "../api";
+import type { AudioState, ClipEnd, LibraryItem, LogicalInput, StingerSlot } from "../api";
 
 const KINDS = ["mxl_live", "clip_player", "black"] as const;
 
@@ -37,6 +37,7 @@ export function SourceSettingsModal({
   const [libraryItemId, setLibraryItemId] = useState(input.library_item_id ?? "");
   const [loop, setLoop] = useState(Boolean(input.loop));
   const [playOnCut, setPlayOnCut] = useState(Boolean(input.play_on_cut));
+  const [onEnd, setOnEnd] = useState<ClipEnd>(input.on_end ?? "off");
   const [stingerSlotId, setStingerSlotId] = useState(input.stinger_slot_id ?? "");
   const [error, setError] = useState<string | null>(null);
   const inputAudio = audio?.inputs[input.id];
@@ -171,6 +172,15 @@ export function SourceSettingsModal({
               <input type="checkbox" checked={playOnCut} onChange={(e) => setPlayOnCut(e.target.checked)} />
               Play on cut (start when taken to Program)
             </label>
+            <label>
+              At the end (not looping): each ME with it on Program takes its Preview
+              <select value={onEnd} onChange={(e) => setOnEnd(e.target.value as ClipEnd)}>
+                <option value="off">Off: hold the last frame</option>
+                <option value="cut">Cut, on the frame after the last</option>
+                <option value="auto">Auto: the ME's mix or wipe, ending on the last frame</option>
+                <option value="stinger">Stinger: the ME's stinger, its cut point on the last frame</option>
+              </select>
+            </label>
             <button type="button" className="ghost" onClick={onOpenLibrary}>
               Open clip and still library…
             </button>
@@ -220,6 +230,7 @@ export function SourceSettingsModal({
                   payload.library_item_id = libraryItemId || null;
                   payload.loop = loop;
                   payload.play_on_cut = playOnCut;
+                  payload.on_end = onEnd;
                 }
                 await onSave(payload);
                 if (kind === "mxl_live" && audio) {

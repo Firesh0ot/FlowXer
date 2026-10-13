@@ -1,6 +1,7 @@
 import type { PreviewMap } from "./preview";
 
 export type InputKind = "mxl_live" | "clip_player" | "black";
+export type ClipEnd = "off" | "cut" | "auto" | "stinger";
 
 export interface LogicalInput {
   id: string;
@@ -12,6 +13,8 @@ export interface LogicalInput {
   /** Clip players: loop, and play when taken to Program. */
   loop?: boolean;
   play_on_cut?: boolean;
+  /** Clip players: what an ME with it on Program does at the end of its clip (docs/clip-end.md). */
+  on_end?: ClipEnd;
   group_hint?: string | null;
   stinger_slot_id?: string | null;
   video?: { flow_id?: string | null; media_type: string } | null;

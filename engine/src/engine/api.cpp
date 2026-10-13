@@ -139,6 +139,7 @@ json meView(Engine& engine, int me)
             return json{{"me", view.me}, {"program", sourceName(view.program)}, {"preview", sourceName(view.preview)}, {"mixing", view.mixing},
                 {"wiping", view.wiping}, {"target", sourceName(view.target)}, {"frames", view.frames}, {"manual", view.manual}, {"t", view.t},
                 {"stinger", view.stinger}, {"start", view.start}, {"tied", view.tied},
+                {"deferred_at", view.deferred ? json(*view.deferred) : json(nullptr)}, {"deferred_made", view.deferredMade},
                 {"transition", transitionJson(view.next)}};
         }
     }
@@ -340,6 +341,15 @@ HttpResponse meCommand(Engine& engine, int me, std::string const& action, json c
             {
                 return error(404, "no stinger player " + std::to_string(sting.player));
             }
+        }
+        if (auto const it = body.find("at"); it != body.end() && !it->is_null())
+        {
+            // Held until that output grain (docs/clip-end.md).
+            if (!it->is_number_unsigned())
+            {
+                return error(400, "at must be an output grain index");
+            }
+            return mixResult(engine, mixer.takeAt(it->get<std::uint64_t>(), me, *s, *n, preview, *type, sting, body.value("ties", false)), me, "ME");
         }
         return mixResult(engine, mixer.take(me, *s, *n, preview, *type, sting, body.value("ties", false)), me, "ME");
     }
@@ -596,6 +606,10 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return HttpResponse{200, "text/plain; version=0.0.4", engine.metricsText()};
         }
+        if (request.path == "/players")
+        {
+            return HttpResponse{200, "application/json", engine.playersJson()};
+        }
         if (request.path == "/mosaic/map")
         {
             return HttpResponse{200, "application/json", engine.mosaicMapJson()};
@@ -664,6 +678,12 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
         {
             return engine.resetLoudness(me) ? reply(200, json{{"me", me}, {"loudness_reset", true}}) : error(404, "no ME " + std::to_string(me));
         }
+        // A held take of this ME (a clip player's end action) is made before any other command
+        // of the ME, so the commands keep the control plane's order.
+        if (!(rest == "take" && body.contains("at") && !body["at"].is_null()))
+        {
+            engine.mixer().runDeferred(me);
+        }
         return meCommand(engine, me, rest, body);
     }
     if (int const k = pathNumber(request.path, "/input/", rest); k > 0 && rest == "audio")
@@ -716,6 +736,8 @@ HttpResponse handleRequest(Engine& engine, HttpRequest const& request)
     if (int const k = pathNumber(request.path, "/keyer/", rest); k > 0)
     {
         auto& mixer = engine.mixer();
+        // A held take may tie this keyer: it is made first.
+        mixer.runDeferred();
         MixResult result = MixResult::Ok;
         if (rest.empty())
         {
