@@ -274,9 +274,11 @@ class VisionMixer:
         self._persist_at = 0.0
         self._persist_timer: threading.Timer | None = None
         # Clip players' end actions: per panel the timer of the next one (player id, start grain,
-        # timer), the last one done (player id, end grain), the engine's last /players (render
-        # index, monotonic time) and the stinger cues asked for.
+        # timer), the clip it saw playing on its Program and the last one done (player id, end
+        # grain), the engine's last /players (render index, monotonic time) and the stinger cues
+        # asked for.
         self._clip_end_timers: dict[str, tuple[str, int, threading.Timer]] = {}
+        self._clip_end_seen: dict[str, tuple[str, int]] = {}
         self._clip_end_done: dict[str, tuple[str, int]] = {}
         self._players_seen: tuple[int, float] | None = None
         self._clip_end_cued: set[tuple[str, str]] = set()
@@ -2443,6 +2445,11 @@ class VisionMixer:
             entry = players[k - 1] if k <= len(players) and isinstance(players[k - 1], dict) else {}
             end = entry.get("end_index")
             if not isinstance(end, int) or end < index - CLIP_END_LATE or self._clip_end_done.get(panel.id) == (item.id, end):
+                continue
+            if entry.get("state") == "playing":
+                self._clip_end_seen[panel.id] = (item.id, end)
+            elif self._clip_end_seen.get(panel.id) != (item.id, end):
+                # Ended before it was on this ME's Program (or before it was seen playing there).
                 continue
             start = self._clip_end_start(panel, end)
             if start - index > CLIP_END_HORIZON:

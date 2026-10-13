@@ -34,6 +34,7 @@ Let E be the output grain that shows the clip's last frame.
 - **A clip shorter than the transition** (or an end action found late) starts at once.
 - **A manual take, cut, Auto or stinger** on that ME before the action is sent cancels it, and so do a stop, pause, cue or play of the player. After it is sent (3 grains before its grain), a take on the ME is a take during a transition.
 - **A transition already running** on the ME (or a held T-bar) delays the action. It is retried every 100 ms and then starts at once, for up to 50 grains after E.
+- **A clip that ended before it was seen playing on that ME's Program** does nothing there (for example, an ended clip taken to another ME).
 - **A stinger that cannot play** (no mezzanine yet, every stinger player busy) becomes a cut in grain E + 1.
 
 ## It is a normal take

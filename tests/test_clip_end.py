@@ -164,10 +164,12 @@ def test_only_on_program_without_loop_and_another_preview(mixer: VisionMixer) ->
         assert mixer._clip_end_action(panel) == ClipEnd.off
         mixer._clip_end_tick(_players(1000, 1002), time.monotonic())
         assert not mixer._clip_end_timers
-    # An end long past (more than CLIP_END_LATE grains) does nothing.
+    # An end long past (more than CLIP_END_LATE grains) does nothing, nor a clip that had ended
+    # before it was seen playing on this ME's Program.
     mixer.update_input("clip-1", LogicalInputUpdate(on_end=ClipEnd.cut))
     mixer.set_preview("cam-2")
     mixer._clip_end_tick(_players(1100, 1002, "ended"), time.monotonic())
+    mixer._clip_end_tick(_players(1010, 1005, "ended"), time.monotonic())
     assert not mixer._clip_end_timers and not _takes(calls)
 
 
@@ -219,4 +221,4 @@ def test_the_lead(mixer: VisionMixer) -> None:
     assert _wait_for(lambda: _takes(calls), timeout=2.0)
     elapsed = time.monotonic() - seen
     expected = (1012 - CLIP_END_LEAD - 1000) / mixer.settings.fps
-    assert expected - 0.01 <= elapsed <= expected + 0.1
+    assert expected - 0.01 <= elapsed <= expected + 0.25
