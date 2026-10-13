@@ -327,6 +327,37 @@ export interface AudioMeters {
   >;
 }
 
+/** What a recall takes besides each ME's Preview, its transition and the settings of its keyers off air. */
+export interface SnapshotOptions {
+  /** Program/on-air: also Program, the keys' on-air state and FTB (cuts). */
+  program: boolean;
+  /** Also the ME's audio strips and master. */
+  audio: boolean;
+}
+
+/** A snapshot without its contents (GET /snapshots). */
+export interface SnapshotInfo {
+  number: number;
+  name: string;
+  /** me-<n>, or all. */
+  panel_id: string;
+  /** The defaults of its recall. */
+  options: SnapshotOptions;
+  stored_at: string;
+}
+
+export interface SnapshotsState {
+  startup: number | null;
+  snapshots: SnapshotInfo[];
+}
+
+export interface SnapshotRecallResult {
+  snapshot: SnapshotInfo;
+  options: SnapshotOptions;
+  /** What it did not change, and why. */
+  skipped: string[];
+}
+
 export interface ConsoleState {
   workspace: WorkspaceConfig;
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
@@ -350,6 +381,8 @@ export interface ConsoleState {
   pinned?: Partial<Record<keyof WorkspaceConfig, string>>;
   /** The audio settings (P5). */
   audio?: AudioState;
+  /** The snapshots without their contents, and the start-up snapshot. */
+  snapshots?: SnapshotsState;
 }
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -491,6 +524,36 @@ export const api = {
     }).then((r) => parse(r)),
   resetLoudness: (panel: string) =>
     fetch(`/api/v1/audio/panels/${encodeURIComponent(panel)}/loudness/reset`, { method: "POST" }).then((r) => parse(r)),
+  /** Store one ME (panel_id) or all MEs ("all"); number: the lowest free one unless given (a used one is stored over). */
+  storeSnapshot: (panel_id: string, number?: number) =>
+    fetch("/api/v1/snapshots", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(number ? { panel_id, number } : { panel_id }),
+    }).then((r) => parse<SnapshotInfo>(r)),
+  patchSnapshot: (number: number, payload: { name?: string; options?: Partial<SnapshotOptions> }) =>
+    fetch(`/api/v1/snapshots/${number}`, {
+      method: "PATCH",
+      headers: jsonHeaders,
+      body: JSON.stringify(payload),
+    }).then((r) => parse<SnapshotInfo>(r)),
+  deleteSnapshot: (number: number) =>
+    fetch(`/api/v1/snapshots/${number}`, { method: "DELETE" }).then(async (r) => {
+      if (!r.ok) await parse(r);
+    }),
+  /** Recall with the snapshot's own options, or with these. */
+  recallSnapshot: (number: number, options?: SnapshotOptions) =>
+    fetch(`/api/v1/snapshots/${number}/recall`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(options ?? {}),
+    }).then((r) => parse<SnapshotRecallResult>(r)),
+  startupSnapshot: (number: number | null) =>
+    fetch("/api/v1/snapshots/startup", {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify({ number }),
+    }).then((r) => parse<SnapshotsState>(r)),
   patchStingerSlot: (id: string, payload: Record<string, unknown>) =>
     fetch(`/api/v1/stinger-slots/${id}`, {
       method: "PATCH",
