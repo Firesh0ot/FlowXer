@@ -1,4 +1,13 @@
-import type { LibraryItem, LogicalInput, SourceRuntime } from "../api";
+import type { ClipEnd, LibraryItem, LogicalInput, SourceRuntime } from "../api";
+
+// A clip player's end action as its mark shows it, and what it does.
+const END_LABELS: Record<ClipEnd, string> = { off: "", cut: "CUT", auto: "AUTO", stinger: "STING" };
+const END_TITLES: Record<ClipEnd, string> = {
+  off: "",
+  cut: "a cut on the frame after the last",
+  auto: "its mix or wipe, ending on the last frame",
+  stinger: "its stinger, the cut point on the last frame",
+};
 
 /** mm:ss.ff of a frame count. */
 function timecode(frames: number, fps: number): string {
@@ -113,6 +122,14 @@ export function PlayerBar({
       >
         AUTO
       </button>
+      {input.on_end && input.on_end !== "off" ? (
+        <span
+          className={`end-mark ${input.loop ? "idle" : ""}`}
+          title={`At the end, each ME with it on Program takes its Preview: ${END_TITLES[input.on_end]}${input.loop ? " (not while it loops)" : ""}`}
+        >
+          END {END_LABELS[input.on_end]}
+        </span>
+      ) : null}
     </div>
   );
 }

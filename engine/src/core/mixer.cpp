@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace fxeng
 {
@@ -88,6 +89,7 @@ Mixer::Mixer(int mes, int inputs, int players, std::vector<KeyerSpec> keyers)
     , inputs_(std::max(0, inputs))
     , players_(std::max(0, players))
     , state_(static_cast<std::size_t>(mes_))
+    , deferred_(static_cast<std::size_t>(mes_))
     , ftbs_(static_cast<std::size_t>(mes_))
 {
     // ME m starts on inputs 2m-1 (Program) and 2m (Preview), wrapped to the inputs there are;
@@ -300,6 +302,53 @@ MixResult Mixer::take(int me, Source target, int frames, std::optional<Source> p
     }
     notify();
     return MixResult::Ok;
+}
+
+MixResult Mixer::takeAt(std::uint64_t at, int me, Source target, int frames, std::optional<Source> preview, Transition type, Sting sting, bool ties)
+{
+    if (!validMe(me))
+    {
+        return MixResult::BadMe;
+    }
+    if (!sourceAllowed(me, target) || (preview && !sourceAllowed(me, *preview)))
+    {
+        return MixResult::BadSource;
+    }
+    if (frames < 0 || frames > kMaxFrames)
+    {
+        return MixResult::BadFrames;
+    }
+    std::lock_guard lock{mu_};
+    deferred_[static_cast<std::size_t>(me - 1)] = Deferred{at, target, frames, preview, type, sting, ties};
+    return MixResult::Ok;
+}
+
+void Mixer::runHeld(std::uint64_t index, bool all, std::optional<int> me)
+{
+    std::vector<std::pair<int, Deferred>> due;
+    {
+        std::lock_guard lock{mu_};
+        for (int m = 1; m <= mes_; ++m)
+        {
+            auto& held = deferred_[static_cast<std::size_t>(m - 1)];
+            if (held && (me ? m == *me : true) && (all || held->at <= index))
+            {
+                due.emplace_back(m, *held);
+                held.reset();
+            }
+        }
+    }
+    for (auto const& [m, d] : due)
+    {
+        take(m, d.target, d.frames, d.preview, d.type, d.sting, d.ties);
+        std::lock_guard lock{mu_};
+        state_[static_cast<std::size_t>(m - 1)].heldMade = all ? 0 : index;
+    }
+}
+
+void Mixer::runDeferred(std::optional<int> me)
+{
+    runHeld(0, true, me);
 }
 
 MixResult Mixer::cut(int me)
@@ -911,6 +960,7 @@ MixResult Mixer::keyAuto(int key, int frames)
 
 FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerReady)
 {
+    runHeld(index, false, std::nullopt);
     FramePlan out;
     bool ended = false;
     std::unique_lock lock{mu_};
@@ -1120,6 +1170,11 @@ std::vector<MeView> Mixer::view() const
             }
         }
         view.next = state.next;
+        if (auto const& held = deferred_[static_cast<std::size_t>(m - 1)])
+        {
+            view.deferred = held->at;
+        }
+        view.deferredMade = state.heldMade;
         views.push_back(view);
     }
     return views;

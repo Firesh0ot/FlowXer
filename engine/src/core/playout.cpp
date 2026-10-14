@@ -30,6 +30,7 @@ void Playout::jump(long long frame)
     shownSeq_ = nextSeq_ = 0;
     ++generation_;
     started_ = false;
+    endedAt_.reset();
 }
 
 void Playout::load(long long frames, bool loop, bool playOnCut)
@@ -86,6 +87,7 @@ void Playout::play()
     }
     state_ = State::Playing;
     started_ = false;
+    endedAt_.reset();
 }
 
 void Playout::pause()
@@ -145,6 +147,8 @@ Playout::Step Playout::advance(std::uint64_t index, bool onAir)
             }
             else
             {
+                // Its last frame was due in a skipped grain.
+                endedAt_ = lastIndex_ + 1 + static_cast<std::uint64_t>(frames_ - 1 - (position_ - skipped));
                 nextSeq_ -= position_ - (frames_ - 1);
                 position_ = shown_ = frames_ - 1;
                 shownSeq_ = nextSeq_;
@@ -173,6 +177,7 @@ Playout::Step Playout::advance(std::uint64_t index, bool onAir)
     {
         // The last frame was shown: hold it.
         state_ = State::Ended;
+        endedAt_ = index;
     }
     return step;
 }
@@ -193,6 +198,20 @@ long long Playout::position() const
 {
     std::lock_guard lock{mu_};
     return shown_;
+}
+
+std::optional<std::uint64_t> Playout::endIndex() const
+{
+    std::lock_guard lock{mu_};
+    if (state_ == State::Ended)
+    {
+        return endedAt_;
+    }
+    if (state_ != State::Playing || loop_ || !started_)
+    {
+        return std::nullopt;
+    }
+    return lastIndex_ + static_cast<std::uint64_t>(frames_ - 1 - shown_);
 }
 
 long long Playout::frames() const

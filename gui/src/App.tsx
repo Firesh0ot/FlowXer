@@ -7,6 +7,7 @@ import { Monitor } from "./components/Monitor";
 import { KeyerControl } from "./components/KeyerControl";
 import { previewSession } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
+import { SnapshotPanel } from "./components/SnapshotPanel";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
 import { SourceTile } from "./components/SourceTile";
 import { StingerSettingsModal } from "./components/StingerSettingsModal";
@@ -42,6 +43,8 @@ export default function App() {
   // A picture's context menu (GRAB) at the mouse, and the toast that names a new still.
   const [grabMenu, setGrabMenu] = useState<{ source: string; label: string; x: number; y: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The SNAP panel (the active ME's snapshots and those of all MEs), open or closed.
+  const [snapOpen, setSnapOpen] = useState(false);
   // The AUDIO strip of the active ME, open or closed (remembered in the browser).
   const [audioOpen, setAudioOpen] = useState(() => {
     try {
@@ -295,6 +298,16 @@ export default function App() {
               </button>
             </div>
           ))}
+          {snapshot.snapshots ? (
+            <div className="snap-wrap">
+              <button className={`snap-toggle ${snapOpen ? "on" : ""}`} title="Snapshots of the active ME and of all MEs" onClick={() => setSnapOpen(!snapOpen)}>
+                SNAP
+              </button>
+              {snapOpen ? (
+                <SnapshotPanel panel={panel} snapshots={snapshot.snapshots} onCommand={(fn) => void command(fn)} onNotice={setNotice} />
+              ) : null}
+            </div>
+          ) : null}
           {snapshot.audio ? (
             <button className={`audio-toggle ${audioOpen ? "on" : ""}`} title="The active ME's audio strip" onClick={toggleAudio}>
               AUDIO
