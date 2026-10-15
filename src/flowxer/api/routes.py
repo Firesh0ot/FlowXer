@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
 
@@ -38,6 +38,12 @@ from flowxer.api.schemas import (
     PositionRequest,
     PreviewRequest,
     ResourceInfo,
+    Snapshot,
+    SnapshotOptionsUpdate,
+    SnapshotRecallResult,
+    SnapshotStartup,
+    SnapshotStore,
+    SnapshotUpdate,
     StingerInfo,
     StingerPlayRequest,
     StingerSlot,
@@ -188,13 +194,15 @@ def preview(mixer: VisionMixer = Depends(get_mixer)) -> dict:
         "Cut/Auto and the transition type (`transition=false` hides it) of one ME. `keys`: one ME's "
         "upstream keyers and DSKs with On/Off and Auto. `dme`: one upstream keyer's box: On/Off, "
         "Auto, Run back and forth, and the presets. `audio`: one ME's audio strips (meter, MUTE, AFV, and the "
-        "fader unless `faders=false`) and its master meter with the loudness."
+        "fader unless `faders=false`) and its master meter with the loudness. `snapshots`: recall buttons for "
+        "one ME's snapshots (`me`) and, unless `all=false`, the snapshots of all MEs."
     ),
 )
 def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
     me = {"type": "integer", "minimum": 1, "maximum": len(mixer.panels), "title": "ME"}
     transition = {"type": "boolean", "default": True, "title": "Transition type"}
     faders = {"type": "boolean", "default": True, "title": "Faders"}
+    all_mes = {"type": "boolean", "default": True, "title": "Snapshots of all MEs"}
     keyer = {"type": "integer", "minimum": 1, "maximum": max(1, mixer.workspace.keyers_per_me), "title": "Upstream keyer"}
     return [
         {
@@ -223,6 +231,13 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "title": "FlowXer audio",
             "params": {"type": "object", "properties": {"me": me, "faders": faders}, "required": ["me"]},
             "min_size": {"w": 480, "h": 240},
+            "version": __version__,
+        },
+        {
+            "id": "snapshots",
+            "title": "FlowXer snapshots",
+            "params": {"type": "object", "properties": {"me": me, "all": all_mes}, "required": []},
+            "min_size": {"w": 240, "h": 120},
             "version": __version__,
         },
     ]
@@ -633,6 +648,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         tally=TallyConfig(receivers=mixer.tally.status(), presets=TALLY_PRESETS),
         nmos=mixer.nmos.status(),
         audio=mixer.audio_state(),
+        snapshots=mixer.snapshots_view(),
         pinned={
             field: variables for field, (_, variables) in mixer.settings.pinned_workspace.items()
         },
@@ -982,3 +998,121 @@ def patch_stinger_slot(
         return mixer.configure_stinger_slot(slot_id, payload)
     except MixerError as exc:
         raise _http(exc, status.HTTP_404_NOT_FOUND)
+
+
+# ── snapshots (docs/snapshots.md) ────────────────────────────────────────────
+
+SnapshotNumber = Path(ge=1, le=99, description="The snapshot's number (1..99)")
+
+
+def _snapshot_error(exc: MixerError) -> HTTPException:
+    """Unknown snapshot or panel: 404; everything else (no free number, an empty name, an ME the
+    console no longer has): 409."""
+    return _http(exc, status.HTTP_404_NOT_FOUND if str(exc).startswith("unknown") else status.HTTP_409_CONFLICT)
+
+
+@router.get(
+    "/snapshots",
+    tags=["snapshots"],
+    summary="Every snapshot (number, name, ME or all, the recall's defaults, when stored) and the start-up snapshot",
+)
+def list_snapshots(mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    return mixer.snapshots_view()
+
+
+@router.post(
+    "/snapshots",
+    response_model=Snapshot,
+    tags=["snapshots"],
+    summary="Store the current state of one ME (panel_id me-<n>) or of all MEs (all) as a snapshot",
+    description=(
+        "A snapshot holds per ME its Program and Preview, FTB, its transition (type, rate, wipe, stinger slot, "
+        "ties, BKGD), its keyers and DSKs (on air, rate, key, box, keyframes, fly) and its audio (master and "
+        "strips). Not the structure, the inputs, the clip players' media, NMOS routes or input delays and maps. "
+        "`number` defaults to the lowest free one; a used number is stored over (its name and options stay "
+        "unless given)."
+    ),
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def store_snapshot(payload: SnapshotStore, mixer: VisionMixer = Depends(get_mixer)) -> Snapshot:
+    try:
+        return mixer.store_snapshot(payload)
+    except MixerError as exc:
+        raise _snapshot_error(exc)
+
+
+@router.put(
+    "/snapshots/startup",
+    tags=["snapshots"],
+    summary="The snapshot recalled (with its options) whenever the mixer starts; number null: none",
+    responses={404: {"model": ErrorBody}},
+)
+def put_startup_snapshot(payload: SnapshotStartup, mixer: VisionMixer = Depends(get_mixer)) -> dict:
+    try:
+        return mixer.set_startup_snapshot(payload.number)
+    except MixerError as exc:
+        raise _snapshot_error(exc)
+
+
+@router.get(
+    "/snapshots/{number}",
+    response_model=Snapshot,
+    tags=["snapshots"],
+    summary="A snapshot with its contents",
+    responses={404: {"model": ErrorBody}},
+)
+def get_snapshot(number: int = SnapshotNumber, mixer: VisionMixer = Depends(get_mixer)) -> Snapshot:
+    try:
+        return mixer.get_snapshot(number)
+    except MixerError as exc:
+        raise _snapshot_error(exc)
+
+
+@router.patch(
+    "/snapshots/{number}",
+    response_model=Snapshot,
+    tags=["snapshots"],
+    summary="Rename a snapshot or change the defaults of its recall (program, audio)",
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def patch_snapshot(payload: SnapshotUpdate, number: int = SnapshotNumber, mixer: VisionMixer = Depends(get_mixer)) -> Snapshot:
+    try:
+        return mixer.update_snapshot(number, payload)
+    except MixerError as exc:
+        raise _snapshot_error(exc)
+
+
+@router.delete(
+    "/snapshots/{number}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["snapshots"],
+    summary="Delete a snapshot (also as the start-up snapshot)",
+    responses={404: {"model": ErrorBody}},
+)
+def delete_snapshot(number: int = SnapshotNumber, mixer: VisionMixer = Depends(get_mixer)) -> None:
+    try:
+        mixer.delete_snapshot(number)
+    except MixerError as exc:
+        raise _snapshot_error(exc)
+
+
+@router.post(
+    "/snapshots/{number}/recall",
+    response_model=SnapshotRecallResult,
+    tags=["snapshots"],
+    summary="Recall a snapshot; program and audio override its defaults for this recall",
+    description=(
+        "Always: each ME's Preview, its transition and the settings of its keyers that are off air. "
+        "`program` (Program/on-air): also Program (a cut), the keyers' and DSKs' on or off (cuts), the settings "
+        "of keyers on air and FTB (a cut). `audio`: also the strips and the master (each ramps over one grain). "
+        "What no longer fits the console is skipped and listed in `skipped`. Off-air only the state changes."
+    ),
+    responses={404: {"model": ErrorBody}, 409: {"model": ErrorBody}},
+)
+def recall_snapshot(
+    payload: SnapshotOptionsUpdate | None = None, number: int = SnapshotNumber, mixer: VisionMixer = Depends(get_mixer)
+) -> dict:
+    try:
+        return mixer.recall_snapshot(number, payload)
+    except MixerError as exc:
+        raise _snapshot_error(exc)

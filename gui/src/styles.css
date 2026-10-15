@@ -21,6 +21,31 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 .audio-section { border-top: 1px solid var(--line); background: #0b0e14; height: 240px; min-height: 0; }
 .aux-row button.audio-toggle { margin-left: auto; font-weight: 700; letter-spacing: 0.08em; }
 .aux-row button.audio-toggle.on { outline: 2px solid var(--accent); }
+/* SNAP (components/SnapshotPanel.tsx): a panel over the console, under the button. */
+.aux-row .snap-wrap { margin-left: auto; position: relative; }
+.aux-row .snap-wrap + .audio-toggle { margin-left: 0; }
+.aux-row button.snap-toggle { font-weight: 700; letter-spacing: 0.08em; }
+.snap-panel {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 20; width: 380px; max-height: 60vh; overflow-y: auto;
+  display: grid; gap: 3px; padding: 6px; background: #0f1520; border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 6px 24px #0008; font-size: 12px;
+}
+.snap-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 2px 2px; color: var(--muted); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+.snap-empty { color: var(--muted); padding: 2px 4px 6px; }
+.snap-row { position: relative; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto auto auto; gap: 3px; align-items: center; }
+.snap-number { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.snap-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; }
+input.snap-name { font: inherit; color: var(--text); background: #0b1220; border: 1px solid var(--accent); border-radius: 3px; padding: 2px 4px; }
+.snap-start { margin-left: 6px; padding: 0 4px; font-size: 9px; border: 1px solid #4a7ab0; border-radius: 3px; color: #9cc6f0; }
+.aux-row .snap-panel button { padding: 3px 6px; font-size: 10px; }
+.aux-row .snap-panel button.snap-flag.on { background: #2a4a6a; border-color: #4a7ab0; color: #fff; outline: 0; }
+.aux-row .snap-panel button.snap-recall { font-weight: 700; letter-spacing: 0.06em; }
+.snap-menu {
+  position: absolute; top: 100%; right: 0; z-index: 21; display: grid; min-width: 240px; padding: 4px 0;
+  background: #0f1520; border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 24px #0008;
+}
+.aux-row .snap-menu button { border: 0; border-radius: 0; background: none; text-align: left; padding: 6px 12px; font-size: 12px; }
+.aux-row .snap-menu button:hover { background: #1a2434; }
 .audio-settings { border: 1px solid var(--line); border-radius: 6px; display: grid; gap: 8px; padding: 8px; }
 .audio-settings legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
 .audio-settings .delay-row { display: flex; gap: 4px; align-items: center; }
@@ -257,6 +282,9 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 .player-bar button:nth-child(5) { margin-left: auto; }
 .player-bar button.on { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* A clip player's end action (docs/clip-end.md); dim while it loops. */
+.player-bar .end-mark { align-self: center; padding: 1px 4px; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; color: #9cc6f0; border: 1px solid #4a7ab0; border-radius: 3px; white-space: nowrap; }
+.player-bar .end-mark.idle { opacity: 0.45; }
 /* A downstream keyer: on/off, Auto and its rate. */
 .dsk-control { display: flex; align-items: stretch; }
 .aux-row .dsk-control button { border-radius: 0; }

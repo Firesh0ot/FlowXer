@@ -183,6 +183,10 @@ struct MeView
     // The keyers tied to the running transition.
     std::vector<int> tied;
     TransitionSettings next;
+    // The grain of a take held for later (takeAt), if any, and the grain the last one was made
+    // in when it was due (0: none yet, or another command made it early).
+    std::optional<std::uint64_t> deferred;
+    std::uint64_t deferredMade = 0;
 };
 
 // A keyer's run along its keyframes (docs/engine-p4.md §5).
@@ -262,6 +266,15 @@ public:
     // transition's frames); with a stinger they cut at its cut point.
     MixResult take(int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix, Sting sting = {},
         bool ties = false);
+    // A take held until output grain `at` (a clip player's end action, docs/clip-end.md): it is
+    // made right before that grain is planned, so a cut shows its target in grain `at` and a Mix,
+    // Wipe or stinger starts there (a grain already planned: the next one). One per ME: a newer
+    // one replaces it. The sources and frames are checked now.
+    MixResult takeAt(std::uint64_t at, int me, Source target, int frames, std::optional<Source> preview, Transition type = Transition::Mix,
+        Sting sting = {}, bool ties = false);
+    // Makes ME me's held take now (every ME's without `me`). The control API calls it before any
+    // other command of that ME (and of a keyer), so the commands keep their order.
+    void runDeferred(std::optional<int> me = std::nullopt);
     // Program and Preview swap at the next grain and the tied keyers cut; a running transition ends
     // there instead (buses and tied keyers as at its end).
     MixResult cut(int me);
@@ -358,6 +371,8 @@ private:
         Sting sting;
         bool waiting = false;
         TransitionSettings next;
+        // The grain its last held take was made in (0: none, or made early).
+        std::uint64_t heldMade = 0;
     };
     // A keyer's (with its place and settings) or an FTB's fade; a keyer's keyframes and run.
     struct Fade
@@ -453,11 +468,27 @@ private:
         }
     }
 
+    // A take held for later (takeAt).
+    struct Deferred
+    {
+        std::uint64_t at = 0;
+        Source target;
+        int frames = 0;
+        std::optional<Source> preview;
+        Transition type = Transition::Mix;
+        Sting sting;
+        bool ties = false;
+    };
+    // Makes the held takes due at grain `index` (all with `all`, or ME me's only). Lock not held.
+    void runHeld(std::uint64_t index, bool all, std::optional<int> me);
+
     int mes_;
     int inputs_;
     int players_;
     mutable std::mutex mu_;
     std::vector<Me> state_;
+    // Per ME its held take.
+    std::vector<std::optional<Deferred>> deferred_;
     std::vector<Fade> keys_;
     // One Fade to Black per ME.
     std::vector<Fade> ftbs_;

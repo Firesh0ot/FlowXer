@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace fxeng
@@ -69,6 +70,10 @@ public:
     [[nodiscard]] State state() const;
     // The frame shown now.
     [[nodiscard]] long long position() const;
+    // The output grain that shows the clip's last frame: while it plays without loop (once it has
+    // shown a frame), or after it ended there; nothing otherwise (empty, cued, paused, looping).
+    // The control plane times a clip player's end action by it (docs/clip-end.md).
+    [[nodiscard]] std::optional<std::uint64_t> endIndex() const;
     [[nodiscard]] long long frames() const;
     [[nodiscard]] bool loop() const;
     [[nodiscard]] bool playOnCut() const;
@@ -91,6 +96,8 @@ private:
     bool onAir_ = false;
     bool started_ = false;
     std::uint64_t lastIndex_ = 0;
+    // The grain that showed the last frame when the clip ended by playing.
+    std::optional<std::uint64_t> endedAt_;
     std::uint64_t generation_ = 1;
 };
 

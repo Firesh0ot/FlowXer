@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -15,6 +16,7 @@ from flowxer.api.schemas import (
     AudioEssence,
     AudioStrip,
     AudioStripUpdate,
+    ClipEnd,
     Dme,
     DmeKeyframe,
     DmeLoop,
@@ -31,6 +33,7 @@ from flowxer.api.schemas import (
     LogicalInputCreate,
     LogicalInputUpdate,
     MeOutputs,
+    MeSnapshot,
     MixerPanel,
     MixerStartRequest,
     MixerState,
@@ -41,6 +44,15 @@ from flowxer.api.schemas import (
     PanelTransition,
     PanelTransitionUpdate,
     ProgramBus,
+    SNAPSHOT_ALL,
+    SNAPSHOT_MAX,
+    Snapshot,
+    SnapshotConfig,
+    SnapshotKeyer,
+    SnapshotOptions,
+    SnapshotOptionsUpdate,
+    SnapshotStore,
+    SnapshotUpdate,
     StingerInfo,
     StingerSlot,
     StingerSlotUpdate,
@@ -110,6 +122,14 @@ PERSIST_INTERVAL_S = 1.0
 METERS_CACHE_S = 0.08
 # Meter values below this are this (silence).
 METER_FLOOR_DB = -120.0
+# A clip player's end action (docs/clip-end.md): the engine's players are read this often while
+# a clip player with one is on a rendering ME's Program; within CLIP_END_HORIZON grains of its
+# start a timer sends the take CLIP_END_LEAD grains early, held by the engine for its grain. An end
+# found up to CLIP_END_LATE grains late still acts (at once).
+CLIP_END_POLL_S = 0.1
+CLIP_END_HORIZON = 12
+CLIP_END_LEAD = 3
+CLIP_END_LATE = 50
 
 
 def _autostart_pause(attempt: int) -> float:
@@ -264,10 +284,21 @@ class VisionMixer:
         self._persist_lock = threading.Lock()
         self._persist_at = 0.0
         self._persist_timer: threading.Timer | None = None
+        # Clip players' end actions: per panel the timer of the next one (player id, start grain,
+        # timer), the clip it saw playing on its Program and the last one done (player id, end
+        # grain), the engine's last /players (render index, monotonic time) and the stinger cues
+        # asked for.
+        self._clip_end_timers: dict[str, tuple[str, int, threading.Timer]] = {}
+        self._clip_end_seen: dict[str, tuple[str, int]] = {}
+        self._clip_end_done: dict[str, tuple[str, int]] = {}
+        self._players_seen: tuple[int, float] | None = None
+        self._clip_end_cued: set[tuple[str, str]] = set()
         # The engine's last /audio/meters and when it was fetched.
         self._meters_lock = threading.Lock()
         self._meters_raw: dict[str, Any] | None = None
         self._meters_at = 0.0
+        # Snapshots (docs/snapshots.md) and the one recalled at start.
+        self.snapshots = SnapshotConfig()
         from flowxer.nmos.service import NmosNode
 
         self.nmos = NmosNode(self)
@@ -1306,6 +1337,8 @@ class VisionMixer:
                 return item
             raise MixerError("the mixer is off-air")
         body = {"frame": frame} if action == "cue" else {}
+        # A stop, pause or cue before the end cancels its end action (a play times it again).
+        self._cancel_clip_end(player_id=input_id)
         try:
             self.engine.call("POST", f"/player/{self._engine_index(item)}/{action}", body)
         except EngineError as exc:
@@ -1640,8 +1673,10 @@ class VisionMixer:
             raise MixerError(str(exc)) from exc
         group_hint = request.group_hint or self.settings.group_hint
         self._bind_group_hints()
-        program = request.program_input_id or self._default_program_id()
-        preview = request.preview_input_id or program
+        # ME 1's buses: the request's, else the saved ones (while ME 1 can still take them), else
+        # the first input (Preview: Program). A start-up snapshot then wins over them.
+        program = request.program_input_id or self._saved_bus("program_input_id") or self._default_program_id()
+        preview = request.preview_input_id or self._saved_bus("preview_input_id") or program
         for source in (program, preview):
             if source is not None and self.panels:
                 self._check_source(self.panels[0], source)
@@ -1650,6 +1685,8 @@ class VisionMixer:
         if self.panels:
             self.panels[0].program_input_id = program
             self.panels[0].preview_input_id = preview
+        if self.snapshots.startup is not None:
+            self._recall_startup()
         self.me_outputs = self._compute_outputs(group_hint)
         first = next(iter(self.me_outputs.values()), None)
         self.outputs = None
@@ -1700,11 +1737,12 @@ class VisionMixer:
             self.engine = runtime
             self.backend = "engine"
             threading.Thread(target=self._watch_domains, args=(runtime,), name="mxl-domain-watch", daemon=True).start()
+            threading.Thread(target=self._watch_clip_ends, args=(runtime,), name="clip-end-watch", daemon=True).start()
         self.state = MixerState.running
         self._autostart_done.set()
         self._frame_mark = (self.frames_rendered, time.monotonic())
         self._stall_logged = False
-        self.last_live_input_id = program
+        self.last_live_input_id = self.program_input_id
         self.program_bus = ProgramBus.live
         self.nmos.sync_senders_from_outputs()
         self._publish_tally()
@@ -1797,6 +1835,8 @@ class VisionMixer:
             self.engine = None
             runtime.stop()
         self._missing_domains.clear()
+        self._cancel_clip_end()
+        self._players_seen = None
         self.state = MixerState.idle
         self.backend = "idle"
         self._mixes.clear()
@@ -1834,6 +1874,11 @@ class VisionMixer:
     def _default_program_id(self) -> str | None:
         inputs = self.list_inputs()
         return inputs[0].id if inputs else None
+
+    def _saved_bus(self, name: str) -> str | None:
+        """ME 1's saved Program or Preview (`name`), while ME 1 can still take it."""
+        source = getattr(self.panels[0], name) if self.panels else None
+        return source if source is not None and self._source_known(self.panels[0], source) else None
 
     def _bind_group_hints(self) -> None:
         for item in self.inputs.values():
@@ -2073,11 +2118,16 @@ class VisionMixer:
         send: bool = True,
         sting: dict[str, int] | None = None,
         ties: bool = False,
+        at: int | None = None,
     ) -> None:
         """Program to `source_id` by `transition` over `frames` (else `duration_ms`, else a mix's
         default); `flip_flop` puts the old Program on Preview. `send=False`: the engine does it
         already (the T-bar). A stinger: `sting` is its player and cut frame, `frames` its length.
-        `ties`: the ME's Cut or Auto, which take its tied keyers along."""
+        `ties`: the ME's Cut or Auto, which take its tied keyers along. `at`: the engine holds the
+        take for that output grain (a clip player's end action, a few grains ahead)."""
+        self._cancel_clip_end(panel.id)
+        # Seconds until the engine makes it (the tally of a mix ends that much later).
+        wait = self._grains_until(at) / self.settings.fps
         held = self._positions.pop(panel.id, None)
         if held is not None:
             # A held T-bar transition ends first, as if it had run to its end (as in the engine).
@@ -2097,7 +2147,7 @@ class VisionMixer:
         if transition in (TransitionType.mix, TransitionType.wipe, TransitionType.stinger):
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
-            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + frames / self.settings.fps)
+            self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2120,6 +2170,8 @@ class VisionMixer:
                 body["preview"] = self._engine_source(outgoing)
             if tied:
                 body["ties"] = True
+            if at is not None:
+                body["at"] = at
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/take", body)
         self._take_ties(tied, frames)
         wipe = panel.transition.wipe
@@ -2131,8 +2183,12 @@ class VisionMixer:
 
     def set_preview(self, input_id: str, panel_id: str = "me-1") -> MixerStatus:
         if self.state != MixerState.running:
-            self.start(MixerStartRequest(preview_input_id=input_id, program_input_id=self._default_program_id()))
-        panel = self.get_panel(panel_id)
+            # Program stays where it was saved.
+            self.start(MixerStartRequest(preview_input_id=input_id))
+        self._set_preview(self.get_panel(panel_id), input_id)
+        return self.status()
+
+    def _set_preview(self, panel: MixerPanel, input_id: str) -> None:
         self._check_source(panel, input_id)
         panel.preview_input_id = input_id
         if panel.id == self.panels[0].id:
@@ -2141,7 +2197,6 @@ class VisionMixer:
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/preview", {"source": self._engine_source(input_id)})
         self._publish_tally()
         self._cue_stingers()
-        return self.status()
 
     def play_stinger(
         self,
@@ -2212,6 +2267,9 @@ class VisionMixer:
             slot = self._slot_for_target(incoming)
         if slot is None and panel.transition.type == TransitionType.stinger:
             slot = self._transition_slot(panel, incoming)
+        if slot is None and self._clip_end_action(panel) == ClipEnd.stinger:
+            # The end action of the clip on Program.
+            slot = self._transition_slot(panel, incoming)
         return slot
 
     def _stinger_media(self, slot: StingerSlot | None, stinger_id: str | None = None) -> tuple[dict[str, Any], int] | None:
@@ -2268,6 +2326,7 @@ class VisionMixer:
         flip_flop: bool,
         stinger_id: str | None = None,
         ties: bool = False,
+        at: int | None = None,
     ) -> bool:
         """Plays a stinger on the ME to `incoming`: on the player that holds it, else on a free one
         (loaded now; the engine starts it when its first frame is decoded). With every player busy
@@ -2298,9 +2357,9 @@ class VisionMixer:
         frames = max(1, int(body["frames"]))
         seconds = frames / self.settings.fps
         # A stinger loaded now may wait for its first frame (the engine waits at most 50 grains).
-        self._stinger_until[player] = now + seconds + (0.1 if cued else 1.0)
+        self._stinger_until[player] = now + self._grains_until(at) / self.settings.fps + seconds + (0.1 if cued else 1.0)
         self._put_on_program(
-            panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut}, ties=ties
+            panel, incoming, TransitionType.stinger, flip_flop=flip_flop, frames=frames, sting={"stinger": player, "cut": cut}, ties=ties, at=at
         )
         self._stinger_run = {
             "id": stinger_id or (slot.stinger_id if slot else None),
@@ -2340,6 +2399,138 @@ class VisionMixer:
             "player": run["player"],
             "events": [],
         }
+
+    # ── a clip player's end action (docs/clip-end.md) ───────────────────────
+
+    def _clip_end_action(self, panel: MixerPanel) -> ClipEnd:
+        """What the ME does at the end of the clip on its Program: its clip player's on_end while
+        it does not loop and Preview is another source; else off."""
+        item = self.inputs.get(panel.program_input_id or "")
+        if item is None or item.kind != InputKind.clip_player or item.loop or not self._rendered(panel):
+            return ClipEnd.off
+        if not panel.preview_input_id or panel.preview_input_id == item.id:
+            return ClipEnd.off
+        return item.on_end
+
+    def _clip_end_start(self, panel: MixerPanel, end: int) -> int:
+        """The output grain the ME's end action starts in, for a clip whose last frame is in grain
+        `end`: a cut on the grain after it; an auto `rate` grains before, so its last grain (the
+        target in full) is the clip's last frame; a stinger so that its cut point is there (a
+        stinger that cannot play cuts on the grain after it)."""
+        action = self._clip_end_action(panel)
+        if action == ClipEnd.auto:
+            return end - panel.transition.rate_frames + 1
+        if action == ClipEnd.stinger:
+            media = self._stinger_media(self._transition_slot(panel, panel.preview_input_id or ""))
+            if media is not None:
+                return end - media[1]
+        return end + 1
+
+    def _grains_until(self, at: int | None) -> float:
+        """Grains from now to output grain `at` (0 without one or when it is past), from the
+        engine's last /players."""
+        if at is None or self._players_seen is None:
+            return 0.0
+        index, seen = self._players_seen
+        return max(0.0, at - index - (time.monotonic() - seen) * self.settings.fps)
+
+    def _watch_clip_ends(self, runtime: EngineRuntime) -> None:
+        """While `runtime` runs Program: reads the engine's clip players (GET /players) while a clip
+        player with an end action is on a rendering ME's Program."""
+        while self.engine is runtime:
+            time.sleep(CLIP_END_POLL_S)
+            if self.engine is not runtime or not runtime.ready:
+                continue
+            if not any(self._clip_end_action(panel) != ClipEnd.off for panel in self.rendered_panels()):
+                continue
+            try:
+                reply = runtime.call("GET", "/players")
+            except EngineError:
+                continue
+            if isinstance(reply, dict):
+                self._clip_end_tick(reply, time.monotonic())
+
+    def _clip_end_tick(self, reply: dict[str, Any], seen: float) -> None:
+        """One read of the engine's players (`index`: the last grain planned, `players`: each one's
+        state and end_index) at monotonic time `seen`: a timer for each ME whose end action starts
+        within CLIP_END_HORIZON grains, to send it CLIP_END_LEAD grains early."""
+        index = int(reply.get("index") or 0)
+        players = reply.get("players") or []
+        self._players_seen = (index, seen)
+        for panel in self.rendered_panels():
+            action = self._clip_end_action(panel)
+            if action == ClipEnd.off:
+                continue
+            item = self.inputs[panel.program_input_id or ""]
+            if action == ClipEnd.stinger and (panel.id, item.id) not in self._clip_end_cued:
+                # Cue the stinger early, so it starts on its grain.
+                self._clip_end_cued.add((panel.id, item.id))
+                self._cue_stingers()
+            k = self._engine_index(item)
+            entry = players[k - 1] if k <= len(players) and isinstance(players[k - 1], dict) else {}
+            end = entry.get("end_index")
+            if not isinstance(end, int) or end < index - CLIP_END_LATE or self._clip_end_done.get(panel.id) == (item.id, end):
+                continue
+            if entry.get("state") == "playing":
+                self._clip_end_seen[panel.id] = (item.id, end)
+            elif self._clip_end_seen.get(panel.id) != (item.id, end):
+                # Ended before it was on this ME's Program (or before it was seen playing there).
+                continue
+            start = self._clip_end_start(panel, end)
+            if start - index > CLIP_END_HORIZON:
+                continue
+            pending = self._clip_end_timers.get(panel.id)
+            if pending is not None and pending[:2] == (item.id, start):
+                continue
+            if pending is not None:
+                pending[2].cancel()
+            delay = max(0.0, (start - CLIP_END_LEAD - index) / self.settings.fps - (time.monotonic() - seen))
+            timer = threading.Timer(delay, self._clip_end_fire, args=(panel.id, item.id, end, start))
+            timer.daemon = True
+            self._clip_end_timers[panel.id] = (item.id, start, timer)
+            timer.start()
+
+    def _cancel_clip_end(self, panel_id: str | None = None, player_id: str | None = None) -> None:
+        """Cancels the end actions not sent yet: of one panel, of one clip player, or all."""
+        for key, (item_id, _start, timer) in list(self._clip_end_timers.items()):
+            if (panel_id is None or key == panel_id) and (player_id is None or item_id == player_id):
+                timer.cancel()
+                self._clip_end_timers.pop(key, None)
+        if panel_id is None and player_id is None:
+            self._clip_end_cued.clear()
+
+    def _clip_end_fire(self, panel_id: str, item_id: str, end: int, start: int) -> None:
+        """The ME's end action, through the paths of a Cut, an Auto and a stinger (tally, tied
+        keyers, audio follow): held by the engine for grain `start`, or at once when that is past.
+        Nothing when the clip is no longer on Program, Preview is the same, a transition runs on
+        the ME or this end was done."""
+        with self._lock:
+            pending = self._clip_end_timers.get(panel_id)
+            if pending is None or pending[:2] != (item_id, start):
+                return
+            del self._clip_end_timers[panel_id]
+            if self.state != MixerState.running or self.engine is None:
+                return
+            panel = self.get_panel(panel_id)
+            action = self._clip_end_action(panel)
+            mix = self._mixes.get(panel.id)
+            busy = panel.id in self._positions or (mix is not None and (mix[2] is None or mix[2] > time.monotonic()))
+            if action == ClipEnd.off or panel.program_input_id != item_id or busy:
+                return
+            self._clip_end_done[panel.id] = (item_id, end)
+            incoming = panel.preview_input_id or ""
+            at = start if self._grains_until(start) >= 1 else None
+            log.info("%s: %s at the end of %s (grain %s)", panel.label, action.value, item_id, start)
+            if action == ClipEnd.auto:
+                kind = panel.transition.type if panel.transition.type in (TransitionType.mix, TransitionType.wipe) else TransitionType.mix
+                self._put_on_program(panel, incoming, kind, flip_flop=True, frames=panel.transition.rate_frames, ties=True, at=at)
+            elif action != ClipEnd.stinger or not self._play_stinger_on(
+                panel, self._transition_slot(panel, incoming), incoming, flip_flop=True, ties=True, at=at
+            ):
+                cut_at = end + 1 if self._grains_until(end + 1) >= 1 else None
+                self._put_on_program(panel, incoming, TransitionType.cut, flip_flop=True, ties=True, at=cut_at)
+            self._clip_end_cued.discard((panel.id, item_id))
+            self.persist()
 
     # ── tally ────────────────────────────────────────────────────────────────
 
@@ -2637,10 +2828,232 @@ class VisionMixer:
                 del strips[strip_id]
             self._tidy_panel_audio(panel_id)
 
+    # ── snapshots (docs/snapshots.md) ────────────────────────────────────────
+
+    def snapshots_view(self) -> dict[str, Any]:
+        """GET /snapshots (and the console): every snapshot without its contents, by number, and
+        the start-up snapshot."""
+        return {
+            "startup": self.snapshots.startup,
+            "snapshots": [item.model_dump(mode="json", exclude={"mes"}) for item in self.snapshots.items],
+        }
+
+    def get_snapshot(self, number: int) -> Snapshot:
+        for item in self.snapshots.items:
+            if item.number == number:
+                return item
+        raise MixerError(f"unknown snapshot {number}")
+
+    @staticmethod
+    def _snapshot_name(name: str) -> str:
+        name = name.strip()
+        if not name:
+            raise MixerError("a snapshot needs a name")
+        return name
+
+    def store_snapshot(self, payload: SnapshotStore) -> Snapshot:
+        """The current state of one ME (or of every ME) into `number`, by default the lowest free
+        one. A used number is stored over: it keeps its name and options unless the request gives
+        new ones."""
+        panels = list(self.panels) if payload.panel_id == SNAPSHOT_ALL else [self.get_panel(payload.panel_id)]
+        used = {item.number: item for item in self.snapshots.items}
+        number = payload.number or next((n for n in range(1, SNAPSHOT_MAX + 1) if n not in used), None)
+        if number is None:
+            raise MixerError(f"every snapshot number (1..{SNAPSHOT_MAX}) is used: store over one or delete one")
+        old = used.get(number)
+        if payload.name is not None:
+            name = self._snapshot_name(payload.name)
+        elif old is not None:
+            name = old.name
+        else:
+            name = f"All MEs #{number}" if payload.panel_id == SNAPSHOT_ALL else f"{panels[0].label} #{number}"
+        options = old.options if old is not None else SnapshotOptions()
+        if payload.options is not None:
+            options = options.model_copy(update=payload.options.model_dump(exclude_none=True))
+        snapshot = Snapshot(
+            number=number,
+            name=name,
+            panel_id=payload.panel_id,
+            options=options,
+            stored_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            mes={panel.id: self._capture_me(panel) for panel in panels},
+        )
+        self.snapshots.items = sorted([item for item in self.snapshots.items if item.number != number] + [snapshot], key=lambda item: item.number)
+        return snapshot
+
+    def _capture_me(self, panel: MixerPanel) -> MeSnapshot:
+        fields = set(SnapshotKeyer.model_fields)
+        audio = (self.audio.panels.get(panel.id) or PanelAudio()).model_copy(deep=True) if self._rendered(panel) else None
+        return MeSnapshot(
+            program_input_id=panel.program_input_id,
+            preview_input_id=panel.preview_input_id,
+            ftb=panel.ftb,
+            transition=panel.transition.model_copy(deep=True),
+            keyers={k.id: SnapshotKeyer.model_validate(k.model_dump(include=fields)) for k in self.keyers if k.panel_id == panel.id},
+            audio=audio,
+        )
+
+    def update_snapshot(self, number: int, payload: SnapshotUpdate) -> Snapshot:
+        """Rename it, or change the defaults of its recall."""
+        snapshot = self.get_snapshot(number)
+        if payload.name is not None:
+            snapshot.name = self._snapshot_name(payload.name)
+        if payload.options is not None:
+            snapshot.options = snapshot.options.model_copy(update=payload.options.model_dump(exclude_none=True))
+        return snapshot
+
+    def delete_snapshot(self, number: int) -> None:
+        self.snapshots.items.remove(self.get_snapshot(number))
+        if self.snapshots.startup == number:
+            self.snapshots.startup = None
+
+    def set_startup_snapshot(self, number: int | None) -> dict[str, Any]:
+        """The snapshot recalled (with its options) when the mixer starts; None: none."""
+        if number is not None:
+            self.get_snapshot(number)
+        self.snapshots.startup = number
+        return self.snapshots_view()
+
+    def recall_snapshot(self, number: int, overrides: SnapshotOptionsUpdate | None = None) -> dict[str, Any]:
+        """Recall through the paths of the single changes, so the engine, tally and the saved state
+        stay consistent. Always: each ME's Preview, its transition and the settings of its keyers
+        that are off air. With `program`: also Program (a cut), the keyers' and DSKs' on or off
+        (cuts), the settings of keyers on air and FTB (a cut). With `audio`: also the ME's strips
+        and master (each ramps over one grain). What no longer fits the console (a source, ME,
+        keyer or stinger slot that is gone) is skipped and reported, as are keyers on air without
+        `program`. Off-air it only changes the state, which the engine gets when it starts."""
+        snapshot = self.get_snapshot(number)
+        options = snapshot.options
+        if overrides is not None:
+            options = options.model_copy(update=overrides.model_dump(exclude_none=True))
+        present = {panel.id for panel in self.panels}
+        if snapshot.panel_id != SNAPSHOT_ALL and snapshot.panel_id not in present:
+            raise MixerError(f"snapshot {number} is of {snapshot.panel_id}, which the console does not have")
+        skipped = [f"{panel_id}: not on the console" for panel_id in snapshot.mes if panel_id not in present]
+        # Higher MEs first: a lower ME that re-enters one takes its new Program at once.
+        for panel in reversed(self.panels):
+            if panel.id in snapshot.mes:
+                self._recall_me(panel, snapshot.mes[panel.id], options, skipped)
+        if skipped:
+            log.info("snapshot %d (%s) skipped: %s", number, snapshot.name, "; ".join(skipped))
+        info = snapshot.model_dump(mode="json", exclude={"mes"})
+        return {"snapshot": info, "options": options.model_dump(), "skipped": skipped}
+
+    def _recall_startup(self) -> None:
+        number = self.snapshots.startup
+        try:
+            result = self.recall_snapshot(number)
+        except MixerError as exc:
+            log.error("start-up snapshot %s not recalled: %s", number, exc)
+            return
+        log.info("start-up snapshot %s (%s) recalled", number, result["snapshot"]["name"])
+
+    def _key_on_air(self, keyer: Keyer) -> bool:
+        """On, fading or flying off, or tied to a transition the T-bar holds (as the raw tally)."""
+        held = self._held_ties.get(keyer.panel_id, [])
+        return keyer.enabled or time.monotonic() < self._key_until.get(keyer.id, 0.0) or keyer.id in held
+
+    def _recall_me(self, panel: MixerPanel, stored: MeSnapshot, options: SnapshotOptions, skipped: list[str]) -> None:
+        """One ME of a recall. With Program/on-air, FTB going on comes first and FTB going off
+        last, and keyers go off before and on after the rest, so the new look shows at once."""
+        on_air = options.program
+        current = {keyer.id: keyer for keyer in self.keyers if keyer.panel_id == panel.id}
+        skipped += [f"{panel.label}: keyer {keyer_id} is not on the console" for keyer_id in stored.keyers if keyer_id not in current]
+        keyers = [(current[keyer_id], item) for keyer_id, item in stored.keyers.items() if keyer_id in current]
+
+        def attempt(what: str, change, *args) -> None:
+            try:
+                change(*args)
+            except MixerError as exc:
+                skipped.append(f"{what}: {exc}")
+
+        if on_air and stored.ftb and not panel.ftb:
+            self._cut_ftb(panel, True)
+        if on_air:
+            for keyer, item in keyers:
+                if not item.enabled and self._key_on_air(keyer):
+                    attempt(keyer.label, self._cut_key, keyer, False)
+            if stored.program_input_id and stored.program_input_id != panel.program_input_id:
+                attempt(f"{panel.label} Program", self._cut_program, panel, stored.program_input_id)
+        if stored.preview_input_id and stored.preview_input_id != panel.preview_input_id:
+            attempt(f"{panel.label} Preview", self._set_preview, panel, stored.preview_input_id)
+        if panel.id in self._positions:
+            skipped.append(f"{panel.label} transition: kept, the T-bar holds a transition")
+        else:
+            attempt(f"{panel.label} transition", self._recall_transition, panel, stored.transition, skipped)
+        for keyer, item in keyers:
+            if not on_air and self._key_on_air(keyer):
+                skipped.append(f"{keyer.label}: kept, it is on air (recall with Program/on-air to change it)")
+                continue
+            attempt(keyer.label, self._recall_keyer, keyer, item)
+        if on_air:
+            for keyer, item in keyers:
+                if item.enabled and not keyer.enabled:
+                    attempt(keyer.label, self._cut_key, keyer, True, item)
+            if not stored.ftb and panel.ftb:
+                self._cut_ftb(panel, False)
+        if options.audio and stored.audio is not None and self._rendered(panel):
+            self._recall_audio(panel, stored.audio)
+        elif options.audio and (stored.audio is not None or self._rendered(panel)):
+            skipped.append(f"{panel.label} audio: it {'no longer renders' if stored.audio is not None else 'did not render when stored'}")
+
+    def _cut_ftb(self, panel: MixerPanel, on: bool) -> None:
+        panel.ftb = on
+        if self._rendered(panel):
+            self._engine_call("POST", f"/me/{self._panel_number(panel)}/ftb", {"on": on})
+
+    def _cut_program(self, panel: MixerPanel, source_id: str) -> None:
+        self._check_source(panel, source_id)
+        self._put_on_program(panel, source_id, TransitionType.cut, flip_flop=False)
+
+    def _cut_key(self, keyer: Keyer, on: bool, item: SnapshotKeyer | None = None) -> None:
+        """A keyer on or off at the next frame; a keyer that flies cuts on at its last keyframe, so
+        its stored box follows when it was elsewhere."""
+        self.update_keyer(keyer.id, enabled=on)
+        if item is not None and keyer.stage == KeyerStage.upstream and keyer.dme != item.dme:
+            self.replace_keyer_box(keyer.id, item.dme)
+
+    def _recall_transition(self, panel: MixerPanel, stored: PanelTransition, skipped: list[str]) -> None:
+        data = stored.model_dump()
+        upstream = [k.id for k in self.keyers if k.panel_id == panel.id and k.stage == KeyerStage.upstream]
+        data["ties"] = [tie for tie in data["ties"] if tie in upstream]
+        data["background"] = data["background"] or not data["ties"]
+        slot = data["stinger_slot_id"]
+        if slot is not None and not any(item.id == slot for item in self.stinger_slots):
+            skipped.append(f"{panel.label} transition: stinger slot {slot} is not on the console")
+            data["stinger_slot_id"] = None
+        if data != panel.transition.model_dump():
+            self.update_transition(panel.id, PanelTransitionUpdate(**data))
+
+    def _recall_keyer(self, keyer: Keyer, item: SnapshotKeyer) -> None:
+        """Its rate, key and box (keyframes first: a box that flies needs them)."""
+        if item.keyframes != keyer.keyframes:
+            self.set_keyframes(keyer.id, [frame.model_dump(mode="json") for frame in item.keyframes])
+        changes = {
+            name: getattr(item, name)
+            for name in ("rate_ms", "mode", "source_id", "clip", "soft", "gain", "invert", "fly")
+            if getattr(item, name) != getattr(keyer, name)
+        }
+        if item.dme != keyer.dme:
+            changes["dme"] = item.dme.model_dump(mode="json")
+        if changes:
+            self.update_keyer(keyer.id, **changes)
+
+    def _recall_audio(self, panel: MixerPanel, stored: PanelAudio) -> None:
+        """The ME's master and strips (strips the snapshot does not name: their defaults)."""
+        strips = {sid for sid, _, _ in self.audio_strips(panel)}
+        audio = PanelAudio(master_db=stored.master_db, strips={sid: strip.model_copy() for sid, strip in stored.strips.items() if sid in strips})
+        if audio == (self.audio.panels.get(panel.id) or PanelAudio()):
+            return
+        self.audio.panels[panel.id] = audio
+        self._tidy_panel_audio(panel.id)
+        self._push_panel_audio(panel)
+
     # ── saved state and config export/import ─────────────────────────────────
 
     def export_state(self) -> dict:
-        """Inputs, layout, keyers, stingers, tally and IS-05 routes. Holds no secrets."""
+        """Inputs, layout, keyers, stingers, tally, IS-05 routes, audio and snapshots. Holds no
+        secrets."""
         # The NMOS lock guards the state: IS-05 activations hold it when they persist.
         with self.nmos.lock:
             slots = [
@@ -2658,6 +3071,7 @@ class VisionMixer:
                 "tally_receivers": [item.model_dump(mode="json") for item in self.tally.receivers],
                 "nmos_receivers": self.nmos.export_routes(),
                 "audio": self.audio.model_dump(mode="json"),
+                "snapshots": self.snapshots.model_dump(mode="json"),
             }
 
     def import_state(self, data: dict) -> dict:
@@ -2723,6 +3137,8 @@ class VisionMixer:
             routes = list(data.get("nmos_receivers") or [])
             # P5: missing (a P4 state) is the defaults.
             audio = AudioConfig(**dict(data.get("audio") or {}))
+            # Missing (a state from before snapshots): none.
+            snapshots = SnapshotConfig(**dict(data.get("snapshots") or {}))
             for item in inputs:
                 if item.library_item_id:
                     require_safe_id(item.library_item_id, what="library item id")
@@ -2757,6 +3173,7 @@ class VisionMixer:
             self.keyers = keyers
             self.stinger_slots = slots
             self.audio = audio
+            self.snapshots = snapshots
             main = panels[0] if panels else None
             self.program_input_id = main.program_input_id if main else None
             self.preview_input_id = main.preview_input_id if main else None

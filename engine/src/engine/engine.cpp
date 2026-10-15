@@ -3481,6 +3481,9 @@ struct Engine::Impl
                 {"target", sourceName(view.target)},
                 {"frames", view.frames},
                 {"position", view.position},
+                // A take held for its grain (a clip player's end action), and the grain the last one was made in.
+                {"deferred_at", view.deferred ? json(*view.deferred) : json(nullptr)},
+                {"deferred_made", view.deferredMade},
                 {"pgm", pgm != nullptr ? flow(*pgm) : json(nullptr)},
                 {"pvw", pvw != nullptr ? flow(*pvw) : json(nullptr)},
                 {"pgm_audio", pgmAudio}});
@@ -3650,6 +3653,16 @@ long long Engine::stingerFrames(int k) const
 std::string Engine::statusJson() const
 {
     return impl_->status().dump(2);
+}
+
+std::string Engine::playersJson() const
+{
+    json list = json::array();
+    for (auto const& player : impl_->players)
+    {
+        list.push_back(json::parse(player->statusJson()));
+    }
+    return json{{"index", impl_->lastIndex.load()}, {"players", list}}.dump();
 }
 
 std::string Engine::metricsText() const
