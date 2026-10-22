@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from flowxer import __version__
 from flowxer.api.schemas import (
+    DME_CROP_MAX_PX,
     AudioConfig,
     AudioEssence,
     AudioStrip,
@@ -197,9 +198,42 @@ def _box_from_engine_units(box: dict[str, Any], width: int, height: int) -> dict
 
 
 def _crop_error(crop: DmeCrop, width: int, height: int) -> str | None:
-    if crop.left + crop.right >= width or crop.top + crop.bottom >= height:
-        return f"the crop must leave a picture: left + right < {width} and top + bottom < {height} source pixels"
+    """Why the engine would refuse the crop (left and right as it gets them: on even columns)."""
+    if _even(crop.left) + _even(crop.right) >= width or crop.top + crop.bottom >= height:
+        return (
+            f"the crop must leave a picture: left + right < {width} (each on an even column) and top + bottom < {height} "
+            "source pixels"
+        )
     return None
+
+
+def repair_crops(data: Any, width: int, height: int) -> list[str]:
+    """A saved state's crops that the raster cannot take (no picture left, out of range) become no
+    crop on that axis; returns what it changed (for the log). Only on restore: an import refuses."""
+    fixed: list[str] = []
+
+    def walk(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "crop" and isinstance(value, dict):
+                    sides = {side: value.get(side, 0) for side in _CROP_SIDES}
+                    bad = [side for side, v in sides.items() if not isinstance(v, (int, float)) or v < 0 or v > DME_CROP_MAX_PX]
+                    pairs = {("left", "right"): width, ("top", "bottom"): height}
+                    for (a, b), size in pairs.items():
+                        values_ok = a not in bad and b not in bad
+                        whole = values_ok and (_even(sides[a]) + _even(sides[b]) if size == width else sides[a] + sides[b]) < size
+                        if not whole:
+                            fixed.append(f"{where}.crop {a}/{b} {sides[a]}/{sides[b]}")
+                            value[a] = 0
+                            value[b] = 0
+                else:
+                    walk(value, f"{where}.{key}" if where else str(key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{where}[{index}]")
+
+    walk(data, "")
+    return fixed
 
 
 def _legacy_crop(crop: Any) -> bool:
@@ -210,14 +244,15 @@ def _legacy_crop(crop: Any) -> bool:
     )
 
 
-def scale_crops(data: Any, sx: float, sy: float, *, legacy_only: bool) -> int:
+def scale_crops(data: Any, sx: float, sy: float, *, legacy_only: bool | None) -> int:
     """Every crop in a document (keyers, keyframes, snapshots: any dict under the key "crop") times
-    sx (left, right) and sy (top, bottom), rounded to whole pixels. `legacy_only`: only crops in
-    fractions (_legacy_crop), to pixels of the raster sx × sy. Returns how many it changed."""
+    sx (left, right) and sy (top, bottom), rounded to whole pixels. `legacy_only` True: only crops
+    in fractions (_legacy_crop), to pixels of the raster sx × sy; False: only crops in pixels (from
+    one raster to another); None: all. Returns how many it changed."""
     changed = 0
     if isinstance(data, dict):
         for key, value in data.items():
-            if key == "crop" and isinstance(value, dict) and (_legacy_crop(value) or not legacy_only):
+            if key == "crop" and isinstance(value, dict) and (legacy_only is None or _legacy_crop(value) == legacy_only):
                 for side in _CROP_SIDES:
                     if isinstance(value.get(side), (int, float)):
                         value[side] = round(value[side] * (sx if side in ("left", "right") else sy))
@@ -637,11 +672,11 @@ class VisionMixer:
         """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change)."""
         for keyer in self.keyers:
             dump = {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]}
-            if scale_crops(dump, sx, sy, legacy_only=False):
+            if scale_crops(dump, sx, sy, legacy_only=None):
                 keyer.dme = Dme.model_validate(dump["dme"])
                 keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in dump["keyframes"]]
         snapshots = self.snapshots.model_dump()
-        if scale_crops(snapshots, sx, sy, legacy_only=False):
+        if scale_crops(snapshots, sx, sy, legacy_only=None):
             self.snapshots = type(self.snapshots).model_validate(snapshots)
 
     @property
@@ -3333,11 +3368,27 @@ class VisionMixer:
         try:
             workspace = self._pinned(WorkspaceConfig(**dict(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
-            # DME crops saved as fractions (before 2026-10-22) become pixels of the raster.
             data = copy.deepcopy(data)
+            # Crops in pixels of another format (a pinned FLOWXER_FORMAT, an import from another
+            # raster) keep their share of the picture. A missing or unknown saved format: as is.
+            saved_id = str((data.get("workspace") or {}).get("format_id") or "")
+            try:
+                saved = format_by_id(saved_id) if saved_id else None
+            except (KeyError, ValueError):
+                saved = None
+                log.warning("the saved format %r is unknown: DME crops are taken as pixels of %s", saved_id, fmt.id)
+            if saved is not None and (saved.width, saved.height) != (fmt.width, fmt.height):
+                scaled = scale_crops(data, fmt.width / saved.width, fmt.height / saved.height, legacy_only=False)
+                if scaled:
+                    log.info("scaled %d DME crops from %s to %s", scaled, saved.id, fmt.id)
+            # DME crops saved as fractions (before 2026-10-22) become pixels of the raster.
             migrated = scale_crops(data, fmt.width, fmt.height, legacy_only=True)
             if migrated:
                 log.info("converted %d DME crops from fractions to pixels of %dx%d", migrated, fmt.width, fmt.height)
+            if not checked:
+                # A restore keeps the rest of the state: a crop the raster cannot take goes.
+                for fixed in repair_crops(data, fmt.width, fmt.height):
+                    log.warning("the saved state's DME %s leaves no picture on %s: no crop there", fixed, fmt.id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
             keyers = [Keyer(**item) for item in data.get("keyers") or []]

@@ -17,7 +17,9 @@ in `docs/platform-integration-plan.md` §8.
 - **Migration:** a saved state, a `POST /config/import` document and its snapshots with crops in
   fractions are converted on load to pixels of their format (0.25 at 1080p → 480 px). A format
   change scales every crop (keyers, keyframes, snapshots) with the raster, so the share of the
-  picture stays.
+  picture stays; so does loading a state or an import whose format differs from the mixer's (a
+  pinned `FLOWXER_FORMAT`). On restore a crop the raster cannot take loses its crop on that axis
+  (logged) instead of the whole state being dropped; an import refuses it.
 - Presets: split crops a quarter of the raster's width (480 px at 1080p) off each side.
 - GUI: crop fields in px. The engine's own control API keeps fractions (the control plane
   converts).

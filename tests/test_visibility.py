@@ -162,7 +162,9 @@ def test_the_shared_vectors_agree_with_the_engine() -> None:
                 KeyLayer(
                     source_id=key["source"] or None, keys_source=key["mode"] in ("pip", "luma"), pip=key["mode"] == "pip",
                     upstream=key["upstream"], on_air=key["fade"] > 0, full=key["fade"] >= 1, leaving=False, gain=key["gain"],
-                    dme=None if box is None else Dme(enabled=True, x=box["x"], y=box["y"], size=box["size"], soft=box["soft"], crop=box["crop"]),
+                    # The vectors' crops are the engine's fractions; the API's are pixels (1920 × 1080).
+                    dme=None if box is None else Dme(enabled=True, x=box["x"], y=box["y"], size=box["size"], soft=box["soft"], crop={
+                        side: round(value * (1920 if side in ("left", "right") else 1080)) for side, value in box["crop"].items()}),
                 )
             )
         assert key_visibility(layers) == (case["keyed"], case["covered"]), case["name"]

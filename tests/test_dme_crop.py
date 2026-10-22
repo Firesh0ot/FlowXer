@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flowxer.api.schemas import WorkspaceUpdate
-from flowxer.engine.mixer import MixerError, VisionMixer, scale_crops
+from flowxer.engine.mixer import MixerError, VisionMixer, repair_crops, scale_crops
 from flowxer.settings import Settings
 
 
@@ -87,7 +87,7 @@ def test_a_saved_state_with_fractions_loads_in_pixels(mixer: VisionMixer, settin
 def test_scale_crops_walks_every_crop() -> None:
     doc = {"keyers": [{"dme": {"crop": {"left": 480, "right": 0, "top": 270, "bottom": 0}}, "keyframes": [{"crop": {"left": 960}}]}],
            "snapshots": {"items": [{"mes": {"me-1": {"keyers": [{"dme": {"crop": {"left": 0.25}}}]}}}]}}
-    assert scale_crops(doc, 1280 / 1920, 720 / 1080, legacy_only=False) == 3
+    assert scale_crops(doc, 1280 / 1920, 720 / 1080, legacy_only=None) == 3
     assert doc["keyers"][0]["dme"]["crop"] == {"left": 320, "right": 0, "top": 180, "bottom": 0}
     assert doc["keyers"][0]["keyframes"][0]["crop"] == {"left": 640}
     # Only the old fractions with legacy_only.
@@ -109,3 +109,64 @@ def test_format_change_rescales_keyers_keyframes_and_snapshots(settings: Setting
     keyer = mixer.get_keyer("me-1-key-1")
     assert (keyer.dme.crop.left, keyer.dme.crop.top) == (320, 180)
     assert keyer.keyframes[0].crop.right == 640 and keyer.keyframes[1].crop.left == 320
+
+
+def test_the_engine_refuses_what_rounds_onto_a_pair(client: TestClient) -> None:
+    # 64 px raster: left 1 and right 63 go to 2 + 64 on even columns, nothing left.
+    base = "/api/v1/keyers/me-1-key-1"
+    client.patch(base, json={"mode": "pip", "source_id": "cam-2"})
+    assert client.patch(base, json={"dme": {"crop": {"left": 1, "right": 62}}}).status_code == 409
+    assert client.patch(base, json={"dme": {"crop": {"left": 1, "right": 60}}}).status_code == 200
+
+
+def _saved_with_crop(mixer: VisionMixer, settings: Settings, crop: dict, format_id: str = "1080p50") -> dict:
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-2")
+    mixer.persist()
+    path = settings.state_dir / "state.json"
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    saved["workspace"]["format_id"] = format_id
+    saved["keyers"][0]["dme"]["crop"] = crop
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    return saved
+
+
+def test_a_pinned_format_scales_the_saved_pixels(mixer: VisionMixer, settings: Settings) -> None:
+    _saved_with_crop(mixer, settings, {"left": 480, "right": 0, "top": 270, "bottom": 0})
+    settings.format = "720p50"
+    again = VisionMixer(settings)
+    assert again.workspace.format_id == "720p50"
+    assert again.get_keyer("me-1-key-1").dme.crop.model_dump() == {"left": 320, "right": 0, "top": 180, "bottom": 0}
+
+
+def test_an_import_from_another_format_scales_and_a_bad_one_is_refused(settings: Settings) -> None:
+    from flowxer.app import create_app
+
+    settings.format = "1080p50"  # pinned: an import keeps the mixer's format
+    mixer = VisionMixer(settings)
+    client = TestClient(create_app(settings, mixer))
+    client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "pip", "source_id": "cam-2"})
+    exported = client.get("/api/v1/config/export").json()
+    exported["workspace"]["format_id"] = "720p50"
+    exported["keyers"][0]["dme"]["crop"] = {"left": 320, "right": 0, "top": 180, "bottom": 0}
+    assert client.post("/api/v1/config/import", json=exported).status_code == 200
+    assert mixer.get_keyer("me-1-key-1").dme.crop.model_dump() == {"left": 480, "right": 0, "top": 270, "bottom": 0}
+    # An import that leaves no picture is refused (a restore would repair it).
+    exported["keyers"][0]["dme"]["crop"] = {"left": 700, "right": 700, "top": 0, "bottom": 0}
+    assert client.post("/api/v1/config/import", json=exported).status_code in (409, 422)
+
+
+def test_a_restore_repairs_a_bad_crop_and_keeps_the_state(mixer: VisionMixer, settings: Settings, caplog) -> None:
+    _saved_with_crop(mixer, settings, {"left": 1500, "right": 1500, "top": 100, "bottom": 0})
+    again = VisionMixer(settings)
+    keyer = again.get_keyer("me-1-key-1")
+    # The state is kept (the pip and its source); only the bad axis loses its crop.
+    assert keyer.mode.value == "pip" and keyer.source_id == "cam-2"
+    assert keyer.dme.crop.model_dump() == {"left": 0, "right": 0, "top": 100, "bottom": 0}
+    assert any("leaves no picture" in record.message for record in caplog.records)
+
+
+def test_repair_crops() -> None:
+    doc = {"a": {"crop": {"left": 1, "right": 1918, "top": 0, "bottom": 0}}, "b": [{"crop": {"left": 10, "right": 10, "top": -1, "bottom": 5}}]}
+    fixed = repair_crops(doc, 1920, 1080)
+    assert len(fixed) == 2
+    assert doc == {"a": {"crop": {"left": 0, "right": 0, "top": 0, "bottom": 0}}, "b": [{"crop": {"left": 10, "right": 10, "top": 0, "bottom": 0}}]}
