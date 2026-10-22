@@ -17,7 +17,11 @@ export function wallTiles(snapshot: ConsoleState, me: number, pvw: boolean): Wal
   const onAir = new Set(snapshot.on_air?.[panel?.id ?? ""] ?? (panel?.program_input_id ? [panel.program_input_id] : []));
   const tally = (id: string): WallTile["tally"] => (onAir.has(id) ? "pgm" : panel?.preview_input_id === id ? "pvw" : "off");
   const tiles: WallTile[] = [];
+  // Only the MEs that render (FLOWXER_RENDER_MES): those the previews have a picture of.
+  const map = snapshot.preview;
+  const shown = (id: string) => !map?.available || map.tiles.some((t) => t.id === id) || (map.streams ?? []).some((s) => s.id === id);
   for (const item of snapshot.panels) {
+    if (!shown(`panel:${item.id}:pgm`) && !shown(`panel:${item.id}:pvw`)) continue;
     // An ME's Program is on air on ME `me` when that ME shows it (or it is ME `me` itself).
     tiles.push({ id: `panel:${item.id}:pgm`, label: `${item.label} PGM`, tally: item.id === panel?.id ? "pgm" : tally(item.id) });
     if (pvw) tiles.push({ id: `panel:${item.id}:pvw`, label: `${item.label} PVW`, tally: item.id === panel?.id ? "pvw" : "off" });

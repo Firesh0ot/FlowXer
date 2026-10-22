@@ -344,7 +344,7 @@ will read and write.
 | `FLOWXER_ENGINE_MOSAIC` | `true` | preview mosaic on/off |
 | `FLOWXER_ENGINE_MOSAIC_FPS` | `25` | mosaic frame rate (every second grain at 50p) |
 | `FLOWXER_ENGINE_MOSAIC_KBPS` | `6000` | NVENC bit rate (CBR) |
-| `FLOWXER_ENGINE_PGM_PREVIEW` | `true` | each ME's Program as a stream of its own (`<prefix>/me<n>-pgm`), not a mosaic tile (only with the mosaic) |
+| `FLOWXER_ENGINE_PGM_PREVIEW` | `true` | each ME's Program as a stream of its own (`<prefix>/me<n>-pgm`), not a mosaic tile (only with the mosaic). Needs 1 + MEs NVENC sessions, opened at start; without them the Programs stay mosaic tiles (`/mosaic/map` → `programs_error`) |
 | `FLOWXER_ENGINE_PGM_PREVIEW_WIDTH` | `960` | its width (even, at most the raster's; the height keeps the raster's aspect: 540 at 16:9) |
 | `FLOWXER_ENGINE_PGM_PREVIEW_FPS` | `25` | its frame rate |
 | `FLOWXER_ENGINE_PGM_PREVIEW_KBPS` | `2500` | its NVENC bit rate (CBR) |

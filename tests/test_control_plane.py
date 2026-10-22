@@ -222,6 +222,11 @@ def test_preview_with_a_shared_mediamtx_and_an_older_engine(engine_mixer) -> Non
     mixer.engine.mosaic_map = {key: value for key, value in engine_map.items() if key != "programs"} | {"tiles": old_tiles}
     info = preview_info(mixer)
     assert info["streams"] == [] and "panel:me-1:pgm" in [tile["id"] for tile in info["tiles"]]
+    assert info["streams_error"] is None
+    # The engine could not open the NVENC sessions: Programs as tiles, and why.
+    mixer.engine.mosaic_map = {**mixer.engine.mosaic_map, "programs": [], "programs_error": "h264_nvenc open: out of sessions"}
+    info = preview_info(mixer)
+    assert info["streams"] == [] and info["streams_error"] == "h264_nvenc open: out of sessions"
 
 
 def test_the_engine_config_carries_the_program_streams(mixer) -> None:

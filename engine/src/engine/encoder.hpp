@@ -16,7 +16,9 @@ struct EncoderConfig
 {
     int width = 1920;
     int height = 1080;
+    // Frame rate fps / fpsDen (the output rate over the grains between frames, e.g. 60000/2002).
     int fps = 25;
+    int fpsDen = 1;
     int kbps = 6000;
     // rtsp://host:port/path
     std::string url;
@@ -48,6 +50,11 @@ public:
     // connection the packets are dropped and the next frame after a reconnect is an IDR.
     void encode(std::uint8_t const* luma, int lumaPitch, std::uint8_t const* chroma, int chromaPitch, std::int64_t pts, cudaStream_t stream);
     [[nodiscard]] EncoderStats stats() const;
+    // Opens the NVENC session now (encode() would on its first frame) and keeps it: whether the
+    // GPU gives one more (`error`: why not). The engine opens the mosaic's and every Program
+    // stream's at once before it gives each ME's Program a stream of its own. Any thread with
+    // the engine's device current (FFmpeg keeps the context it was opened with).
+    bool open(std::string& error);
 
 private:
     struct Impl;

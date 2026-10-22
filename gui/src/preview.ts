@@ -46,6 +46,8 @@ export interface PreviewMap {
   tiles: PreviewTile[];
   /** Pictures that are streams of their own (absent: none, an older engine). */
   streams?: PreviewStream[];
+  /** Why the Programs are mosaic tiles although streams were asked for (no NVENC session left). */
+  streams_error?: string | null;
 }
 
 /** Pixels of the mosaic left out at each edge of a tile: the browser scales the whole mosaic, so

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { wallGrid, wallTiles } from "../multiview";
 import { previewSession } from "../preview";
 import { Monitor } from "./Monitor";
@@ -9,6 +9,13 @@ import { useWidget } from "./useWidget";
  * the mixer's sources and MEs. */
 export function MultiviewWidget({ me = 1, pvw = false }: { me?: number; pvw?: boolean }) {
   const { snapshot, error, root } = useWidget();
+  // The frame's size: the grid follows it when the dashboard resizes the widget.
+  const [size, setSize] = useState({ w: window.innerWidth, h: window.innerHeight });
+  useEffect(() => {
+    const resized = () => setSize({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", resized);
+    return () => window.removeEventListener("resize", resized);
+  }, []);
 
   // The widget's sessions follow the mixer's preview map (the mosaic and the Program streams).
   useEffect(() => {
@@ -16,7 +23,7 @@ export function MultiviewWidget({ me = 1, pvw = false }: { me?: number; pvw?: bo
   }, [snapshot]);
 
   const tiles = snapshot ? wallTiles(snapshot, me, pvw) : [];
-  const { cols, rows } = wallGrid(tiles.length, window.innerWidth, window.innerHeight);
+  const { cols, rows } = wallGrid(tiles.length, size.w, size.h);
 
   return (
     <div ref={root} className="multiview-widget">

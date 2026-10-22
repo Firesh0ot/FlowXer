@@ -642,6 +642,8 @@ struct Engine::Impl
     std::unique_ptr<MosaicEncoder> encoder;
     // Each ME's Program stream (cfg.pgmStreams()), ME 1 first.
     std::vector<std::unique_ptr<PgmStream>> pgmStreams;
+    // Why the Programs are mosaic tiles although cfg.pgmStreams() asked for streams ("": they are not).
+    std::string pgmStreamsError;
     // The own MediaMTX (no shared one given); started and stopped by start()/stop(), polled
     // by the stats thread in between.
     std::unique_ptr<MediamtxProcess> mediamtx;
@@ -1083,7 +1085,9 @@ struct Engine::Impl
             EncoderConfig enc;
             enc.width = cfg.width;
             enc.height = cfg.height;
-            enc.fps = cfg.mosaicFps;
+            // The real rate: the output's over the grains between mosaic frames.
+            enc.fps = static_cast<int>(cfg.rate.num);
+            enc.fpsDen = static_cast<int>(cfg.rate.den) * mosaicDivisor;
             enc.kbps = cfg.mosaicKbps;
             enc.url = cfg.rtspBase() + "/" + cfg.streamPath("mosaic");
             enc.gpu = cfg.gpu;
@@ -1108,12 +1112,36 @@ struct Engine::Impl
                 EncoderConfig enc;
                 enc.width = ps->width;
                 enc.height = ps->height;
-                enc.fps = cfg.pgmPreviewFps;
+                enc.fps = static_cast<int>(cfg.rate.num);
+                enc.fpsDen = static_cast<int>(cfg.rate.den) * pgmDivisor;
                 enc.kbps = cfg.pgmPreviewKbps;
                 enc.url = cfg.rtspBase() + "/" + cfg.streamPath(ps->stream);
                 enc.gpu = cfg.gpu;
                 ps->encoder = std::make_unique<MosaicEncoder>(enc);
                 pgmStreams.push_back(std::move(ps));
+            }
+            // Each Program stream needs an NVENC session of its own (1 + MEs with the mosaic). When
+            // the GPU cannot give them all, the Programs go back into the mosaic as tiles.
+            std::string why;
+            bool ok = !encoder || encoder->open(why);
+            for (auto& ps : pgmStreams)
+            {
+                ok = ok && ps->encoder->open(why);
+            }
+            if (!ok)
+            {
+                logWarn("program_streams_off", {{"reason", why}});
+                for (auto& ps : pgmStreams)
+                {
+                    for (auto& slot : ps->slots)
+                    {
+                        cudaFree(slot.nv12);
+                        cudaEventDestroy(slot.ready);
+                    }
+                }
+                pgmStreams.clear();
+                pgmStreamsError = why.empty() ? "an NVENC session could not be opened" : why;
+                tiles = mosaicTiles(cfg.width, cfg.height, static_cast<int>(inputs.size()), static_cast<int>(players.size()), cfg.mes, true);
             }
         }
         check(cudaStreamSynchronize(renderStream), "setup");
@@ -4042,7 +4070,7 @@ std::string Engine::mosaicMapJson() const
     }
     // Each ME's Program as a stream of its own (not in the mosaic then).
     json programs = json::array();
-    if (cfg.pgmStreams())
+    if (cfg.pgmStreams() && impl_->pgmStreamsError.empty())
     {
         for (int m = 1; m <= cfg.mes; ++m)
         {
@@ -4054,7 +4082,7 @@ std::string Engine::mosaicMapJson() const
     // The GUI plays <base>/<path>/whep; an empty base means the own MediaMTX on the page's host.
     return json{{"width", cfg.width}, {"height", cfg.height}, {"fps", cfg.mosaicFps}, {"enabled", cfg.mosaic}, {"path", cfg.streamPath("mosaic")},
         {"mode", cfg.ownMediamtx() ? "own" : "shared"}, {"whep_base", cfg.whepBase}, {"hls_base", cfg.hlsBase}, {"whep_port", cfg.whepPort},
-        {"hls_port", cfg.hlsPort}, {"tiles", tiles}, {"programs", programs}}
+        {"hls_port", cfg.hlsPort}, {"tiles", tiles}, {"programs", programs}, {"programs_error", impl_->pgmStreamsError}}
         .dump(2);
 }
 } // namespace fxeng

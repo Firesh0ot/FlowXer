@@ -249,7 +249,7 @@ Settings come from the environment (or a `.env` file). Where a platform name exi
 | `FLOWXER_FORMAT`, `FLOWXER_LIVE_INPUTS`, `FLOWXER_INPUT_LABELS`, `FLOWXER_CLIP_PLAYERS`, `FLOWXER_PANELS` | empty | The production's structure, see below |
 | `FLOWXER_RENDER_MES` | all MEs | The first n MEs render (PGM, PVW, senders and flows) |
 | `FLOWXER_PVW_OUTPUTS` | `true` | PVW video flows; `false` renders PVW for the previews only (saves PCIe) |
-| `FLOWXER_PREVIEW_PGM` | `true` | Each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`), sharper than a mosaic tile; the mosaic then has no Program tiles. One NVENC session per ME more (cost below) |
+| `FLOWXER_PREVIEW_PGM` | `true` | Each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`), sharper than a mosaic tile; the mosaic then has no Program tiles. The engine needs **1 + MEs NVENC sessions** (the mosaic and each Program; cost below): it opens them all at start, and when the GPU cannot give them (e.g. a GeForce card's session limit, or other encoders on it) the Programs stay mosaic tiles (`GET /preview` → `streams_error` says why; the console falls back by itself). `false`: the mosaic only (1 session) |
 | `FLOWXER_PREVIEW_PGM_WIDTH`, `FLOWXER_PREVIEW_PGM_FPS`, `FLOWXER_PREVIEW_PGM_KBPS` | `960`, `25`, `2500` | Its width (the height keeps the raster's aspect: 960×540 at 16:9), frame rate and bit rate (CBR) |
 | `FLOWXER_AUDIO_CHANNELS` | `2` | PGM audio channels of every ME (a flow that exists keeps its own); each live input maps into them 1:1 or by its channel map |
 | `FLOWXER_AUDIO_MAX_DELAY_MS` | `1000` | The longest audio delay of a live input (0–5000); the engine's delay lines hold this much (stereo: about 0.44 MB per live input at 1 s, 16 channels 3.5 MB) |

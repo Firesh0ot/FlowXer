@@ -88,4 +88,7 @@ def preview_info(mixer) -> dict[str, Any]:
         "hls_port": None if hls_base else mosaic.get("hls_port"),
         "tiles": tiles,
         "streams": streams,
+        # Why the Programs are mosaic tiles although Program streams were asked for (e.g. the GPU
+        # gave no more NVENC sessions); None when they are not.
+        "streams_error": mosaic.get("programs_error") or None,
     }
