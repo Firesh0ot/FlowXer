@@ -89,6 +89,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.tally import TallyService
 from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
+from flowxer.engine.visibility import KeyLayer, MeLayers, direct_visibility, visible_on_program
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
@@ -205,6 +206,10 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
     return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
 
 
+# A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
+TALLY_END_MARGIN_S = 0.05
+
+
 class MixerError(RuntimeError):
     pass
 
@@ -261,6 +266,12 @@ class VisionMixer:
         # Keyer id -> monotonic time until which a keyer that fades or flies off is still on air
         # (raw tally).
         self._key_until: dict[str, float] = {}
+        # A keyer fading in (Auto on, or tied to a mix): the monotonic time its fade ends. Until
+        # then it is not at full level (a full-raster pip covers nothing yet).
+        self._key_in: dict[str, float] = {}
+        # The receivers' republish timers (a mix's or a key's fade end), cancelled on stop.
+        self._tally_timers: set[threading.Timer] = set()
+        self._tally_timers_lock = threading.Lock()
         # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
         self._autostart_done = threading.Event()
         self.tally = TallyService()
@@ -711,6 +722,7 @@ class VisionMixer:
         if enabled is not None:
             keyer.enabled = enabled
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if enabled else 0])
             self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
@@ -779,6 +791,7 @@ class VisionMixer:
         if isinstance(reply, dict) and reply.get("on") is True and not keyer.enabled:
             keyer.enabled = True
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             self._publish_tally()
         return self._with_run(keyer, reply)
 
@@ -830,9 +843,14 @@ class VisionMixer:
             span = sum(item.frames for item in keyer.keyframes[1:])
         if keyer.enabled:
             self._key_until.pop(keyer.id, None)
+            # Fading (or flying) in: at full level when it ends.
+            self._key_in[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_in[keyer.id])
         else:
+            self._key_in.pop(keyer.id, None)
             # The raw tally keeps it on air until the fade or the fly has ended.
             self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_until[keyer.id])
         self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
         self._publish_tally()
         return keyer
@@ -1840,6 +1858,8 @@ class VisionMixer:
         self.state = MixerState.idle
         self.backend = "idle"
         self._mixes.clear()
+        self._key_in.clear()
+        self._cancel_tally_timers()
         self._publish_tally()
         return self.status()
 
@@ -1860,6 +1880,7 @@ class VisionMixer:
             self.library.stop()
         except Exception:
             log.exception("stopping the media library failed")
+        self._cancel_tally_timers()
         self.tally.close()
         if self.tally_export is not None:
             self.tally_export.close()
@@ -2031,10 +2052,15 @@ class VisionMixer:
             keyer.enabled = not keyer.enabled
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            self._key_in.pop(keyer.id, None)
             if keyer.enabled or frames <= 0:
                 self._key_until.pop(keyer.id, None)
+                if keyer.enabled and frames > 0:
+                    self._key_in[keyer.id] = now + frames / self.settings.fps
+                    self._tally_again_at(self._key_in[keyer.id])
             else:
                 self._key_until[keyer.id] = now + frames / self.settings.fps
+                self._tally_again_at(self._key_until[keyer.id])
 
     def _end_held_ties(self, panel: MixerPanel, frames: int = 0) -> None:
         """A T-bar transition that completes (now, or by an Auto over `frames`): its tied keyers
@@ -2148,6 +2174,7 @@ class VisionMixer:
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
+            self._tally_again_at(self._mixes[panel.id][2])
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2556,6 +2583,39 @@ class VisionMixer:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
 
+    def _tally_again_at(self, at: float | None) -> None:
+        """The receivers' tally once more when a mix or a key's fade or fly ends (monotonic `at`):
+        what is visible changes then without an operator action."""
+        if at is None or not self.tally.receivers:
+            return
+        timer: threading.Timer
+
+        def fire() -> None:
+            with self._tally_timers_lock:
+                if timer not in self._tally_timers:
+                    return  # cancelled meanwhile
+                self._tally_timers.discard(timer)
+            self._publish_tally_quietly()
+
+        timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, fire)
+        timer.daemon = True
+        with self._tally_timers_lock:
+            self._tally_timers.add(timer)
+        timer.start()
+
+    def _cancel_tally_timers(self) -> None:
+        """Stop, a reload, shutdown: no republish after them."""
+        with self._tally_timers_lock:
+            timers, self._tally_timers = self._tally_timers, set()
+        for timer in timers:
+            timer.cancel()
+
+    def _publish_tally_quietly(self) -> None:
+        try:
+            self._publish_tally()
+        except Exception:  # a timer thread must not die loudly
+            log.exception("tally publish after a mix or a key fade failed")
+
     def _export_tally(self) -> None:
         """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it."""
         if self.tally_export is not None:
@@ -2588,6 +2648,48 @@ class VisionMixer:
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
         )
+
+    def _me_layers(self, keyers: list[Keyer] | None = None) -> dict[str, MeLayers]:
+        """Each ME's background (Program, both sources of a running mix) and keyers as tally sees
+        them (engine/visibility.py); `keyers` as keyer_views() gives them (boxes where they are)."""
+        keyers = self.keyer_views() if keyers is None else keyers
+        now = time.monotonic()
+        out: dict[str, MeLayers] = {}
+        for panel in list(self.panels):
+            background = [panel.program_input_id] if panel.program_input_id else []
+            mix = self._mixes.get(panel.id)
+            if mix is not None and (mix[2] is None or now < mix[2]):
+                background += [source for source in mix[:2] if source and source not in background]
+            held = self._held_ties.get(panel.id, [])
+            layers = []
+            for keyer in keyers:
+                if keyer.panel_id != panel.id:
+                    continue
+                leaving = not keyer.enabled and now < self._key_until.get(keyer.id, 0.0)
+                boxed = keyer.stage == KeyerStage.upstream and (keyer.mode == KeyMode.pip or keyer.dme.enabled)
+                layers.append(
+                    KeyLayer(
+                        source_id=keyer.source_id,
+                        keys_source=keyer.mode in (KeyMode.luma, KeyMode.pip),
+                        pip=keyer.mode == KeyMode.pip,
+                        upstream=keyer.stage == KeyerStage.upstream,
+                        on_air=keyer.enabled or leaving or keyer.id in held,
+                        # Not while it fades in (the shared vectors' fade >= 1).
+                        full=keyer.enabled and keyer.id not in held and now >= self._key_in.get(keyer.id, 0.0),
+                        leaving=leaving,
+                        gain=keyer.gain,
+                        dme=keyer.dme if boxed else None,
+                    )
+                )
+            out[panel.id] = MeLayers(tuple(background), tuple(layers))
+        return out
+
+    def program_visibility(self, keyers: list[Keyer] | None = None) -> dict[str, list[str]]:
+        """Per ME what is visible on its Program through any path (engine/visibility.py): its
+        background unless a full-raster pip covers it, its visible keys' sources, and what the MEs
+        it shows have on their Programs, recursively."""
+        mes = self._me_layers(keyers)
+        return {panel.id: visible_on_program(panel.id, mes) for panel in list(self.panels)}
 
     def _key_tally(self, keyer: Keyer, on_air: bool) -> tuple[int, str, bool]:
         """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
@@ -2777,6 +2879,7 @@ class VisionMixer:
             sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
         engine_mes = (raw or {}).get("mes") or {}
         panels: dict[str, Any] = {}
+        layers = self._me_layers() if raw is None else {}
         pairs = (channels + 1) // 2
         for panel in self.rendered_panels():
             entry = engine_mes.get(str(self._panel_number(panel))) or {}
@@ -2787,7 +2890,8 @@ class VisionMixer:
                 measured = engine_strips.get(self._engine_strip(strip_id))
                 if measured is None:
                     setting = audio.strips.get(strip_id) or AudioStrip()
-                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    shown = direct_visibility(layers[panel.id]) if panel.id in layers else [panel.program_input_id]
+                    on_air = kind != "stinger" and (not setting.afv or strip_id in shown)
                     gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
                     measured = {"gain_db": gain, "heard": gain > -90.0}
                 strips[strip_id] = measured
@@ -3078,6 +3182,7 @@ class VisionMixer:
         """Restore an export_state() document (POST /config/import). The mixer must be stopped."""
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before importing a configuration")
+        self._cancel_tally_timers()
         self._apply_state(data, checked=True)
         self._publish_tally()
         self.persist()

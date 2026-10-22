@@ -1,0 +1,639 @@
+{
+ "about": "Shared cases of what keys show on an ME's Program (engine core/visibility.hpp and src/flowxer/engine/visibility.py). keys bottom to top; fade = the keyer's on/off level, gain = its own gain; box crop in fractions of the source; keyed and covered as both must answer.",
+ "cases": [
+  {
+   "name": "a pip shows its source",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3"
+   ],
+   "covered": false
+  },
+  {
+   "name": "off (fade 0)",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 0.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "fading: visible",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 0.4,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3"
+   ],
+   "covered": false
+  },
+  {
+   "name": "the keyer's gain 0",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 0.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "off screen",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 1.5,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "size 0",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "cropped off the screen",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.95,
+      "y": 0.25,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.55,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "half on screen",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": -0.2,
+      "y": 0.25,
+      "size": 0.5,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3"
+   ],
+   "covered": false
+  },
+  {
+   "name": "a full-raster pip covers the background and the layers under it",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "cp1",
+     "mode": "luma",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": null
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in5"
+   ],
+   "covered": true
+  },
+  {
+   "name": "not while it fades",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 0.9,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3",
+    "in5"
+   ],
+   "covered": false
+  },
+  {
+   "name": "not with its own gain under 1",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 0.9,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3",
+    "in5"
+   ],
+   "covered": false
+  },
+  {
+   "name": "not with a soft edge",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 2.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3",
+    "in5"
+   ],
+   "covered": false
+  },
+  {
+   "name": "not cropped inside the raster",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.1,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in3",
+    "in5"
+   ],
+   "covered": false
+  },
+  {
+   "name": "a layer above the cover stays",
+   "keys": [
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in5",
+    "in3"
+   ],
+   "covered": true
+  },
+  {
+   "name": "a DSK is over the upstream keys",
+   "keys": [
+    {
+     "source": "in6",
+     "mode": "luma",
+     "upstream": false,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": null
+    },
+    {
+     "source": "in5",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.5,
+      "y": 0.5,
+      "size": 1.0,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [
+    "in5",
+    "in6"
+   ],
+   "covered": true
+  },
+  {
+   "name": "a luma key with a box off screen",
+   "keys": [
+    {
+     "source": "cp1",
+     "mode": "luma",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": -0.5,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "a linear key shows no source",
+   "keys": [
+    {
+     "source": "",
+     "mode": "linear",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    }
+   ],
+   "keyed": [],
+   "covered": false
+  },
+  {
+   "name": "a source keyed twice counts once",
+   "keys": [
+    {
+     "source": "in3",
+     "mode": "pip",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": {
+      "x": 0.75,
+      "y": 0.25,
+      "size": 0.25,
+      "soft": 0.0,
+      "crop": {
+       "left": 0.0,
+       "right": 0.0,
+       "top": 0.0,
+       "bottom": 0.0
+      }
+     }
+    },
+    {
+     "source": "in3",
+     "mode": "luma",
+     "upstream": true,
+     "fade": 1.0,
+     "gain": 1.0,
+     "box": null
+    }
+   ],
+   "keyed": [
+    "in3"
+   ],
+   "covered": false
+  }
+ ]
+}

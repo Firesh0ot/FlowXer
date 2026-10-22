@@ -5,6 +5,24 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: tally and audio follow what is visible, through every path
+
+- Tally (TSL receivers and the console's source tiles): red for what is visible on an ME's
+  Program through any path: Program, the sources of visible luma keys and pips, and recursively
+  what the MEs it shows (re-entry as Program or in a key) have on theirs. Hidden layers do not
+  count: gain 0, a box at size 0, off screen or cropped away, and what an opaque full-raster pip
+  covers (the background included). Before, the receivers lit only each ME's Program.
+- Audio (engine): AFV follows the same rules per grain (`core/visibility.hpp`): a visible pip's or
+  luma key's source is heard; a full-raster pip silences the background it covers. Nested MEs
+  work through each ME's own PGM mix. Before, AFV followed the background only (P5 decision,
+  changed with the user).
+- `GET /console` has `on_air`: per ME id what is visible on its Program.
+- The receivers get the tally again when a mix or a key's fade or fly ends (not after a stop or
+  shutdown); one publish at a time. A full-raster pip covers the background only once it has
+  faded in.
+- **For the platform:** the raw tally export (`FLOWXER_TALLY_TSL`) is unchanged (per ME; a hidden
+  box still lights its source there).
+
 ### Changed: operator console layout, higher MEs, upload progress
 
 - GUI: PREVIEW and PROGRAM take about 40 % of the window's height and are centred as a pair on a

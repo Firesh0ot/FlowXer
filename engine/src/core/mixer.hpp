@@ -108,6 +108,11 @@ struct MePlan
     // before (the audio ramps between them).
     float ftb = 0.f;
     float ftbPrev = 0.f;
+    // What the ME's keys show in this grain (core/visibility.hpp): the sources of its visible
+    // luma keys and pips, and whether an opaque full-raster pip covers the background. Audio
+    // follows them (AFV).
+    std::vector<Source> keyed;
+    bool backgroundCovered = false;
 
     // The background picture (a, or b after a stinger's cut point; a Mix or Wipe adds b).
     [[nodiscard]] Source background() const

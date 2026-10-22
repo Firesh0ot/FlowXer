@@ -336,6 +336,7 @@ export default function App() {
               input={input}
               panel={panel}
               runtime={snapshot.sources?.[input.id]}
+              onAir={snapshot.on_air?.[panel.id]?.includes(input.id)}
               library={playable}
               fps={fps}
               onPreview={() => void command(() => api.preview(input.id, panel.id))}
@@ -350,6 +351,7 @@ export default function App() {
               key={item.id}
               me={item}
               panel={panel}
+              onAir={snapshot.on_air?.[panel.id]?.includes(item.id)}
               onPreview={() => void command(() => api.preview(item.id, panel.id))}
               onProgram={() => void command(() => api.take(item.id, panel.id))}
               onGrab={openGrab(item.id, `${item.label} PGM`)}

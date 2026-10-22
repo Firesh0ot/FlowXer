@@ -1054,6 +1054,15 @@ class ConsoleState(BaseModel):
     inputs: list[LogicalInput]
     panels: list[MixerPanel]
     keyers: list[Keyer]
+    on_air: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Per ME id what is visible on its Program through any path (red tally): its Program "
+            "(both sources of a running mix) unless a full-raster pip covers it, the sources of its "
+            "visible luma keys and pips, and the ids and on-air sources of the MEs it shows, "
+            "recursively. Hidden boxes (off, size 0, off screen, cropped away, covered) do not count."
+        ),
+    )
     stinger_slots: list[StingerSlot]
     mixer: MixerStatus
     resources: ResourceInfo
