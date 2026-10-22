@@ -1,9 +1,9 @@
 import { useEffect, useRef, type MouseEvent, type ReactNode } from "react";
-import { tileCrop, usePreview } from "../preview";
+import { streamView, tileCrop, usePreview } from "../preview";
 
-/** One picture of the preview mosaic (a source, or an ME's Program or Preview), cropped from the
- * page's one stream; `children` are drawn over it (the box editor); `onMenu` is its context menu
- * (GRAB). */
+/** One picture of the previews: an ME's Program from its own stream when the map has one, else a
+ * tile (a source, an ME's Preview or Program) cropped from the page's mosaic stream; `children`
+ * are drawn over it (the box editor); `onMenu` is its context menu (GRAB). */
 export function Monitor({
   tileId,
   label,
@@ -22,11 +22,13 @@ export function Monitor({
 }) {
   const preview = usePreview();
   const videoRef = useRef<HTMLVideoElement>(null);
-  const crop = placeholder ? null : tileCrop(preview.map, tileId);
+  const own = placeholder ? null : streamView(preview.map, tileId);
+  const crop = placeholder ? null : own ?? tileCrop(preview.map, tileId);
+  const stream = own ? preview.streamOf(tileId) : preview.stream;
 
   useEffect(() => {
     const video = videoRef.current;
-    if (video && video.srcObject !== preview.stream) video.srcObject = preview.stream;
+    if (video && video.srcObject !== stream) video.srcObject = stream;
   });
 
   return (

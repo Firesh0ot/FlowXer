@@ -118,6 +118,14 @@ struct Config
     bool mosaic = true;
     int mosaicFps = 25;
     int mosaicKbps = 6000;
+    // A WebRTC stream of each ME's Program of its own (stream `me<n>-pgm`), sharper than its
+    // mosaic tile; the mosaic then has no Program tiles. pgmPreviewWidth wide (even, at most the
+    // raster's width; the height keeps the raster's aspect), at pgmPreviewFps, pgmPreviewKbps (CBR).
+    // Only with the mosaic.
+    bool pgmPreview = true;
+    int pgmPreviewWidth = 960;
+    int pgmPreviewFps = 25;
+    int pgmPreviewKbps = 2500;
     // Preview contract (platform spec 11.5): publish to a shared MediaMTX at publishUrl
     // (RTSP), or run an own MediaMTX when it is empty. Streams are <pathPrefix>/<stream>.
     std::string publishUrl;
@@ -136,6 +144,14 @@ struct Config
     int apiPort = 9897;
     std::string publicIp;
 
+    [[nodiscard]] bool pgmStreams() const
+    {
+        return mosaic && pgmPreview;
+    }
+    [[nodiscard]] int pgmPreviewHeight() const
+    {
+        return (pgmPreviewWidth * height / width) & ~1;
+    }
     [[nodiscard]] bool ownMediamtx() const
     {
         return publishUrl.empty();

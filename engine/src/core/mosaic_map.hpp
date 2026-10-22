@@ -1,5 +1,6 @@
 // The preview mosaic: one canvas, a square grid of 16:9 tiles. The live inputs and the clip
-// players first (slot order), then per rendering ME its Program and Preview. A GUI crops single
+// players first (slot order), then per rendering ME its Program (unless each Program has a
+// stream of its own) and Preview. A GUI crops single
 // tiles out of the one stream (GET /mosaic/map).
 #pragma once
 
@@ -28,10 +29,11 @@ struct MosaicTile
     int h = 0;
 };
 
-// Tiles for `inputs` live inputs, `players` clip players and `mes` MEs on a width × height
-// canvas: the smallest n × n grid (n >= 2) that holds them all. Tile edges are even (NV12 chroma
-// is 2×2).
-std::vector<MosaicTile> mosaicTiles(int width, int height, int inputs, int players, int mes);
+// Tiles for `inputs` live inputs, `players` clip players and `mes` MEs (their Program and
+// Preview; Preview only without `programs`: each Program is a stream of its own) on a width ×
+// height canvas: the smallest n × n grid (n >= 2) that holds them all. Tile edges are even (NV12
+// chroma is 2×2).
+std::vector<MosaicTile> mosaicTiles(int width, int height, int inputs, int players, int mes, bool programs = true);
 // Columns (and rows) of that grid.
 int mosaicGrid(int tiles);
 } // namespace fxeng

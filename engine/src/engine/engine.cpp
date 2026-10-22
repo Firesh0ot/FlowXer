@@ -501,6 +501,20 @@ struct MosaicSlot
     std::atomic<bool> busy{false};
 };
 
+// A preview stream of one ME's Program (cfg.pgmStreams()): its NV12 frames at the stream's size
+// (area-averaged from the ME's packed Program, as a mosaic tile) and its NVENC session.
+struct PgmStream
+{
+    int me = 1;
+    std::string stream;
+    int width = 0;
+    int height = 0;
+    std::array<MosaicSlot, kMosaicSlots> slots;
+    std::unique_ptr<MosaicEncoder> encoder;
+    std::atomic<std::uint64_t> frames{0};
+    std::atomic<std::uint64_t> dropped{0};
+};
+
 // A stable id for one of the engine's own names (output flows, domain): 128 bits of two
 // FNV-1a hashes, formatted as a UUID version 8 (RFC 9562, custom).
 std::string nameUuid(std::string const& name)
@@ -579,6 +593,7 @@ struct Engine::Impl
     int keyRowBytes = 0;
     int recentDepth = 4;
     int mosaicDivisor = 2;
+    int pgmDivisor = 2;
     std::atomic<bool> run{false};
     bool started = false;
 
@@ -625,6 +640,8 @@ struct Engine::Impl
     std::string gpuName;
     std::string pciBus;
     std::unique_ptr<MosaicEncoder> encoder;
+    // Each ME's Program stream (cfg.pgmStreams()), ME 1 first.
+    std::vector<std::unique_ptr<PgmStream>> pgmStreams;
     // The own MediaMTX (no shared one given); started and stopped by start()/stop(), polled
     // by the stats thread in between.
     std::unique_ptr<MediamtxProcess> mediamtx;
@@ -635,7 +652,8 @@ struct Engine::Impl
     std::deque<int> writeQueue;
     std::mutex encodeMu;
     std::condition_variable encodeCv;
-    std::deque<int> encodeQueue;
+    // (stream, slot): stream −1 is the mosaic, m ≥ 0 pgmStreams[m].
+    std::deque<std::pair<int, int>> encodeQueue;
     std::mutex statsMu;
     std::condition_variable statsCv;
     std::thread renderThread;
@@ -685,6 +703,7 @@ struct Engine::Impl
     Window commitMs;
     Window lagGrains;
     Window encodeMs;
+    Window pgmEncodeMs;
     Window audioMs;
     Window audioWaitMs;
     // P5 audio: the mix (made at start, with the PGM flows' channels), its delay lines' length,
@@ -1048,7 +1067,7 @@ struct Engine::Impl
             dmeMs.push_back(std::make_unique<Window>());
         }
 
-        tiles = mosaicTiles(cfg.width, cfg.height, static_cast<int>(inputs.size()), static_cast<int>(players.size()), cfg.mes);
+        tiles = mosaicTiles(cfg.width, cfg.height, static_cast<int>(inputs.size()), static_cast<int>(players.size()), cfg.mes, !cfg.pgmStreams());
         mosaicDivisor = std::max(1, static_cast<int>(std::lround(static_cast<double>(cfg.rate.num) / static_cast<double>(cfg.rate.den) / cfg.mosaicFps)));
         if (cfg.mosaic)
         {
@@ -1069,6 +1088,33 @@ struct Engine::Impl
             enc.url = cfg.rtspBase() + "/" + cfg.streamPath("mosaic");
             enc.gpu = cfg.gpu;
             encoder = std::make_unique<MosaicEncoder>(enc);
+        }
+        if (cfg.pgmStreams())
+        {
+            pgmDivisor = std::max(1, static_cast<int>(std::lround(static_cast<double>(cfg.rate.num) / static_cast<double>(cfg.rate.den) / cfg.pgmPreviewFps)));
+            for (int m = 1; m <= cfg.mes; ++m)
+            {
+                auto ps = std::make_unique<PgmStream>();
+                ps->me = m;
+                ps->stream = "me" + std::to_string(m) + "-pgm";
+                ps->width = cfg.pgmPreviewWidth;
+                ps->height = cfg.pgmPreviewHeight();
+                std::size_t const lumaBytes = static_cast<std::size_t>(ps->width) * static_cast<std::size_t>(ps->height);
+                for (auto& slot : ps->slots)
+                {
+                    allocDevice(reinterpret_cast<void**>(&slot.nv12), lumaBytes * 3 / 2, "program stream frame");
+                    check(cudaEventCreateWithFlags(&slot.ready, cudaEventBlockingSync | cudaEventDisableTiming), "cudaEventCreate");
+                }
+                EncoderConfig enc;
+                enc.width = ps->width;
+                enc.height = ps->height;
+                enc.fps = cfg.pgmPreviewFps;
+                enc.kbps = cfg.pgmPreviewKbps;
+                enc.url = cfg.rtspBase() + "/" + cfg.streamPath(ps->stream);
+                enc.gpu = cfg.gpu;
+                ps->encoder = std::make_unique<MosaicEncoder>(enc);
+                pgmStreams.push_back(std::move(ps));
+            }
         }
         check(cudaStreamSynchronize(renderStream), "setup");
     }
@@ -1657,10 +1703,53 @@ struct Engine::Impl
         target.busy.store(true);
         {
             std::lock_guard lock{encodeMu};
-            encodeQueue.push_back(free);
+            encodeQueue.emplace_back(-1, free);
         }
         encodeCv.notify_one();
         ++mosaicFrames;
+    }
+
+    // Each ME's Program stream of this grain: its packed Program area-averaged into a free NV12
+    // slot of the stream (a stream whose encoder still holds both drops this frame).
+    void renderPgmStreams(Slot& slot, std::uint64_t index)
+    {
+        for (std::size_t m = 0; m < pgmStreams.size(); ++m)
+        {
+            auto& ps = *pgmStreams[m];
+            int free = -1;
+            for (int k = 0; k < kMosaicSlots; ++k)
+            {
+                if (!ps.slots[static_cast<std::size_t>(k)].busy.load())
+                {
+                    free = k;
+                    break;
+                }
+            }
+            if (free < 0)
+            {
+                ++ps.dropped;
+                continue;
+            }
+            auto& target = ps.slots[static_cast<std::size_t>(free)];
+            gpu::MosaicSource source;
+            source.v210 = slot.out[2 * m];
+            source.rowBytes = rowBytes;
+            source.width = cfg.width;
+            source.height = cfg.height;
+            source.w = ps.width;
+            source.h = ps.height;
+            std::size_t const lumaBytes = static_cast<std::size_t>(ps.width) * static_cast<std::size_t>(ps.height);
+            gpu::mosaic(renderStream, &source, 1, target.nv12, ps.width, target.nv12 + lumaBytes, ps.width);
+            cudaEventRecord(target.ready, renderStream);
+            target.pts = static_cast<std::int64_t>(index / static_cast<std::uint64_t>(pgmDivisor));
+            target.busy.store(true);
+            {
+                std::lock_guard lock{encodeMu};
+                encodeQueue.emplace_back(static_cast<int>(m), free);
+            }
+            encodeCv.notify_one();
+            ++ps.frames;
+        }
     }
 
     // Queues all GPU work of output grain `index` on the render stream (returns at once).
@@ -1946,6 +2035,10 @@ struct Engine::Impl
         if (cfg.mosaic && index % static_cast<std::uint64_t>(mosaicDivisor) == 0)
         {
             renderMosaic(slot, pictures, index);
+        }
+        if (!pgmStreams.empty() && index % static_cast<std::uint64_t>(pgmDivisor) == 0)
+        {
+            renderPgmStreams(slot, index);
         }
         cudaEventRecord(*mark, st);
         // Frame grabs of this grain (at most kGrabsPerGrain; more wait for the next one): the
@@ -2832,7 +2925,7 @@ struct Engine::Impl
         std::size_t const lumaBytes = static_cast<std::size_t>(cfg.width) * static_cast<std::size_t>(cfg.height);
         while (true)
         {
-            int k = 0;
+            std::pair<int, int> job;
             {
                 std::unique_lock lock{encodeMu};
                 encodeCv.wait(lock, [&] { return !encodeQueue.empty() || !run.load(); });
@@ -2840,14 +2933,28 @@ struct Engine::Impl
                 {
                     break;
                 }
-                k = encodeQueue.front();
+                job = encodeQueue.front();
                 encodeQueue.pop_front();
             }
-            auto& slot = mosaicSlots[static_cast<std::size_t>(k)];
+            auto const k = static_cast<std::size_t>(job.second);
+            if (job.first < 0)
+            {
+                auto& slot = mosaicSlots[k];
+                cudaEventSynchronize(slot.ready);
+                auto const started = std::chrono::steady_clock::now();
+                encoder->encode(slot.nv12, cfg.width, slot.nv12 + lumaBytes, cfg.width, slot.pts, stream);
+                encodeMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                slot.busy.store(false);
+                continue;
+            }
+            // An ME's Program stream (same thread: the encodes are short and NVENC runs them).
+            auto& ps = *pgmStreams[static_cast<std::size_t>(job.first)];
+            auto& slot = ps.slots[k];
             cudaEventSynchronize(slot.ready);
             auto const started = std::chrono::steady_clock::now();
-            encoder->encode(slot.nv12, cfg.width, slot.nv12 + lumaBytes, cfg.width, slot.pts, stream);
-            encodeMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+            std::size_t const pgmLuma = static_cast<std::size_t>(ps.width) * static_cast<std::size_t>(ps.height);
+            ps.encoder->encode(slot.nv12, ps.width, slot.nv12 + pgmLuma, ps.width, slot.pts, stream);
+            pgmEncodeMs.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
             slot.busy.store(false);
         }
         cudaStreamDestroy(stream);
@@ -3028,6 +3135,10 @@ struct Engine::Impl
         }
         outInstances.clear();
         encoder.reset();
+        for (auto& ps : pgmStreams)
+        {
+            ps->encoder.reset();
+        }
         if (mediamtx)
         {
             mediamtx->stop();
@@ -3108,6 +3219,18 @@ struct Engine::Impl
                 cudaEventDestroy(slot.ready);
             }
         }
+        for (auto& ps : pgmStreams)
+        {
+            for (auto& slot : ps->slots)
+            {
+                cudaFree(slot.nv12);
+                if (slot.ready != nullptr)
+                {
+                    cudaEventDestroy(slot.ready);
+                }
+            }
+        }
+        pgmStreams.clear();
         cudaFree(black);
         inputs.clear();
         keys.clear();
@@ -3506,6 +3629,22 @@ struct Engine::Impl
             streams.push_back({{"stream", "mosaic"}, {"path", cfg.streamPath("mosaic")}, {"url", cfg.rtspBase() + "/" + cfg.streamPath("mosaic")},
                 {"publishing", s.connected}, {"connects", s.connects}, {"last_error", s.lastError}});
         }
+        json programs = json::array();
+        for (auto const& ps : pgmStreams)
+        {
+            if (!ps->encoder)
+            {
+                continue;
+            }
+            auto const s = ps->encoder->stats();
+            programs.push_back({{"me", ps->me}, {"width", ps->width}, {"height", ps->height}, {"frames", ps->frames.load()},
+                {"dropped", ps->dropped.load()}, {"encoder", {{"open", s.open}, {"connected", s.connected}, {"frames", s.frames}, {"bytes", s.bytes},
+                {"connects", s.connects}, {"errors", s.errors}, {"last_error", s.lastError}}}});
+            streams.push_back({{"stream", ps->stream}, {"path", cfg.streamPath(ps->stream)}, {"url", cfg.rtspBase() + "/" + cfg.streamPath(ps->stream)},
+                {"publishing", s.connected}, {"connects", s.connects}, {"last_error", s.lastError}});
+        }
+        mosaic["programs"] = programs;
+        mosaic["program_encode_ms"] = pgmEncodeMs.toJson();
         out["preview"] = {{"mode", cfg.ownMediamtx() ? "own" : "shared"},
             {"publish_url", cfg.rtspBase()},
             {"path_prefix", cfg.pathPrefix},
@@ -3901,10 +4040,21 @@ std::string Engine::mosaicMapJson() const
         }
         tiles.push_back({{"id", tile.id}, {"kind", kind}, {"source", source}, {"label", label}, {"x", tile.x}, {"y", tile.y}, {"w", tile.w}, {"h", tile.h}});
     }
+    // Each ME's Program as a stream of its own (not in the mosaic then).
+    json programs = json::array();
+    if (cfg.pgmStreams())
+    {
+        for (int m = 1; m <= cfg.mes; ++m)
+        {
+            auto const stream = "me" + std::to_string(m) + "-pgm";
+            programs.push_back({{"me", m}, {"id", stream}, {"source", "me" + std::to_string(m)}, {"path", cfg.streamPath(stream)},
+                {"width", cfg.pgmPreviewWidth}, {"height", cfg.pgmPreviewHeight()}, {"fps", cfg.pgmPreviewFps}, {"kbps", cfg.pgmPreviewKbps}});
+        }
+    }
     // The GUI plays <base>/<path>/whep; an empty base means the own MediaMTX on the page's host.
     return json{{"width", cfg.width}, {"height", cfg.height}, {"fps", cfg.mosaicFps}, {"enabled", cfg.mosaic}, {"path", cfg.streamPath("mosaic")},
         {"mode", cfg.ownMediamtx() ? "own" : "shared"}, {"whep_base", cfg.whepBase}, {"hls_base", cfg.hlsBase}, {"whep_port", cfg.whepPort},
-        {"hls_port", cfg.hlsPort}, {"tiles", tiles}}
+        {"hls_port", cfg.hlsPort}, {"tiles", tiles}, {"programs", programs}}
         .dump(2);
 }
 } // namespace fxeng
