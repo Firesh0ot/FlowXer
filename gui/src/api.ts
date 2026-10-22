@@ -56,7 +56,8 @@ export interface MixerPanel {
 }
 
 /** A keyer's box (docs/engine-p4.md §3): x, y the centre of the uncropped picture (fractions of
- * the raster), size its scale; crop fractions of the source; border and shadow in raster pixels. */
+ * the raster), size its scale; crop in source pixels (whole numbers); border and shadow in raster
+ * pixels. */
 export interface Dme {
   enabled: boolean;
   x: number;

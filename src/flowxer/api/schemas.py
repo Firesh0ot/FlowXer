@@ -498,17 +498,21 @@ class KeyMode(str, Enum):
     pip = "pip"
 
 
-class DmeCrop(BaseModel):
-    left: float = Field(default=0.0, ge=0.0, le=1.0)
-    right: float = Field(default=0.0, ge=0.0, le=1.0)
-    top: float = Field(default=0.0, ge=0.0, le=1.0)
-    bottom: float = Field(default=0.0, ge=0.0, le=1.0)
+# The largest crop on one edge (pixels of an 8K raster).
+DME_CROP_MAX_PX = 8192
 
-    @model_validator(mode="after")
-    def _leaves_a_picture(self) -> "DmeCrop":
-        if self.left + self.right >= 1.0 or self.top + self.bottom >= 1.0:
-            raise ValueError("the crop must leave a picture (left + right < 1, top + bottom < 1)")
-        return self
+
+class DmeCrop(BaseModel):
+    """What a box cuts off each edge of its source, in source pixels (every source is at the
+    production raster). The crop must leave a picture: left + right < the raster's width, top +
+    bottom < its height (the mixer checks it against the format). Left and right act on 4:2:2
+    sample pairs: an odd value is rounded to the nearest even column. Before 2026-10-22 these were
+    fractions of the source (0..1); saved states, exports and snapshots are converted on load."""
+
+    left: int = Field(default=0, ge=0, le=DME_CROP_MAX_PX, description="Source pixels cut from the left")
+    right: int = Field(default=0, ge=0, le=DME_CROP_MAX_PX, description="Source pixels cut from the right")
+    top: int = Field(default=0, ge=0, le=DME_CROP_MAX_PX, description="Source lines cut from the top")
+    bottom: int = Field(default=0, ge=0, le=DME_CROP_MAX_PX, description="Source lines cut from the bottom")
 
 
 class DmeBorder(BaseModel):
@@ -528,8 +532,8 @@ class DmeShadow(BaseModel):
 class Dme(BaseModel):
     """A keyer's box (docs/engine-p4.md §3): its fill (and key) cropped, scaled and placed. x and
     y are the centre of the uncropped picture as fractions of the raster, size its scale (1 = the
-    full raster); the crop cuts the picture without moving it. Upstream keyers only; always on
-    for a pip."""
+    full raster); the crop (source pixels) cuts the picture without moving it. Upstream keyers
+    only; always on for a pip."""
 
     enabled: bool = False
     x: float = Field(default=0.5, ge=-1.0, le=2.0)

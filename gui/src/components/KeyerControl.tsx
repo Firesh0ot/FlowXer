@@ -318,13 +318,12 @@ export function KeyerControl({
                     {(["left", "right", "top", "bottom"] as const).map((side) => (
                       <NumberField
                         key={side}
-                        label={`crop ${side[0].toUpperCase()} %`}
+                        label={`crop ${side[0].toUpperCase()} px`}
                         value={dme.crop[side]}
                         min={0}
-                        max={99}
-                        step={0.1}
-                        scale={100}
-                        onCommit={(v) => box({ crop: { [side]: v } })}
+                        max={8192}
+                        step={1}
+                        onCommit={(v) => box({ crop: { [side]: Math.round(v) } })}
                       />
                     ))}
                   </div>

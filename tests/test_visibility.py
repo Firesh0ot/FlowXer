@@ -30,14 +30,21 @@ def luma(source: str, upstream: bool = True, **extra) -> KeyLayer:
 
 
 def test_boxes_that_show_nothing() -> None:
-    assert box_shows(Dme(x=0.5, y=0.5, size=0.5))
-    assert not box_shows(Dme(size=0.0))
-    assert not box_shows(Dme(x=-0.3, size=0.5))  # off screen left
-    assert not box_shows(Dme(y=1.3, size=0.5))  # off screen below
-    assert box_shows(Dme(x=-0.2, size=0.5))  # half on screen
-    assert not box_shows(Dme(size=0.5, crop={"left": 0.6, "right": 0.39999}))
-    assert box_covers(Dme(size=1.0)) and not box_covers(Dme(size=0.99))
-    assert not box_covers(Dme(size=1.0, soft=2.0)) and not box_covers(Dme(size=1.0, crop={"top": 0.1}))
+    w, h = 1920, 1080
+    assert box_shows(Dme(x=0.5, y=0.5, size=0.5), w, h)
+    assert not box_shows(Dme(size=0.0), w, h)
+    assert not box_shows(Dme(x=-0.3, size=0.5), w, h)  # off screen left
+    assert not box_shows(Dme(y=1.3, size=0.5), w, h)  # off screen below
+    assert box_shows(Dme(x=-0.2, size=0.5), w, h)  # half on screen
+    # Crops in source pixels: at x 0.95 only the left 55 % of the full-size picture is on screen
+    # (1056 px); cropping 1056 px off the left leaves nothing on screen.
+    assert box_shows(Dme(x=0.95, size=1.0, crop={"right": 960}), w, h)
+    assert box_shows(Dme(x=0.95, size=1.0, crop={"left": 1050}), w, h)
+    assert not box_shows(Dme(x=0.95, size=1.0, crop={"left": 1056}), w, h)
+    assert box_covers(Dme(size=1.0), w, h) and not box_covers(Dme(size=0.99), w, h)
+    assert not box_covers(Dme(size=1.0, soft=2.0), w, h) and not box_covers(Dme(size=1.0, crop={"top": 108}), w, h)
+    # A crop of 1 px at size 1 still covers when the box is larger by more than that.
+    assert box_covers(Dme(size=1.01, crop={"top": 1}), w, h)
 
 
 def test_hidden_and_covered_keys() -> None:

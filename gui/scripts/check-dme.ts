@@ -8,7 +8,8 @@ const doc = JSON.parse(readFileSync(new URL("../../engine/tests/dme-vectors.json
 let worst = 0;
 let handle = 0;
 for (const [x, y, size, left, right, top, bottom, L, R, T, B] of doc.vectors as number[][]) {
-  const box = { x, y, size, crop: { left, right, top, bottom } };
+  // The vectors' crops are the engine's fractions; the GUI's are source pixels.
+  const box = { x, y, size, crop: { left: left * doc.width, right: right * doc.width, top: top * doc.height, bottom: bottom * doc.height } };
   const r = boxRect(box, doc.width, doc.height);
   worst = Math.max(worst, Math.abs(r.left - L), Math.abs(r.right - R), Math.abs(r.top - T), Math.abs(r.bottom - B));
   if (size < 0.02) continue;
