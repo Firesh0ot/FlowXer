@@ -24,7 +24,8 @@ export function LibraryModal({
   const [jobs, setJobs] = useState<ConvertJob[]>([]);
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<number | null>(null);
+  // The upload under way: what goes up and how much of it has (0..1); 1 while the mixer takes it.
+  const [upload, setUpload] = useState<{ name: string; progress: number } | null>(null);
   const [mode, setMode] = useState<UploadMode>("video");
   const [fit, setFit] = useState("fit");
   const [sequenceFps, setSequenceFps] = useState(50);
@@ -47,6 +48,11 @@ export function LibraryModal({
     return () => window.clearInterval(timer);
   }, [kind, query]);
 
+  // Conversions under way (the list keeps finished jobs; their items show how they ended).
+  const activeJobs = jobs.filter((job) => job.state === "queued" || job.state === "running");
+  const jobFor = (itemId: string) => activeJobs.find((job) => job.item_id === itemId);
+  const itemName = (itemId: string) => items.find((item) => item.id === itemId)?.name ?? itemId.slice(0, 8);
+
   const onDrop = async (event: DragEvent) => {
     event.preventDefault();
     const files = Array.from(event.dataTransfer.files);
@@ -57,19 +63,23 @@ export function LibraryModal({
   const ingestFiles = async (files: File[]) => {
     setBusy(true);
     setError(null);
-    setProgress(0);
     try {
       if (kind === "stinger" && mode === "folder") {
         // TGA or PNG frames and one optional WAV (the stinger's sound).
         const sequence = files.filter((file) => /\.(tga|png|wav)$/i.test(file.name));
         if (!sequence.some((file) => /\.(tga|png)$/i.test(file.name))) throw new Error("Drop a folder of .tga or .png frames");
-        await api.uploadSequence(sequence[0].webkitRelativePath?.split("/")[0] || "sequence", sequence, {
-          sequence_fps: sequenceFps,
-          cut_frame: cutFrame,
-          fit,
-        });
+        const name = sequence[0].webkitRelativePath?.split("/")[0] || "sequence";
+        setUpload({ name, progress: 0 });
+        await api.uploadSequence(
+          name,
+          sequence,
+          { sequence_fps: sequenceFps, cut_frame: cutFrame, fit },
+          (ratio) => setUpload({ name, progress: ratio }),
+        );
       } else {
-        for (const file of files) {
+        for (const [index, file] of files.entries()) {
+          const name = files.length > 1 ? `${file.name} (${index + 1}/${files.length})` : file.name;
+          setUpload({ name, progress: 0 });
           const uploadMode = kind === "stinger" && mode === "zip" ? "zip" : "video";
           await uploadFileChunked(
             file,
@@ -80,17 +90,16 @@ export function LibraryModal({
               sequence_fps: kind === "stinger" ? sequenceFps : undefined,
               cut_frame: kind === "stinger" ? cutFrame : undefined,
             },
-            setProgress,
+            (ratio) => setUpload({ name, progress: ratio }),
           );
         }
       }
       await refresh();
       await onChanged();
-      setProgress(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "upload failed");
-      setProgress(null);
     } finally {
+      setUpload(null);
       setBusy(false);
     }
   };
@@ -176,25 +185,28 @@ export function LibraryModal({
           </label>
         </div>
 
-        {progress != null ? (
-          <div className="upload-progress">
-            <div style={{ width: `${Math.round(progress * 100)}%` }} />
-            <span>Uploading {Math.round(progress * 100)}%</span>
-          </div>
-        ) : null}
-
-        {jobs.length ? (
-          <div className="job-list">
-            {jobs.map((job) => (
+        {/* Stays at the top while the list scrolls: the upload, then each conversion under way. */}
+        {upload || activeJobs.length ? (
+          <div className="library-status">
+            {upload ? (
+              <ProgressBar
+                value={upload.progress}
+                label={
+                  upload.progress < 1
+                    ? `Uploading ${upload.name} · ${Math.floor(upload.progress * 100)} %`
+                    : `Uploaded ${upload.name} · the mixer takes it…`
+                }
+              />
+            ) : null}
+            {activeJobs.map((job) => (
               <div key={job.id} className="job-row">
-                <span>
-                  {job.item_id.slice(0, 8)} · {job.state} · {Math.round(job.progress * 100)}%
-                </span>
-                {job.state === "queued" || job.state === "running" ? (
-                  <button className="ghost" onClick={() => void api.cancelJob(job.id).then(refresh)}>
-                    Cancel
-                  </button>
-                ) : null}
+                <ProgressBar
+                  value={job.progress}
+                  label={`${job.state === "queued" ? "Queued" : "Converting"} ${itemName(job.item_id)} · ${Math.floor(job.progress * 100)} %`}
+                />
+                <button className="ghost" onClick={() => void api.cancelJob(job.id).then(refresh)}>
+                  Cancel
+                </button>
               </div>
             ))}
           </div>
@@ -203,6 +215,9 @@ export function LibraryModal({
         <div className="library-grid">
           {items.map((item) => (
             <article key={item.id} className={`library-card status-${item.status}`}>
+              {jobFor(item.id) ? (
+                <ProgressBar value={jobFor(item.id)!.progress} label={`${Math.floor(jobFor(item.id)!.progress * 100)} %`} />
+              ) : null}
               {item.thumb_url ? (
                 <img src={item.thumb_url} alt="" />
               ) : (
@@ -252,6 +267,17 @@ export function LibraryModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** A bar with its text over it (an upload, a conversion). */
+function ProgressBar({ value, label }: { value: number; label: string }) {
+  const percent = Math.max(0, Math.min(100, value * 100));
+  return (
+    <div className="upload-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(percent)}>
+      <div style={{ width: `${percent}%` }} />
+      <span>{label}</span>
     </div>
   );
 }

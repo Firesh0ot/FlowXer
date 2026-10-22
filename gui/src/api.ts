@@ -395,6 +395,28 @@ async function parse<T>(response: Response): Promise<T> {
   return body as T;
 }
 
+/** A request whose body's upload reports its progress (fetch cannot): `onSent(bytes)` while it
+ * goes out. Answers like parse(). */
+function sendWithProgress<T>(method: string, url: string, body: Blob | FormData, onSent?: (bytes: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(method, url);
+    xhr.upload.onprogress = (event) => onSent?.(event.loaded);
+    xhr.onload = () => {
+      let parsed: { detail?: unknown } = {};
+      try {
+        parsed = JSON.parse(xhr.responseText || "{}");
+      } catch {
+        // not JSON
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(parsed as T);
+      else reject(new Error(typeof parsed.detail === "string" ? parsed.detail : xhr.statusText || `HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error("upload failed: network error"));
+    xhr.send(body);
+  });
+}
+
 export const api = {
   console: () => fetch("/api/v1/console").then((r) => parse<ConsoleState>(r)),
   start: () =>
@@ -619,19 +641,20 @@ export const api = {
       headers: jsonHeaders,
       body: JSON.stringify(payload),
     }).then((r) => parse<{ id: string; chunk_size: number; received: number[] }>(r)),
-  uploadChunk: async (uploadId: string, index: number, chunk: Blob) => {
-    const response = await fetch(`/api/v1/uploads/${uploadId}/chunks/${index}`, {
-      method: "PUT",
-      body: chunk,
-    });
-    return parse<{ id: string; chunk_size: number; received: number[] }>(response);
-  },
+  uploadChunk: (uploadId: string, index: number, chunk: Blob, onSent?: (bytes: number) => void) =>
+    sendWithProgress<{ id: string; chunk_size: number; received: number[] }>(
+      "PUT",
+      `/api/v1/uploads/${uploadId}/chunks/${index}`,
+      chunk,
+      onSent,
+    ),
   uploadComplete: (uploadId: string) =>
     fetch(`/api/v1/uploads/${uploadId}/complete`, { method: "POST" }).then((r) => parse<LibraryItem>(r)),
   uploadSequence: async (
     name: string,
     files: File[],
     options?: { sequence_fps?: number; cut_frame?: number; fit?: string },
+    onProgress?: (ratio: number) => void,
   ) => {
     const body = new FormData();
     body.set("name", name);
@@ -639,8 +662,10 @@ export const api = {
     if (options?.cut_frame != null) body.set("cut_frame", String(options.cut_frame));
     if (options?.fit) body.set("fit", options.fit);
     for (const file of files) body.append("files", file, file.name);
-    const response = await fetch("/api/v1/uploads/sequence", { method: "POST", body });
-    return parse<LibraryItem>(response);
+    const total = Math.max(1, files.reduce((sum, file) => sum + file.size, 0));
+    return sendWithProgress<LibraryItem>("POST", "/api/v1/uploads/sequence", body, (sent) =>
+      onProgress?.(Math.min(1, sent / total)),
+    );
   },
 };
 
@@ -660,11 +685,15 @@ export async function uploadFileChunked(
   });
   const chunkSize = session.chunk_size;
   const total = Math.max(1, Math.ceil(file.size / chunkSize));
+  const size = Math.max(1, file.size);
   for (let index = 0; index < total; index += 1) {
     const start = index * chunkSize;
     const end = Math.min(file.size, start + chunkSize);
-    await api.uploadChunk(session.id, index, file.slice(start, end));
-    onProgress?.((index + 1) / total);
+    // Within a chunk too (8 MiB): the bytes sent so far of the whole file.
+    await api.uploadChunk(session.id, index, file.slice(start, end), (sent) =>
+      onProgress?.(Math.min(1, (start + Math.min(sent, end - start)) / size)),
+    );
+    onProgress?.(end / size);
   }
   return api.uploadComplete(session.id);
 }

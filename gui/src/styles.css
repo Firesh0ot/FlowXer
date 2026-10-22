@@ -12,12 +12,15 @@
 * { box-sizing: border-box; }
 html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
 .boot { display: grid; place-items: center; height: 100%; }
+/* PREVIEW and PROGRAM take about 40 % of the window's height (--monitor-h, with their titles), the
+   deck (source tiles, transition) the rest; what does not fit scrolls. */
 .console {
-  height: 100%; min-height: 100%; overflow: hidden;
-  display: grid; grid-template-rows: auto auto minmax(0, 1fr);
+  --monitor-h: 40vh;
+  height: 100%; min-height: 100%; overflow-x: hidden; overflow-y: auto;
+  display: grid; grid-template-rows: auto auto minmax(min-content, 1fr);
 }
 /* The AUDIO strip of the active ME, a row under the deck (P5). */
-.console.with-audio { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.console.with-audio { grid-template-rows: auto auto minmax(min-content, 1fr) auto; }
 .audio-section { border-top: 1px solid var(--line); background: #0b0e14; height: 240px; min-height: 0; }
 .aux-row button.audio-toggle { margin-left: auto; font-weight: 700; letter-spacing: 0.08em; }
 .aux-row button.audio-toggle.on { outline: 2px solid var(--accent); }
@@ -118,9 +121,14 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
 .status-issues .issue-info { color: var(--muted); }
 .me-row {
   padding: 8px 18px 4px; display: flex; flex-direction: column; gap: 6px;
-  min-height: 0;
 }
-.monitors { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-height: 0; }
+/* Two columns of at most the width a 16:9 picture of --monitor-h has (less the title), centred
+   together: a wide window gets no gap between them. */
+.monitors {
+  --monitor-w: calc((var(--monitor-h) - 20px) * 16 / 9);
+  display: grid; grid-template-columns: repeat(2, minmax(0, var(--monitor-w))); justify-content: center;
+  gap: 12px;
+}
 .bus-column h2 { margin: 0 0 4px; font-size: 12px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); }
 .monitor { position: relative; background: #000; aspect-ratio: 16/9; overflow: hidden; border: 2px solid #222; container-type: size; }
 /* A picture of the preview mosaic: a box of its tile's aspect ratio, centred, with the page's one
@@ -167,7 +175,7 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
   --tile-aspect: 16 / 9;
   display: grid; gap: 8px; padding: 8px;
   min-width: 0; min-height: 0; height: 100%;
-  align-content: stretch; grid-auto-rows: 1fr;
+  align-content: stretch; grid-auto-rows: minmax(150px, 1fr);
 }
 .source-strip[data-aspect="9:16"] { --tile-aspect: 9 / 16; }
 .deck {
@@ -371,8 +379,14 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
 .upload-progress { position: relative; height: 18px; background: #0b1220; border: 1px solid var(--line); }
 .upload-progress > div { height: 100%; background: var(--accent, #3d8bfd); }
 .upload-progress > span { position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; }
-.job-list { display: grid; gap: 4px; font-size: 12px; }
-.job-row { display: flex; justify-content: space-between; align-items: center; }
+/* The upload and the conversions under way, kept in view at the top of the library. */
+.library-status {
+  position: sticky; top: -20px; z-index: 2; display: grid; gap: 4px; padding: 6px 0;
+  background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.job-row { display: flex; gap: 8px; align-items: center; }
+.job-row .upload-progress { flex: 1; }
+.library-card .upload-progress { height: 14px; }
 .library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-top: 8px; }
 .library-card { border: 1px solid var(--line); padding: 8px; display: grid; gap: 6px; background: #0b1220; }
 .library-card img, .thumb-placeholder, .cut-preview img { width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #111827; }
@@ -405,7 +419,8 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
 }
 .toast.notice { background: #13361f; bottom: 56px; }
 @media (max-width: 900px) {
-  .monitors { grid-template-columns: 1fr; }
+  .console { --monitor-h: 32vh; }
+  .monitors { grid-template-columns: minmax(0, var(--monitor-w)); }
   .deck { grid-template-columns: 1fr; }
   .transition-section { border-left: 0; border-top: 1px solid var(--line); min-height: 140px; }
 }

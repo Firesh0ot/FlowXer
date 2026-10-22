@@ -5,6 +5,19 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: operator console layout, higher MEs, upload progress
+
+- GUI: PREVIEW and PROGRAM take about 40 % of the window's height and are centred as a pair on a
+  wide window (no growing gap); the deck gets the rest and the console scrolls where it does not
+  fit (before, a wide window showed little but the two monitors, without a scrollbar).
+- GUI: the higher MEs are tiles after the sources (re-entry): left half to Preview, right half to
+  Program of the active ME, like the bus widget's ME buttons.
+- GUI: the library shows the upload's progress by bytes (also within each 8 MiB chunk), then a bar
+  per conversion with the item's name; they stay in view at the top, and a converting card has its
+  own bar.
+- Library: conversion jobs report ffmpeg's progress (`-progress`) for a clip's picture and a
+  stinger's colour and alpha, instead of a few fixed steps (a clip's picture: 10 % to 80 %).
+
 ### Added: clip end back to Preview
 
 - A clip player's `on_end` (`off`, `cut`, `auto`, `stinger`; `docs/clip-end.md`). When the player

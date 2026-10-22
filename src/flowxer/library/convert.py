@@ -345,12 +345,33 @@ class ConversionQueue:
         except OSError:
             pass  # item deleted meanwhile
 
-    def _run(self, item: LibraryItem, cmd: list[str], timeout: float, cancel: threading.Event) -> RunResult:
-        result = self.ffmpeg.run(cmd, timeout=timeout, cancel=cancel)
+    def _run(
+        self,
+        item: LibraryItem,
+        cmd: list[str],
+        timeout: float,
+        cancel: threading.Event,
+        progress: Callable[[float], None] | None = None,
+    ) -> RunResult:
+        result = self.ffmpeg.run(cmd, timeout=timeout, cancel=cancel, progress=progress)
         self._append_log(item.id, result.output)
         if result.cancelled or cancel.is_set() or self._stop.is_set():
             raise _Cancelled()
         return result
+
+    def _progress(self, job: ConvertJob, start: float, end: float, duration: float) -> Callable[[float], None] | None:
+        """A step's ffmpeg progress (seconds written of `duration`) as the job's progress from
+        `start` to `end`, sent on in steps of at least 1 %."""
+        if duration <= 0:
+            return None
+
+        def report(seconds: float) -> None:
+            value = round(start + (end - start) * min(1.0, seconds / duration), 3)
+            if value >= job.progress + 0.01:
+                job.progress = value
+                self._emit(job)
+
+        return report
 
     def _original_path(self, item: LibraryItem) -> Path:
         """item.json names the original: relative to the item directory, or absolute for
@@ -410,7 +431,8 @@ class ConversionQueue:
             af = "loudnorm=I=-23:TP=-1.5:LRA=11," + af
 
         try:
-            job.progress = 0.2
+            # The picture is most of the time: 10 % to 80 % as ffmpeg reports it.
+            job.progress = 0.1
             self._emit(job)
             keyint = max(1, round(fmt.frame_rate_num / fmt.frame_rate_den))
             result = self._run(
@@ -425,6 +447,7 @@ class ConversionQueue:
                 ),
                 timeout,
                 cancel,
+                self._progress(job, 0.1, 0.8, probe.duration),
             )
             if result.code != 0:
                 return ConversionInfo(status=ConversionStatus.failed, error="video transcode failed")
@@ -442,7 +465,7 @@ class ConversionQueue:
                 return ConversionInfo(status=ConversionStatus.failed, error="mezzanine has no frames")
 
             # Sound of exactly the clip's length in whole frames, so it loops without drift.
-            job.progress = 0.45
+            job.progress = 0.8
             self._emit(job)
             need = samples_until_grain(frames, fmt.frame_rate_num, fmt.frame_rate_den, 48000)
             audio = None
@@ -476,7 +499,7 @@ class ConversionQueue:
                     return ConversionInfo(status=ConversionStatus.failed, error="audio conform failed")
             crossfade_loop_file(audio_tmp, use_ch, need, int(item.options.crossfade_ms * 48))
 
-            job.progress = 0.85
+            job.progress = 0.9
             self._emit(job)
             self._run(item, build_thumb_command(mezz=video_tmp, thumb=thumb_tmp), 120.0, cancel)
             self._publish(audio_tmp, audio_file)
@@ -733,6 +756,7 @@ class ConversionQueue:
                 ),
                 timeout,
                 cancel,
+                self._progress(job, 0.2, 0.5 if has_alpha else 0.75, duration),
             )
             if result.code != 0:
                 return ConversionInfo(status=ConversionStatus.failed, error="stinger transcode failed")
@@ -764,6 +788,7 @@ class ConversionQueue:
                     ),
                     timeout,
                     cancel,
+                    self._progress(job, 0.5, 0.75, duration),
                 )
                 if result.code != 0:
                     return ConversionInfo(status=ConversionStatus.failed, error="stinger alpha transcode failed")
