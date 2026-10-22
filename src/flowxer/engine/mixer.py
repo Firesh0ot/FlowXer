@@ -206,6 +206,10 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
     return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
 
 
+# A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
+TALLY_END_MARGIN_S = 0.05
+
+
 class MixerError(RuntimeError):
     pass
 
@@ -834,6 +838,7 @@ class VisionMixer:
         else:
             # The raw tally keeps it on air until the fade or the fly has ended.
             self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_until[keyer.id])
         self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
         self._publish_tally()
         return keyer
@@ -2036,6 +2041,7 @@ class VisionMixer:
                 self._key_until.pop(keyer.id, None)
             else:
                 self._key_until[keyer.id] = now + frames / self.settings.fps
+                self._tally_again_at(self._key_until[keyer.id])
 
     def _end_held_ties(self, panel: MixerPanel, frames: int = 0) -> None:
         """A T-bar transition that completes (now, or by an Auto over `frames`): its tied keyers
@@ -2149,6 +2155,7 @@ class VisionMixer:
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
+            self._tally_again_at(self._mixes[panel.id][2])
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2556,6 +2563,21 @@ class VisionMixer:
         except Exception as exc:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
+
+    def _tally_again_at(self, at: float | None) -> None:
+        """The receivers' tally once more when a mix or a key's fade or fly ends (monotonic `at`):
+        what is visible changes then without an operator action."""
+        if at is None or not self.tally.receivers:
+            return
+        timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, self._publish_tally_quietly)
+        timer.daemon = True
+        timer.start()
+
+    def _publish_tally_quietly(self) -> None:
+        try:
+            self._publish_tally()
+        except Exception:  # a timer thread must not die loudly
+            log.exception("tally publish after a mix or a key fade failed")
 
     def _export_tally(self) -> None:
         """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it."""

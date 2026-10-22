@@ -3,8 +3,10 @@ pips and nested MEs included, hidden boxes and covered layers excluded."""
 
 from __future__ import annotations
 
+import json
 import socket
 import time
+from pathlib import Path
 
 from flowxer.api.schemas import Dme, MixerStartRequest, TallyKind, TallyReceiver, WorkspaceUpdate
 from flowxer.engine.mixer import VisionMixer
@@ -136,3 +138,82 @@ def test_simulated_meters_hear_a_visible_pip(mixer: VisionMixer) -> None:
         mixer._meters_at = 0.0
     strips = mixer.audio_meters()["panels"]["me-1"]["strips"]
     assert strips["cam-1"]["heard"] and strips["cam-3"]["heard"]
+
+
+VECTORS = Path(__file__).parents[1] / "engine" / "tests" / "visibility-vectors.json"
+
+
+def test_the_shared_vectors_agree_with_the_engine() -> None:
+    # engine/tests/test_visibility.cpp runs the same cases against core/visibility.cpp.
+    cases = json.loads(VECTORS.read_text(encoding="utf-8"))["cases"]
+    assert len(cases) >= 10
+    for case in cases:
+        layers = []
+        for key in case["keys"]:
+            box = key["box"]
+            layers.append(
+                KeyLayer(
+                    source_id=key["source"] or None, keys_source=key["mode"] in ("pip", "luma"), pip=key["mode"] == "pip",
+                    upstream=key["upstream"], on_air=key["fade"] > 0, full=key["fade"] >= 1, leaving=False, gain=key["gain"],
+                    dme=None if box is None else Dme(enabled=True, x=box["x"], y=box["y"], size=box["size"], soft=box["soft"], crop=box["crop"]),
+                )
+            )
+        assert key_visibility(layers) == (case["keyed"], case["covered"]), case["name"]
+
+
+def _receiver(mixer: VisionMixer) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(2.0)
+    mixer.replace_tally_receivers([TallyReceiver(id="r", kind=TallyKind.custom, label="r", host="127.0.0.1", port=sock.getsockname()[1])])
+    return sock
+
+
+def _red(packet: bytes) -> set[str]:
+    return {m["text"] for m in decode_packet(packet)["messages"] if m["rh"] == TALLY_RED}
+
+
+def _last_red(sock: socket.socket, wait: float) -> set[str]:
+    """The red labels of the last packet that comes within `wait` seconds."""
+    red: set[str] | None = None
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            red = _red(sock.recvfrom(4096)[0])
+        except TimeoutError:
+            break
+    assert red is not None
+    return red
+
+
+def test_receivers_get_the_end_of_a_mix_and_of_a_key_fade(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    labels = {item.id: item.label for item in mixer.list_inputs()}
+    sock = _receiver(mixer)
+    try:
+        sock.recvfrom(4096)  # the receivers' first packet
+        mixer.auto("me-1", frames=5)
+        assert _red(sock.recvfrom(4096)[0]) == {labels["cam-1"], labels["cam-2"]}
+        # The mix ends (0.1 s) without an operator action: a packet with only cam-2 red follows.
+        assert _last_red(sock, 1.0) == {labels["cam-2"]}
+        assert mixer.program_visibility()["me-1"] == ["cam-2"]
+        # A pip fading off: red until the fade ends, then a packet without it.
+        mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4", enabled=True, rate_ms=100)
+        mixer.keyer_auto("me-1-key-1")
+        assert labels["cam-4"] in _red(sock.recvfrom(4096)[0])
+        assert _last_red(sock, 1.0) == {labels["cam-2"]}
+    finally:
+        sock.close()
+
+
+def test_a_covered_program_is_not_red_on_the_receivers(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    labels = {item.id: item.label for item in mixer.list_inputs()}
+    sock = _receiver(mixer)
+    try:
+        sock.recvfrom(4096)
+        mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-5", dme={"x": 0.5, "y": 0.5, "size": 1.0}, enabled=True)
+        assert _last_red(sock, 0.3) == {labels["cam-5"]}
+    finally:
+        sock.close()

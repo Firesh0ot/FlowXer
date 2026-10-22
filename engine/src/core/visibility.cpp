@@ -46,7 +46,9 @@ KeyVisibility keyVisibility(int me, std::vector<KeyPlan> const& keys)
 {
     KeyVisibility out;
     // From the top down: a covering pip hides every layer under it and the background.
-    std::vector<KeyPlan const*> layers;
+    // Reused per thread (the render thread calls this every grain for every ME).
+    thread_local std::vector<KeyPlan const*> layers;
+    layers.clear();
     for (auto const& key : keys)
     {
         if (key.me == me)

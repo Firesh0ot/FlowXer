@@ -164,7 +164,12 @@ w_k(s) = 1                 AFV off
   The engine works this out per grain from the keys it renders (`core/visibility.hpp`,
   `MePlan::keyed` and `backgroundCovered`); a key's source comes in and goes out over one grain on
   the Cut curve; during a transition a key's source stays in full. A strip whose source is the
-  transition's A or B and a key's source at once is heard once, in full.
+  transition's A or B and a key's source at once is heard once, in full. While a full-raster pip
+  covers the background, a transition's A and B stay out; a strip that enters the transition's
+  curve from elsewhere (the cover ends, a key of its source goes off) ramps from where it was onto
+  the curve within one grain, without a step. The shared cases `engine/tests/visibility-vectors.json`
+  are run by the engine's tests and by pytest against the control plane's rules (which cannot know
+  a box's position during a fly off: a key that flies off stays visible until the fly ends).
 
 ### Fades without clicks
 

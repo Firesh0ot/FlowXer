@@ -133,11 +133,9 @@ class TallyService:
         # background or in a key, recursively; hidden boxes and covered layers do not count).
         program_ids = {source for shown in mixer.program_visibility().values() for source in shown}
         preview_ids = {panel.preview_input_id for panel in mixer.panels if panel.preview_input_id}
-        if running:
-            if mixer.program_input_id:
-                program_ids.add(mixer.program_input_id)
-            if mixer.preview_input_id:
-                preview_ids.add(mixer.preview_input_id)
+        # (ME 1's Program is in program_ids unless a full-raster pip covers it.)
+        if running and mixer.preview_input_id:
+            preview_ids.add(mixer.preview_input_id)
         messages: list[DisplayMessage] = []
         for source in mixer.list_inputs():
             program = running and source.id in program_ids

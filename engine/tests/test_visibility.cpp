@@ -8,7 +8,11 @@
 #include "core/mixer.hpp"
 #include "core/visibility.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <fstream>
+#include <iostream>
 #include <cmath>
 
 using namespace fxeng;
@@ -252,4 +256,107 @@ TEST(audio_follows_nested_mes)
     mix.grain(plans, sources, n, out);
     mix.grain(plans, sources, n, out);
     CHECK(out[0][0] == 1.f / 2);
+}
+
+TEST(audio_transition_ramps_from_where_the_strip_is)
+{
+    std::size_t const n = 480;
+    AudioMix mix(1, 3, 0, 1);
+    auto const a = flat(n, 0.5f);
+    auto const b = flat(n, 0.25f);
+    auto const c = flat(n, 0.125f);
+    MixSources sources{{a.data(), b.data(), c.data()}, {}, {}};
+    std::vector<std::vector<float>> out;
+    auto mixing = [](float tPrev, float t) {
+        MePlan p = still(1, in(1));
+        p.b = in(3);
+        p.mixing = true;
+        p.tPrev = tPrev;
+        p.t = t;
+        return p;
+    };
+    // A full-raster pip of in2 covers in1: only in2 is heard.
+    MePlan covered = still(1, in(1));
+    covered.keyed = {in(2)};
+    covered.backgroundCovered = true;
+    mix.grain({covered}, sources, n, out);
+    mix.grain({covered}, sources, n, out);
+    CHECK(out[0][n - 1] == 0.25f);
+    // A Mix in1 → in3 starts under the cover: A and B stay out (no jump to the curve).
+    MePlan m = mixing(0.f, 0.1f);
+    m.keyed = {in(2)};
+    m.backgroundCovered = true;
+    mix.grain({m}, sources, n, out);
+    CHECK(out[0][0] == 0.25f && out[0][n - 1] == 0.25f);
+    // The cover ends: A and B ramp from 0 onto the curve, no step at the grain's start.
+    m = mixing(0.1f, 0.2f);
+    m.keyed = {in(2)};
+    mix.grain({m}, sources, n, out);
+    CHECK(std::abs(out[0][0] - 0.25f) < 0.01f);
+    auto const e = crossfade(0.2f);
+    CHECK(std::abs(out[0][n - 1] - (0.25f + 0.5f * e.a + 0.125f * e.b)) < 1e-4f);
+    // in1 is also a key's source (in full) and the key goes off mid-transition: in1 ramps from 1
+    // down onto the curve instead of jumping.
+    m = mixing(0.2f, 0.3f);
+    m.keyed = {in(1)};
+    mix.grain({m}, sources, n, out);
+    CHECK(std::abs(out[0][n - 1] - (0.5f + 0.125f * crossfade(0.3f).b)) < 1e-4f);
+    m = mixing(0.3f, 0.4f);
+    mix.grain({m}, sources, n, out);
+    CHECK(std::abs(out[0][0] - (0.5f + 0.125f * crossfade(0.3f).b)) < 0.01f);
+    CHECK(std::abs(out[0][n - 1] - (0.5f * crossfade(0.4f).a + 0.125f * crossfade(0.4f).b)) < 1e-4f);
+}
+
+TEST(visibility_shared_vectors)
+{
+    // The same cases as tests/test_visibility.py runs against the control plane's rules.
+    std::ifstream file(FXENG_VISIBILITY_VECTORS);
+    auto const doc = nlohmann::json::parse(file, nullptr, false);
+    CHECK(!doc.is_discarded() && doc["cases"].size() >= 10u);
+    if (doc.is_discarded())
+    {
+        return;
+    }
+    for (auto const& c : doc["cases"])
+    {
+        std::vector<KeyPlan> keys;
+        for (auto const& k : c["keys"])
+        {
+            KeyPlan key;
+            key.me = 1;
+            key.upstream = k["upstream"].get<bool>();
+            key.gain = k["fade"].get<float>();
+            auto const mode = k["mode"].get<std::string>();
+            key.settings.pip = mode == "pip";
+            key.settings.luma = mode == "luma";
+            key.settings.gain = k["gain"].get<float>();
+            if (auto const source = parseSource(k["source"].get<std::string>()))
+            {
+                key.settings.source = *source;
+            }
+            if (!k["box"].is_null())
+            {
+                auto const& b = k["box"];
+                key.settings.dme = box(b["x"].get<float>(), b["y"].get<float>(), b["size"].get<float>());
+                key.settings.dme.soft = b["soft"].get<float>();
+                key.settings.dme.cropLeft = b["crop"]["left"].get<float>();
+                key.settings.dme.cropRight = b["crop"]["right"].get<float>();
+                key.settings.dme.cropTop = b["crop"]["top"].get<float>();
+                key.settings.dme.cropBottom = b["crop"]["bottom"].get<float>();
+            }
+            keys.push_back(key);
+        }
+        auto const v = keyVisibility(1, keys);
+        std::vector<std::string> keyed;
+        for (auto const& s : v.keyed)
+        {
+            keyed.push_back(sourceName(s));
+        }
+        bool const ok = keyed == c["keyed"].get<std::vector<std::string>>() && v.backgroundCovered == c["covered"].get<bool>();
+        if (!ok)
+        {
+            std::cerr << "visibility vector: " << c["name"].get<std::string>() << "\n";
+        }
+        CHECK(ok);
+    }
 }

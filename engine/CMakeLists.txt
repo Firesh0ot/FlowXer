@@ -43,7 +43,8 @@ if(FXENG_BUILD_TESTS)
     add_executable(fxeng-tests tests/test_main.cpp tests/test_audio.cpp tests/test_core.cpp tests/test_keyframes.cpp tests/test_logic.cpp tests/test_meter.cpp tests/test_ties.cpp tests/test_visibility.cpp)
     target_link_libraries(fxeng-tests PRIVATE fxeng-core)
     target_compile_definitions(fxeng-tests PRIVATE FXENG_WIPE_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/wipe-vectors.json"
-        FXENG_DME_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/dme-vectors.json")
+        FXENG_DME_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/dme-vectors.json"
+        FXENG_VISIBILITY_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/tests/visibility-vectors.json")
     target_compile_options(fxeng-tests PRIVATE -Wall -Wextra)
     add_test(NAME fxeng-tests COMMAND fxeng-tests)
 endif()

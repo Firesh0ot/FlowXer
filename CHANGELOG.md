@@ -17,7 +17,9 @@ in `docs/platform-integration-plan.md` §8.
   work through each ME's own PGM mix. Before, AFV followed the background only (P5 decision,
   changed with the user).
 - `GET /console` has `on_air`: per ME id what is visible on its Program.
-- The raw tally export (`FLOWXER_TALLY_TSL`) is unchanged.
+- The receivers get the tally again when a mix or a key's fade or fly ends.
+- **For the platform:** the raw tally export (`FLOWXER_TALLY_TSL`) is unchanged (per ME; a hidden
+  box still lights its source there).
 
 ### Changed: operator console layout, higher MEs, upload progress
 
