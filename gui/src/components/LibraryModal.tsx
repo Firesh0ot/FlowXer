@@ -53,8 +53,16 @@ export function LibraryModal({
   const jobFor = (itemId: string) => activeJobs.find((job) => job.item_id === itemId);
   const itemName = (itemId: string) => items.find((item) => item.id === itemId)?.name ?? itemId.slice(0, 8);
 
+  // The bar moves in whole percent (not a React render per XHR progress event).
+  const showUpload = (name: string, ratio: number) =>
+    setUpload((current) =>
+      current && current.name === name && Math.floor(current.progress * 100) === Math.floor(ratio * 100) ? current : { name, progress: ratio },
+    );
+
   const onDrop = async (event: DragEvent) => {
     event.preventDefault();
+    // One upload at a time: a second one would share the progress and the busy state.
+    if (busy) return;
     const files = Array.from(event.dataTransfer.files);
     if (!files.length) return;
     await ingestFiles(files);
@@ -74,7 +82,7 @@ export function LibraryModal({
           name,
           sequence,
           { sequence_fps: sequenceFps, cut_frame: cutFrame, fit },
-          (ratio) => setUpload({ name, progress: ratio }),
+          (ratio) => showUpload(name, ratio),
         );
       } else {
         for (const [index, file] of files.entries()) {
@@ -90,7 +98,7 @@ export function LibraryModal({
               sequence_fps: kind === "stinger" ? sequenceFps : undefined,
               cut_frame: kind === "stinger" ? cutFrame : undefined,
             },
-            (ratio) => setUpload({ name, progress: ratio }),
+            (ratio) => showUpload(name, ratio),
           );
         }
       }

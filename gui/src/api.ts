@@ -397,11 +397,16 @@ async function parse<T>(response: Response): Promise<T> {
 
 /** A request whose body's upload reports its progress (fetch cannot): `onSent(bytes)` while it
  * goes out. Answers like parse(). */
-function sendWithProgress<T>(method: string, url: string, body: Blob | FormData, onSent?: (bytes: number) => void): Promise<T> {
+function sendWithProgress<T>(
+  method: string,
+  url: string,
+  body: Blob | FormData,
+  onSent?: (bytes: number, total: number) => void,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open(method, url);
-    xhr.upload.onprogress = (event) => onSent?.(event.loaded);
+    xhr.upload.onprogress = (event) => onSent?.(event.loaded, event.lengthComputable ? event.total : 0);
     xhr.onload = () => {
       let parsed: { detail?: unknown } = {};
       try {
@@ -413,6 +418,8 @@ function sendWithProgress<T>(method: string, url: string, body: Blob | FormData,
       else reject(new Error(typeof parsed.detail === "string" ? parsed.detail : xhr.statusText || `HTTP ${xhr.status}`));
     };
     xhr.onerror = () => reject(new Error("upload failed: network error"));
+    xhr.onabort = () => reject(new Error("upload aborted"));
+    xhr.ontimeout = () => reject(new Error("upload timed out"));
     xhr.send(body);
   });
 }
@@ -662,9 +669,10 @@ export const api = {
     if (options?.cut_frame != null) body.set("cut_frame", String(options.cut_frame));
     if (options?.fit) body.set("fit", options.fit);
     for (const file of files) body.append("files", file, file.name);
-    const total = Math.max(1, files.reduce((sum, file) => sum + file.size, 0));
-    return sendWithProgress<LibraryItem>("POST", "/api/v1/uploads/sequence", body, (sent) =>
-      onProgress?.(Math.min(1, sent / total)),
+    // The multipart body's own size when the browser knows it, else the files' sizes.
+    const files_ = Math.max(1, files.reduce((sum, file) => sum + file.size, 0));
+    return sendWithProgress<LibraryItem>("POST", "/api/v1/uploads/sequence", body, (sent, total) =>
+      onProgress?.(Math.min(1, sent / (total || files_))),
     );
   },
 };

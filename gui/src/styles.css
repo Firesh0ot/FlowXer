@@ -267,6 +267,7 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
   color: transparent; cursor: pointer; font-size: 11px; letter-spacing: 0.12em;
 }
 .hit:hover { color: #fff; background: #ffffff14; }
+.hit:focus-visible { color: #fff; background: #ffffff14; outline: 2px solid var(--accent); outline-offset: -2px; }
 /* A clip player: its library item in the header, the position over the picture, the transport
    in one row under it. */
 .source-tile header .player-select {
