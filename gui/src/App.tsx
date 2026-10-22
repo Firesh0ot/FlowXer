@@ -351,6 +351,7 @@ export default function App() {
               key={item.id}
               me={item}
               panel={panel}
+              onAir={snapshot.on_air?.[panel.id]?.includes(item.id)}
               onPreview={() => void command(() => api.preview(item.id, panel.id))}
               onProgram={() => void command(() => api.take(item.id, panel.id))}
               onGrab={openGrab(item.id, `${item.label} PGM`)}

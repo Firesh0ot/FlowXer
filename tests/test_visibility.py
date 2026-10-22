@@ -217,3 +217,46 @@ def test_a_covered_program_is_not_red_on_the_receivers(mixer: VisionMixer) -> No
         assert _last_red(sock, 0.3) == {labels["cam-5"]}
     finally:
         sock.close()
+
+
+def test_a_covering_pip_covers_only_once_it_has_faded_in(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-5", dme={"x": 0.5, "y": 0.5, "size": 1.0}, rate_ms=400)
+    mixer.keyer_auto("me-1-key-1")
+    # Fading in: cam-1 is still seen (and heard) under it.
+    assert mixer.program_visibility()["me-1"] == ["cam-1", "cam-5"]
+    mixer._key_in["me-1-key-1"] = time.monotonic() - 0.01
+    assert mixer.program_visibility()["me-1"] == ["cam-5"]
+
+
+def test_republish_timers_stop_with_the_mixer_and_tally_closes(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    sock = _receiver(mixer)
+    try:
+        sock.recvfrom(4096)
+        mixer.auto("me-1", frames=50)  # 1 s
+        sock.recvfrom(4096)
+        assert mixer._tally_timers
+        mixer.stop()
+        assert not mixer._tally_timers
+        sock.recvfrom(4096)  # the stop's own packet
+        # No republish after the stop (the mix's end would have come after 1 s).
+        sock.settimeout(1.3)
+        try:
+            sock.recvfrom(4096)
+            got = True
+        except TimeoutError:
+            got = False
+        assert not got
+        # After close() nothing goes out (no reconnect of a TCP receiver either).
+        mixer.tally.close()
+        mixer.publish_tally()
+        sock.settimeout(0.3)
+        try:
+            sock.recvfrom(4096)
+            got = True
+        except TimeoutError:
+            got = False
+        assert not got
+    finally:
+        sock.close()

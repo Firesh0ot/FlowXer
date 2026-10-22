@@ -10,6 +10,7 @@ export function MeTile({
   onPreview,
   onProgram,
   onGrab,
+  onAir,
 }: {
   /** The higher ME (the source). */
   me: MixerPanel;
@@ -18,8 +19,10 @@ export function MeTile({
   onPreview: () => void;
   onProgram: () => void;
   onGrab?: (event: MouseEvent) => void;
+  /** Visible on the active ME's Program through any path (a key, a pip, a nested ME). */
+  onAir?: boolean;
 }) {
-  const isPgm = panel.program_input_id === me.id;
+  const isPgm = onAir ?? panel.program_input_id === me.id;
   const isPvw = panel.preview_input_id === me.id;
   return (
     <article className={`source-tile me-tile ${isPgm ? "is-pgm" : ""} ${isPvw && !isPgm ? "is-pvw" : ""}`}>

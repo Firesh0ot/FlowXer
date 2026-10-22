@@ -266,6 +266,12 @@ class VisionMixer:
         # Keyer id -> monotonic time until which a keyer that fades or flies off is still on air
         # (raw tally).
         self._key_until: dict[str, float] = {}
+        # A keyer fading in (Auto on, or tied to a mix): the monotonic time its fade ends. Until
+        # then it is not at full level (a full-raster pip covers nothing yet).
+        self._key_in: dict[str, float] = {}
+        # The receivers' republish timers (a mix's or a key's fade end), cancelled on stop.
+        self._tally_timers: set[threading.Timer] = set()
+        self._tally_timers_lock = threading.Lock()
         # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
         self._autostart_done = threading.Event()
         self.tally = TallyService()
@@ -716,6 +722,7 @@ class VisionMixer:
         if enabled is not None:
             keyer.enabled = enabled
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if enabled else 0])
             self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
@@ -784,6 +791,7 @@ class VisionMixer:
         if isinstance(reply, dict) and reply.get("on") is True and not keyer.enabled:
             keyer.enabled = True
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             self._publish_tally()
         return self._with_run(keyer, reply)
 
@@ -835,7 +843,11 @@ class VisionMixer:
             span = sum(item.frames for item in keyer.keyframes[1:])
         if keyer.enabled:
             self._key_until.pop(keyer.id, None)
+            # Fading (or flying) in: at full level when it ends.
+            self._key_in[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_in[keyer.id])
         else:
+            self._key_in.pop(keyer.id, None)
             # The raw tally keeps it on air until the fade or the fly has ended.
             self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
             self._tally_again_at(self._key_until[keyer.id])
@@ -1846,6 +1858,8 @@ class VisionMixer:
         self.state = MixerState.idle
         self.backend = "idle"
         self._mixes.clear()
+        self._key_in.clear()
+        self._cancel_tally_timers()
         self._publish_tally()
         return self.status()
 
@@ -1866,6 +1880,7 @@ class VisionMixer:
             self.library.stop()
         except Exception:
             log.exception("stopping the media library failed")
+        self._cancel_tally_timers()
         self.tally.close()
         if self.tally_export is not None:
             self.tally_export.close()
@@ -2037,8 +2052,12 @@ class VisionMixer:
             keyer.enabled = not keyer.enabled
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            self._key_in.pop(keyer.id, None)
             if keyer.enabled or frames <= 0:
                 self._key_until.pop(keyer.id, None)
+                if keyer.enabled and frames > 0:
+                    self._key_in[keyer.id] = now + frames / self.settings.fps
+                    self._tally_again_at(self._key_in[keyer.id])
             else:
                 self._key_until[keyer.id] = now + frames / self.settings.fps
                 self._tally_again_at(self._key_until[keyer.id])
@@ -2569,9 +2588,27 @@ class VisionMixer:
         what is visible changes then without an operator action."""
         if at is None or not self.tally.receivers:
             return
-        timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, self._publish_tally_quietly)
+        timer: threading.Timer
+
+        def fire() -> None:
+            with self._tally_timers_lock:
+                if timer not in self._tally_timers:
+                    return  # cancelled meanwhile
+                self._tally_timers.discard(timer)
+            self._publish_tally_quietly()
+
+        timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, fire)
         timer.daemon = True
+        with self._tally_timers_lock:
+            self._tally_timers.add(timer)
         timer.start()
+
+    def _cancel_tally_timers(self) -> None:
+        """Stop, a reload, shutdown: no republish after them."""
+        with self._tally_timers_lock:
+            timers, self._tally_timers = self._tally_timers, set()
+        for timer in timers:
+            timer.cancel()
 
     def _publish_tally_quietly(self) -> None:
         try:
@@ -2637,7 +2674,8 @@ class VisionMixer:
                         pip=keyer.mode == KeyMode.pip,
                         upstream=keyer.stage == KeyerStage.upstream,
                         on_air=keyer.enabled or leaving or keyer.id in held,
-                        full=keyer.enabled and keyer.id not in held,
+                        # Not while it fades in (the shared vectors' fade >= 1).
+                        full=keyer.enabled and keyer.id not in held and now >= self._key_in.get(keyer.id, 0.0),
                         leaving=leaving,
                         gain=keyer.gain,
                         dme=keyer.dme if boxed else None,
@@ -3144,6 +3182,7 @@ class VisionMixer:
         """Restore an export_state() document (POST /config/import). The mixer must be stopped."""
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before importing a configuration")
+        self._cancel_tally_timers()
         self._apply_state(data, checked=True)
         self._publish_tally()
         self.persist()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -62,6 +63,10 @@ class TallyService:
         self._last_sent_at: dict[str, float] = {}
         self._tcp: dict[tuple[str, int], socket.socket] = {}
         self.send_errors = 0
+        # One publish at a time (request threads and the mixer's republish timers share the TCP
+        # sockets; packets go out in order); none after close().
+        self._lock = threading.Lock()
+        self._closed = False
 
     def list(self) -> list[TallyReceiver]:
         return list(self.receivers)
@@ -95,6 +100,11 @@ class TallyService:
         return self.status()
 
     def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._close_sockets()
+
+    def _close_sockets(self) -> None:
         for sock in self._tcp.values():
             try:
                 sock.close()
@@ -103,6 +113,12 @@ class TallyService:
         self._tcp.clear()
 
     def publish(self, mixer: VisionMixer) -> list[TallyReceiverStatus]:
+        with self._lock:
+            if self._closed:
+                return self.status()
+            return self._publish(mixer)
+
+    def _publish(self, mixer: VisionMixer) -> list[TallyReceiverStatus]:
         messages_by_offset: dict[tuple[int, int], list[DisplayMessage]] = {}
         for receiver in self.receivers:
             if not receiver.enabled:
