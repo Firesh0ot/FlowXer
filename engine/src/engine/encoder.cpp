@@ -1,5 +1,7 @@
 #include "engine/encoder.hpp"
 
+#include <algorithm>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -115,15 +117,16 @@ struct MosaicEncoder::Impl
         enc = avcodec_alloc_context3(codec);
         enc->width = cfg.width;
         enc->height = cfg.height;
-        enc->time_base = AVRational{1, cfg.fps};
-        enc->framerate = AVRational{cfg.fps, 1};
+        enc->time_base = AVRational{cfg.fpsDen, cfg.fps};
+        enc->framerate = AVRational{cfg.fps, cfg.fpsDen};
+        int const perSecond = std::max(1, (cfg.fps + cfg.fpsDen / 2) / cfg.fpsDen);
         enc->pix_fmt = AV_PIX_FMT_CUDA;
         enc->hw_frames_ctx = av_buffer_ref(frames);
         enc->bit_rate = static_cast<std::int64_t>(cfg.kbps) * 1000;
         enc->rc_max_rate = enc->bit_rate;
-        enc->rc_buffer_size = static_cast<int>(enc->bit_rate / cfg.fps * 2);
+        enc->rc_buffer_size = static_cast<int>(enc->bit_rate / perSecond * 2);
         // One second GOP: a new WHEP viewer gets a picture within a second.
-        enc->gop_size = cfg.fps;
+        enc->gop_size = perSecond;
         enc->max_b_frames = 0;
         // SPS/PPS in the RTSP SDP; MediaMTX repeats them before each IDR for WebRTC readers.
         enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -190,6 +193,23 @@ MosaicEncoder::~MosaicEncoder()
     impl_->closeOutput();
     impl_->closeEncoder();
     av_packet_free(&impl_->packet);
+}
+
+bool MosaicEncoder::open(std::string& error)
+{
+    auto& s = *impl_;
+    if (s.enc != nullptr)
+    {
+        return true;
+    }
+    if (s.openEncoder())
+    {
+        return true;
+    }
+    s.closeEncoder();
+    std::lock_guard lock{s.mu};
+    error = s.stats.lastError;
+    return false;
 }
 
 void MosaicEncoder::encode(std::uint8_t const* luma, int lumaPitch, std::uint8_t const* chroma, int chromaPitch, std::int64_t pts, cudaStream_t stream)

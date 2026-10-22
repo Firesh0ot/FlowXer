@@ -63,6 +63,9 @@ check(wall.map((t) => t.id).join() === "panel:me-1:pgm,panel:me-2:pgm,source:cam
 check(wall.map((t) => t.tally).join() === "pgm,pgm,pgm,pvw,pgm,off", "wall tally (ME 2 in a pip of ME 1)");
 check(wallTiles({ ...snapshot, on_air: undefined } as ConsoleState, 1, false).map((t) => t.tally).join() === "pgm,off,pgm,pvw,off,off", "tally without on_air");
 check(wallTiles(snapshot, 1, true).length === 8, "with previews");
+// ME 2 does not render (FLOWXER_RENDER_MES=1): the map has no picture of it, the wall no tile.
+const oneMe = { ...snapshot, preview: { ...map, tiles: [...map.tiles, { id: "panel:me-1:pvw", x: 0, y: 0, w: 480, h: 270 }] } } as unknown as ConsoleState;
+check(wallTiles(oneMe, 1, true).map((t) => t.id).join() === "panel:me-1:pgm,panel:me-1:pvw,source:cam-1,source:cam-2,source:cam-3,source:clip-1", "rendering MEs only");
 // The grid: as large 16:9 pictures as fit.
 const g6 = wallGrid(6, 1920, 1080);
 check(g6.cols === 3 && g6.rows === 2, `6 on 1920x1080: ${JSON.stringify(g6)}`);
