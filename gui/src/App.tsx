@@ -5,6 +5,7 @@ import { LibraryModal } from "./components/LibraryModal";
 import { BoxEditor } from "./components/BoxEditor";
 import { Monitor } from "./components/Monitor";
 import { KeyerControl } from "./components/KeyerControl";
+import { MeTile } from "./components/MeTile";
 import { previewSession } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
 import { SnapshotPanel } from "./components/SnapshotPanel";
@@ -113,9 +114,11 @@ export default function App() {
     (keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream" && (keyer.mode === "pip" || keyer.dme.enabled),
   );
   // A luma key may key any source the ME may take: the inputs and the Programs of higher MEs.
+  // The higher MEs, whose Programs the active ME may take (re-entry).
+  const higherPanels = snapshot.panels.slice(snapshot.panels.indexOf(panel) + 1);
   const keySources = [
     ...snapshot.inputs.map((item) => ({ id: item.id, label: item.label })),
-    ...snapshot.panels.slice(snapshot.panels.indexOf(panel) + 1).map((item) => ({ id: item.id, label: item.label })),
+    ...higherPanels.map((item) => ({ id: item.id, label: item.label })),
   ];
   const playable = (snapshot.library ?? []).filter((item) => item.ready && (item.kind === "clip" || item.kind === "still"));
   const players = snapshot.inputs.filter((item) => item.kind === "clip_player");
@@ -322,7 +325,7 @@ export default function App() {
           data-aspect={snapshot.workspace.source_tile_aspect ?? "16:9"}
           style={{
             gridTemplateColumns: `repeat(${sourceStripColumns(
-              snapshot.inputs.length,
+              snapshot.inputs.length + higherPanels.length,
               snapshot.workspace.source_tile_aspect ?? "16:9",
             )}, minmax(0, 1fr))`,
           }}
@@ -340,6 +343,16 @@ export default function App() {
               onSettings={() => setSourceEdit(input)}
               onPlayer={(fn) => void command(fn)}
               onGrab={openGrab(input.id, input.label)}
+            />
+          ))}
+          {higherPanels.map((item) => (
+            <MeTile
+              key={item.id}
+              me={item}
+              panel={panel}
+              onPreview={() => void command(() => api.preview(item.id, panel.id))}
+              onProgram={() => void command(() => api.take(item.id, panel.id))}
+              onGrab={openGrab(item.id, `${item.label} PGM`)}
             />
           ))}
         </div>
