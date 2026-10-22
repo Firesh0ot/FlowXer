@@ -129,7 +129,9 @@ class TallyService:
 
     def _messages(self, mixer: VisionMixer, *, index_offset: int) -> list[DisplayMessage]:
         running = mixer.state == MixerState.running
-        program_ids = {panel.program_input_id for panel in mixer.panels if panel.program_input_id}
+        # Red: visible on some ME's Program through any path (keys and pips, MEs re-entered as
+        # background or in a key, recursively; hidden boxes and covered layers do not count).
+        program_ids = {source for shown in mixer.program_visibility().values() for source in shown}
         preview_ids = {panel.preview_input_id for panel in mixer.panels if panel.preview_input_id}
         if running:
             if mixer.program_input_id:

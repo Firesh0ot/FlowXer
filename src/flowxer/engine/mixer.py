@@ -89,6 +89,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.tally import TallyService
 from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
+from flowxer.engine.visibility import KeyLayer, MeLayers, direct_visibility, visible_on_program
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
@@ -2589,6 +2590,47 @@ class VisionMixer:
             mes=tuple(mes),
         )
 
+    def _me_layers(self, keyers: list[Keyer] | None = None) -> dict[str, MeLayers]:
+        """Each ME's background (Program, both sources of a running mix) and keyers as tally sees
+        them (engine/visibility.py); `keyers` as keyer_views() gives them (boxes where they are)."""
+        keyers = self.keyer_views() if keyers is None else keyers
+        now = time.monotonic()
+        out: dict[str, MeLayers] = {}
+        for panel in list(self.panels):
+            background = [panel.program_input_id] if panel.program_input_id else []
+            mix = self._mixes.get(panel.id)
+            if mix is not None and (mix[2] is None or now < mix[2]):
+                background += [source for source in mix[:2] if source and source not in background]
+            held = self._held_ties.get(panel.id, [])
+            layers = []
+            for keyer in keyers:
+                if keyer.panel_id != panel.id:
+                    continue
+                leaving = not keyer.enabled and now < self._key_until.get(keyer.id, 0.0)
+                boxed = keyer.stage == KeyerStage.upstream and (keyer.mode == KeyMode.pip or keyer.dme.enabled)
+                layers.append(
+                    KeyLayer(
+                        source_id=keyer.source_id,
+                        keys_source=keyer.mode in (KeyMode.luma, KeyMode.pip),
+                        pip=keyer.mode == KeyMode.pip,
+                        upstream=keyer.stage == KeyerStage.upstream,
+                        on_air=keyer.enabled or leaving or keyer.id in held,
+                        full=keyer.enabled and keyer.id not in held,
+                        leaving=leaving,
+                        gain=keyer.gain,
+                        dme=keyer.dme if boxed else None,
+                    )
+                )
+            out[panel.id] = MeLayers(tuple(background), tuple(layers))
+        return out
+
+    def program_visibility(self, keyers: list[Keyer] | None = None) -> dict[str, list[str]]:
+        """Per ME what is visible on its Program through any path (engine/visibility.py): its
+        background unless a full-raster pip covers it, its visible keys' sources, and what the MEs
+        it shows have on their Programs, recursively."""
+        mes = self._me_layers(keyers)
+        return {panel.id: visible_on_program(panel.id, mes) for panel in list(self.panels)}
+
     def _key_tally(self, keyer: Keyer, on_air: bool) -> tuple[int, str, bool]:
         """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
         ME n) or 3000 + 100·n + k (DSK k), its receiver label, on air."""
@@ -2777,6 +2819,7 @@ class VisionMixer:
             sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
         engine_mes = (raw or {}).get("mes") or {}
         panels: dict[str, Any] = {}
+        layers = self._me_layers() if raw is None else {}
         pairs = (channels + 1) // 2
         for panel in self.rendered_panels():
             entry = engine_mes.get(str(self._panel_number(panel))) or {}
@@ -2787,7 +2830,8 @@ class VisionMixer:
                 measured = engine_strips.get(self._engine_strip(strip_id))
                 if measured is None:
                     setting = audio.strips.get(strip_id) or AudioStrip()
-                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    shown = direct_visibility(layers[panel.id]) if panel.id in layers else [panel.program_input_id]
+                    on_air = kind != "stinger" and (not setting.afv or strip_id in shown)
                     gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
                     measured = {"gain_db": gain, "heard": gain > -90.0}
                 strips[strip_id] = measured

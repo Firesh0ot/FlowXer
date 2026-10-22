@@ -16,9 +16,12 @@ export function SourceTile({
   onSettings,
   onPlayer,
   onGrab,
+  onAir,
 }: {
   input: LogicalInput;
   panel: MixerPanel;
+  /** Visible on the ME's Program through any path (a key, a pip, a nested ME): red tally. */
+  onAir?: boolean;
   runtime?: SourceRuntime;
   /** Ready clips and stills, for a clip player. */
   library: LibraryItem[];
@@ -30,7 +33,7 @@ export function SourceTile({
   /** Its picture's context menu (GRAB); none for Black. */
   onGrab?: (event: MouseEvent) => void;
 }) {
-  const isPgm = panel.program_input_id === input.id;
+  const isPgm = onAir ?? panel.program_input_id === input.id;
   const isPvw = panel.preview_input_id === input.id;
   const tally = isPgm ? "pgm" : isPvw ? "pvw" : "off";
   const player = input.kind === "clip_player";

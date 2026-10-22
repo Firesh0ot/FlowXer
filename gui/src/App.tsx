@@ -336,6 +336,7 @@ export default function App() {
               input={input}
               panel={panel}
               runtime={snapshot.sources?.[input.id]}
+              onAir={snapshot.on_air?.[panel.id]?.includes(input.id)}
               library={playable}
               fps={fps}
               onPreview={() => void command(() => api.preview(input.id, panel.id))}

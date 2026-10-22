@@ -460,7 +460,8 @@ std::vector<bool> AudioMix::heardInputs(std::vector<MePlan> const& plans) const
             auto const& strip = set.strips[static_cast<std::size_t>(k)];
             Source const source{Source::Kind::Input, k + 1};
             bool const level = !strip.mute && strip.faderDb > kFaderOffDb;
-            bool const onAir = plan.a == source || (transition && plan.b == source);
+            bool const onAir = plan.a == source || (transition && plan.b == source) ||
+                               std::find(plan.keyed.begin(), plan.keyed.end(), source) != plan.keyed.end();
             if ((level && (!strip.afv || onAir)) || run.states[static_cast<std::size_t>(k)].gain > 0.f)
             {
                 out[static_cast<std::size_t>(k)] = true;
@@ -502,6 +503,19 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
         bool const transition = plan.mixing || plan.stinger > 0;
         int const slotA = sourceSlot(m, plan.a);
         int const slotB = transition ? sourceSlot(m, plan.b) : -1;
+        // A source a visible key shows (a pip, a luma key) is heard like Program, whatever the
+        // background does (core/visibility.hpp).
+        auto& keyed = keyed_;
+        keyed.assign(slots_, 0);
+        for (auto const& source : plan.keyed)
+        {
+            int const k = sourceSlot(m, source);
+            if (k >= 0)
+            {
+                keyed[static_cast<std::size_t>(k)] = 1;
+            }
+        }
+        auto const isKeyed = [&](int s) { return s >= 0 && keyed[static_cast<std::size_t>(s)] != 0; };
         if (transition)
         {
             transitionCurve(plan.tPrev, plan.t, n, curveA_.data(), curveB_.data());
@@ -520,11 +534,18 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
             }
             if (slotA >= 0)
             {
-                run.weight[static_cast<std::size_t>(slotA)] = transition ? crossfade(plan.tPrev).a : 1.f;
+                run.weight[static_cast<std::size_t>(slotA)] = transition ? crossfade(plan.tPrev).a : plan.backgroundCovered ? 0.f : 1.f;
             }
             if (slotB >= 0)
             {
                 run.weight[static_cast<std::size_t>(slotB)] += crossfade(plan.tPrev).b;
+            }
+            for (std::size_t s = 0; s < slots_; ++s)
+            {
+                if (keyed[s] != 0)
+                {
+                    run.weight[s] = 1.f;
+                }
             }
         }
         bool first = true;
@@ -626,6 +647,10 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
             for (int role = 0; role < 2; ++role)
             {
                 int const s = role == 0 ? slotA : slotB;
+                if (isKeyed(s))
+                {
+                    continue; // heard in full as a key's source (step 2)
+                }
                 float const* curve = role == 0 ? curveA_.data() : curveB_.data();
                 float const* x = s >= 0 ? sourceOf(static_cast<std::size_t>(s)) : nullptr;
                 float gc = 0.f;
@@ -633,11 +658,11 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
                 add(x != nullptr ? x : zeros_.data(), g, gc);
             }
             auto const ends = crossfade(plan.t);
-            if (slotA >= 0)
+            if (slotA >= 0 && !isKeyed(slotA))
             {
                 finish(static_cast<std::size_t>(slotA), slotA == slotB ? ends.a + ends.b : ends.a);
             }
-            if (slotB >= 0 && slotB != slotA)
+            if (slotB >= 0 && slotB != slotA && !isKeyed(slotB))
             {
                 finish(static_cast<std::size_t>(slotB), ends.b);
             }
@@ -646,14 +671,15 @@ void AudioMix::grain(std::vector<MePlan> const& plans, MixSources const& sources
         for (std::size_t s = 0; s + 1 < slots_; ++s)
         {
             if (slot(m, refOf(static_cast<int>(s))) != static_cast<int>(s) ||
-                (transition && (static_cast<int>(s) == slotA || static_cast<int>(s) == slotB)))
+                (transition && keyed[s] == 0 && (static_cast<int>(s) == slotA || static_cast<int>(s) == slotB)))
             {
                 continue;
             }
             float const w0 = run.weight[s];
-            // Without a transition Program's strip goes to 1 and every other to 0 (a Cut: the
-            // equal-power curve over this grain); in a transition the others fade out.
-            float const w1 = !transition && static_cast<int>(s) == slotA ? 1.f : 0.f;
+            // Without a transition Program's strip goes to 1 (0 while a full-raster pip covers it)
+            // and every other to 0 (a Cut: the equal-power curve over this grain); in a transition
+            // the others fade out. A visible key's source goes to 1.
+            float const w1 = keyed[s] != 0 || (!transition && static_cast<int>(s) == slotA && !plan.backgroundCovered) ? 1.f : 0.f;
             float const* weight = nullptr;
             if (w0 != w1)
             {

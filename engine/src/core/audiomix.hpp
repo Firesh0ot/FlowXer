@@ -238,6 +238,8 @@ private:
     std::vector<float> blend_;
     std::vector<float> weight_;
     std::vector<float> gain_;
+    // Per strip of the ME being mixed: a visible key shows its source (audio thread).
+    std::vector<unsigned char> keyed_;
     mutable std::mutex stateMu_;
     std::vector<std::vector<StripState>> published_;
 };

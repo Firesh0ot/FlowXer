@@ -359,6 +359,8 @@ export interface SnapshotRecallResult {
 }
 
 export interface ConsoleState {
+  /** Per ME id what is visible on its Program through any path (keys, pips, nested MEs): red tally. */
+  on_air?: Record<string, string[]>;
   workspace: WorkspaceConfig;
   formats: { id: string; label: string; width: number; height: number; frame_rate: string }[];
   inputs: LogicalInput[];
