@@ -14,9 +14,9 @@ int mosaicGrid(int tiles)
     return n;
 }
 
-std::vector<MosaicTile> mosaicTiles(int width, int height, int inputs, int players, int mes)
+std::vector<MosaicTile> mosaicTiles(int width, int height, int inputs, int players, int mes, bool programs)
 {
-    int const count = std::max(0, inputs) + std::max(0, players) + 2 * std::max(0, mes);
+    int const count = std::max(0, inputs) + std::max(0, players) + (programs ? 2 : 1) * std::max(0, mes);
     int const n = mosaicGrid(count);
     int const tileW = (width / n) & ~1;
     int const tileH = (height / n) & ~1;
@@ -43,7 +43,10 @@ std::vector<MosaicTile> mosaicTiles(int width, int height, int inputs, int playe
     }
     for (int m = 1; m <= mes; ++m)
     {
-        add(MosaicTile::Kind::Program, m, "me" + std::to_string(m) + "-pgm");
+        if (programs)
+        {
+            add(MosaicTile::Kind::Program, m, "me" + std::to_string(m) + "-pgm");
+        }
         add(MosaicTile::Kind::Preview, m, "me" + std::to_string(m) + "-pvw");
     }
     return tiles;

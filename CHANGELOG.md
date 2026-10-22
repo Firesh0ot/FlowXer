@@ -5,6 +5,21 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: Program streams, multiview widget
+
+- Engine: each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`, NVENC H.264,
+  960×540p25 at 2.5 Mbit/s by default: `FLOWXER_PREVIEW_PGM`, `_WIDTH`, `_FPS`, `_KBPS`); the
+  mosaic has no Program tiles then (fewer tiles: e.g. 6 inputs, a clip player and 2 MEs fit 3×3
+  at 640×360 instead of 4×4 at 480×270). Cost: about +0.9 % NVENC per ME on an A16, 2 × 1.5 MB
+  GPU memory, 1–2 % of a core per stream, +2.5 Mbit/s per viewer and ME.
+- `GET /api/v1/preview` (and `/console` → `preview`): `streams` with each Program stream
+  (`panel:<id>:pgm`, path, size, WHEP URL); the engine's `/mosaic/map` has `programs`.
+- GUI: the Program monitor and the higher-ME tiles play the Program streams (one WHEP session per
+  stream); mosaic tiles are cropped 5 px inside their edges, so the browser's scaling shows no
+  neighbouring tile.
+- Widget `multiview` (`/widget/multiview[?me=<n>][&pvw=true]`): a control-room wall of the mixer's
+  pictures with labels and tally borders, its layout following the mixer.
+
 ### Changed: operator console layout, higher MEs, upload progress
 
 - GUI: PREVIEW and PROGRAM take about 40 % of the window's height and are centred as a pair on a
