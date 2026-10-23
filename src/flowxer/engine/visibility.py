@@ -46,32 +46,36 @@ class MeLayers:
 
     background: tuple[str, ...]
     keys: tuple[KeyLayer, ...]
+    # The raster (every source has it): the crops are in its pixels.
+    width: int = 1920
+    height: int = 1080
 
 
-def picture_rect(dme: Dme) -> tuple[float, float, float, float]:
-    """The box's picture after the crop on the raster (fractions): left, right, top, bottom."""
+def picture_rect(dme: Dme, width: int, height: int) -> tuple[float, float, float, float]:
+    """The box's picture after the crop (source pixels of a width × height source) on the raster,
+    as fractions: left, right, top, bottom."""
     half = dme.size / 2
     return (
-        dme.x - half + dme.crop.left * dme.size,
-        dme.x + half - dme.crop.right * dme.size,
-        dme.y - half + dme.crop.top * dme.size,
-        dme.y + half - dme.crop.bottom * dme.size,
+        dme.x - half + dme.crop.left / width * dme.size,
+        dme.x + half - dme.crop.right / width * dme.size,
+        dme.y - half + dme.crop.top / height * dme.size,
+        dme.y + half - dme.crop.bottom / height * dme.size,
     )
 
 
-def box_shows(dme: Dme) -> bool:
+def box_shows(dme: Dme, width: int, height: int) -> bool:
     if dme.size <= 0:
         return False
-    left, right, top, bottom = picture_rect(dme)
+    left, right, top, bottom = picture_rect(dme, width, height)
     return min(right, 1.0) - max(left, 0.0) > MIN_SHOWN and min(bottom, 1.0) - max(top, 0.0) > MIN_SHOWN
 
 
-def box_covers(dme: Dme) -> bool:
-    left, right, top, bottom = picture_rect(dme)
+def box_covers(dme: Dme, width: int, height: int) -> bool:
+    left, right, top, bottom = picture_rect(dme, width, height)
     return dme.soft <= 0 and left <= 0 and right >= 1 and top <= 0 and bottom >= 1
 
 
-def key_visibility(keys: Sequence[KeyLayer]) -> tuple[list[str], bool]:
+def key_visibility(keys: Sequence[KeyLayer], width: int = 1920, height: int = 1080) -> tuple[list[str], bool]:
     """The sources of the visible keys (key order) and whether the background is covered."""
     # DSKs are over the upstream keys; from the top down a covering pip hides what is under it.
     layers = [k for k in keys if k.upstream] + [k for k in keys if not k.upstream]
@@ -80,11 +84,11 @@ def key_visibility(keys: Sequence[KeyLayer]) -> tuple[list[str], bool]:
     for key in reversed(layers):
         if not key.on_air or key.gain <= 0:
             continue
-        if key.dme is not None and not key.leaving and not box_shows(key.dme):
+        if key.dme is not None and not key.leaving and not box_shows(key.dme, width, height):
             continue
         if key.keys_source and key.source_id and key.source_id not in found:
             found.append(key.source_id)
-        if key.pip and key.dme is not None and key.full and key.gain >= 1 and box_covers(key.dme):
+        if key.pip and key.dme is not None and key.full and key.gain >= 1 and box_covers(key.dme, width, height):
             covered = True
             break
     found.reverse()
@@ -93,7 +97,7 @@ def key_visibility(keys: Sequence[KeyLayer]) -> tuple[list[str], bool]:
 
 def direct_visibility(me: MeLayers) -> list[str]:
     """What ME shows itself (higher MEs as their ids, not opened up)."""
-    keyed, covered = key_visibility(me.keys)
+    keyed, covered = key_visibility(me.keys, me.width, me.height)
     shown = [] if covered else [s for s in me.background if s]
     return shown + [s for s in keyed if s not in shown]
 

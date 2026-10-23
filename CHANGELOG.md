@@ -5,6 +5,25 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed (breaking API): DME crop in source pixels
+
+- **API:** a box's `crop` (`dme.crop` of `PATCH /keyers/{id}`, `PUT /keyers/{id}/dme`, each
+  keyframe of `PUT /keyers/{id}/keyframes`, `GET /keyers`, `/console`, snapshots, the export) is
+  now whole **source pixels** (`{"left": 480, "right": 480, "top": 0, "bottom": 0}`), no longer
+  fractions of the source (`0.25`). A fraction is refused (422/409: "Input should be a valid
+  integer"); a crop that leaves no picture (left + right ≥ the raster's width, top + bottom ≥
+  its height) is refused with 409. Left and right act on 4:2:2 sample pairs (an odd value goes
+  to the nearest even column), as before.
+- **Migration:** a saved state, a `POST /config/import` document and its snapshots with crops in
+  fractions are converted on load to pixels of their format (0.25 at 1080p → 480 px). A format
+  change scales every crop (keyers, keyframes, snapshots) with the raster, so the share of the
+  picture stays; so does loading a state or an import whose format differs from the mixer's (a
+  pinned `FLOWXER_FORMAT`). On restore a crop the raster cannot take loses its crop on that axis
+  (logged) instead of the whole state being dropped; an import refuses it.
+- Presets: split crops a quarter of the raster's width (480 px at 1080p) off each side.
+- GUI: crop fields in px. The engine's own control API keeps fractions (the control plane
+  converts).
+
 ### Changed: tally and audio follow what is visible, through every path
 
 - Tally (TSL receivers and the console's source tiles): red for what is visible on an ME's

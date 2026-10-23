@@ -30,14 +30,21 @@ def luma(source: str, upstream: bool = True, **extra) -> KeyLayer:
 
 
 def test_boxes_that_show_nothing() -> None:
-    assert box_shows(Dme(x=0.5, y=0.5, size=0.5))
-    assert not box_shows(Dme(size=0.0))
-    assert not box_shows(Dme(x=-0.3, size=0.5))  # off screen left
-    assert not box_shows(Dme(y=1.3, size=0.5))  # off screen below
-    assert box_shows(Dme(x=-0.2, size=0.5))  # half on screen
-    assert not box_shows(Dme(size=0.5, crop={"left": 0.6, "right": 0.39999}))
-    assert box_covers(Dme(size=1.0)) and not box_covers(Dme(size=0.99))
-    assert not box_covers(Dme(size=1.0, soft=2.0)) and not box_covers(Dme(size=1.0, crop={"top": 0.1}))
+    w, h = 1920, 1080
+    assert box_shows(Dme(x=0.5, y=0.5, size=0.5), w, h)
+    assert not box_shows(Dme(size=0.0), w, h)
+    assert not box_shows(Dme(x=-0.3, size=0.5), w, h)  # off screen left
+    assert not box_shows(Dme(y=1.3, size=0.5), w, h)  # off screen below
+    assert box_shows(Dme(x=-0.2, size=0.5), w, h)  # half on screen
+    # Crops in source pixels: at x 0.95 only the left 55 % of the full-size picture is on screen
+    # (1056 px); cropping 1056 px off the left leaves nothing on screen.
+    assert box_shows(Dme(x=0.95, size=1.0, crop={"right": 960}), w, h)
+    assert box_shows(Dme(x=0.95, size=1.0, crop={"left": 1050}), w, h)
+    assert not box_shows(Dme(x=0.95, size=1.0, crop={"left": 1056}), w, h)
+    assert box_covers(Dme(size=1.0), w, h) and not box_covers(Dme(size=0.99), w, h)
+    assert not box_covers(Dme(size=1.0, soft=2.0), w, h) and not box_covers(Dme(size=1.0, crop={"top": 108}), w, h)
+    # A crop of 1 px at size 1 still covers when the box is larger by more than that.
+    assert box_covers(Dme(size=1.01, crop={"top": 1}), w, h)
 
 
 def test_hidden_and_covered_keys() -> None:
@@ -155,7 +162,9 @@ def test_the_shared_vectors_agree_with_the_engine() -> None:
                 KeyLayer(
                     source_id=key["source"] or None, keys_source=key["mode"] in ("pip", "luma"), pip=key["mode"] == "pip",
                     upstream=key["upstream"], on_air=key["fade"] > 0, full=key["fade"] >= 1, leaving=False, gain=key["gain"],
-                    dme=None if box is None else Dme(enabled=True, x=box["x"], y=box["y"], size=box["size"], soft=box["soft"], crop=box["crop"]),
+                    # The vectors' crops are the engine's fractions; the API's are pixels (1920 × 1080).
+                    dme=None if box is None else Dme(enabled=True, x=box["x"], y=box["y"], size=box["size"], soft=box["soft"], crop={
+                        side: round(value * (1920 if side in ("left", "right") else 1080)) for side, value in box["crop"].items()}),
                 )
             )
         assert key_visibility(layers) == (case["keyed"], case["covered"]), case["name"]

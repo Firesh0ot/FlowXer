@@ -176,7 +176,7 @@ def test_keyer_keyframes_runs_and_presets(client: TestClient) -> None:
     assert [p["name"] for p in presets] == ["corner-tl", "corner-tr", "corner-bl", "corner-br", "split", "quad", "full"]
     assert [p["keyers"] for p in presets] == [1, 1, 1, 1, 2, 4, 1]
     written = client.post(f"{base}/preset", json={"name": "split"}).json()
-    assert [k["id"] for k in written] == ["me-1-key-1", "me-1-key-2"] and written[1]["dme"]["crop"]["left"] == 0.25
+    assert [k["id"] for k in written] == ["me-1-key-1", "me-1-key-2"] and written[1]["dme"]["crop"]["left"] == 16  # a quarter of the 64 px test raster
     assert client.post(f"{base}/preset", json={"name": "zoom"}).status_code == 422
     assert client.post(f"{base}/preset", json={"name": "quad"}).status_code == 409
     keyer = client.put(f"{base}/dme", json={"x": 0.3}).json()

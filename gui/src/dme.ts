@@ -8,6 +8,7 @@ export interface BoxGeometry {
   x: number;
   y: number;
   size: number;
+  /** Source pixels. */
   crop: { left: number; right: number; top: number; bottom: number };
 }
 
@@ -21,12 +22,13 @@ export interface Rect {
 
 export type Corner = "tl" | "tr" | "bl" | "br";
 
-/** The crop in source samples: columns [cl, cr) (even), rows [ct, cb). */
+/** The crop (source pixels) in source samples: columns [cl, cr) (even: left and right on 4:2:2
+ * pairs, an odd value to the nearest even one), rows [ct, cb). */
 function cropSamples(box: BoxGeometry, width: number, height: number) {
-  const cl = Math.min(2 * Math.floor(box.crop.left * width * 0.5 + 0.5), width - 2);
-  const cr = Math.max(width - 2 * Math.floor(box.crop.right * width * 0.5 + 0.5), cl + 2);
-  const ct = Math.min(Math.floor(box.crop.top * height + 0.5), height - 1);
-  const cb = Math.max(height - Math.floor(box.crop.bottom * height + 0.5), ct + 1);
+  const cl = Math.min(2 * Math.floor(box.crop.left * 0.5 + 0.5), width - 2);
+  const cr = Math.max(width - 2 * Math.floor(box.crop.right * 0.5 + 0.5), cl + 2);
+  const ct = Math.min(Math.floor(box.crop.top + 0.5), height - 1);
+  const cb = Math.max(height - Math.floor(box.crop.bottom + 0.5), ct + 1);
   return { cl, cr, ct, cb };
 }
 

@@ -106,13 +106,16 @@ All values are floats in the production raster (W × H luma pixels).
 |---|---|---|
 | `x`, `y` | the box centre, as a fraction of the raster (0.5, 0.5 is the centre) | −1 … 2 (outside 0–1 is off screen, for flies) |
 | `size` | the scale of the source picture (1 = full raster) | 0 … 2 |
-| `crop` | `left`, `right`, `top`, `bottom`: fractions of the source cut away | 0 … 1 each; left + right < 1 |
+| `crop` | `left`, `right`, `top`, `bottom`: source pixels cut away (public API since 2026-10-22; the engine's own control API keeps fractions, the control plane converts) | whole pixels ≥ 0; left + right < W, top + bottom < H |
 | `border` | `width` (px), `soft` (px), `color` (`#RRGGBB`), `opacity` | 0–64 px, 0–64 px, 0–1 |
 | `shadow` | `dx`, `dy` (px), `blur` (px), `opacity` | ±128 px, 0–128 px, 0–1 |
 | `soft` | the soft edge of the picture when there is no border (px) | 0–64 px |
 
 - The crop cuts the picture; the box shrinks with it and does not rescale (as ATEM).
-- The picture's rectangle in the raster: L = x·W − ½·W·size + crop.left·W·size, and so on.
+- The picture's rectangle in the raster: L = x·W − ½·W·size + crop.left·size (crop.left in
+  source pixels; the engine has it as the fraction crop.left / W), and so on. Left and right act
+  on 4:2:2 sample pairs: the control plane sends the nearest even column, so the engine's float32
+  rounding and the GUI's geometry agree.
 - **Mapping:** an output pixel centre X + ½ maps to the source position u = c<sub>l</sub> +
   (X + ½ − L) / size. Luma takes the continuous index u − ½. **Chroma (4:2:2):** BT.709 chroma is
   co-sited with the even luma samples, so chroma sample *k* sits at luma position 2*k* and takes
