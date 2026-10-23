@@ -8,10 +8,11 @@ in `docs/platform-integration-plan.md` §8.
 ### Added: Program streams, multiview widget
 
 - Engine: each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`, NVENC H.264,
-  960×540p25 at 2.5 Mbit/s by default: `FLOWXER_PREVIEW_PGM`, `_WIDTH`, `_FPS`, `_KBPS`); the
+  1280×720p25 at 4 Mbit/s by default: `FLOWXER_PREVIEW_PGM`, `_WIDTH`, `_FPS`, `_KBPS`); the
   mosaic has no Program tiles then (fewer tiles: e.g. 6 inputs, a clip player and 2 MEs fit 3×3
-  at 640×360 instead of 4×4 at 480×270). Cost: about +0.9 % NVENC per ME on an A16, 2 × 1.5 MB
-  GPU memory, 1–2 % of a core per stream, +2.5 Mbit/s per viewer and ME. **NVENC sessions: 1 + MEs**
+  at 640×360 instead of 4×4 at 480×270). Cost on an A16: about +1.4 % NVENC per ME (960×540 at
+  2.5 Mbit/s: about +1 %), about 20 MiB GPU memory per ME, 1–2 % of a core per stream, +4 Mbit/s
+  per viewer and ME (a console with 3 MEs: about 18 Mbit/s). **NVENC sessions: 1 + MEs**
   (was 1); the engine opens them all at start and, when the GPU cannot give them, keeps the
   Programs as mosaic tiles (`GET /preview` → `streams_error`); `FLOWXER_PREVIEW_PGM=false` turns the
   streams off.
@@ -23,7 +24,8 @@ in `docs/platform-integration-plan.md` §8.
   stream); mosaic tiles are cropped 5 px inside their edges, so the browser's scaling shows no
   neighbouring tile.
 - Widget `multiview` (`/widget/multiview[?me=<n>][&pvw=true]`): a control-room wall of the mixer's
-  pictures with labels and tally borders, its layout following the mixer (MEs that do not render
+  pictures with labels and tally borders (red: on air on ME `me`; green: on the Preview of any
+  ME), its layout following the mixer (MEs that do not render
   left out) and the frame's size.
 
 ### Changed (breaking API): DME crop in source pixels

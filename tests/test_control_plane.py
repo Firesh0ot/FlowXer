@@ -205,7 +205,7 @@ def test_preview_tiles_name_the_console_pictures(engine_mixer) -> None:
     assert "panel:me-1:pvw" in ids and "panel:me-1:pgm" not in ids
     stream = info["streams"][0]
     assert stream["id"] == "panel:me-1:pgm" and stream["panel_id"] == "me-1" and stream["path"] == "flowxer/me1-pgm"
-    assert (stream["width"], stream["height"], stream["whep_url"]) == (960, 540, None)
+    assert (stream["width"], stream["height"], stream["whep_url"]) == (1280, 720, None)
 
 
 def test_preview_with_a_shared_mediamtx_and_an_older_engine(engine_mixer) -> None:
@@ -231,5 +231,5 @@ def test_preview_with_a_shared_mediamtx_and_an_older_engine(engine_mixer) -> Non
 
 def test_the_engine_config_carries_the_program_streams(mixer) -> None:
     config = mixer._engine_config("test")
-    assert (config["FLOWXER_ENGINE_PGM_PREVIEW"], config["FLOWXER_ENGINE_PGM_PREVIEW_WIDTH"]) == (True, 960)
-    assert (config["FLOWXER_ENGINE_PGM_PREVIEW_FPS"], config["FLOWXER_ENGINE_PGM_PREVIEW_KBPS"]) == (25, 2500)
+    assert (config["FLOWXER_ENGINE_PGM_PREVIEW"], config["FLOWXER_ENGINE_PGM_PREVIEW_WIDTH"]) == (True, 1280)
+    assert (config["FLOWXER_ENGINE_PGM_PREVIEW_FPS"], config["FLOWXER_ENGINE_PGM_PREVIEW_KBPS"]) == (25, 4000)
