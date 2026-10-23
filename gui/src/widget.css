@@ -138,3 +138,27 @@ html, body, #root { margin: 0; height: 100%; background: var(--bg); color: var(-
 }
 .multiview-cell .monitor.tally-pgm .monitor-label { background: var(--pgm); }
 .multiview-cell .monitor.tally-pvw .monitor-label { background: var(--pvw); color: #041018; }
+
+/* The tbar widget: the ME's T-bar lever (the console's, components/TBar.tsx), Cut and Auto. */
+.tbar-widget {
+  position: relative; min-width: 120px; min-height: 240px; height: 100%; padding: 8px;
+  display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 8px; background: var(--panel);
+}
+.tbar-widget { user-select: none; -webkit-user-select: none; }
+.tbar-widget .tbar { position: relative; min-height: 120px; cursor: ns-resize; touch-action: none; }
+.tbar-widget .tbar-slot {
+  position: absolute; left: 50%; top: 0; bottom: 0; width: 8px; transform: translateX(-50%);
+  background: #05070b; border: 1px solid var(--line); border-radius: 4px;
+}
+.tbar-widget .tbar-handle {
+  position: absolute; left: 50%; width: min(76%, 160px); height: 18px; transform: translate(-50%, -50%);
+  background: linear-gradient(#d8dde6, #8d96a6); border: 1px solid #3a4456; border-radius: 3px;
+}
+.tbar-widget .tbar:focus-visible { outline: 2px solid var(--pvw); }
+.tbar-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.tbar-buttons button {
+  font: inherit; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #fff;
+  min-height: 40px; border-radius: 8px; border: 1px solid var(--line); cursor: pointer;
+}
+.tbar-buttons .cut { background: #3a1518; border-color: #6a2a30; }
+.tbar-buttons .auto { background: #15243a; border-color: #2a4a6a; }

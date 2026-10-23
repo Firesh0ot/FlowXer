@@ -224,7 +224,7 @@ input.snap-name { font: inherit; color: var(--text); background: #0b1220; border
 .sting-slot { display: grid; gap: 4px; color: var(--muted); }
 .take-row { display: grid; grid-template-columns: 1fr 1fr 1fr 44px; gap: 8px; align-self: end; }
 .take-row .ftb.on { outline: 2px solid #e23b3b; }
-.tbar { position: relative; min-height: 96px; cursor: ns-resize; touch-action: none; }
+.tbar { position: relative; min-height: 96px; cursor: ns-resize; touch-action: none; user-select: none; -webkit-user-select: none; }
 .tbar-slot { position: absolute; left: 50%; top: 0; bottom: 0; width: 6px; transform: translateX(-50%); background: #05070b; border: 1px solid var(--line); border-radius: 3px; }
 .tbar-handle {
   position: absolute; left: 2px; right: 2px; height: 14px; transform: translateY(-50%);

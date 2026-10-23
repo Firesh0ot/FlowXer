@@ -328,9 +328,48 @@ class AutoRequest(BaseModel):
 
 class PositionRequest(BaseModel):
     panel_id: str = Field(default="me-1", description="Mixer panel (ME)")
-    position: float = Field(
-        ..., ge=0.0, le=1.0, description="T-bar: off 0 starts the ME's transition, 1 completes it, 0 ends it without the swap"
+    position: float | None = Field(
+        default=None, ge=0.0, le=1.0, description="T-bar: off 0 starts the ME's transition, 1 completes it, 0 ends it without the swap"
     )
+    lever: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "The T-bar lever where it physically is (0 top .. 1 bottom), instead of `position`: the mixer "
+            "makes it the transition's progress from the end the lever rests at (the panel's tbar_end), "
+            "so a lever at the bottom makes the next transition by moving up. Within 2 % of its resting "
+            "end it starts nothing (no flicker at the end of travel)."
+        ),
+    )
+
+    from_end: str | None = Field(
+        default=None,
+        alias="from",
+        pattern="^(top|bottom)$",
+        description=(
+            "With `lever`: the end the drag began at. A drag from an end that is no longer the resting "
+            "end (another console's Auto or Cut flipped it) is ignored. Without it the lever counts again "
+            "only after it came back to the resting end after a flip (pickup, for hardware panels)."
+        ),
+    )
+
+    source: str = Field(
+        default="",
+        max_length=64,
+        description=(
+            "With `lever` and without `from`: which hardware lever this is (each picks up on its own). "
+            "Without it all hardware levers of an ME share one pickup: one per ME, or give each its own."
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _one_of(self) -> "PositionRequest":
+        if (self.position is None) == (self.lever is None):
+            raise ValueError("give either position or lever")
+        return self
 
 
 class PlayerCueRequest(BaseModel):
@@ -474,6 +513,9 @@ class HealthResponse(BaseModel):
 class MixerCommandResponse(BaseModel):
     status: str
     mixer: MixerStatus
+    reason: str | None = Field(
+        default=None, description="With status ignored (a T-bar lever value): stale_from or pickup (POST /mixer/position)"
+    )
 
 
 class MixerPanel(BaseModel):
@@ -485,6 +527,15 @@ class MixerPanel(BaseModel):
     last_transition: str = "cut"
     transition: PanelTransition = Field(default_factory=PanelTransition)
     ftb: bool = Field(default=False, description="Fade to Black: the ME's whole output (DSKs and sound too) is black")
+    tbar_end: str = Field(
+        default="top",
+        pattern="^(top|bottom)$",
+        description=(
+            "Where the T-bar lever rests (a real lever, ping-pong): top or bottom. Each transition the "
+            "T-bar or an Auto completes (and a Cut of a held one) moves it to the other end; the next "
+            "transition is made by moving the lever back."
+        ),
+    )
 
 
 class KeyerStage(str, Enum):
@@ -1058,6 +1109,10 @@ class ConsoleState(BaseModel):
     inputs: list[LogicalInput]
     panels: list[MixerPanel]
     keyers: list[Keyer]
+    tbar: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Per ME the T-bar: end (where the lever rests: top or bottom), position (the progress of a transition it holds, 0: none) and lever (where it is, 0 top .. 1 bottom)",
+    )
     on_air: dict[str, list[str]] = Field(
         default_factory=dict,
         description=(
