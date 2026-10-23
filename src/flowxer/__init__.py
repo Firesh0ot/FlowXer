@@ -1,3 +1,3 @@
 """FlowXer — DMF Vision Mixer microservice for uncompressed MXL workflows."""
 
-__version__ = "17.24.66"
+__version__ = "17.25.66"
