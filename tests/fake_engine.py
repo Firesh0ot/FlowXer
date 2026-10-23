@@ -74,11 +74,14 @@ def audio_meters() -> dict:
 def mosaic_map() -> dict:
     tiles = [{"id": f"in{k}", "kind": "input", "source": f"in{k}", "x": 0, "y": 0, "w": 480, "h": 270} for k in range(1, len(inputs) + 1)]
     tiles += [{"id": f"cp{k}", "kind": "player", "source": f"cp{k}", "x": 0, "y": 0, "w": 480, "h": 270} for k in range(1, len(players) + 1)]
+    # Each ME's Program is a stream of its own (FLOWXER_ENGINE_PGM_PREVIEW, the default).
+    programs = []
     for m in range(1, mes + 1):
-        tiles.append({"id": f"me{m}-pgm", "kind": "program", "source": f"me{m}", "x": 0, "y": 540, "w": 480, "h": 270})
         tiles.append({"id": f"me{m}-pvw", "kind": "preview", "source": f"me{m}", "x": 480, "y": 540, "w": 480, "h": 270})
+        programs.append({"me": m, "id": f"me{m}-pgm", "source": f"me{m}", "path": f"flowxer/me{m}-pgm", "width": 960, "height": 540,
+                         "fps": 25, "kbps": 2500})
     return {"width": 1920, "height": 1080, "fps": 25, "enabled": True, "path": "flowxer/mosaic", "mode": "own",
-            "whep_base": "", "hls_base": "", "whep_port": 8989, "hls_port": 8988, "tiles": tiles}
+            "whep_base": "", "hls_base": "", "whep_port": 8989, "hls_port": 8988, "tiles": tiles, "programs": programs}
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -10,7 +10,7 @@ from flowxer.engine.preview import preview_info
 
 def test_no_preview_off_air_or_simulated(mixer: VisionMixer) -> None:
     off = preview_info(mixer)
-    assert off == {"available": False, "reason": "the mixer is off-air", "tiles": []}
+    assert off == {"available": False, "reason": "the mixer is off-air", "tiles": [], "streams": []}
     mixer.start(MixerStartRequest(program_input_id="cam-1"))
     simulated = preview_info(mixer)
     assert simulated["available"] is False and "simulated" in simulated["reason"]

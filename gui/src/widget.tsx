@@ -6,7 +6,9 @@
 // forth, Stop and the presets; /widget/audio?me=<n>[&faders=false][&theme=...] one ME's audio
 // strips (meter, MUTE, AFV, fader) and its master meter with the loudness;
 // /widget/snapshots[?me=<n>][&all=false][&theme=...] recall buttons for one ME's snapshots and
-// (unless all=false) those of all MEs. It runs on flowxer-gui's own
+// (unless all=false) those of all MEs; /widget/multiview[?me=<n>][&pvw=true][&theme=...] a wall of
+// the mixer's pictures over WebRTC (each ME's Program, the sources) with labels and the tally of
+// ME n (default 1). It runs on flowxer-gui's own
 // origin (its /api); only the origins in WIDGET_FRAME_ANCESTORS may frame it. It posts
 // {type: "widget-ready"} and {type: "widget-size", w, h} to the page that frames it.
 import React from "react";
@@ -15,10 +17,13 @@ import { AudioWidget } from "./components/AudioWidget";
 import { BusWidget } from "./components/BusWidget";
 import { DmeWidget } from "./components/DmeWidget";
 import { KeysWidget } from "./components/KeysWidget";
+import { MultiviewWidget } from "./components/MultiviewWidget";
 import { SnapshotsWidget } from "./components/SnapshotsWidget";
 import "./widget.css";
 
 const params = new URLSearchParams(location.search);
+// nginx serves /widget/<id>; the Vite dev server only /widget.html?widget=<id>&….
+const widget = location.pathname.endsWith("/widget.html") ? `/${params.get("widget") ?? "bus"}` : location.pathname;
 const theme = params.get("theme") || "dark";
 document.documentElement.dataset.theme = theme;
 // A frame is see-through only when its colour scheme matches its parent's; without the meta it is
@@ -29,13 +34,15 @@ else scheme?.setAttribute("content", theme === "light" ? "light" : "dark");
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    {location.pathname.endsWith("/keys") ? (
+    {widget.endsWith("/keys") ? (
       <KeysWidget me={Number(params.get("me")) || 1} />
-    ) : location.pathname.endsWith("/audio") ? (
+    ) : widget.endsWith("/audio") ? (
       <AudioWidget me={Number(params.get("me")) || 1} faders={params.get("faders") !== "false"} />
-    ) : location.pathname.endsWith("/snapshots") ? (
+    ) : widget.endsWith("/snapshots") ? (
       <SnapshotsWidget me={Number(params.get("me")) || null} all={params.get("all") !== "false"} />
-    ) : location.pathname.endsWith("/dme") ? (
+    ) : widget.endsWith("/multiview") ? (
+      <MultiviewWidget me={Number(params.get("me")) || 1} pvw={params.get("pvw") === "true"} />
+    ) : widget.endsWith("/dme") ? (
       <DmeWidget me={Number(params.get("me")) || 1} keyer={Number(params.get("keyer")) || 1} />
     ) : (
       <BusWidget me={Number(params.get("me")) || 1} transition={params.get("transition") !== "false"} />

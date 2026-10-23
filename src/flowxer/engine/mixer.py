@@ -1719,6 +1719,10 @@ class VisionMixer:
             ],
             "FLOWXER_ENGINE_STINGER_PLAYERS": self._stinger_players(),
             "FLOWXER_ENGINE_PVW_OUTPUTS": self.settings.pvw_outputs,
+            "FLOWXER_ENGINE_PGM_PREVIEW": self.settings.preview_pgm,
+            "FLOWXER_ENGINE_PGM_PREVIEW_WIDTH": self.settings.preview_pgm_width,
+            "FLOWXER_ENGINE_PGM_PREVIEW_FPS": self.settings.preview_pgm_fps,
+            "FLOWXER_ENGINE_PGM_PREVIEW_KBPS": self.settings.preview_pgm_kbps,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN": output_domain,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": self.settings.resolved_output_domain_id,
             "FLOWXER_ENGINE_OUTPUTS": [
