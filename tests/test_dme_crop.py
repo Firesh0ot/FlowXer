@@ -170,3 +170,33 @@ def test_repair_crops() -> None:
     fixed = repair_crops(doc, 1920, 1080)
     assert len(fixed) == 2
     assert doc == {"a": {"crop": {"left": 0, "right": 0, "top": 0, "bottom": 0}}, "b": [{"crop": {"left": 10, "right": 10, "top": 0, "bottom": 0}}]}
+
+
+def test_back_and_forth_format_changes_do_not_drift(settings: Settings) -> None:
+    settings.width, settings.height = 1920, 1080
+    mixer = VisionMixer(settings)
+    mixer.apply_workspace(WorkspaceUpdate(format_id="1080p50"))
+    _record_engine(mixer)
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-2", dme={"crop": {"left": 481, "top": 271}})
+    for _ in range(3):
+        mixer.apply_workspace(WorkspaceUpdate(format_id="720p50"))
+        assert mixer.get_keyer("me-1-key-1").dme.crop.left == 321
+        mixer.apply_workspace(WorkspaceUpdate(format_id="1080p50"))
+        # From its value at 1080p, not from 321 (which would give 482).
+        assert (mixer.get_keyer("me-1-key-1").dme.crop.left, mixer.get_keyer("me-1-key-1").dme.crop.top) == (481, 271)
+    # Changed in between: scaled from the new value.
+    mixer.apply_workspace(WorkspaceUpdate(format_id="720p50"))
+    mixer.update_keyer("me-1-key-1", dme={"crop": {"left": 100}})
+    mixer.apply_workspace(WorkspaceUpdate(format_id="1080p50"))
+    assert mixer.get_keyer("me-1-key-1").dme.crop.left == 150
+
+
+def test_an_import_refuses_a_snapshot_crop_that_leaves_no_picture(client: TestClient, mixer: VisionMixer) -> None:
+    client.patch("/api/v1/keyers/me-1-key-1", json={"mode": "pip", "source_id": "cam-2"})
+    client.post("/api/v1/snapshots", json={"panel_id": "me-1", "number": 1, "name": "Box"})
+    exported = client.get("/api/v1/config/export").json()
+    snapshot_keyers = exported["snapshots"]["items"][0]["mes"]["me-1"]["keyers"]
+    keyer = snapshot_keyers[0] if isinstance(snapshot_keyers, list) else next(iter(snapshot_keyers.values()))
+    keyer["dme"]["crop"] = {"left": 1500, "right": 1500, "top": 0, "bottom": 0}
+    response = client.post("/api/v1/config/import", json=exported)
+    assert response.status_code in (409, 422) and "crop" in response.text

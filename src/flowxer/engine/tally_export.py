@@ -2,13 +2,15 @@
 
 Each ME is one SCREEN (ME 1 = 1 .. ME 4 = 4), each input one display INDEX, and the Program
 of a higher ME that this ME can take (re-entry) INDEX 1000 + n. LH tally is red while the
-source is on that ME's Program, and for both sources of a mix while it runs; RH tally is
-green while the source is on the ME's Preview. Keys light LH only (keys have no preview): a
-luma key's source while the key is on air, and each linear keyer's key input as INDEX
-2000 + 100·n + k (upstream keyer k of ME n) or 3000 + 100·n + k (DSK k of ME n), TEXT its
-receiver label. Text tally is off, TEXT is the label (UTF-16LE). Every send carries all sources of every ME, on each change, when a mix ends and
-at least once a second. The calculator works out what is on air further down (path-aware
-tally).
+source is visible on that ME's Program through any path (since 2026-10-23, as the receivers and
+the console: its Program and both sources of a running mix unless a full-raster pip covers them,
+the sources of visible luma keys and pips, and what the MEs it shows have on theirs, recursively;
+hidden boxes and covered layers do not count); RH tally is green while the source is on the ME's
+Preview. Each linear keyer's key input (of the ME and of the higher MEs it can take) is INDEX
+2000 + 100·n + k (upstream keyer k of ME n) or 3000 + 100·n + k (DSK k of ME n), TEXT its receiver
+label, red while the key is visible on that ME's Program by the same rule. Text
+tally is off, TEXT is the label (UTF-16LE). Every send carries all sources of every ME, on each
+change, when a mix or a key's fade or fly ends, and at least once a second.
 """
 
 from __future__ import annotations
@@ -40,14 +42,16 @@ class MeTally:
     program: str | None = None
     preview: str | None = None
     # A mix or stinger that runs: outgoing input, incoming input, monotonic end (None: until
-    # the mixer reports its end).
+    # the mixer reports its end). Only for when the export sends again (the mix's end).
     transition: tuple[str | None, str, float | None] | None = None
     # The Programs of higher MEs this ME can take: (source id, label, INDEX).
     reentry: tuple[tuple[str, str, int], ...] = ()
-    # The sources of the luma keys on air.
-    keyed: tuple[str, ...] = ()
-    # The linear keyers' key inputs: (INDEX, receiver label, on air).
+    # The linear keyers' key inputs of this ME and of the higher MEs it can take: (INDEX,
+    # receiver label, visible on this ME's Program).
     keys: tuple[tuple[int, str, bool], ...] = ()
+    # What is visible on the ME's Program through any path (the mixer's program_visibility: keys,
+    # pips and nested MEs, hidden and covered layers left out): the red tally.
+    visible: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,10 +70,9 @@ def assign_indexes(indexes: dict[str, int], snapshot: TallySnapshot) -> None:
 
 
 def me_messages(snapshot: TallySnapshot, me: MeTally, indexes: dict[str, int], now: float) -> list[DisplayMessage]:
-    """One display message per input for one ME."""
-    on_air = {me.program, *me.keyed}
-    if me.transition is not None and (me.transition[2] is None or now < me.transition[2]):
-        on_air.update(me.transition[:2])
+    """One display message per input for one ME (`now` is kept for the callers; what is red was
+    worked out when the snapshot was taken)."""
+    on_air = set(me.visible)
     sources = [(input_id, label, indexes[input_id]) for input_id, label in snapshot.inputs]
     sources += list(me.reentry)
     return [

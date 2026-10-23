@@ -38,6 +38,8 @@ class KeyLayer:
     gain: float
     # The box (upstream keyers with a box, always for a pip), else None.
     dme: Dme | None
+    # The keyer's id: a linear key shows its own key input (raw tally INDEX 2000/3000).
+    key_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,11 +77,13 @@ def box_covers(dme: Dme, width: int, height: int) -> bool:
     return dme.soft <= 0 and left <= 0 and right >= 1 and top <= 0 and bottom >= 1
 
 
-def key_visibility(keys: Sequence[KeyLayer], width: int = 1920, height: int = 1080) -> tuple[list[str], bool]:
-    """The sources of the visible keys (key order) and whether the background is covered."""
+def layer_visibility(keys: Sequence[KeyLayer], width: int = 1920, height: int = 1080) -> tuple[list[str], bool, list[str]]:
+    """The sources of the visible luma keys and pips (key order), whether the background is
+    covered, and the ids of the visible linear keys (their key inputs are on Program)."""
     # DSKs are over the upstream keys; from the top down a covering pip hides what is under it.
     layers = [k for k in keys if k.upstream] + [k for k in keys if not k.upstream]
     found: list[str] = []
+    linear: list[str] = []
     covered = False
     for key in reversed(layers):
         if not key.on_air or key.gain <= 0:
@@ -88,10 +92,19 @@ def key_visibility(keys: Sequence[KeyLayer], width: int = 1920, height: int = 10
             continue
         if key.keys_source and key.source_id and key.source_id not in found:
             found.append(key.source_id)
+        if not key.keys_source and key.key_id:
+            linear.append(key.key_id)
         if key.pip and key.dme is not None and key.full and key.gain >= 1 and box_covers(key.dme, width, height):
             covered = True
             break
     found.reverse()
+    linear.reverse()
+    return found, covered, linear
+
+
+def key_visibility(keys: Sequence[KeyLayer], width: int = 1920, height: int = 1080) -> tuple[list[str], bool]:
+    """The sources of the visible keys (key order) and whether the background is covered."""
+    found, covered, _linear = layer_visibility(keys, width, height)
     return found, covered
 
 
@@ -119,4 +132,16 @@ def visible_on_program(panel_id: str, mes: Mapping[str, MeLayers]) -> list[str]:
                 walk(source)
 
     walk(panel_id)
+    return out
+
+
+def visible_keys_on_program(panel_id: str, mes: Mapping[str, MeLayers]) -> list[str]:
+    """The linear keys visible on ME `panel_id`'s Program through any path: its own, and those of
+    every ME it shows (recursively), with the same hidden-layer rules."""
+    out: list[str] = []
+    for me_id in [panel_id, *(item for item in visible_on_program(panel_id, mes) if item in mes)]:
+        me = mes[me_id]
+        for key_id in layer_visibility(me.keys, me.width, me.height)[2]:
+            if key_id not in out:
+                out.append(key_id)
     return out

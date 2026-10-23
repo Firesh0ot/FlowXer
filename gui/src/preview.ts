@@ -96,6 +96,19 @@ export function insetTile<T extends { x: number; y: number; w: number; h: number
   return { ...tile, x: tile.x + TILE_INSET, y: tile.y + TILE_INSET, w: tile.w - 2 * TILE_INSET, h: tile.h - 2 * TILE_INSET };
 }
 
+/** The part of a width × height raster that picture `id` shows: all of it for a stream of its
+ * own, less the scaled TILE_INSET at each edge for a mosaic tile (the box editor draws over it). */
+export function rasterView(map: PreviewMap | null, id: string, width: number, height: number) {
+  const full = { left: 0, top: 0, right: width, bottom: height };
+  if (!map?.available || map.streams?.some((s) => s.id === id)) return full;
+  const tile = map.tiles.find((t) => t.id === id);
+  if (!tile || !tile.w || !tile.h) return full;
+  const inner = insetTile(tile);
+  const dx = ((inner.x - tile.x) * width) / tile.w;
+  const dy = ((inner.y - tile.y) * height) / tile.h;
+  return { left: dx, top: dy, right: width - dx, bottom: height - dy };
+}
+
 /** A picture that is a stream of its own: the whole stream in a box of its aspect ratio. */
 export function streamView(map: PreviewMap | null, id: string): { box: CSSProperties; video: CSSProperties } | null {
   const stream = map?.available ? map.streams?.find((s) => s.id === id) : undefined;

@@ -67,7 +67,8 @@ export function dragStep(drag: Drag, pointer: number): { send: number | null; sh
   // A value already sent is not sent again.
   const sendIf = (value: number, next: Drag) => ({ send: drag.last === value ? null : value, shown: value, drag: { ...next, last: value } });
   if (v === far) return sendIf(far, { ...drag, active: false, latched: true, completed: true });
-  if (t < DEADBAND) {
+  // (The deadband's edge counts, as in the mixer.)
+  if (t <= DEADBAND + 1e-9) {
     // Back at (or not yet off) the resting end: a held transition ends without the swap.
     if (drag.active) return sendIf(rest, { ...drag, active: false });
     return { send: null, shown: v, drag };
