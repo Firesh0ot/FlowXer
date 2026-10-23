@@ -21,7 +21,8 @@ export function TbarWidget({ me, buttons = true }: { me: number; buttons?: boole
             state={snapshot.tbar?.[panel.id] ?? { end: "top", position: 0, lever: 0 }}
             rateFrames={panel.transition.rate_frames}
             fps={fps}
-            onLever={(lever) => api.lever(panel.id, lever).catch((err: Error) => setError(err.message))}
+            oneShot={panel.transition.type === "stinger" || panel.transition.background === false}
+            onLever={(lever, from) => api.lever(panel.id, lever, from).catch((err: Error) => setError(err.message))}
           />
           {buttons ? (
             <div className="tbar-buttons">

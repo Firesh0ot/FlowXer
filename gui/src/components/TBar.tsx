@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { dragStep, startDrag, travelSeconds, type Drag, type TbarState } from "../tbar";
+import { createSender, dragStep, endChanged, startDrag, travelSeconds, type Drag, type TbarState } from "../tbar";
 
 /** The T-bar lever (src/tbar.ts): top 0, bottom 1, resting at the end the mixer says. A drag
  * holds the ME's transition; the other end completes it and the lever stays there (the next
@@ -10,14 +10,17 @@ export function TBar({
   state,
   rateFrames,
   fps,
+  oneShot = false,
   onLever,
 }: {
   state: TbarState;
   rateFrames: number;
   fps: number;
-  /** Sends the lever to the mixer; the component sends one at a time, in order (the last value
-   * waits for the one in flight), so a completion is never overtaken by an older position. */
-  onLever: (lever: number) => Promise<unknown>;
+  /** A stinger or BKGD off: the lever fires an Auto (no scrubbing), once per drag. */
+  oneShot?: boolean;
+  /** Sends the lever and the end its drag began at to the mixer; the component sends one at a
+   * time, in order (newest wins), so a completion is never overtaken by an older position. */
+  onLever: (lever: number, from: TbarState["end"]) => Promise<unknown>;
 }) {
   const track = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
@@ -25,6 +28,8 @@ export function TBar({
   const [shown, setShown] = useState(state.lever);
   const shownRef = useRef(shown);
   shownRef.current = shown;
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   // Follow the mixer when not dragging: a jump of the resting end (an Auto) runs at the ME's rate.
   useEffect(() => {
@@ -47,22 +52,17 @@ export function TBar({
   }, [state.end, state.lever, state.position, rateFrames, fps]);
   useEffect(() => () => window.cancelAnimationFrame(animation.current), []);
 
-  // One request at a time: positions that wait are replaced by newer ones, never reordered.
-  const inFlight = useRef(false);
-  const waiting = useRef<number | null>(null);
-  const send = (lever: number) => {
-    if (inFlight.current) {
-      waiting.current = lever;
-      return;
-    }
-    inFlight.current = true;
-    void onLever(lever).finally(() => {
-      inFlight.current = false;
-      const next = waiting.current;
-      waiting.current = null;
-      if (next !== null) send(next);
-    });
-  };
+  // One request at a time, newest wins (src/tbar.ts createSender).
+  const onLeverRef = useRef(onLever);
+  onLeverRef.current = onLever;
+  const sender = useRef<((value: number) => void) | null>(null);
+  const from = useRef<TbarState["end"]>(state.end);
+  if (!sender.current) sender.current = createSender((value) => onLeverRef.current(value, from.current));
+  const send = (lever: number) => sender.current?.(lever);
+  // The resting end changed under a drag (another console's Auto or Cut): the drag stops.
+  useEffect(() => {
+    if (drag.current) drag.current = endChanged(drag.current, state);
+  }, [state.end, state.position]);
 
   const at = (event: React.PointerEvent) => {
     const rect = track.current?.getBoundingClientRect();
@@ -78,10 +78,25 @@ export function TBar({
     setShown(step.shown);
     if (step.send !== null) send(step.send);
   };
-  const release = (event: React.PointerEvent) => {
-    if (!drag.current) return;
+  // The drag ends (released, cancelled or its capture lost): the handle goes to where the mixer
+  // has the lever (unchanged after a completion or a held position; corrected after a latched drag
+  // or a failed request).
+  const resync = useRef(0);
+  const end = () => {
+    const ended = drag.current;
+    if (!ended) return;
     drag.current = null;
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    if (ended.completed) return;
+    // Once the mixer's state has caught up (the console polls every second).
+    window.clearTimeout(resync.current);
+    resync.current = window.setTimeout(() => {
+      if (!drag.current) setShown(stateRef.current.lever);
+    }, 1200);
+  };
+  useEffect(() => () => window.clearTimeout(resync.current), []);
+  const release = (event: React.PointerEvent) => {
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    end();
   };
   return (
     <div
@@ -99,7 +114,8 @@ export function TBar({
         event.preventDefault();
         window.cancelAnimationFrame(animation.current);
         event.currentTarget.setPointerCapture(event.pointerId);
-        drag.current = startDrag(state);
+        drag.current = startDrag(state, oneShot);
+        from.current = state.end;
         grab.current = at(event) - shownRef.current;
       }}
       onPointerMove={(event) => {
@@ -107,9 +123,7 @@ export function TBar({
       }}
       onPointerUp={release}
       onPointerCancel={release}
-      onLostPointerCapture={() => {
-        drag.current = null;
-      }}
+      onLostPointerCapture={end}
     >
       <div className="tbar-slot" />
       <div className="tbar-handle" style={{ top: `${shown * 100}%` }} />

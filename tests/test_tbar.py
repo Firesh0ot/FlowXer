@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from flowxer.api.schemas import MixerStartRequest
+import pytest
+
+from flowxer.api.schemas import MixerStartRequest, PanelTransitionUpdate
+from flowxer.engine.mixer import MixerError
 from flowxer.engine.mixer import VisionMixer
 
 
@@ -51,14 +54,14 @@ def test_auto_and_cut_leave_the_lever_at_the_right_end(mixer: VisionMixer) -> No
     mixer.auto("me-1")
     assert mixer.get_panel("me-1").tbar_end == "bottom"
     # From a held position, Auto runs the rest: the lever ends at the far end.
-    mixer.set_lever("me-1", 0.6)  # from the bottom: 40 % of the next transition
+    mixer.set_lever("me-1", 0.6, "bottom")  # from the bottom: 40 % of the next transition
     assert mixer.tbar_state()["me-1"]["position"] == 0.4
     mixer.auto("me-1")
     assert mixer.tbar_state()["me-1"] == {"end": "top", "position": 0.0, "lever": 0.0}
     # A Cut at rest leaves the lever where it is; a Cut of a held transition completes it.
     mixer.cut("me-1")
     assert mixer.get_panel("me-1").tbar_end == "top"
-    mixer.set_lever("me-1", 0.3)
+    mixer.set_lever("me-1", 0.3, "top")
     mixer.cut("me-1")
     assert mixer.tbar_state()["me-1"] == {"end": "bottom", "position": 0.0, "lever": 1.0}
 
@@ -75,3 +78,89 @@ def test_the_api_takes_lever_or_position_and_the_console_shows_the_tbar(client: 
     # The resting end is part of the saved state.
     client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "position": 1.0})
     assert client.get("/api/v1/config/export").json()["panels"][0]["tbar_end"] == "top"
+
+
+def test_a_drag_from_an_end_that_flipped_under_it_is_ignored(mixer: VisionMixer, client: TestClient) -> None:
+    # Console A holds the lever at 0.4 (from the top); console B's Auto completes it.
+    _start(mixer)
+    mixer.set_lever("me-1", 0.4, "top")
+    mixer.auto("me-1")
+    assert _bus(mixer) == ("cam-2", "cam-1") and mixer.get_panel("me-1").tbar_end == "bottom"
+    # A drags on: counted from the new end it would start a transition back; it is ignored.
+    for lever in (0.5, 0.7, 1.0):
+        mixer.set_lever("me-1", lever, "top")
+    assert _bus(mixer) == ("cam-2", "cam-1") and mixer.tbar_state()["me-1"]["position"] == 0.0
+    # The next drag from the new end works.
+    mixer.set_lever("me-1", 0.5, "bottom")
+    assert mixer.tbar_state()["me-1"]["position"] == 0.5
+    # Through the API the same, with "from".
+    mixer.auto("me-1")
+    assert client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 0.6, "from": "bottom"}).status_code == 200
+    assert mixer.tbar_state()["me-1"]["position"] == 0.0
+
+
+def test_a_hardware_lever_picks_up_after_another_console_flipped_the_end(mixer: VisionMixer) -> None:
+    _start(mixer)
+    # The hardware lever (no from) rests at the top; a console's Auto flips the end to the bottom.
+    mixer.set_lever("me-1", 0.0)
+    mixer.auto("me-1")
+    # The hardware lever moves: ignored until it has come down to the new resting end ...
+    for lever in (0.1, 0.5, 0.9):
+        mixer.set_lever("me-1", lever)
+    assert mixer.tbar_state()["me-1"]["position"] == 0.0 and _bus(mixer) == ("cam-2", "cam-1")
+    mixer.set_lever("me-1", 0.99)  # picked up at the bottom
+    # ... then it makes the next transition going up.
+    mixer.set_lever("me-1", 0.6)
+    assert mixer.tbar_state()["me-1"]["position"] == 0.4
+    mixer.set_lever("me-1", 0.0)
+    assert _bus(mixer) == ("cam-1", "cam-2") and mixer.get_panel("me-1").tbar_end == "top"
+    # Its own completion leaves it at the new end: the next move up counts at once (no pickup).
+    mixer.set_lever("me-1", 0.3)
+    assert mixer.tbar_state()["me-1"]["position"] == 0.3
+
+
+def test_keys_only_fires_one_auto_per_drag(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.update_transition("me-1", PanelTransitionUpdate(ties=["me-1-key-1"], background=False))
+    key = lambda: mixer.get_keyer("me-1-key-1").enabled
+    # A GUI drag from the top: the first move fires the keyer's Auto, the rest of the drag nothing.
+    for lever in (0.05, 0.2, 0.6, 1.0):
+        mixer.set_lever("me-1", lever, "top")
+    assert key() is True and mixer.get_panel("me-1").tbar_end == "bottom"
+    # The next drag (from the bottom) takes it off again: once.
+    for lever in (0.9, 0.5, 0.0):
+        mixer.set_lever("me-1", lever, "bottom")
+    assert key() is False and mixer.get_panel("me-1").tbar_end == "top"
+    # A hardware lever (picked up at the top): one Auto, then nothing until it has come to the
+    # other end (pickup).
+    for lever in (0.0, 0.05, 0.3, 0.7):
+        mixer.set_lever("me-1", lever)
+    assert key() is True
+    for lever in (0.99, 0.6):
+        mixer.set_lever("me-1", lever)
+    assert key() is False
+
+
+def test_a_failed_auto_does_not_move_the_lever(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.get_panel("me-1").preview_input_id = None
+    with pytest.raises(MixerError, match="Preview"):
+        mixer.auto("me-1")
+    assert mixer.get_panel("me-1").tbar_end == "top"
+
+
+def test_a_held_lever_snaps_at_both_ends(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.set_lever("me-1", 0.5, "top")
+    mixer.set_lever("me-1", 0.01, "top")  # within 2 % of the start: back, without the swap
+    assert mixer.tbar_state()["me-1"]["position"] == 0.0 and _bus(mixer) == ("cam-1", "cam-2")
+    mixer.set_lever("me-1", 0.5, "top")
+    mixer.set_lever("me-1", 0.995, "top")  # within 2 % of the end: complete
+    assert _bus(mixer) == ("cam-2", "cam-1") and mixer.get_panel("me-1").tbar_end == "bottom"
+
+
+def test_position_one_from_rest_completes_the_transition(client: TestClient, mixer: VisionMixer) -> None:
+    _start(mixer)
+    response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "position": 1.0})
+    assert response.status_code == 200 and response.json()["status"] == "position"
+    assert _bus(mixer) == ("cam-2", "cam-1") and mixer.get_panel("me-1").tbar_end == "bottom"

@@ -464,11 +464,11 @@ export const api = {
     }).then((r) => parse(r)),
   /** The T-bar lever where it physically is (0 top .. 1 bottom): the mixer counts the transition
    * from the end the lever rests at (ping-pong). */
-  lever: (panel_id: string, lever: number) =>
+  lever: (panel_id: string, lever: number, from?: "top" | "bottom") =>
     fetch("/api/v1/mixer/position", {
       method: "POST",
       headers: jsonHeaders,
-      body: JSON.stringify({ panel_id, lever }),
+      body: JSON.stringify({ panel_id, lever, from }),
     }).then((r) => parse(r)),
   /** The T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it. */
   position: (panel_id: string, position: number) =>

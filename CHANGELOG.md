@@ -18,7 +18,10 @@ in `docs/platform-integration-plan.md` §8.
   instead of `position`; the panel's `tbar_end` (`top`/`bottom`, saved) says where the lever rests
   and flips with each transition the T-bar or an Auto completes; `GET /console` → `tbar` per ME
   (`end`, `position`, `lever`). `position` keeps its meaning. `position: 1` straight from rest now
-  completes the transition (it answered 500).
+  completes the transition (it answered 500). With `from` (the end the drag began at) a drag from
+  an end that another console's Auto or Cut changed is ignored; a lever without it (a hardware
+  panel) is picked up at the new resting end first. A held lever snaps within 2 % of either end;
+  with a stinger or BKGD off it fires one Auto per drag; an Auto that fails leaves the lever.
 - Widget `tbar` (`/widget/tbar[?me=<n>][&buttons=false]`): the ME's T-bar lever with Cut and Auto.
 
 ### Added: Program streams, multiview widget

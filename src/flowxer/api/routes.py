@@ -497,7 +497,7 @@ def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mi
         body = (
             mixer.set_position(payload.panel_id, payload.position)
             if payload.position is not None
-            else mixer.set_lever(payload.panel_id, payload.lever)
+            else mixer.set_lever(payload.panel_id, payload.lever, payload.from_end)
         )
     except MixerError as exc:
         raise _http(exc)

@@ -7,7 +7,11 @@
 // - starts a transition only past DEADBAND from that end;
 // - completes it at the other end (the last few % snap there) and is then latched until the
 //   pointer is released: wiggling at the end of travel starts nothing (no flicker);
-// - back to its resting end ends the transition without the swap.
+// - back to its resting end ends the transition without the swap;
+// - with a stinger or BKGD off (an Auto from the lever, no scrubbing) it is latched after its first
+//   send: one drag, one Auto;
+// - when the mixer's resting end changes under it (another console's Auto or Cut) it is latched
+//   (endChanged), and each send says the end it began at (`from`), which the mixer checks too.
 
 export interface TbarState {
   /** Where the lever rests. */
@@ -31,10 +35,20 @@ export interface Drag {
   latched: boolean;
   /** The last lever value sent. */
   last: number | null;
+  /** A stinger or BKGD off: the first send fires an Auto, then the drag is latched. */
+  oneShot: boolean;
+  /** It reached the other end (the handle stays there). */
+  completed: boolean;
 }
 
-export function startDrag(state: TbarState): Drag {
-  return { rest: state.end, active: state.position > 0, latched: false, last: null };
+export function startDrag(state: TbarState, oneShot = false): Drag {
+  return { rest: state.end, active: state.position > 0, latched: false, last: null, oneShot, completed: false };
+}
+
+/** The mixer's state while a drag runs: a resting end that changed under it (another console's
+ * Auto or Cut) latches the drag, so it cannot take the shot back. */
+export function endChanged(drag: Drag, state: TbarState): Drag {
+  return !drag.latched && state.end !== drag.rest && state.position === 0 ? { ...drag, latched: true } : drag;
 }
 
 const restLever = (end: TbarState["end"]) => (end === "top" ? 0 : 1);
@@ -52,13 +66,36 @@ export function dragStep(drag: Drag, pointer: number): { send: number | null; sh
   const t = Math.abs(v - rest);
   // A value already sent is not sent again.
   const sendIf = (value: number, next: Drag) => ({ send: drag.last === value ? null : value, shown: value, drag: { ...next, last: value } });
-  if (v === far) return sendIf(far, { ...drag, active: false, latched: true });
+  if (v === far) return sendIf(far, { ...drag, active: false, latched: true, completed: true });
   if (t < DEADBAND) {
     // Back at (or not yet off) the resting end: a held transition ends without the swap.
     if (drag.active) return sendIf(rest, { ...drag, active: false });
     return { send: null, shown: v, drag };
   }
-  return sendIf(v, { ...drag, active: true });
+  return sendIf(v, { ...drag, active: true, latched: drag.oneShot });
+}
+
+/** Sends one value at a time, in order: a value given while one is in flight waits, and a newer
+ * one replaces it (newest wins), so a completion is never overtaken by an older position. */
+export function createSender(send: (value: number) => Promise<unknown>): (value: number) => void {
+  let inFlight = false;
+  let waiting: number | null = null;
+  const next = (value: number) => {
+    if (inFlight) {
+      waiting = value;
+      return;
+    }
+    inFlight = true;
+    void send(value)
+      .catch(() => undefined)
+      .finally(() => {
+        inFlight = false;
+        const queued = waiting;
+        waiting = null;
+        if (queued !== null) next(queued);
+      });
+  };
+  return next;
 }
 
 /** Seconds an Auto moves the lever from `from` to `to` (both 0..1) at the ME's rate. */

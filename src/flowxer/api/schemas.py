@@ -343,6 +343,19 @@ class PositionRequest(BaseModel):
         ),
     )
 
+    from_end: str | None = Field(
+        default=None,
+        alias="from",
+        pattern="^(top|bottom)$",
+        description=(
+            "With `lever`: the end the drag began at. A drag from an end that is no longer the resting "
+            "end (another console's Auto or Cut flipped it) is ignored. Without it the lever counts again "
+            "only after it came back to the resting end after a flip (pickup, for hardware panels)."
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
+
     @model_validator(mode="after")
     def _one_of(self) -> "PositionRequest":
         if (self.position is None) == (self.lever is None):

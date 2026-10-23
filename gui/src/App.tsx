@@ -364,7 +364,7 @@ export default function App() {
           stingerSlots={snapshot.stinger_slots}
           fps={fps}
           tbar={snapshot.tbar?.[panel.id]}
-          onLever={(lever) => api.lever(panel.id, lever).catch((err: Error) => setError(err.message))}
+          onLever={(lever, from) => api.lever(panel.id, lever, from).catch((err: Error) => setError(err.message))}
           onChange={(patch) => void command(() => api.transition(panel.id, patch))}
           onCut={() => void command(() => api.cut(panel.id))}
           onAuto={() => void command(() => api.auto(panel.id))}

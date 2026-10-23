@@ -107,7 +107,7 @@ export function TransitionSection({
   onCut: () => void;
   onAuto: () => void;
   /** The T-bar lever where the operator holds it (0 top .. 1 bottom). */
-  onLever: (lever: number) => Promise<unknown>;
+  onLever: (lever: number, from: TbarState["end"]) => Promise<unknown>;
   /** The ME's T-bar as the mixer has it (GET /console → tbar). */
   tbar?: TbarState;
   onFadeToBlack: () => void;
@@ -222,7 +222,13 @@ export function TransitionSection({
         <button className={`ftb${panel.ftb ? " on" : ""}`} onClick={onFadeToBlack} title="Fade the whole output (keys and sound too) to black, or back">
           FTB
         </button>
-        <TBar state={tbar ?? { end: "top", position: 0, lever: 0 }} rateFrames={transition.rate_frames} fps={fps} onLever={onLever} />
+        <TBar
+          state={tbar ?? { end: "top", position: 0, lever: 0 }}
+          rateFrames={transition.rate_frames}
+          fps={fps}
+          oneShot={transition.type === "stinger" || transition.background === false}
+          onLever={onLever}
+        />
       </div>
     </aside>
   );
