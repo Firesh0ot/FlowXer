@@ -11,10 +11,18 @@ in `docs/platform-integration-plan.md` §8.
   as the TSL receivers and the console do: its Program and both sources of a running mix unless a
   full-raster pip covers them, the sources of visible luma keys and pips, and what the MEs it shows
   have on theirs, recursively. Hidden boxes (gain 0, size 0, off screen, cropped away) and covered
-  layers no longer light their sources. The packet format, the INDEXes (inputs, re-entry 1000 + n,
-  key inputs 2000/3000) and the green Preview are unchanged; the export also sends when a key's
-  fade or fly ends. **For the platform's tally calculator:** a nested ME's sources are now red on the
-  outer ME's SCREEN directly (following the re-entry INDEXes still gives the same result).
+  layers no longer light their sources.
+- Linear key inputs (INDEX 2000/3000 + 100·n + k) follow the same rule: red while the key is
+  visible (not at gain 0, not under a full-raster pip), also through a nested ME; an ME's SCREEN
+  now lists the key inputs of the higher MEs it can take too.
+- Unchanged: the packet format, the INDEX numbers, the re-entry INDEX 1000 + n (still sent, red
+  while that ME is visible), the green Preview. The export also sends when a key's fade or fly ends.
+- **For the platform's tally calculator:** everything visible through a nested ME is now red on the
+  outer ME's SCREEN directly; following the re-entry INDEXes is optional (same result). A
+  calculator that keeps per-ME attribution sees a nested ME's sources on the outer ME as well.
+- T-bar: a hardware lever picks up where the lever is (also the position of a transition another
+  lever holds); the source cap keeps the most recently used levers and never the one that holds
+  the ME's transition.
 
 ### Fixed: small follow-ups
 

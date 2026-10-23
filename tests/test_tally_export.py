@@ -329,7 +329,7 @@ def test_export_resolves_the_name_again_and_logs_once(monkeypatch: pytest.Monkey
         return resolve("127.0.0.1", *args, **kwargs)
 
     monkeypatch.setattr(tally_export.socket, "getaddrinfo", not_ready_yet)
-    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"),), mes=(MeTally(program="cam-1"),))
+    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"),), mes=(MeTally(program="cam-1", visible=("cam-1",)),))
     with caplog.at_level(logging.WARNING, logger=tally_export.__name__):
         export = TallyExport("udp", "mxl-tally.example", receiver.getsockname()[1], lambda: snapshot)
         try:
@@ -375,7 +375,7 @@ def test_export_over_tcp_frames_and_reconnects(monkeypatch: pytest.MonkeyPatch) 
     server.bind(("127.0.0.1", 0))
     server.listen(2)
     server.settimeout(3.0)
-    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"), ("cam-2", "Cam 2")), mes=(MeTally("cam-1", "cam-2"),))
+    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"), ("cam-2", "Cam 2")), mes=(MeTally("cam-1", "cam-2", visible=("cam-1",)),))
     export = TallyExport("tcp", "127.0.0.1", server.getsockname()[1], lambda: snapshot)
     try:
         conn, _ = server.accept()
@@ -437,3 +437,25 @@ def test_the_export_sends_again_when_a_key_fade_ends(settings: Settings, monkeyp
     finally:
         mixer.shutdown()
         receiver.close()
+
+
+def test_linear_key_inputs_follow_the_same_rule(mixer: VisionMixer) -> None:
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # Screen 1 lists ME 2's key inputs too (ME 1 can take ME 2): all off while ME 2 is not shown.
+    assert [index for index, _label, _on in mixer._tally_snapshot().mes[0].keys] == [2101, 2102, 3101, 2201, 2202, 3201]
+    mixer.update_keyer("me-2-dsk-1", enabled=True)
+    assert "3201" not in lit(mixer, 1)[0] and "3201" in lit(mixer, 2)[0]
+    # ME 1 shows ME 2 (a pip): ME 2's DSK key input is red on screen 1 too.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="me-2", enabled=True)
+    assert {"me-2", "3201"} <= lit(mixer, 1)[0]
+    # ME 1's own linear USK 2 on: red; under a full-raster pip of cam-4 on top of it, not red.
+    mixer.update_keyer("me-1-key-1", mode="linear", enabled=False)
+    mixer.update_keyer("me-1-key-1", enabled=True)
+    assert "2101" in lit(mixer, 1)[0]
+    mixer.update_keyer("me-1-key-2", mode="pip", source_id="cam-4", dme={"x": 0.5, "y": 0.5, "size": 1.0}, enabled=True)
+    assert "2101" not in lit(mixer, 1)[0] and lit(mixer, 1)[0] >= {"cam-4"}
+    # At gain 0 a linear key shows nothing.
+    mixer.update_keyer("me-1-key-2", enabled=False)
+    mixer.update_keyer("me-1-key-1", gain=0.0)
+    assert "2101" not in lit(mixer, 1)[0]
