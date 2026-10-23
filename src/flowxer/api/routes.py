@@ -494,13 +494,14 @@ def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(
 )
 def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     try:
-        body = (
-            mixer.set_position(payload.panel_id, payload.position)
-            if payload.position is not None
-            else mixer.set_lever(payload.panel_id, payload.lever, payload.from_end)
-        )
+        if payload.position is not None:
+            body, ignored = mixer.set_position(payload.panel_id, payload.position), None
+        else:
+            body, ignored = mixer.set_lever(payload.panel_id, payload.lever, payload.from_end, payload.source)
     except MixerError as exc:
         raise _http(exc)
+    if ignored:
+        return MixerCommandResponse(status="ignored", reason=ignored, mixer=body)
     return MixerCommandResponse(status="position", mixer=body)
 
 

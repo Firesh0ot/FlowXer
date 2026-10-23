@@ -100,5 +100,20 @@ check(travelSeconds(0, 1, 25, 50) === 0.5 && travelSeconds(0.6, 1, 25, 50) === 0
   check(JSON.stringify(calls) === JSON.stringify([0.2, 1, 0.5]), "idle again: sent at once");
 }
 
+// A queued value keeps the end its own drag began at (not the end of the time it is sent).
+{
+  const calls: string[] = [];
+  const pending: (() => void)[] = [];
+  const send = createSender((value: { lever: number; from: string }) => {
+    calls.push(`${value.lever}@${value.from}`);
+    return new Promise<void>((resolve) => pending.push(resolve));
+  });
+  send({ lever: 0.5, from: "top" });
+  send({ lever: 1, from: "top" });
+  pending.shift()!();
+  await new Promise((r) => setTimeout(r, 0));
+  check(JSON.stringify(calls) === JSON.stringify(["0.5@top", "1@top"]), `from per value: ${JSON.stringify(calls)}`);
+}
+
 console.log(`t-bar: ${failed ? `${failed} failed` : "ok"}`);
 if (failed) process.exit(1);

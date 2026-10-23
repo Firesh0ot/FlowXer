@@ -354,6 +354,15 @@ class PositionRequest(BaseModel):
         ),
     )
 
+    source: str = Field(
+        default="",
+        max_length=64,
+        description=(
+            "With `lever` and without `from`: which hardware lever this is (each picks up on its own). "
+            "Without it all hardware levers of an ME share one pickup: one per ME, or give each its own."
+        ),
+    )
+
     model_config = {"populate_by_name": True}
 
     @model_validator(mode="after")
@@ -504,6 +513,9 @@ class HealthResponse(BaseModel):
 class MixerCommandResponse(BaseModel):
     status: str
     mixer: MixerStatus
+    reason: str | None = Field(
+        default=None, description="With status ignored (a T-bar lever value): stale_from or pickup (POST /mixer/position)"
+    )
 
 
 class MixerPanel(BaseModel):

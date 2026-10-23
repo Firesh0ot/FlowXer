@@ -25,6 +25,7 @@ def _bus(mixer: VisionMixer) -> tuple[str | None, str | None]:
 def test_a_drag_down_completes_and_the_next_one_goes_up(mixer: VisionMixer) -> None:
     _start(mixer)
     assert mixer.tbar_state()["me-1"] == {"end": "top", "position": 0.0, "lever": 0.0}
+    mixer.set_lever("me-1", 0.0)  # a hardware lever picks up at the resting end first
     mixer.set_lever("me-1", 0.4)
     assert mixer.tbar_state()["me-1"] == {"end": "top", "position": 0.4, "lever": 0.4}
     mixer.set_lever("me-1", 1.0)
@@ -68,7 +69,7 @@ def test_auto_and_cut_leave_the_lever_at_the_right_end(mixer: VisionMixer) -> No
 
 def test_the_api_takes_lever_or_position_and_the_console_shows_the_tbar(client: TestClient, mixer: VisionMixer) -> None:
     _start(mixer)
-    assert client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 1.0}).status_code == 200
+    assert client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 1.0, "from": "top"}).status_code == 200
     assert client.get("/api/v1/console").json()["tbar"]["me-1"] == {"end": "bottom", "position": 0.0, "lever": 1.0}
     # `position` keeps its meaning (the progress, whatever end the lever rests at).
     assert client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "position": 0.25}).status_code == 200
@@ -164,3 +165,54 @@ def test_position_one_from_rest_completes_the_transition(client: TestClient, mix
     response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "position": 1.0})
     assert response.status_code == 200 and response.json()["status"] == "position"
     assert _bus(mixer) == ("cam-2", "cam-1") and mixer.get_panel("me-1").tbar_end == "bottom"
+
+
+def test_a_hardware_lever_that_has_not_picked_up_cannot_complete_a_held_transition(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.auto("me-1")  # the lever rests at the bottom
+    mixer.set_lever("me-1", 0.6, "bottom")  # a console holds the next transition
+    # A hardware lever (no from) somewhere near the top jitters: ignored, also while held.
+    status, ignored = mixer.set_lever("me-1", 0.01)
+    assert ignored == "pickup" and mixer.tbar_state()["me-1"]["position"] == 0.4 and _bus(mixer) == ("cam-2", "cam-1")
+
+
+def test_hardware_levers_pick_up_after_start_restart_and_a_loaded_state(mixer: VisionMixer, settings) -> None:
+    _start(mixer)
+    mixer.auto("me-1")  # rests at the bottom; saved
+    mixer.persist()
+    again = VisionMixer(settings)
+    again.start(MixerStartRequest())
+    assert again.get_panel("me-1").tbar_end == "bottom"
+    # A hardware panel connecting with its lever at the top: nothing taken until it is at the bottom.
+    assert again.set_lever("me-1", 0.0)[1] == "pickup"
+    assert again.tbar_state()["me-1"]["position"] == 0.0
+    assert again.set_lever("me-1", 1.0)[1] is None  # picked up
+    # The engine restarts (or a state is loaded): picked up again first.
+    again._arm_lever_pickup()
+    assert again.set_lever("me-1", 0.5)[1] == "pickup"
+
+
+def test_a_stale_from_cannot_move_a_transition_held_from_the_other_end(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.auto("me-1")
+    mixer.set_lever("me-1", 0.6, "bottom")
+    status, ignored = mixer.set_lever("me-1", 0.99, "top")
+    assert ignored == "stale_from" and mixer.tbar_state()["me-1"]["position"] == 0.4
+
+
+def test_two_hardware_levers_are_told_apart_by_source(mixer: VisionMixer) -> None:
+    _start(mixer)
+    assert mixer.set_lever("me-1", 0.0, source="panel-a")[1] is None  # A picks up at the top
+    assert mixer.set_lever("me-1", 0.3, source="panel-b")[1] == "pickup"  # B has not
+    assert mixer.set_lever("me-1", 0.3, source="panel-a")[1] is None
+    assert mixer.tbar_state()["me-1"]["position"] == 0.3
+
+
+def test_ignored_lever_values_say_why(client: TestClient, mixer: VisionMixer) -> None:
+    _start(mixer)
+    response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 0.5})
+    assert response.status_code == 200 and response.json()["status"] == "ignored" and response.json()["reason"] == "pickup"
+    response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 0.5, "from": "bottom"})
+    assert response.json()["status"] == "ignored" and response.json()["reason"] == "stale_from"
+    response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 0.5, "from": "top"})
+    assert response.json()["status"] == "position" and response.json()["reason"] is None

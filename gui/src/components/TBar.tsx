@@ -55,10 +55,11 @@ export function TBar({
   // One request at a time, newest wins (src/tbar.ts createSender).
   const onLeverRef = useRef(onLever);
   onLeverRef.current = onLever;
-  const sender = useRef<((value: number) => void) | null>(null);
+  // Each value carries the end its drag began at (a value waiting in the queue keeps its own).
+  const sender = useRef<((value: { lever: number; from: TbarState["end"] }) => void) | null>(null);
   const from = useRef<TbarState["end"]>(state.end);
-  if (!sender.current) sender.current = createSender((value) => onLeverRef.current(value, from.current));
-  const send = (lever: number) => sender.current?.(lever);
+  if (!sender.current) sender.current = createSender((value: { lever: number; from: TbarState["end"] }) => onLeverRef.current(value.lever, value.from));
+  const send = (lever: number) => sender.current?.({ lever, from: from.current });
   // The resting end changed under a drag (another console's Auto or Cut): the drag stops.
   useEffect(() => {
     if (drag.current) drag.current = endChanged(drag.current, state);

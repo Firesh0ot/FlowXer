@@ -77,10 +77,10 @@ export function dragStep(drag: Drag, pointer: number): { send: number | null; sh
 
 /** Sends one value at a time, in order: a value given while one is in flight waits, and a newer
  * one replaces it (newest wins), so a completion is never overtaken by an older position. */
-export function createSender(send: (value: number) => Promise<unknown>): (value: number) => void {
+export function createSender<T>(send: (value: T) => Promise<unknown>): (value: T) => void {
   let inFlight = false;
-  let waiting: number | null = null;
-  const next = (value: number) => {
+  let waiting: T | null = null;
+  const next = (value: T) => {
     if (inFlight) {
       waiting = value;
       return;
