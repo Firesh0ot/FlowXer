@@ -5,6 +5,17 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed (platform): the raw tally export follows what is visible
+
+- `FLOWXER_TALLY_TSL`: an ME's SCREEN lights red what is visible on its Program through any path,
+  as the TSL receivers and the console do: its Program and both sources of a running mix unless a
+  full-raster pip covers them, the sources of visible luma keys and pips, and what the MEs it shows
+  have on theirs, recursively. Hidden boxes (gain 0, size 0, off screen, cropped away) and covered
+  layers no longer light their sources. The packet format, the INDEXes (inputs, re-entry 1000 + n,
+  key inputs 2000/3000) and the green Preview are unchanged; the export also sends when a key's
+  fade or fly ends. **For the platform's tally calculator:** a nested ME's sources are now red on the
+  outer ME's SCREEN directly (following the re-entry INDEXes still gives the same result).
+
 ### Fixed: small follow-ups
 
 - GUI: the PROGRAM title says why the Program is a mosaic tile instead of its own stream

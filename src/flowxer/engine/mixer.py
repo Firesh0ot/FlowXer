@@ -2455,7 +2455,7 @@ class VisionMixer:
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
-            self._tally_again_at(self._mixes[panel.id][2])
+            self._tally_again_at(self._mixes[panel.id][2], export=False)
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2864,10 +2864,12 @@ class VisionMixer:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
 
-    def _tally_again_at(self, at: float | None) -> None:
-        """The receivers' tally once more when a mix or a key's fade or fly ends (monotonic `at`):
-        what is visible changes then without an operator action."""
-        if at is None or not self.tally.receivers:
+    def _tally_again_at(self, at: float | None, *, export: bool = True) -> None:
+        """The tally once more when a mix or a key's fade or fly ends (monotonic `at`): what is
+        visible changes then without an operator action. `export`: the raw tally export too (it
+        sends at a mix's end by itself)."""
+        export = export and self.tally_export is not None
+        if at is None or not (self.tally.receivers or export):
             return
         timer: threading.Timer
 
@@ -2876,7 +2878,7 @@ class VisionMixer:
                 if timer not in self._tally_timers:
                     return  # cancelled meanwhile
                 self._tally_timers.discard(timer)
-            self._publish_tally_quietly()
+            self._publish_tally_quietly(export=export)
 
         timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, fire)
         timer.daemon = True
@@ -2891,9 +2893,12 @@ class VisionMixer:
         for timer in timers:
             timer.cancel()
 
-    def _publish_tally_quietly(self) -> None:
+    def _publish_tally_quietly(self, *, export: bool = True) -> None:
         try:
-            self._publish_tally()
+            if export:
+                self._publish_tally()
+            else:
+                self.tally.publish(self)
         except Exception:  # a timer thread must not die loudly
             log.exception("tally publish after a mix or a key fade failed")
 
@@ -2906,6 +2911,9 @@ class VisionMixer:
         """Program, Preview and the running mix of each ME, and the re-entry sources each ME can
         take (lamps off while Program is stopped). Called by the export thread."""
         running = self.state == MixerState.running
+        # Red: what is visible on the ME's Program through any path (engine/visibility.py), as for
+        # the receivers and the console.
+        visible = self.program_visibility() if running else {}
         mes = []
         for panel in list(self.panels):
             reentry = tuple(
@@ -2924,7 +2932,9 @@ class VisionMixer:
             air = {k.id: k.enabled or now < self._key_until.get(k.id, 0.0) or k.id in held for k in keyers}
             keyed = tuple(k.source_id for k in keyers if air[k.id] and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
             keys = tuple(self._key_tally(keyer, air[keyer.id]) for keyer in keyers if keyer.mode == KeyMode.linear)
-            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
+            mes.append(
+                MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys, tuple(visible.get(panel.id, ())))
+            )
         return TallySnapshot(
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
