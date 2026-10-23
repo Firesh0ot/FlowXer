@@ -1,7 +1,7 @@
 // The previews' geometry (src/preview.ts) and the multiview wall (src/multiview.ts): a mosaic tile
 // cropped 5 px inside its edges, a Program that is a stream of its own, the WHEP URLs, the wall's
 // pictures, tally and grid. Run: node --experimental-strip-types scripts/check-preview.ts
-import { insetTile, streamView, tileCrop, whepUrl, TILE_INSET, type PreviewMap } from "../src/preview.ts";
+import { insetTile, rasterView, streamView, tileCrop, whepUrl, TILE_INSET, type PreviewMap } from "../src/preview.ts";
 import { wallGrid, wallTiles } from "../src/multiview.ts";
 import type { ConsoleState } from "../src/api.ts";
 
@@ -37,6 +37,11 @@ check((crop?.box as Record<string, string>)["--ar"] === "470 / 260", "crop aspec
 check(tileCrop(map, "panel:me-1:pgm") === null, "pgm is no tile");
 check((streamView(map, "panel:me-1:pgm")?.box as Record<string, string>)["--ar"] === "960 / 540", "pgm stream aspect");
 check(streamView(map, "source:cam-1") === null, "a source is no stream");
+// What part of the raster a picture shows (the box editor draws over it): a Program stream all of
+// it; a mosaic tile 5 mosaic px less at each edge (480-px tile of 1920: 20 raster px).
+check(JSON.stringify(rasterView(map, "panel:me-1:pgm", 1920, 1080)) === JSON.stringify({ left: 0, top: 0, right: 1920, bottom: 1080 }), "stream view");
+check(JSON.stringify(rasterView(map, "source:cam-1", 1920, 1080)) === JSON.stringify({ left: 20, top: 20, right: 1900, bottom: 1060 }), `tile view ${JSON.stringify(rasterView(map, "source:cam-1", 1920, 1080))}`);
+check(rasterView(null, "x", 1920, 1080).right === 1920, "no map: all");
 // WHEP URLs: the own MediaMTX on the page's host, or the shared one's absolute URL.
 check(whepUrl(map) === "http://mixer:8989/flowxer/mosaic/whep", "mosaic url");
 check(whepUrl(map, map.streams![0]) === "http://mixer:8989/flowxer/me1-pgm/whep", "pgm url");

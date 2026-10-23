@@ -5,6 +5,39 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed (platform): the raw tally export follows what is visible
+
+- `FLOWXER_TALLY_TSL`: an ME's SCREEN lights red what is visible on its Program through any path,
+  as the TSL receivers and the console do: its Program and both sources of a running mix unless a
+  full-raster pip covers them, the sources of visible luma keys and pips, and what the MEs it shows
+  have on theirs, recursively. Hidden boxes (gain 0, size 0, off screen, cropped away) and covered
+  layers no longer light their sources.
+- Linear key inputs (INDEX 2000/3000 + 100·n + k) follow the same rule: red while the key is
+  visible (not at gain 0, not under a full-raster pip), also through a nested ME; an ME's SCREEN
+  now lists the key inputs of the higher MEs it can take too.
+- Unchanged: the packet format, the INDEX numbers, the re-entry INDEX 1000 + n (still sent, red
+  while that ME is visible), the green Preview. The export also sends when a key's fade or fly ends.
+- **For the platform's tally calculator:** everything visible through a nested ME is now red on the
+  outer ME's SCREEN directly; following the re-entry INDEXes is optional (same result). A
+  calculator that keeps per-ME attribution sees a nested ME's sources on the outer ME as well.
+- While Program is stopped the export lists the key inputs too, all off (a calculator keeping the
+  last state per INDEX gets them off).
+- T-bar: a hardware lever picks up where the lever is (also the position of a transition another
+  lever holds), within 2 % or by crossing it between two of its values; the source cap keeps the most recently used levers and never the one that holds
+  the ME's transition.
+
+### Fixed: small follow-ups
+
+- GUI: the PROGRAM title says why the Program is a mosaic tile instead of its own stream
+  (`streams_error`), and the box editor over such a tile allows for its 5 px inset (it was about
+  1 % off).
+- `POST /config/import` refuses a snapshot's DME crop that leaves no picture (it checked the
+  keyers only).
+- DME crops: back-and-forth format changes no longer drift by rounding (a crop not changed since
+  an earlier format change is scaled from its value then; within the session).
+- T-bar: the deadband's edges count (a lever 2 % from an end exactly is at that end); at most 64
+  hardware levers (`source`) per ME are kept for the pickup.
+
 ### Changed: the T-bar is a real lever (ping-pong), T-bar widget
 
 - GUI: the T-bar stays at the end a transition took it to; the next transition is made by moving

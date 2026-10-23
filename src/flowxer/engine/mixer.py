@@ -93,7 +93,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.tally import TallyService
 from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
-from flowxer.engine.visibility import KeyLayer, MeLayers, direct_visibility, visible_on_program
+from flowxer.engine.visibility import KeyLayer, MeLayers, direct_visibility, visible_keys_on_program, visible_on_program
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
@@ -244,6 +244,29 @@ def _legacy_crop(crop: Any) -> bool:
     )
 
 
+def crop_paths(node: Any, path: tuple = ()) -> list[tuple[tuple, dict]]:
+    """Every crop (a dict under the key "crop") in a document, with its path."""
+    found: list[tuple[tuple, dict]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "crop" and isinstance(value, dict):
+                found.append((path + (key,), value))
+            else:
+                found += crop_paths(value, path + (key,))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found += crop_paths(item, path + (index,))
+    return found
+
+
+def _scaled_crop(crop: dict, raster: tuple[int, int], to: tuple[int, int]) -> dict:
+    """A crop in pixels of `raster` in pixels of `to` (whole pixels)."""
+    return {
+        side: round((crop.get(side) or 0) * (to[0] / raster[0] if side in ("left", "right") else to[1] / raster[1]))
+        for side in _CROP_SIDES
+    }
+
+
 def scale_crops(data: Any, sx: float, sy: float, *, legacy_only: bool | None) -> int:
     """Every crop in a document (keyers, keyframes, snapshots: any dict under the key "crop") times
     sx (left, right) and sy (top, bottom), rounded to whole pixels. `legacy_only` True: only crops
@@ -315,6 +338,10 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
 
 # The T-bar lever starts nothing within this much of the end it rests at (end-of-travel hysteresis).
 TBAR_DEADBAND = 0.02
+# The deadband's edges count (1 − 0.98 is 0.020000000000000018 in floats).
+_EPS = 1e-9
+# Hardware levers (`source`) kept per ME for the pickup.
+TBAR_SOURCES = 64
 
 # A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
 TALLY_END_MARGIN_S = 0.05
@@ -396,7 +423,14 @@ class VisionMixer:
         # (ME, source) of hardware levers (without from_end) that came to the resting end since it
         # last changed, the engine started or a state was loaded: the others are ignored until they
         # do (pickup). Empty at start: every hardware lever picks up first.
-        self._lever_picked: set[tuple[str, str]] = set()
+        self._lever_picked: dict[tuple[str, str], None] = {}  # least recently used first
+        # Per ME the hardware lever (source) that holds its transition.
+        self._lever_driver: dict[str, str] = {}
+        # The last value of each hardware lever waiting for its pickup (least recently first).
+        self._lever_last: dict[tuple[str, str], float] = {}
+        # Each crop's value before the format changes of this session (path -> (raster, crop)),
+        # so back-and-forth changes scale from it and do not drift (_scale_crops).
+        self._crop_base: dict[tuple, tuple[tuple[int, int], dict]] = {}
         self._held_ties: dict[str, list[str]] = {}
         # Stinger player -> the stinger it holds (its mezzanine), and the monotonic time until which
         # it plays one; the last stinger taken (for the status).
@@ -676,15 +710,30 @@ class VisionMixer:
         return self.workspace
 
     def _scale_crops(self, sx: float, sy: float) -> None:
-        """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change)."""
+        """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change). A crop
+        that has not been changed since an earlier format change is scaled from the value it had
+        then (its base), so going back and forth between formats does not drift by rounding."""
+        old = (self.settings.width, self.settings.height)
+        new = (round(old[0] * sx), round(old[1] * sy))
+        doc = {
+            "keyers": {keyer.id: {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]} for keyer in self.keyers},
+            "snapshots": self.snapshots.model_dump(),
+        }
+        bases: dict[tuple, tuple[tuple[int, int], dict]] = {}
+        for path, crop in crop_paths(doc):
+            base = self._crop_base.get(path)
+            if base is not None and _scaled_crop(base[1], base[0], old) == {side: crop.get(side) for side in _CROP_SIDES}:
+                raster, value = base
+            else:
+                raster, value = old, {side: crop.get(side, 0) for side in _CROP_SIDES}
+            crop.update(_scaled_crop(value, raster, new))
+            bases[path] = (raster, value)
+        self._crop_base = bases
         for keyer in self.keyers:
-            dump = {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]}
-            if scale_crops(dump, sx, sy, legacy_only=None):
-                keyer.dme = Dme.model_validate(dump["dme"])
-                keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in dump["keyframes"]]
-        snapshots = self.snapshots.model_dump()
-        if scale_crops(snapshots, sx, sy, legacy_only=None):
-            self.snapshots = type(self.snapshots).model_validate(snapshots)
+            entry = doc["keyers"][keyer.id]
+            keyer.dme = Dme.model_validate(entry["dme"])
+            keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in entry["keyframes"]]
+        self.snapshots = type(self.snapshots).model_validate(doc["snapshots"])
 
     @property
     def render_count(self) -> int:
@@ -2295,29 +2344,70 @@ class VisionMixer:
                 log.debug("T-bar of %s: lever from %s ignored (rests at %s)", panel.id, from_end, panel.tbar_end)
                 return self.status(), "stale_from"
         elif (panel.id, source) not in self._lever_picked:
-            if abs(lever - rest) > TBAR_DEADBAND:
-                log.debug("T-bar of %s: lever %.3f of %r ignored until it is at the %s", panel.id, lever, source, panel.tbar_end)
+            # Pickup: where the lever is now (the resting end, or a transition another lever holds),
+            # so taking over never makes the transition jump.
+            held_at = self._positions[panel.id][0] if held else 0.0
+            current = held_at if panel.tbar_end == "top" else 1.0 - held_at
+            last = self._lever_last.get((panel.id, source))
+            self._remember_lever(panel.id, source, lever)
+            # Within the window, or crossed it since this lever's last value (a quick move steps
+            # over the window).
+            crossed = last is not None and (last - current) * (lever - current) <= 0
+            if abs(lever - current) > TBAR_DEADBAND + _EPS and not crossed:
+                log.debug("T-bar of %s: lever %.3f of %r ignored until it is at %.3f", panel.id, lever, source, current)
                 return self.status(), "pickup"
-            self._lever_picked.add((panel.id, source))
+            self._pick_lever(panel.id, source)
+        else:
+            # Recently used: the last to go when the cap is reached.
+            self._pick_lever(panel.id, source)
         position = lever if panel.tbar_end == "top" else 1.0 - lever
         if held:
-            if position < TBAR_DEADBAND:
+            if position <= TBAR_DEADBAND + _EPS:
                 position = 0.0
-            elif position > 1.0 - TBAR_DEADBAND:
+            elif position >= 1.0 - TBAR_DEADBAND - _EPS:
                 position = 1.0
-        elif position < TBAR_DEADBAND:
+        elif position <= TBAR_DEADBAND + _EPS:
             return self.status(), None
         end = panel.tbar_end
+        before = self._positions[panel.id][0] if held else 0.0
         status = self.set_position(panel.id, position)
-        if from_end is None and panel.tbar_end != end and abs(lever - (0.0 if panel.tbar_end == "top" else 1.0)) <= TBAR_DEADBAND:
+        if panel.id in self._positions and from_end is None and abs(position - before) > _EPS:
+            self._lever_driver[panel.id] = source  # this hardware lever moved the held transition
+        elif panel.id not in self._positions:
+            self._lever_driver.pop(panel.id, None)
+        if from_end is None and panel.tbar_end != end and abs(lever - (0.0 if panel.tbar_end == "top" else 1.0)) <= TBAR_DEADBAND + _EPS:
             # The hardware lever completed it itself: it is at the new resting end already.
-            self._lever_picked.add((panel.id, source))
+            self._pick_lever(panel.id, source)
         return status, None
+
+    def _remember_lever(self, panel_id: str, source: str, lever: float) -> None:
+        """The last value of a hardware lever that has not picked up (for the crossing), at most
+        TBAR_SOURCES per ME (the oldest goes)."""
+        key = (panel_id, source)
+        self._lever_last.pop(key, None)
+        mine = [item for item in self._lever_last if item[0] == panel_id]
+        if len(mine) >= TBAR_SOURCES:
+            del self._lever_last[mine[0]]
+        self._lever_last[key] = lever
+
+    def _pick_lever(self, panel_id: str, source: str) -> None:
+        """A hardware lever came to the resting end, or sent a value that counted (most recent
+        last). At most TBAR_SOURCES per ME are kept: the least recently used one goes (it picks up
+        again), never the one that holds the ME's transition."""
+        mine = [item for item in self._lever_picked if item[0] == panel_id]
+        if (panel_id, source) not in self._lever_picked and len(mine) >= TBAR_SOURCES:
+            driver = (panel_id, self._lever_driver.get(panel_id)) if panel_id in self._positions else None
+            victim = next((item for item in mine if item != driver), None)
+            if victim is not None:
+                del self._lever_picked[victim]
+        self._lever_picked.pop((panel_id, source), None)
+        self._lever_picked[(panel_id, source)] = None
 
     def _arm_lever_pickup(self, panel_id: str | None = None) -> None:
         """Hardware levers (without from_end) must come to the resting end before they count:
         for one ME (its end changed) or every ME (start, engine restart, a loaded state)."""
-        self._lever_picked = {item for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
+        self._lever_picked = {item: None for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
+        self._lever_last = {item: value for item, value in self._lever_last.items() if panel_id is not None and item[0] != panel_id}
 
     def tbar_state(self) -> dict[str, dict[str, Any]]:
         """Per ME the T-bar: the end the lever rests at, the progress of a transition it holds
@@ -2401,7 +2491,7 @@ class VisionMixer:
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
-            self._tally_again_at(self._mixes[panel.id][2])
+            self._tally_again_at(self._mixes[panel.id][2], export=False)
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2810,10 +2900,12 @@ class VisionMixer:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
 
-    def _tally_again_at(self, at: float | None) -> None:
-        """The receivers' tally once more when a mix or a key's fade or fly ends (monotonic `at`):
-        what is visible changes then without an operator action."""
-        if at is None or not self.tally.receivers:
+    def _tally_again_at(self, at: float | None, *, export: bool = True) -> None:
+        """The tally once more when a mix or a key's fade or fly ends (monotonic `at`): what is
+        visible changes then without an operator action. `export`: the raw tally export too (it
+        sends at a mix's end by itself)."""
+        export = export and self.tally_export is not None
+        if at is None or not (self.tally.receivers or export):
             return
         timer: threading.Timer
 
@@ -2822,7 +2914,7 @@ class VisionMixer:
                 if timer not in self._tally_timers:
                     return  # cancelled meanwhile
                 self._tally_timers.discard(timer)
-            self._publish_tally_quietly()
+            self._publish_tally_quietly(export=export)
 
         timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, fire)
         timer.daemon = True
@@ -2837,9 +2929,12 @@ class VisionMixer:
         for timer in timers:
             timer.cancel()
 
-    def _publish_tally_quietly(self) -> None:
+    def _publish_tally_quietly(self, *, export: bool = True) -> None:
         try:
-            self._publish_tally()
+            if export:
+                self._publish_tally()
+            else:
+                self.tally.publish(self)
         except Exception:  # a timer thread must not die loudly
             log.exception("tally publish after a mix or a key fade failed")
 
@@ -2849,28 +2944,38 @@ class VisionMixer:
             self.tally_export.changed()
 
     def _tally_snapshot(self) -> TallySnapshot:
-        """Program, Preview and the running mix of each ME, and the re-entry sources each ME can
-        take (lamps off while Program is stopped). Called by the export thread."""
+        """Per ME what is visible on its Program through any path (engine/visibility.py, as for the
+        receivers and the console), its Preview, its running mix (when to send again), the
+        re-entry sources it can take, and the linear key inputs of it and of the higher MEs it
+        can take, red while visible on its Program (lamps off while Program is stopped). Called by
+        the export thread."""
         running = self.state == MixerState.running
+        keyers = self.keyer_views()
+        mes_layers = self._me_layers(keyers) if running else {}
         mes = []
         for panel in list(self.panels):
-            reentry = tuple(
-                (other.id, other.label, REENTRY_INDEX + self._panel_number(other))
-                for other in self.reentry_sources(panel)
-            )
+            reachable = self.reentry_sources(panel)
+            reentry = tuple((other.id, other.label, REENTRY_INDEX + self._panel_number(other)) for other in reachable)
+            # The key inputs of this ME and of every ME it can show (nested ones on the outer screen too).
+            panel_ids = [panel.id, *(other.id for other in reachable)]
+            linear = [k for k in self.keyers if k.panel_id in panel_ids and k.mode == KeyMode.linear]
             if not running:
-                mes.append(MeTally(reentry=reentry))
+                # Every lamp off, the key inputs' too (a calculator keeping the last state per
+                # INDEX gets them off).
+                mes.append(MeTally(reentry=reentry, keys=tuple(self._key_tally(k, False) for k in linear)))
                 continue
-            transition = self._mixes.get(panel.id)
-            keyers = [keyer for keyer in self.keyers if keyer.panel_id == panel.id]
-            # A keyer is on air while it is on, fading off or flying off, or tied to a transition the
-            # T-bar holds.
-            now = time.monotonic()
-            held = self._held_ties.get(panel.id, [])
-            air = {k.id: k.enabled or now < self._key_until.get(k.id, 0.0) or k.id in held for k in keyers}
-            keyed = tuple(k.source_id for k in keyers if air[k.id] and k.mode in (KeyMode.luma, KeyMode.pip) and k.source_id)
-            keys = tuple(self._key_tally(keyer, air[keyer.id]) for keyer in keyers if keyer.mode == KeyMode.linear)
-            mes.append(MeTally(panel.program_input_id, panel.preview_input_id, transition, reentry, keyed, keys))
+            visible = visible_on_program(panel.id, mes_layers)
+            visible_keys = set(visible_keys_on_program(panel.id, mes_layers))
+            mes.append(
+                MeTally(
+                    panel.program_input_id,
+                    panel.preview_input_id,
+                    self._mixes.get(panel.id),
+                    reentry,
+                    tuple(self._key_tally(k, k.id in visible_keys) for k in linear),
+                    tuple(visible),
+                )
+            )
         return TallySnapshot(
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
@@ -2906,6 +3011,7 @@ class VisionMixer:
                         leaving=leaving,
                         gain=keyer.gain,
                         dme=keyer.dme if boxed else None,
+                        key_id=keyer.id,
                     )
                 )
             out[panel.id] = MeLayers(tuple(background), tuple(layers), self.settings.width, self.settings.height)
@@ -3482,6 +3588,11 @@ class VisionMixer:
                 # A restore keeps the rest of the state: a crop the raster cannot take goes.
                 for fixed in repair_crops(data, fmt.width, fmt.height):
                     log.warning("the saved state's DME %s leaves no picture on %s: no crop there", fixed, fmt.id)
+            else:
+                # An import refuses one, the snapshots' too (repair_crops on a copy finds them).
+                bad = repair_crops(copy.deepcopy(data), fmt.width, fmt.height)
+                if bad:
+                    raise ValueError(f"DME {bad[0]}: the crop must leave a picture on {fmt.id}")
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
             keyers = [Keyer(**item) for item in data.get("keyers") or []]

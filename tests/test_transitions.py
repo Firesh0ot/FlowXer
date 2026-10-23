@@ -145,7 +145,10 @@ def test_a_wipe_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
     mixer.auto("me-1")
     assert lit(mixer) == ({"cam-1", "cam-2"}, {"cam-1"})
     # 30 frames at 50 fps.
-    assert lit(mixer, now=time.monotonic() + 0.7) == ({"cam-2"}, {"cam-1"})
+    # After its 30 frames at 50 fps (the mixer's own clock decides what is visible).
+    outgoing, incoming, _end = mixer._mixes["me-1"]
+    mixer._mixes["me-1"] = (outgoing, incoming, time.monotonic() - 0.01)
+    assert lit(mixer) == ({"cam-2"}, {"cam-1"})
     mixer.stop()
 
 
@@ -175,7 +178,8 @@ def test_the_t_bar(client: TestClient, mixer: VisionMixer) -> None:
     assert not any(path == "/me/1/take" for _method, path, _body in calls)
     assert mixer.program_input_id == "cam-2" and mixer.preview_input_id == "cam-1"
     assert mixer.panels[0].transition.wipe.reverse and mixer.last_transition == "wipe"
-    assert lit(mixer, now=time.monotonic() + 0.1) == ({"cam-2"}, {"cam-1"})
+    time.sleep(0.05)  # its last frame (the mixer's own clock decides what is visible)
+    assert lit(mixer) == ({"cam-2"}, {"cam-1"})
     # Back to 0 ends it without the swap.
     mixer.set_position("me-1", 0.4)
     mixer.set_position("me-1", 0.0)
@@ -186,7 +190,11 @@ def test_the_t_bar(client: TestClient, mixer: VisionMixer) -> None:
     mixer.auto("me-1")
     assert calls[-1][1] == "/me/1/transition" and calls[-2] == ("POST", "/me/1/auto", {"frames": 30})
     assert mixer.program_input_id == "cam-1" and mixer.preview_input_id == "cam-2"
-    assert lit(mixer)[0] == {"cam-1", "cam-2"} and lit(mixer, now=time.monotonic() + 0.35)[0] == {"cam-1"}
+    assert lit(mixer)[0] == {"cam-1", "cam-2"}
+    # Its rest (15 frames, 0.3 s) over (the mixer's own clock decides what is visible).
+    outgoing, incoming, _end = mixer._mixes["me-1"]
+    mixer._mixes["me-1"] = (outgoing, incoming, time.monotonic() - 0.01)
+    assert lit(mixer)[0] == {"cam-1"}
     # A Cut at a held position completes it (the engine ends it as if it had run to its end).
     mixer.set_position("me-1", 0.5)
     mixer.cut("me-1")
