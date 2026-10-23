@@ -5,6 +5,18 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Fixed: small follow-ups
+
+- GUI: the PROGRAM title says why the Program is a mosaic tile instead of its own stream
+  (`streams_error`), and the box editor over such a tile allows for its 5 px inset (it was about
+  1 % off).
+- `POST /config/import` refuses a snapshot's DME crop that leaves no picture (it checked the
+  keyers only).
+- DME crops: back-and-forth format changes no longer drift by rounding (a crop not changed since
+  an earlier format change is scaled from its value then; within the session).
+- T-bar: the deadband's edges count (a lever 2 % from an end exactly is at that end); at most 64
+  hardware levers (`source`) per ME are kept for the pickup.
+
 ### Changed: the T-bar is a real lever (ping-pong), T-bar widget
 
 - GUI: the T-bar stays at the end a transition took it to; the next transition is made by moving

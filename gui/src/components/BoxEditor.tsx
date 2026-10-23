@@ -14,6 +14,7 @@ export function BoxEditor({
   keyers,
   width,
   height,
+  view,
   onDone,
   onError,
 }: {
@@ -22,10 +23,16 @@ export function BoxEditor({
   /** The production raster. */
   width: number;
   height: number;
+  /** The part of the raster the picture under the editor shows (raster pixels; a mosaic tile is
+   * shown a little inside its edges, preview.ts rasterView). Default: all of it. */
+  view?: { left: number; top: number; right: number; bottom: number };
   /** After a drag: refresh the console. */
   onDone: () => void;
   onError: (message: string) => void;
 }) {
+  const v = view ?? { left: 0, top: 0, right: width, bottom: height };
+  const vw = v.right - v.left;
+  const vh = v.bottom - v.top;
   const frame = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   // The box being dragged as the editor shows it (the console catches up after the drag).
@@ -64,10 +71,10 @@ export function BoxEditor({
 
   const move = (event: ReactPointerEvent) => {
     if (!drag) return;
-    const sx = width / drag.frame.width;
-    const sy = height / drag.frame.height;
+    const sx = vw / drag.frame.width;
+    const sy = vh / drag.frame.height;
     const change = drag.corner
-      ? boxResized(drag.start, drag.corner, (event.clientX - drag.frame.left) * sx, (event.clientY - drag.frame.top) * sy, width, height)
+      ? boxResized(drag.start, drag.corner, v.left + (event.clientX - drag.frame.left) * sx, v.top + (event.clientY - drag.frame.top) * sy, width, height)
       : boxMoved(drag.start, (event.clientX - drag.startX) * sx, (event.clientY - drag.startY) * sy, width, height);
     setShown({ id: drag.id, dme: { ...drag.start, ...change } });
     send(drag.id, change);
@@ -92,16 +99,16 @@ export function BoxEditor({
     <div
       className="box-frame"
       ref={frame}
-      style={{ aspectRatio: `${width} / ${height}`, width: `min(100cqw, calc(100cqh * ${width} / ${height}))` }}
+      style={{ aspectRatio: `${vw} / ${vh}`, width: `min(100cqw, calc(100cqh * ${vw} / ${vh}))` }}
     >
       {keyers.map((keyer) => {
         const dme = shown?.id === keyer.id ? shown.dme : keyer.dme;
         const r = boxRect(dme, width, height);
         const style = {
-          left: `${(100 * r.left) / width}%`,
-          top: `${(100 * r.top) / height}%`,
-          width: `${(100 * (r.right - r.left)) / width}%`,
-          height: `${(100 * (r.bottom - r.top)) / height}%`,
+          left: `${(100 * (r.left - v.left)) / vw}%`,
+          top: `${(100 * (r.top - v.top)) / vh}%`,
+          width: `${(100 * (r.right - r.left)) / vw}%`,
+          height: `${(100 * (r.bottom - r.top)) / vh}%`,
         };
         return (
           <div

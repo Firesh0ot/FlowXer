@@ -216,3 +216,26 @@ def test_ignored_lever_values_say_why(client: TestClient, mixer: VisionMixer) ->
     assert response.json()["status"] == "ignored" and response.json()["reason"] == "stale_from"
     response = client.post("/api/v1/mixer/position", json={"panel_id": "me-1", "lever": 0.5, "from": "top"})
     assert response.json()["status"] == "position" and response.json()["reason"] is None
+
+
+def test_the_snap_edges_are_inclusive(mixer: VisionMixer) -> None:
+    _start(mixer)
+    assert mixer.set_lever("me-1", 0.02, "top")[1] is None and mixer.tbar_state()["me-1"]["position"] == 0.0  # 2 %: nothing starts
+    mixer.set_lever("me-1", 0.5, "top")
+    mixer.set_lever("me-1", 0.98, "top")  # exactly 2 % from the end: complete
+    assert _bus(mixer) == ("cam-2", "cam-1")
+    mixer.set_lever("me-1", 0.5, "bottom")
+    mixer.set_lever("me-1", 0.98, "bottom")  # exactly 2 % from the start: back
+    assert mixer.tbar_state()["me-1"]["position"] == 0.0 and _bus(mixer) == ("cam-2", "cam-1")
+
+
+def test_at_most_64_hardware_levers_per_me_are_kept(mixer: VisionMixer) -> None:
+    from flowxer.engine.mixer import TBAR_SOURCES
+
+    _start(mixer)
+    for n in range(TBAR_SOURCES + 10):
+        mixer.set_lever("me-1", 0.0, source=f"panel-{n}")
+    assert len([item for item in mixer._lever_picked if item[0] == "me-1"]) == TBAR_SOURCES
+    # The oldest went (it picks up again); the newest are kept.
+    assert mixer.set_lever("me-1", 0.5, source="panel-0")[1] == "pickup"
+    assert mixer.set_lever("me-1", 0.5, source=f"panel-{TBAR_SOURCES + 9}")[1] is None

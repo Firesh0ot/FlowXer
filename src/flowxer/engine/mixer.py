@@ -244,6 +244,29 @@ def _legacy_crop(crop: Any) -> bool:
     )
 
 
+def crop_paths(node: Any, path: tuple = ()) -> list[tuple[tuple, dict]]:
+    """Every crop (a dict under the key "crop") in a document, with its path."""
+    found: list[tuple[tuple, dict]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "crop" and isinstance(value, dict):
+                found.append((path + (key,), value))
+            else:
+                found += crop_paths(value, path + (key,))
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            found += crop_paths(item, path + (index,))
+    return found
+
+
+def _scaled_crop(crop: dict, raster: tuple[int, int], to: tuple[int, int]) -> dict:
+    """A crop in pixels of `raster` in pixels of `to` (whole pixels)."""
+    return {
+        side: round((crop.get(side) or 0) * (to[0] / raster[0] if side in ("left", "right") else to[1] / raster[1]))
+        for side in _CROP_SIDES
+    }
+
+
 def scale_crops(data: Any, sx: float, sy: float, *, legacy_only: bool | None) -> int:
     """Every crop in a document (keyers, keyframes, snapshots: any dict under the key "crop") times
     sx (left, right) and sy (top, bottom), rounded to whole pixels. `legacy_only` True: only crops
@@ -315,6 +338,10 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
 
 # The T-bar lever starts nothing within this much of the end it rests at (end-of-travel hysteresis).
 TBAR_DEADBAND = 0.02
+# The deadband's edges count (1 − 0.98 is 0.020000000000000018 in floats).
+_EPS = 1e-9
+# Hardware levers (`source`) kept per ME for the pickup.
+TBAR_SOURCES = 64
 
 # A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
 TALLY_END_MARGIN_S = 0.05
@@ -396,7 +423,10 @@ class VisionMixer:
         # (ME, source) of hardware levers (without from_end) that came to the resting end since it
         # last changed, the engine started or a state was loaded: the others are ignored until they
         # do (pickup). Empty at start: every hardware lever picks up first.
-        self._lever_picked: set[tuple[str, str]] = set()
+        self._lever_picked: dict[tuple[str, str], None] = {}  # insertion-ordered (oldest first)
+        # Each crop's value before the format changes of this session (path -> (raster, crop)),
+        # so back-and-forth changes scale from it and do not drift (_scale_crops).
+        self._crop_base: dict[tuple, tuple[tuple[int, int], dict]] = {}
         self._held_ties: dict[str, list[str]] = {}
         # Stinger player -> the stinger it holds (its mezzanine), and the monotonic time until which
         # it plays one; the last stinger taken (for the status).
@@ -676,15 +706,30 @@ class VisionMixer:
         return self.workspace
 
     def _scale_crops(self, sx: float, sy: float) -> None:
-        """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change)."""
+        """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change). A crop
+        that has not been changed since an earlier format change is scaled from the value it had
+        then (its base), so going back and forth between formats does not drift by rounding."""
+        old = (self.settings.width, self.settings.height)
+        new = (round(old[0] * sx), round(old[1] * sy))
+        doc = {
+            "keyers": {keyer.id: {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]} for keyer in self.keyers},
+            "snapshots": self.snapshots.model_dump(),
+        }
+        bases: dict[tuple, tuple[tuple[int, int], dict]] = {}
+        for path, crop in crop_paths(doc):
+            base = self._crop_base.get(path)
+            if base is not None and _scaled_crop(base[1], base[0], old) == {side: crop.get(side) for side in _CROP_SIDES}:
+                raster, value = base
+            else:
+                raster, value = old, {side: crop.get(side, 0) for side in _CROP_SIDES}
+            crop.update(_scaled_crop(value, raster, new))
+            bases[path] = (raster, value)
+        self._crop_base = bases
         for keyer in self.keyers:
-            dump = {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]}
-            if scale_crops(dump, sx, sy, legacy_only=None):
-                keyer.dme = Dme.model_validate(dump["dme"])
-                keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in dump["keyframes"]]
-        snapshots = self.snapshots.model_dump()
-        if scale_crops(snapshots, sx, sy, legacy_only=None):
-            self.snapshots = type(self.snapshots).model_validate(snapshots)
+            entry = doc["keyers"][keyer.id]
+            keyer.dme = Dme.model_validate(entry["dme"])
+            keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in entry["keyframes"]]
+        self.snapshots = type(self.snapshots).model_validate(doc["snapshots"])
 
     @property
     def render_count(self) -> int:
@@ -2295,29 +2340,38 @@ class VisionMixer:
                 log.debug("T-bar of %s: lever from %s ignored (rests at %s)", panel.id, from_end, panel.tbar_end)
                 return self.status(), "stale_from"
         elif (panel.id, source) not in self._lever_picked:
-            if abs(lever - rest) > TBAR_DEADBAND:
+            if abs(lever - rest) > TBAR_DEADBAND + _EPS:
                 log.debug("T-bar of %s: lever %.3f of %r ignored until it is at the %s", panel.id, lever, source, panel.tbar_end)
                 return self.status(), "pickup"
-            self._lever_picked.add((panel.id, source))
+            self._pick_lever(panel.id, source)
         position = lever if panel.tbar_end == "top" else 1.0 - lever
         if held:
-            if position < TBAR_DEADBAND:
+            if position <= TBAR_DEADBAND + _EPS:
                 position = 0.0
-            elif position > 1.0 - TBAR_DEADBAND:
+            elif position >= 1.0 - TBAR_DEADBAND - _EPS:
                 position = 1.0
-        elif position < TBAR_DEADBAND:
+        elif position <= TBAR_DEADBAND + _EPS:
             return self.status(), None
         end = panel.tbar_end
         status = self.set_position(panel.id, position)
-        if from_end is None and panel.tbar_end != end and abs(lever - (0.0 if panel.tbar_end == "top" else 1.0)) <= TBAR_DEADBAND:
+        if from_end is None and panel.tbar_end != end and abs(lever - (0.0 if panel.tbar_end == "top" else 1.0)) <= TBAR_DEADBAND + _EPS:
             # The hardware lever completed it itself: it is at the new resting end already.
-            self._lever_picked.add((panel.id, source))
+            self._pick_lever(panel.id, source)
         return status, None
+
+    def _pick_lever(self, panel_id: str, source: str) -> None:
+        """A hardware lever came to the resting end. At most TBAR_SOURCES per ME are kept (the
+        oldest one goes: it picks up again)."""
+        mine = [item for item in self._lever_picked if item[0] == panel_id]
+        if (panel_id, source) not in self._lever_picked and len(mine) >= TBAR_SOURCES:
+            del self._lever_picked[mine[0]]
+        self._lever_picked.pop((panel_id, source), None)
+        self._lever_picked[(panel_id, source)] = None
 
     def _arm_lever_pickup(self, panel_id: str | None = None) -> None:
         """Hardware levers (without from_end) must come to the resting end before they count:
         for one ME (its end changed) or every ME (start, engine restart, a loaded state)."""
-        self._lever_picked = {item for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
+        self._lever_picked = {item: None for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
 
     def tbar_state(self) -> dict[str, dict[str, Any]]:
         """Per ME the T-bar: the end the lever rests at, the progress of a transition it holds
@@ -3482,6 +3536,11 @@ class VisionMixer:
                 # A restore keeps the rest of the state: a crop the raster cannot take goes.
                 for fixed in repair_crops(data, fmt.width, fmt.height):
                     log.warning("the saved state's DME %s leaves no picture on %s: no crop there", fixed, fmt.id)
+            else:
+                # An import refuses one, the snapshots' too (repair_crops on a copy finds them).
+                bad = repair_crops(copy.deepcopy(data), fmt.width, fmt.height)
+                if bad:
+                    raise ValueError(f"DME {bad[0]}: the crop must leave a picture on {fmt.id}")
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
             keyers = [Keyer(**item) for item in data.get("keyers") or []]

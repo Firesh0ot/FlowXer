@@ -6,7 +6,7 @@ import { BoxEditor } from "./components/BoxEditor";
 import { Monitor } from "./components/Monitor";
 import { KeyerControl } from "./components/KeyerControl";
 import { MeTile } from "./components/MeTile";
-import { previewSession } from "./preview";
+import { previewSession, rasterView } from "./preview";
 import { SettingsModal } from "./components/SettingsModal";
 import { SnapshotPanel } from "./components/SnapshotPanel";
 import { SourceSettingsModal } from "./components/SourceSettingsModal";
@@ -243,7 +243,14 @@ export default function App() {
             />
           </div>
           <div className="bus-column">
-            <h2>Program</h2>
+            <h2>
+              Program
+              {snapshot.preview.streams_error ? (
+                <span className="streams-error" title={`The Program streams are off: ${snapshot.preview.streams_error}`}>
+                  from the mosaic: {snapshot.preview.streams_error}
+                </span>
+              ) : null}
+            </h2>
             <Monitor
               tileId={`panel:${panel.id}:pgm`}
               label={panel.program_input_id ?? "NO SRC"}
@@ -255,6 +262,7 @@ export default function App() {
                   keyers={boxes}
                   width={format.width}
                   height={format.height}
+                  view={rasterView(snapshot.preview, `panel:${panel.id}:pgm`, format.width, format.height)}
                   onDone={() => void refresh()}
                   onError={setError}
                 />
