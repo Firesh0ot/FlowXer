@@ -426,6 +426,8 @@ class VisionMixer:
         self._lever_picked: dict[tuple[str, str], None] = {}  # least recently used first
         # Per ME the hardware lever (source) that holds its transition.
         self._lever_driver: dict[str, str] = {}
+        # The last value of each hardware lever waiting for its pickup (least recently first).
+        self._lever_last: dict[tuple[str, str], float] = {}
         # Each crop's value before the format changes of this session (path -> (raster, crop)),
         # so back-and-forth changes scale from it and do not drift (_scale_crops).
         self._crop_base: dict[tuple, tuple[tuple[int, int], dict]] = {}
@@ -2346,7 +2348,12 @@ class VisionMixer:
             # so taking over never makes the transition jump.
             held_at = self._positions[panel.id][0] if held else 0.0
             current = held_at if panel.tbar_end == "top" else 1.0 - held_at
-            if abs(lever - current) > TBAR_DEADBAND + _EPS:
+            last = self._lever_last.get((panel.id, source))
+            self._remember_lever(panel.id, source, lever)
+            # Within the window, or crossed it since this lever's last value (a quick move steps
+            # over the window).
+            crossed = last is not None and (last - current) * (lever - current) <= 0
+            if abs(lever - current) > TBAR_DEADBAND + _EPS and not crossed:
                 log.debug("T-bar of %s: lever %.3f of %r ignored until it is at %.3f", panel.id, lever, source, current)
                 return self.status(), "pickup"
             self._pick_lever(panel.id, source)
@@ -2373,6 +2380,16 @@ class VisionMixer:
             self._pick_lever(panel.id, source)
         return status, None
 
+    def _remember_lever(self, panel_id: str, source: str, lever: float) -> None:
+        """The last value of a hardware lever that has not picked up (for the crossing), at most
+        TBAR_SOURCES per ME (the oldest goes)."""
+        key = (panel_id, source)
+        self._lever_last.pop(key, None)
+        mine = [item for item in self._lever_last if item[0] == panel_id]
+        if len(mine) >= TBAR_SOURCES:
+            del self._lever_last[mine[0]]
+        self._lever_last[key] = lever
+
     def _pick_lever(self, panel_id: str, source: str) -> None:
         """A hardware lever came to the resting end, or sent a value that counted (most recent
         last). At most TBAR_SOURCES per ME are kept: the least recently used one goes (it picks up
@@ -2390,6 +2407,7 @@ class VisionMixer:
         """Hardware levers (without from_end) must come to the resting end before they count:
         for one ME (its end changed) or every ME (start, engine restart, a loaded state)."""
         self._lever_picked = {item: None for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
+        self._lever_last = {item: value for item, value in self._lever_last.items() if panel_id is not None and item[0] != panel_id}
 
     def tbar_state(self) -> dict[str, dict[str, Any]]:
         """Per ME the T-bar: the end the lever rests at, the progress of a transition it holds
@@ -2942,7 +2960,9 @@ class VisionMixer:
             panel_ids = [panel.id, *(other.id for other in reachable)]
             linear = [k for k in self.keyers if k.panel_id in panel_ids and k.mode == KeyMode.linear]
             if not running:
-                mes.append(MeTally(reentry=reentry))
+                # Every lamp off, the key inputs' too (a calculator keeping the last state per
+                # INDEX gets them off).
+                mes.append(MeTally(reentry=reentry, keys=tuple(self._key_tally(k, False) for k in linear)))
                 continue
             visible = visible_on_program(panel.id, mes_layers)
             visible_keys = set(visible_keys_on_program(panel.id, mes_layers))

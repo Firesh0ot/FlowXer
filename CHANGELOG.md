@@ -20,8 +20,10 @@ in `docs/platform-integration-plan.md` §8.
 - **For the platform's tally calculator:** everything visible through a nested ME is now red on the
   outer ME's SCREEN directly; following the re-entry INDEXes is optional (same result). A
   calculator that keeps per-ME attribution sees a nested ME's sources on the outer ME as well.
+- While Program is stopped the export lists the key inputs too, all off (a calculator keeping the
+  last state per INDEX gets them off).
 - T-bar: a hardware lever picks up where the lever is (also the position of a transition another
-  lever holds); the source cap keeps the most recently used levers and never the one that holds
+  lever holds), within 2 % or by crossing it between two of its values; the source cap keeps the most recently used levers and never the one that holds
   the ME's transition.
 
 ### Fixed: small follow-ups

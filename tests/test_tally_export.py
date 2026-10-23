@@ -173,7 +173,7 @@ def test_indexes_stay_when_an_input_is_removed(mixer: VisionMixer) -> None:
     assert indexes["clip-2"] == 8
     messages = me_messages(snapshot, snapshot.mes[0], indexes, time.monotonic())
     # Slot order (live, clip players, Black); the numbers stay with their inputs.
-    assert [message.index for message in messages] == [0, 1, 3, 4, 5, 6, 8, 7]
+    assert [message.index for message in messages][:8] == [0, 1, 3, 4, 5, 6, 8, 7]
 
 
 # Encoder: byte vectors from the platform's reference codec (mxl-poc-platform, tally
@@ -278,7 +278,13 @@ def test_export_over_udp(settings: Settings, monkeypatch: pytest.MonkeyPatch) ->
     try:
         # Every ME, every input (designer order) and the re-entry of the higher MEs, all off before
         # Program starts.
-        for screen, extra in ((1, [(1002, "ME 2", TALLY_OFF, TALLY_OFF)]), (2, [])):
+        # (Then the linear key inputs of the ME and of the higher MEs it can take, off as well.)
+        keys1 = [(2101, "ME 1 Key 1"), (2102, "ME 1 Key 2"), (3101, "DSK 1 Key"), (2201, "ME 2 Key 1"), (2202, "ME 2 Key 2"), (3201, "ME 2 DSK 1 Key")]
+        keys2 = keys1[3:]
+        for screen, extra in (
+            (1, [(1002, "ME 2", TALLY_OFF, TALLY_OFF)] + [(i, t, TALLY_OFF, TALLY_OFF) for i, t in keys1]),
+            (2, [(i, t, TALLY_OFF, TALLY_OFF) for i, t in keys2]),
+        ):
             _, decoded = _receive(receiver, screen)
             assert decoded["flags"] == FLAG_UTF16
             assert [(item["index"], item["text"], item["lh"], item["rh"]) for item in decoded["messages"]] == [
@@ -459,3 +465,14 @@ def test_linear_key_inputs_follow_the_same_rule(mixer: VisionMixer) -> None:
     mixer.update_keyer("me-1-key-2", enabled=False)
     mixer.update_keyer("me-1-key-1", gain=0.0)
     assert "2101" not in lit(mixer, 1)[0]
+
+
+def test_stopped_every_key_input_is_listed_off(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    mixer.update_keyer("dsk-1", enabled=True)
+    assert "3101" in lit(mixer)[0]
+    mixer.stop()
+    keys = mixer._tally_snapshot().mes[0].keys
+    # Listed (so a calculator keeping the last state per INDEX gets them off), and all off.
+    assert [index for index, _label, _on in keys] == [2101, 2102, 3101] and not any(on for _i, _l, on in keys)
+    assert lit(mixer) == (set(), set())
