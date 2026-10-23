@@ -313,6 +313,9 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
     return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
 
 
+# The T-bar lever starts nothing within this much of the end it rests at (end-of-travel hysteresis).
+TBAR_DEADBAND = 0.02
+
 # A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
 TALLY_END_MARGIN_S = 0.05
 
@@ -390,6 +393,10 @@ class VisionMixer:
         # Panel id -> (position, outgoing, incoming) of a transition the T-bar holds, and the keyers
         # tied to it (on air while it is held; they change state when it completes).
         self._positions: dict[str, tuple[float, str | None, str]] = {}
+        # (ME, source) of hardware levers (without from_end) that came to the resting end since it
+        # last changed, the engine started or a state was loaded: the others are ignored until they
+        # do (pickup). Empty at start: every hardware lever picks up first.
+        self._lever_picked: set[tuple[str, str]] = set()
         self._held_ties: dict[str, list[str]] = {}
         # Stinger player -> the stinger it holds (its mezzanine), and the monotonic time until which
         # it plays one; the last stinger taken (for the status).
@@ -1753,6 +1760,7 @@ class VisionMixer:
                 self._mixes.pop(panel_id, None)
             self._positions.clear()
             self._held_ties.clear()
+            self._arm_lever_pickup()
             for item in self.list_inputs():
                 if item.kind == InputKind.mxl_live:
                     self._push_route(item, client)
@@ -2153,6 +2161,13 @@ class VisionMixer:
         buses swap. A stinger plays the ME's stinger slot (or the slot by direction) over its own
         length."""
         panel = self._ensure_running_panel(panel_id)
+        status = self._auto(panel, frames)
+        # The virtual lever goes to its other end with the Auto (it runs there at the rate); only
+        # once the Auto has started (a failure raised above).
+        self._flip_tbar(panel)
+        return status
+
+    def _auto(self, panel: MixerPanel, frames: int | None) -> MixerStatus:
         held = self._positions.pop(panel.id, None)
         if held is not None:
             # From the held T-bar position: the engine runs the rest at the rate (with the keyers
@@ -2236,7 +2251,9 @@ class VisionMixer:
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/position", {"t": position})
         _position, outgoing, incoming = held
         if position >= 1:
-            del self._positions[panel.id]
+            # (Also straight from rest to the end: a whole transition in one move.)
+            self._positions.pop(panel.id, None)
+            self._flip_tbar(panel)
             swap = panel.preview_input_id == incoming
             self._end_held_ties(panel)
             self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
@@ -2249,6 +2266,76 @@ class VisionMixer:
             self._positions[panel.id] = (position, outgoing, incoming)
             self._publish_tally()
         return self.status()
+
+    def set_lever(
+        self, panel_id: str = "me-1", lever: float = 0.0, from_end: str | None = None, source: str = ""
+    ) -> tuple[MixerStatus, str | None]:
+        """The T-bar lever where it physically is (0 top .. 1 bottom): the transition's progress
+        counted from the end it rests at (panel.tbar_end), so the lever works both ways
+        (ping-pong). Within TBAR_DEADBAND of its resting end it starts nothing; while it holds a
+        transition, within TBAR_DEADBAND of either end it snaps there (back without the swap, or
+        complete). Returns the status and, when the value was ignored, why ("stale_from",
+        "pickup").
+
+        Another console's Auto or Cut, or the lever's own completion, moves the resting end:
+        - `from_end` (the end the client's drag began at; the GUI sends it): a value whose
+          from_end is not the resting end is ignored (it would take the shot back, or move a
+          transition someone else holds from the other end);
+        - without it (a hardware lever, told apart by `source`): the lever counts only once it has
+          come within TBAR_DEADBAND of the resting end (pickup), at start, after the engine
+          (re)starts, after a state is loaded and after each change of the end; until then it is
+          ignored, also while another console holds a transition.
+        With a stinger or BKGD off (an Auto from the lever, no scrubbing) the flip makes the lever
+        wait for the next drag (from_end) or for its pickup, so one move fires one Auto."""
+        panel = self._ensure_running_panel(panel_id)
+        held = panel.id in self._positions
+        rest = 0.0 if panel.tbar_end == "top" else 1.0
+        if from_end is not None:
+            if from_end != panel.tbar_end:
+                log.debug("T-bar of %s: lever from %s ignored (rests at %s)", panel.id, from_end, panel.tbar_end)
+                return self.status(), "stale_from"
+        elif (panel.id, source) not in self._lever_picked:
+            if abs(lever - rest) > TBAR_DEADBAND:
+                log.debug("T-bar of %s: lever %.3f of %r ignored until it is at the %s", panel.id, lever, source, panel.tbar_end)
+                return self.status(), "pickup"
+            self._lever_picked.add((panel.id, source))
+        position = lever if panel.tbar_end == "top" else 1.0 - lever
+        if held:
+            if position < TBAR_DEADBAND:
+                position = 0.0
+            elif position > 1.0 - TBAR_DEADBAND:
+                position = 1.0
+        elif position < TBAR_DEADBAND:
+            return self.status(), None
+        end = panel.tbar_end
+        status = self.set_position(panel.id, position)
+        if from_end is None and panel.tbar_end != end and abs(lever - (0.0 if panel.tbar_end == "top" else 1.0)) <= TBAR_DEADBAND:
+            # The hardware lever completed it itself: it is at the new resting end already.
+            self._lever_picked.add((panel.id, source))
+        return status, None
+
+    def _arm_lever_pickup(self, panel_id: str | None = None) -> None:
+        """Hardware levers (without from_end) must come to the resting end before they count:
+        for one ME (its end changed) or every ME (start, engine restart, a loaded state)."""
+        self._lever_picked = {item for item in self._lever_picked if panel_id is not None and item[0] != panel_id}
+
+    def tbar_state(self) -> dict[str, dict[str, Any]]:
+        """Per ME the T-bar: the end the lever rests at, the progress of a transition it holds
+        (0: none) and where the lever is (0 top .. 1 bottom)."""
+        out: dict[str, dict[str, Any]] = {}
+        for panel in list(self.panels):
+            held = self._positions.get(panel.id)
+            position = held[0] if held is not None else 0.0
+            lever = position if panel.tbar_end == "top" else 1.0 - position
+            out[panel.id] = {"end": panel.tbar_end, "position": position, "lever": lever}
+        return out
+
+    def _flip_tbar(self, panel: MixerPanel) -> None:
+        """A transition of the T-bar (or an Auto) completed: the lever rests at the other end. A
+        lever that does not say where its drag began (a hardware panel) must first come to that end
+        (pickup) before it counts again."""
+        panel.tbar_end = "bottom" if panel.tbar_end == "top" else "top"
+        self._arm_lever_pickup(panel.id)
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
         """Arm (or toggle) Wipe: the next Cut plays the stinger slot by direction (FlowXer 14's
@@ -2294,7 +2381,9 @@ class VisionMixer:
         wait = self._grains_until(at) / self.settings.fps
         held = self._positions.pop(panel.id, None)
         if held is not None:
-            # A held T-bar transition ends first, as if it had run to its end (as in the engine).
+            # A held T-bar transition ends first, as if it had run to its end (as in the engine);
+            # the lever counts it as done.
+            self._flip_tbar(panel)
             _position, _outgoing, incoming = held
             swap = panel.preview_input_id == incoming
             self._end_held_ties(panel)
@@ -3437,6 +3526,8 @@ class VisionMixer:
             self.settings.frame_rate_num = fmt.frame_rate_num
             self.settings.frame_rate_den = fmt.frame_rate_den
             self.workspace = workspace
+            # A loaded state may have the T-bar at another end: hardware levers pick up again.
+            self._arm_lever_pickup()
             self.inputs = {item.id: item for item in inputs}
             self.panels = panels
             self.keyers = keyers

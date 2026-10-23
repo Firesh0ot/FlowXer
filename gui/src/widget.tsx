@@ -8,7 +8,8 @@
 // /widget/snapshots[?me=<n>][&all=false][&theme=...] recall buttons for one ME's snapshots and
 // (unless all=false) those of all MEs; /widget/multiview[?me=<n>][&pvw=true][&theme=...] a wall of
 // the mixer's pictures over WebRTC (each ME's Program, the sources) with labels and the tally of
-// ME n (default 1). It runs on flowxer-gui's own
+// ME n (default 1); /widget/tbar[?me=<n>][&buttons=false][&theme=...] ME n's T-bar lever (it
+// stays at the end a transition took it to) with Cut and Auto. It runs on flowxer-gui's own
 // origin (its /api); only the origins in WIDGET_FRAME_ANCESTORS may frame it. It posts
 // {type: "widget-ready"} and {type: "widget-size", w, h} to the page that frames it.
 import React from "react";
@@ -19,6 +20,7 @@ import { DmeWidget } from "./components/DmeWidget";
 import { KeysWidget } from "./components/KeysWidget";
 import { MultiviewWidget } from "./components/MultiviewWidget";
 import { SnapshotsWidget } from "./components/SnapshotsWidget";
+import { TbarWidget } from "./components/TbarWidget";
 import "./widget.css";
 
 const params = new URLSearchParams(location.search);
@@ -40,6 +42,8 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <AudioWidget me={Number(params.get("me")) || 1} faders={params.get("faders") !== "false"} />
     ) : widget.endsWith("/snapshots") ? (
       <SnapshotsWidget me={Number(params.get("me")) || null} all={params.get("all") !== "false"} />
+    ) : widget.endsWith("/tbar") ? (
+      <TbarWidget me={Number(params.get("me")) || 1} buttons={params.get("buttons") !== "false"} />
     ) : widget.endsWith("/multiview") ? (
       <MultiviewWidget me={Number(params.get("me")) || 1} pvw={params.get("pvw") === "true"} />
     ) : widget.endsWith("/dme") ? (

@@ -108,8 +108,11 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio", "snapshots", "multiview"]
-    multiview = widgets[5]
+    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio", "snapshots", "tbar", "multiview"]
+    tbar = widgets[5]
+    assert tbar["params"]["required"] == [] and tbar["min_size"] == {"w": 120, "h": 240}
+    assert tbar["params"]["properties"]["buttons"]["default"] is True and tbar["params"]["properties"]["me"]["default"] == 1
+    multiview = widgets[6]
     assert multiview["params"]["required"] == [] and multiview["min_size"] == {"w": 480, "h": 270}
     assert multiview["params"]["properties"]["pvw"]["default"] is False and multiview["params"]["properties"]["me"]["default"] == 1
     snapshots = widgets[4]

@@ -241,6 +241,17 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "version": __version__,
         },
         {
+            "id": "tbar",
+            "title": "FlowXer T-bar",
+            "params": {
+                "type": "object",
+                "properties": {"me": {**me, "default": 1}, "buttons": {"type": "boolean", "default": True, "title": "Cut and Auto"}},
+                "required": [],
+            },
+            "min_size": {"w": 120, "h": 240},
+            "version": __version__,
+        },
+        {
             "id": "multiview",
             "title": "FlowXer multiview",
             "params": {
@@ -483,9 +494,14 @@ def mixer_auto(payload: AutoRequest | None = None, mixer: VisionMixer = Depends(
 )
 def mixer_position(payload: PositionRequest, mixer: VisionMixer = Depends(get_mixer)) -> MixerCommandResponse:
     try:
-        body = mixer.set_position(payload.panel_id, payload.position)
+        if payload.position is not None:
+            body, ignored = mixer.set_position(payload.panel_id, payload.position), None
+        else:
+            body, ignored = mixer.set_lever(payload.panel_id, payload.lever, payload.from_end, payload.source)
     except MixerError as exc:
         raise _http(exc)
+    if ignored:
+        return MixerCommandResponse(status="ignored", reason=ignored, mixer=body)
     return MixerCommandResponse(status="position", mixer=body)
 
 
@@ -649,6 +665,7 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         panels=mixer.panels,
         keyers=keyers,
         on_air=mixer.program_visibility(keyers),
+        tbar=mixer.tbar_state(),
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
         resources=ResourceInfo.model_validate(collect_resources(mixer)),
