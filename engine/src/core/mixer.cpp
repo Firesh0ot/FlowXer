@@ -1,6 +1,7 @@
 #include "core/mixer.hpp"
 
 #include "core/audio.hpp"
+#include "core/visibility.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1135,6 +1136,7 @@ FramePlan Mixer::frame(std::uint64_t index, std::vector<bool> const& stingerRead
         }
     }
     lock.unlock();
+    markVisibility(out);
     if (ended)
     {
         notify();

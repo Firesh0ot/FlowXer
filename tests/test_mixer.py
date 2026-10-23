@@ -207,10 +207,14 @@ def test_pip_and_dme_keyers(mixer: VisionMixer) -> None:
     keyer = mixer.update_keyer("me-1-key-1", dme={"y": 0.25, "shadow": {"opacity": 0.5}})
     assert keyer.dme.x == 0.75 and keyer.dme.y == 0.25 and keyer.dme.border.width == 4.0 and keyer.dme.shadow.opacity == 0.5
     # A box on a linear key; ranges; upstream keyers only; a pip needs a source.
-    mixer.update_keyer("me-1-key-2", dme={"enabled": True, "crop": {"left": 0.2}})
+    mixer.update_keyer("me-1-key-2", dme={"enabled": True, "crop": {"left": 13}})
     assert mixer.get_keyer("me-1-key-2").dme.enabled and calls[-1][2]["mode"] == "linear"
+    # The engine takes fractions: 13 px of the 64 px test raster on the nearest even column.
+    assert calls[-1][2]["dme"]["crop"] == {"left": 14 / 64}
+    with pytest.raises(MixerError, match="must leave a picture"):
+        mixer.update_keyer("me-1-key-2", dme={"crop": {"right": 51}})
     with pytest.raises(MixerError, match="invalid key"):
-        mixer.update_keyer("me-1-key-2", dme={"crop": {"right": 0.9}})
+        mixer.update_keyer("me-1-key-2", dme={"crop": {"right": 0.25}})  # fractions are gone
     with pytest.raises(MixerError, match="invalid key"):
         mixer.update_keyer("me-1-key-2", dme={"size": 3})
     with pytest.raises(MixerError, match="upstream"):
@@ -332,7 +336,7 @@ def test_dme_presets(mixer: VisionMixer) -> None:
     # Split: keyers 1 and 2 (a linear keyer gets its box on), each cropped to its centre half.
     left, right = mixer.apply_preset("me-1-key-2", DmePreset.split)
     assert (left.id, right.id) == ("me-1-key-1", "me-1-key-2") and right.dme.enabled
-    assert (left.dme.x, right.dme.x, left.dme.size, left.dme.crop.left, right.dme.crop.right) == (0.25, 0.75, 1.0, 0.25, 0.25)
+    assert (left.dme.x, right.dme.x, left.dme.size, left.dme.crop.left, right.dme.crop.right) == (0.25, 0.75, 1.0, 16, 16)
     assert left.dme.border.width == 0.0 and left.keyframes[0].x == -0.3 and right.keyframes[0].x == 1.3
     with pytest.raises(MixerError, match="quad needs 4 upstream keyers"):
         mixer.apply_preset("me-1-key-1", DmePreset.quad)

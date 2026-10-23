@@ -150,10 +150,26 @@ w_k(s) = 1                 AFV off
 ### Keys and boxes
 
 - Key inputs (v210a) have no audio receiver.
-- Key fills and boxes (luma, pip) do not change AFV: AFV follows the background (Program and the
-  transition) only.
-- **The sound of a PiP:** set the strip of its source to AFV off, and use its fader or mute
-  ([open question 8](#14-open-questions-for-the-user)).
+- ~~Key fills and boxes (luma, pip) do not change AFV~~ (changed 2026-10-22, decided with the
+  user): **audio follows what is visible.** With AFV on, a strip is heard while its source is
+  visible on the ME's Program through any path:
+  - the background: Program, and both sources of a mix, wipe or stinger crossfade (as before);
+  - the source of a luma key or a pip whose keyer's gain is above 0 (on, or fading), whose box
+    (when it has one) shows some of the picture on the raster (not size 0, off screen or cropped
+    away), and that no opaque pip above it covers;
+  - an opaque pip that covers the whole raster (gain 1, no soft edge, the picture after the crop
+    over every edge) hides the layers under it and the background: their strips go out.
+  - A re-entered ME heard this way brings its own PGM mix, so nesting works by itself: ME 1 with a
+    pip of ME 2 hears ME 2's strip, and ME 2's mix has what is visible on ME 2 (its pips too).
+  The engine works this out per grain from the keys it renders (`core/visibility.hpp`,
+  `MePlan::keyed` and `backgroundCovered`); a key's source comes in and goes out over one grain on
+  the Cut curve; during a transition a key's source stays in full. A strip whose source is the
+  transition's A or B and a key's source at once is heard once, in full. While a full-raster pip
+  covers the background, a transition's A and B stay out; a strip that enters the transition's
+  curve from elsewhere (the cover ends, a key of its source goes off) ramps from where it was onto
+  the curve within one grain, without a step. The shared cases `engine/tests/visibility-vectors.json`
+  are run by the engine's tests and by pytest against the control plane's rules (which cannot know
+  a box's position during a fly off: a key that flies off stays visible until the fly ends).
 
 ### Fades without clicks
 
@@ -483,8 +499,10 @@ As built in #97 (`gui/src/components/AudioStrip.tsx`, `AudioWidget.tsx`, `src/fa
     exist since P2.
   - Key inputs stay video only.
   - The channel map is FlowXer's own API, not IS-08.
-- **Tally: nothing new.** TSL tally stays a picture tally: an AFV-off strip that is heard lights
-  nothing. Whether a strip is heard is in `/audio/meters` and in the metrics.
+- **Tally:** TSL tally stays a picture tally: an AFV-off strip that is heard lights nothing.
+  Whether a strip is heard is in `/audio/meters` and in the metrics. Since 2026-10-22 the
+  receivers' red follows the same visibility as AFV, recursively over nested MEs
+  (`src/flowxer/engine/visibility.py`; README "Tally and UMD").
 
 ## 10. Contract changes for the platform
 

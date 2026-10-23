@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     latency: int = Field(default=4, ge=1, le=10)
     # PVW video flows per ME; false: PVW is rendered for the previews only (saves PCIe).
     pvw_outputs: bool = True
+    # Each ME's Program as a WebRTC stream of its own (sharper than a mosaic tile; the mosaic then
+    # has no Program tiles): its width (the height keeps the raster's aspect), frame rate and
+    # bit rate. One NVENC session per ME more.
+    preview_pgm: bool = True
+    preview_pgm_width: int = Field(default=1280, ge=160, le=7680)
+    preview_pgm_fps: int = Field(default=25, ge=1, le=60)
+    preview_pgm_kbps: int = Field(default=4000, ge=200, le=50000)
     # CSP frame-ancestors of the operator-screen widgets (served by flowxer-gui).
     widget_frame_ancestors: str = Field(default="'self'", validation_alias=AliasChoices("WIDGET_FRAME_ANCESTORS", "FLOWXER_WIDGET_FRAME_ANCESTORS"))
 

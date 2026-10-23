@@ -201,4 +201,35 @@ def test_preview_tiles_name_the_console_pictures(engine_mixer) -> None:
     assert info["available"] and info["whep_url"] is None and info["whep_port"] == 8989
     ids = [tile["id"] for tile in info["tiles"]]
     assert ids[0] == "source:cam-1"
-    assert "panel:me-1:pgm" in ids and "panel:me-1:pvw" in ids
+    # Preview in the mosaic; each Program a stream of its own (sharper), not a tile.
+    assert "panel:me-1:pvw" in ids and "panel:me-1:pgm" not in ids
+    stream = info["streams"][0]
+    assert stream["id"] == "panel:me-1:pgm" and stream["panel_id"] == "me-1" and stream["path"] == "flowxer/me1-pgm"
+    assert (stream["width"], stream["height"], stream["whep_url"]) == (1280, 720, None)
+
+
+def test_preview_with_a_shared_mediamtx_and_an_older_engine(engine_mixer) -> None:
+    from flowxer.engine.preview import preview_info
+
+    mixer, _log = engine_mixer
+    mixer.start()
+    engine_map = dict(mixer.engine.mosaic_map)
+    # A shared MediaMTX: absolute WHEP URLs for the Program streams too.
+    mixer.engine.mosaic_map = {**engine_map, "whep_base": "https://mtx.example/"}
+    assert preview_info(mixer)["streams"][0]["whep_url"] == "https://mtx.example/flowxer/me1-pgm/whep"
+    # An engine without Program streams: Program is a mosaic tile again.
+    old_tiles = engine_map["tiles"] + [{"id": "me1-pgm", "kind": "program", "source": "me1", "x": 0, "y": 540, "w": 480, "h": 270}]
+    mixer.engine.mosaic_map = {key: value for key, value in engine_map.items() if key != "programs"} | {"tiles": old_tiles}
+    info = preview_info(mixer)
+    assert info["streams"] == [] and "panel:me-1:pgm" in [tile["id"] for tile in info["tiles"]]
+    assert info["streams_error"] is None
+    # The engine could not open the NVENC sessions: Programs as tiles, and why.
+    mixer.engine.mosaic_map = {**mixer.engine.mosaic_map, "programs": [], "programs_error": "h264_nvenc open: out of sessions"}
+    info = preview_info(mixer)
+    assert info["streams"] == [] and info["streams_error"] == "h264_nvenc open: out of sessions"
+
+
+def test_the_engine_config_carries_the_program_streams(mixer) -> None:
+    config = mixer._engine_config("test")
+    assert (config["FLOWXER_ENGINE_PGM_PREVIEW"], config["FLOWXER_ENGINE_PGM_PREVIEW_WIDTH"]) == (True, 1280)
+    assert (config["FLOWXER_ENGINE_PGM_PREVIEW_FPS"], config["FLOWXER_ENGINE_PGM_PREVIEW_KBPS"]) == (25, 4000)

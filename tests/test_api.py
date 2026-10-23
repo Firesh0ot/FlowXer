@@ -108,7 +108,10 @@ def test_openapi_documents_the_mixer(client: TestClient) -> None:
 
 def test_widgets_list_the_bus_widget(client: TestClient, mixer: VisionMixer) -> None:
     widgets = client.get("/api/v1/widgets").json()
-    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio", "snapshots"]
+    assert [w["id"] for w in widgets] == ["bus", "keys", "dme", "audio", "snapshots", "multiview"]
+    multiview = widgets[5]
+    assert multiview["params"]["required"] == [] and multiview["min_size"] == {"w": 480, "h": 270}
+    assert multiview["params"]["properties"]["pvw"]["default"] is False and multiview["params"]["properties"]["me"]["default"] == 1
     snapshots = widgets[4]
     assert snapshots["params"]["required"] == [] and snapshots["params"]["properties"]["all"]["default"] is True
     assert snapshots["min_size"] == {"w": 240, "h": 120}
@@ -176,7 +179,7 @@ def test_keyer_keyframes_runs_and_presets(client: TestClient) -> None:
     assert [p["name"] for p in presets] == ["corner-tl", "corner-tr", "corner-bl", "corner-br", "split", "quad", "full"]
     assert [p["keyers"] for p in presets] == [1, 1, 1, 1, 2, 4, 1]
     written = client.post(f"{base}/preset", json={"name": "split"}).json()
-    assert [k["id"] for k in written] == ["me-1-key-1", "me-1-key-2"] and written[1]["dme"]["crop"]["left"] == 0.25
+    assert [k["id"] for k in written] == ["me-1-key-1", "me-1-key-2"] and written[1]["dme"]["crop"]["left"] == 16  # a quarter of the 64 px test raster
     assert client.post(f"{base}/preset", json={"name": "zoom"}).status_code == 422
     assert client.post(f"{base}/preset", json={"name": "quad"}).status_code == 409
     keyer = client.put(f"{base}/dme", json={"x": 0.3}).json()
