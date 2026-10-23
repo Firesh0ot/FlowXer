@@ -123,9 +123,9 @@ struct Config
     // raster's width; the height keeps the raster's aspect), at pgmPreviewFps, pgmPreviewKbps (CBR).
     // Only with the mosaic.
     bool pgmPreview = true;
-    int pgmPreviewWidth = 960;
+    int pgmPreviewWidth = 1280;
     int pgmPreviewFps = 25;
-    int pgmPreviewKbps = 2500;
+    int pgmPreviewKbps = 4000;
     // Preview contract (platform spec 11.5): publish to a shared MediaMTX at publishUrl
     // (RTSP), or run an own MediaMTX when it is empty. Streams are <pathPrefix>/<stream>.
     std::string publishUrl;

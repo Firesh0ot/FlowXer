@@ -11,11 +11,13 @@ export interface WallTile {
 
 /** The wall's pictures as the mixer has them: each ME's Program (its own stream), with `pvw` each
  * ME's Preview, then the live inputs and clip players (mosaic tiles; Black has none). Red: on air
- * on ME `me` through any path (the console's `on_air`, else its Program); green: its Preview. */
+ * on ME `me` through any path (the console's `on_air`, else its Program); green: on the Preview of
+ * any ME (and every ME's Preview picture). Red wins. */
 export function wallTiles(snapshot: ConsoleState, me: number, pvw: boolean): WallTile[] {
   const panel = snapshot.panels[me - 1] ?? snapshot.panels[0];
   const onAir = new Set(snapshot.on_air?.[panel?.id ?? ""] ?? (panel?.program_input_id ? [panel.program_input_id] : []));
-  const tally = (id: string): WallTile["tally"] => (onAir.has(id) ? "pgm" : panel?.preview_input_id === id ? "pvw" : "off");
+  const previews = new Set(snapshot.panels.map((item) => item.preview_input_id).filter((id): id is string => !!id));
+  const tally = (id: string): WallTile["tally"] => (onAir.has(id) ? "pgm" : previews.has(id) ? "pvw" : "off");
   const tiles: WallTile[] = [];
   // Only the MEs that render (FLOWXER_RENDER_MES): those the previews have a picture of.
   const map = snapshot.preview;
@@ -24,7 +26,7 @@ export function wallTiles(snapshot: ConsoleState, me: number, pvw: boolean): Wal
     if (!shown(`panel:${item.id}:pgm`) && !shown(`panel:${item.id}:pvw`)) continue;
     // An ME's Program is on air on ME `me` when that ME shows it (or it is ME `me` itself).
     tiles.push({ id: `panel:${item.id}:pgm`, label: `${item.label} PGM`, tally: item.id === panel?.id ? "pgm" : tally(item.id) });
-    if (pvw) tiles.push({ id: `panel:${item.id}:pvw`, label: `${item.label} PVW`, tally: item.id === panel?.id ? "pvw" : "off" });
+    if (pvw) tiles.push({ id: `panel:${item.id}:pvw`, label: `${item.label} PVW`, tally: "pvw" });
   }
   for (const input of snapshot.inputs) {
     if (input.kind === "black") continue;

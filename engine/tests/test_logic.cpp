@@ -573,10 +573,10 @@ TEST(config_pgm_preview)
 {
     auto const cfg = loadConfig({});
     CHECK(cfg.pgmPreview && cfg.pgmStreams());
-    CHECK_EQ(cfg.pgmPreviewWidth, 960);
-    CHECK_EQ(cfg.pgmPreviewHeight(), 540);
+    CHECK_EQ(cfg.pgmPreviewWidth, 1280);
+    CHECK_EQ(cfg.pgmPreviewHeight(), 720);
     CHECK_EQ(cfg.pgmPreviewFps, 25);
-    CHECK_EQ(cfg.pgmPreviewKbps, 2500);
+    CHECK_EQ(cfg.pgmPreviewKbps, 4000);
     // Even, at most the raster; the height keeps the raster's aspect.
     auto const odd = loadConfig({{"FLOWXER_ENGINE_PGM_PREVIEW_WIDTH", "1281"}, {"FLOWXER_ENGINE_FORMAT", "720p50"}});
     CHECK_EQ(odd.pgmPreviewWidth, 1280);

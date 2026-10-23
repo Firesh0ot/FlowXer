@@ -63,6 +63,18 @@ check(wall.map((t) => t.id).join() === "panel:me-1:pgm,panel:me-2:pgm,source:cam
 check(wall.map((t) => t.tally).join() === "pgm,pgm,pgm,pvw,pgm,off", "wall tally (ME 2 in a pip of ME 1)");
 check(wallTiles({ ...snapshot, on_air: undefined } as ConsoleState, 1, false).map((t) => t.tally).join() === "pgm,off,pgm,pvw,off,off", "tally without on_air");
 check(wallTiles(snapshot, 1, true).length === 8, "with previews");
+// Green for every ME's Preview: ME 2 previews Clip 1, ME 1 previews ME 3; every PVW picture green.
+const three = {
+  ...snapshot,
+  panels: [
+    { id: "me-1", label: "ME 1", program_input_id: "cam-1", preview_input_id: "me-3" },
+    { id: "me-2", label: "ME 2", program_input_id: "cam-3", preview_input_id: "clip-1" },
+    { id: "me-3", label: "ME 3", program_input_id: "cam-2", preview_input_id: null },
+  ],
+  on_air: { "me-1": ["cam-1"] },
+} as unknown as ConsoleState;
+check(wallTiles(three, 1, false).map((t) => t.tally).join() === "pgm,off,pvw,pgm,off,off,pvw", "green for every ME's Preview");
+check(wallTiles(three, 1, true).filter((t) => t.id.endsWith(":pvw")).every((t) => t.tally === "pvw"), "every PVW picture green");
 // ME 2 does not render (FLOWXER_RENDER_MES=1): the map has no picture of it, the wall no tile.
 const oneMe = { ...snapshot, preview: { ...map, tiles: [...map.tiles, { id: "panel:me-1:pvw", x: 0, y: 0, w: 480, h: 270 }] } } as unknown as ConsoleState;
 check(wallTiles(oneMe, 1, true).map((t) => t.id).join() === "panel:me-1:pgm,panel:me-1:pvw,source:cam-1,source:cam-2,source:cam-3,source:clip-1", "rendering MEs only");
