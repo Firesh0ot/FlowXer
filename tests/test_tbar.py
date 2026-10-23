@@ -239,3 +239,54 @@ def test_at_most_64_hardware_levers_per_me_are_kept(mixer: VisionMixer) -> None:
     # The oldest went (it picks up again); the newest are kept.
     assert mixer.set_lever("me-1", 0.5, source="panel-0")[1] == "pickup"
     assert mixer.set_lever("me-1", 0.5, source=f"panel-{TBAR_SOURCES + 9}")[1] is None
+
+
+def test_the_source_cap_keeps_recent_levers_and_the_one_that_drives(mixer: VisionMixer) -> None:
+    from flowxer.engine.mixer import TBAR_SOURCES
+
+    _start(mixer)
+    # panel-0 picks up and holds a transition at 0.4.
+    mixer.set_lever("me-1", 0.0, source="panel-0")
+    mixer.set_lever("me-1", 0.4, source="panel-0")
+    # 64 other levers pick up where the lever is now (0.4): panel-0 is now the least recently
+    # used, but it drives the transition, so the others go first.
+    for n in range(1, TBAR_SOURCES + 1):
+        assert mixer.set_lever("me-1", 0.4, source=f"panel-{n}")[1] is None
+    assert len([item for item in mixer._lever_picked if item[0] == "me-1"]) == TBAR_SOURCES
+    assert mixer.set_lever("me-1", 0.6, source="panel-0")[1] is None and mixer.tbar_state()["me-1"]["position"] == 0.6
+    assert mixer.set_lever("me-1", 0.2, source="panel-1")[1] == "pickup"  # the least recently used went
+    # Every accepted value refreshes recency: panel-2 (now the oldest) sends one and survives.
+    assert mixer.set_lever("me-1", 0.6, source="panel-2")[1] is None
+    for n in range(100, 103):
+        mixer.set_lever("me-1", 0.6, source=f"panel-{n}")
+    assert mixer.set_lever("me-1", 0.6, source="panel-2")[1] is None
+    assert mixer.set_lever("me-1", 0.2, source="panel-3")[1] == "pickup"
+
+
+def test_a_lever_picks_up_where_a_held_transition_is(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.set_lever("me-1", 0.5, "top")  # a console holds 50 %
+    # A hardware lever connecting at the top would pull it back: ignored until it reaches 0.5.
+    assert mixer.set_lever("me-1", 0.0, source="hw")[1] == "pickup"
+    assert mixer.tbar_state()["me-1"]["position"] == 0.5
+    assert mixer.set_lever("me-1", 0.51, source="hw")[1] is None  # caught: it takes over
+    assert mixer.set_lever("me-1", 0.8, source="hw")[1] is None and mixer.tbar_state()["me-1"]["position"] == 0.8
+
+
+def test_a_quick_move_across_the_held_position_picks_up(mixer: VisionMixer) -> None:
+    _start(mixer)
+    mixer.set_lever("me-1", 0.5, "top")  # a console holds 50 %
+    assert mixer.set_lever("me-1", 0.40, source="hw")[1] == "pickup"
+    # 0.40 -> 0.60 steps over the 0.48..0.52 window: crossing the held position picks up.
+    assert mixer.set_lever("me-1", 0.60, source="hw")[1] is None
+    assert mixer.tbar_state()["me-1"]["position"] == 0.6
+    # Another lever staying on one side is still ignored.
+    assert mixer.set_lever("me-1", 0.10, source="hw2")[1] == "pickup"
+    assert mixer.set_lever("me-1", 0.30, source="hw2")[1] == "pickup"
+    assert mixer.tbar_state()["me-1"]["position"] == 0.6
+    # The memory of last values is bounded per ME.
+    from flowxer.engine.mixer import TBAR_SOURCES
+
+    for n in range(TBAR_SOURCES + 5):
+        mixer.set_lever("me-1", 0.0, source=f"far-{n}")
+    assert len([item for item in mixer._lever_last if item[0] == "me-1"]) == TBAR_SOURCES

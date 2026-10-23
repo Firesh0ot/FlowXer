@@ -121,7 +121,10 @@ def test_mix_lights_both_sources_until_it_ends(mixer: VisionMixer) -> None:
     mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
     mixer.fade(duration_ms=400)
     assert lit(mixer) == ({"cam-1", "cam-2"}, {"cam-1"})
-    assert lit(mixer, now=time.monotonic() + 0.5) == ({"cam-2"}, {"cam-1"})
+    # After the mix (the mixer's own clock decides what is visible).
+    outgoing, incoming, _end = mixer._mixes["me-1"]
+    mixer._mixes["me-1"] = (outgoing, incoming, time.monotonic() - 0.01)
+    assert lit(mixer) == ({"cam-2"}, {"cam-1"})
     mixer.take("cam-3", TransitionType.mix, duration_ms=200)
     assert lit(mixer)[0] == {"cam-2", "cam-3"}
     mixer.cut()
@@ -170,7 +173,7 @@ def test_indexes_stay_when_an_input_is_removed(mixer: VisionMixer) -> None:
     assert indexes["clip-2"] == 8
     messages = me_messages(snapshot, snapshot.mes[0], indexes, time.monotonic())
     # Slot order (live, clip players, Black); the numbers stay with their inputs.
-    assert [message.index for message in messages] == [0, 1, 3, 4, 5, 6, 8, 7]
+    assert [message.index for message in messages][:8] == [0, 1, 3, 4, 5, 6, 8, 7]
 
 
 # Encoder: byte vectors from the platform's reference codec (mxl-poc-platform, tally
@@ -275,7 +278,13 @@ def test_export_over_udp(settings: Settings, monkeypatch: pytest.MonkeyPatch) ->
     try:
         # Every ME, every input (designer order) and the re-entry of the higher MEs, all off before
         # Program starts.
-        for screen, extra in ((1, [(1002, "ME 2", TALLY_OFF, TALLY_OFF)]), (2, [])):
+        # (Then the linear key inputs of the ME and of the higher MEs it can take, off as well.)
+        keys1 = [(2101, "ME 1 Key 1"), (2102, "ME 1 Key 2"), (3101, "DSK 1 Key"), (2201, "ME 2 Key 1"), (2202, "ME 2 Key 2"), (3201, "ME 2 DSK 1 Key")]
+        keys2 = keys1[3:]
+        for screen, extra in (
+            (1, [(1002, "ME 2", TALLY_OFF, TALLY_OFF)] + [(i, t, TALLY_OFF, TALLY_OFF) for i, t in keys1]),
+            (2, [(i, t, TALLY_OFF, TALLY_OFF) for i, t in keys2]),
+        ):
             _, decoded = _receive(receiver, screen)
             assert decoded["flags"] == FLAG_UTF16
             assert [(item["index"], item["text"], item["lh"], item["rh"]) for item in decoded["messages"]] == [
@@ -326,7 +335,7 @@ def test_export_resolves_the_name_again_and_logs_once(monkeypatch: pytest.Monkey
         return resolve("127.0.0.1", *args, **kwargs)
 
     monkeypatch.setattr(tally_export.socket, "getaddrinfo", not_ready_yet)
-    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"),), mes=(MeTally(program="cam-1"),))
+    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"),), mes=(MeTally(program="cam-1", visible=("cam-1",)),))
     with caplog.at_level(logging.WARNING, logger=tally_export.__name__):
         export = TallyExport("udp", "mxl-tally.example", receiver.getsockname()[1], lambda: snapshot)
         try:
@@ -372,7 +381,7 @@ def test_export_over_tcp_frames_and_reconnects(monkeypatch: pytest.MonkeyPatch) 
     server.bind(("127.0.0.1", 0))
     server.listen(2)
     server.settimeout(3.0)
-    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"), ("cam-2", "Cam 2")), mes=(MeTally("cam-1", "cam-2"),))
+    snapshot = TallySnapshot(inputs=(("cam-1", "Cam 1"), ("cam-2", "Cam 2")), mes=(MeTally("cam-1", "cam-2", visible=("cam-1",)),))
     export = TallyExport("tcp", "127.0.0.1", server.getsockname()[1], lambda: snapshot)
     try:
         conn, _ = server.accept()
@@ -395,3 +404,75 @@ def test_export_over_tcp_frames_and_reconnects(monkeypatch: pytest.MonkeyPatch) 
     finally:
         export.close()
         server.close()
+
+
+def test_red_is_what_is_visible_through_any_path(mixer: VisionMixer) -> None:
+    """Since 2026-10-23 the raw export lights what the receivers and the console light."""
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=3))
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    mixer.take("cam-2", panel_id="me-2")
+    # ME 2: a pip of cam-3. ME 1: a pip of ME 2. Screen 1 lights cam-3 and cam-2 through ME 2.
+    mixer.update_keyer("me-2-key-1", mode="pip", source_id="cam-3", enabled=True)
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="me-2", enabled=True)
+    assert lit(mixer, 1)[0] == {"cam-1", "me-2", "cam-2", "cam-3"}
+    assert lit(mixer, 2)[0] == {"cam-2", "cam-3"}
+    # A box at size 0 lights nothing (before: its source stayed red).
+    mixer.update_keyer("me-2-key-1", dme={"size": 0.0})
+    assert "cam-3" not in lit(mixer, 1)[0] and "cam-3" not in lit(mixer, 2)[0]
+    # A full-raster pip covers ME 1's Program and its pip of ME 2.
+    mixer.update_keyer("me-1-key-2", mode="pip", source_id="cam-4", dme={"x": 0.5, "y": 0.5, "size": 1.0}, enabled=True)
+    assert lit(mixer, 1)[0] == {"cam-4"}
+
+
+def test_the_export_sends_again_when_a_key_fade_ends(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tally_export, "REFRESH_S", 5.0)
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    settings.tally_tsl = f"udp://127.0.0.1:{receiver.getsockname()[1]}"
+    mixer = VisionMixer(settings)
+    try:
+        mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+        label = next(item.label for item in mixer.list_inputs() if item.id == "cam-4")
+        mixer.update_keyer("me-1-key-1", mode="pip", source_id="cam-4", enabled=True, rate_ms=100)
+        _receive(receiver, 1, lambda lamps: lamps[label][0] == TALLY_RED)
+        started = time.monotonic()
+        mixer.keyer_auto("me-1-key-1")  # fades off over 0.1 s
+        ended, _ = _receive(receiver, 1, lambda lamps: lamps[label][0] == TALLY_OFF)
+        # At the fade's end, long before the 5 s refresh.
+        assert ended - started < 1.0
+    finally:
+        mixer.shutdown()
+        receiver.close()
+
+
+def test_linear_key_inputs_follow_the_same_rule(mixer: VisionMixer) -> None:
+    mixer.apply_workspace(WorkspaceUpdate(mixer_panel_count=2))
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    # Screen 1 lists ME 2's key inputs too (ME 1 can take ME 2): all off while ME 2 is not shown.
+    assert [index for index, _label, _on in mixer._tally_snapshot().mes[0].keys] == [2101, 2102, 3101, 2201, 2202, 3201]
+    mixer.update_keyer("me-2-dsk-1", enabled=True)
+    assert "3201" not in lit(mixer, 1)[0] and "3201" in lit(mixer, 2)[0]
+    # ME 1 shows ME 2 (a pip): ME 2's DSK key input is red on screen 1 too.
+    mixer.update_keyer("me-1-key-1", mode="pip", source_id="me-2", enabled=True)
+    assert {"me-2", "3201"} <= lit(mixer, 1)[0]
+    # ME 1's own linear USK 2 on: red; under a full-raster pip of cam-4 on top of it, not red.
+    mixer.update_keyer("me-1-key-1", mode="linear", enabled=False)
+    mixer.update_keyer("me-1-key-1", enabled=True)
+    assert "2101" in lit(mixer, 1)[0]
+    mixer.update_keyer("me-1-key-2", mode="pip", source_id="cam-4", dme={"x": 0.5, "y": 0.5, "size": 1.0}, enabled=True)
+    assert "2101" not in lit(mixer, 1)[0] and lit(mixer, 1)[0] >= {"cam-4"}
+    # At gain 0 a linear key shows nothing.
+    mixer.update_keyer("me-1-key-2", enabled=False)
+    mixer.update_keyer("me-1-key-1", gain=0.0)
+    assert "2101" not in lit(mixer, 1)[0]
+
+
+def test_stopped_every_key_input_is_listed_off(mixer: VisionMixer) -> None:
+    mixer.start(MixerStartRequest(program_input_id="cam-1", preview_input_id="cam-2"))
+    mixer.update_keyer("dsk-1", enabled=True)
+    assert "3101" in lit(mixer)[0]
+    mixer.stop()
+    keys = mixer._tally_snapshot().mes[0].keys
+    # Listed (so a calculator keeping the last state per INDEX gets them off), and all off.
+    assert [index for index, _label, _on in keys] == [2101, 2102, 3101] and not any(on for _i, _l, on in keys)
+    assert lit(mixer) == (set(), set())
