@@ -34,6 +34,7 @@ jobs:
           node --experimental-strip-types scripts/check-dme.ts
           node --experimental-strip-types scripts/check-fader.ts
           node --experimental-strip-types scripts/check-preview.ts
+          node --experimental-strip-types scripts/check-tbar.ts
 
   engine:
     name: Engine unit tests

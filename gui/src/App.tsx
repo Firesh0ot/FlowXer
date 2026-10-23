@@ -363,7 +363,8 @@ export default function App() {
           keyers={snapshot.keyers.filter((keyer) => keyer.panel_id === panel.id && keyer.stage === "upstream")}
           stingerSlots={snapshot.stinger_slots}
           fps={fps}
-          onPosition={(position) => void api.position(panel.id, position).catch((err: Error) => setError(err.message))}
+          tbar={snapshot.tbar?.[panel.id]}
+          onLever={(lever) => api.lever(panel.id, lever).catch((err: Error) => setError(err.message))}
           onChange={(patch) => void command(() => api.transition(panel.id, patch))}
           onCut={() => void command(() => api.cut(panel.id))}
           onAuto={() => void command(() => api.auto(panel.id))}

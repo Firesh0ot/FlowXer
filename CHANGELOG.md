@@ -5,6 +5,22 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Changed: the T-bar is a real lever (ping-pong), T-bar widget
+
+- GUI: the T-bar stays at the end a transition took it to; the next transition is made by moving
+  it back (bottom to top, then down again). Before, it jumped back to the top at the bottom, and a
+  mouse at the end of travel could start the next transition and flicker. Now the drag follows the
+  pointer only (from where the handle was grabbed), sends one position at a time and in order, is
+  latched after reaching the end until released, starts nothing within 2 % of the resting end, and
+  the browser cannot cancel it with a text drag. An Auto runs the handle to the other end; a Cut of
+  a held transition counts as done.
+- API (compatible): `POST /mixer/position` takes `lever` (0 top … 1 bottom, where the lever is)
+  instead of `position`; the panel's `tbar_end` (`top`/`bottom`, saved) says where the lever rests
+  and flips with each transition the T-bar or an Auto completes; `GET /console` → `tbar` per ME
+  (`end`, `position`, `lever`). `position` keeps its meaning. `position: 1` straight from rest now
+  completes the transition (it answered 500).
+- Widget `tbar` (`/widget/tbar[?me=<n>][&buttons=false]`): the ME's T-bar lever with Cut and Auto.
+
 ### Added: Program streams, multiview widget
 
 - Engine: each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`, NVENC H.264,

@@ -313,6 +313,9 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
     return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
 
 
+# The T-bar lever starts nothing within this much of the end it rests at (end-of-travel hysteresis).
+TBAR_DEADBAND = 0.02
+
 # A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
 TALLY_END_MARGIN_S = 0.05
 
@@ -2153,6 +2156,8 @@ class VisionMixer:
         buses swap. A stinger plays the ME's stinger slot (or the slot by direction) over its own
         length."""
         panel = self._ensure_running_panel(panel_id)
+        # The virtual lever goes to its other end with the Auto (it runs there at the rate).
+        self._flip_tbar(panel)
         held = self._positions.pop(panel.id, None)
         if held is not None:
             # From the held T-bar position: the engine runs the rest at the rate (with the keyers
@@ -2236,7 +2241,9 @@ class VisionMixer:
             self._engine_call("POST", f"/me/{self._panel_number(panel)}/position", {"t": position})
         _position, outgoing, incoming = held
         if position >= 1:
-            del self._positions[panel.id]
+            # (Also straight from rest to the end: a whole transition in one move.)
+            self._positions.pop(panel.id, None)
+            self._flip_tbar(panel)
             swap = panel.preview_input_id == incoming
             self._end_held_ties(panel)
             self._put_on_program(panel, incoming, panel.transition.type, flip_flop=swap, frames=1, send=False)
@@ -2249,6 +2256,32 @@ class VisionMixer:
             self._positions[panel.id] = (position, outgoing, incoming)
             self._publish_tally()
         return self.status()
+
+    def set_lever(self, panel_id: str = "me-1", lever: float = 0.0) -> MixerStatus:
+        """The T-bar lever where it physically is (0 top .. 1 bottom): the transition's progress
+        counted from the end it rests at (panel.tbar_end), so the lever works both ways
+        (ping-pong). Within TBAR_DEADBAND of its resting end it starts nothing."""
+        panel = self._ensure_running_panel(panel_id)
+        position = lever if panel.tbar_end == "top" else 1.0 - lever
+        if panel.id not in self._positions and position < TBAR_DEADBAND:
+            return self.status()
+        return self.set_position(panel.id, position)
+
+    def tbar_state(self) -> dict[str, dict[str, Any]]:
+        """Per ME the T-bar: the end the lever rests at, the progress of a transition it holds
+        (0: none) and where the lever is (0 top .. 1 bottom)."""
+        out: dict[str, dict[str, Any]] = {}
+        for panel in list(self.panels):
+            held = self._positions.get(panel.id)
+            position = held[0] if held is not None else 0.0
+            lever = position if panel.tbar_end == "top" else 1.0 - position
+            out[panel.id] = {"end": panel.tbar_end, "position": position, "lever": lever}
+        return out
+
+    @staticmethod
+    def _flip_tbar(panel: MixerPanel) -> None:
+        """A transition of the T-bar (or an Auto) completed: the lever rests at the other end."""
+        panel.tbar_end = "bottom" if panel.tbar_end == "top" else "top"
 
     def set_wipe(self, panel_id: str = "me-1", armed: bool | None = None) -> MixerStatus:
         """Arm (or toggle) Wipe: the next Cut plays the stinger slot by direction (FlowXer 14's
@@ -2294,7 +2327,9 @@ class VisionMixer:
         wait = self._grains_until(at) / self.settings.fps
         held = self._positions.pop(panel.id, None)
         if held is not None:
-            # A held T-bar transition ends first, as if it had run to its end (as in the engine).
+            # A held T-bar transition ends first, as if it had run to its end (as in the engine);
+            # the lever counts it as done.
+            self._flip_tbar(panel)
             _position, _outgoing, incoming = held
             swap = panel.preview_input_id == incoming
             self._end_held_ties(panel)

@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import type { Keyer, MixerPanel, PanelTransition, StingerSlot, TransitionKind } from "../api";
+import type { TbarState } from "../tbar";
 import { WIPE_PATTERNS, wipePattern } from "../wipe";
+import { TBar } from "./TBar";
 
 const TYPES: { type: TransitionKind; label: string }[] = [
   { type: "mix", label: "Mix" },
@@ -30,33 +32,6 @@ function WipeIcon({ code, reverse }: { code: number; reverse: boolean }) {
   return <canvas ref={canvas} width={32} height={18} />;
 }
 
-/** The T-bar: a vertical lever (top 0, bottom 1). Dragging holds the ME's transition there; the
- * bottom completes it, the top ends it without the swap. */
-function TBar({ value, onMove }: { value: number; onMove: (position: number) => void }) {
-  const track = useRef<HTMLDivElement>(null);
-  const drag = (event: React.PointerEvent) => {
-    const rect = track.current?.getBoundingClientRect();
-    if (!rect) return;
-    onMove(Math.round(Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) * 100) / 100);
-  };
-  return (
-    <div
-      className="tbar"
-      ref={track}
-      title="T-bar: drag to hold the transition, to the bottom to complete it"
-      onPointerDown={(event) => {
-        event.currentTarget.setPointerCapture(event.pointerId);
-        drag(event);
-      }}
-      onPointerMove={(event) => {
-        if (event.buttons) drag(event);
-      }}
-    >
-      <div className="tbar-slot" />
-      <div className="tbar-handle" style={{ top: `${value * 100}%` }} />
-    </div>
-  );
-}
 
 /** The next transition's elements: BKGD and the ME's upstream keyers (KEY 1 .. K), each lit when
  * it goes with Cut, Auto and the T-bar. At least one stays lit. */
@@ -118,7 +93,8 @@ export function TransitionSection({
   onChange,
   onCut,
   onAuto,
-  onPosition,
+  onLever,
+  tbar,
   onFadeToBlack,
   onGrab,
 }: {
@@ -130,34 +106,14 @@ export function TransitionSection({
   onChange: (patch: Record<string, unknown>) => void;
   onCut: () => void;
   onAuto: () => void;
-  onPosition: (position: number) => void;
+  /** The T-bar lever where the operator holds it (0 top .. 1 bottom). */
+  onLever: (lever: number) => Promise<unknown>;
+  /** The ME's T-bar as the mixer has it (GET /console → tbar). */
+  tbar?: TbarState;
   onFadeToBlack: () => void;
   onGrab: () => void;
 }) {
   const transition: PanelTransition = panel.transition;
-  // The lever: where the operator holds it, or where an Auto is (it runs at the ME's rate).
-  const [position, setPosition] = useState(0);
-  const animation = useRef(0);
-  const move = (next: number) => {
-    window.cancelAnimationFrame(animation.current);
-    if (next === position) return;
-    onPosition(next);
-    setPosition(next >= 1 ? 0 : next);
-  };
-  const auto = () => {
-    onAuto();
-    const from = position;
-    const seconds = ((1 - from) * transition.rate_frames) / fps;
-    const start = performance.now();
-    const step = (now: number) => {
-      const t = from + (1 - from) * Math.min(1, (now - start) / 1000 / seconds);
-      setPosition(t >= 1 ? 0 : t);
-      if (t < 1) animation.current = window.requestAnimationFrame(step);
-    };
-    window.cancelAnimationFrame(animation.current);
-    if (transition.type !== "stinger" && (transition.background ?? true)) animation.current = window.requestAnimationFrame(step);
-  };
-  useEffect(() => () => window.cancelAnimationFrame(animation.current), []);
   const wipe = transition.wipe;
   const setWipe = (patch: Record<string, unknown>) => onChange({ wipe: patch });
   return (
@@ -260,13 +216,13 @@ export function TransitionSection({
         <button className="cut" onClick={onCut} title="Cut Preview to Program">
           Cut
         </button>
-        <button className="auto" onClick={auto} title={`${transition.type} Preview to Program over ${transition.rate_frames} frames`}>
+        <button className="auto" onClick={onAuto} title={`${transition.type} Preview to Program over ${transition.rate_frames} frames`}>
           Auto
         </button>
         <button className={`ftb${panel.ftb ? " on" : ""}`} onClick={onFadeToBlack} title="Fade the whole output (keys and sound too) to black, or back">
           FTB
         </button>
-        <TBar value={position} onMove={move} />
+        <TBar state={tbar ?? { end: "top", position: 0, lever: 0 }} rateFrames={transition.rate_frames} fps={fps} onLever={onLever} />
       </div>
     </aside>
   );

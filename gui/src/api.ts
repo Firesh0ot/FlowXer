@@ -1,4 +1,5 @@
 import type { PreviewMap } from "./preview";
+import type { TbarState } from "./tbar";
 
 export type InputKind = "mxl_live" | "clip_player" | "black";
 export type ClipEnd = "off" | "cut" | "auto" | "stinger";
@@ -360,6 +361,8 @@ export interface SnapshotRecallResult {
 }
 
 export interface ConsoleState {
+  /** Per ME the T-bar: where the lever rests, the progress of a held transition, where it is. */
+  tbar?: Record<string, TbarState>;
   /** Per ME id what is visible on its Program through any path (keys, pips, nested MEs): red tally. */
   on_air?: Record<string, string[]>;
   workspace: WorkspaceConfig;
@@ -458,6 +461,14 @@ export const api = {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ panel_id }),
+    }).then((r) => parse(r)),
+  /** The T-bar lever where it physically is (0 top .. 1 bottom): the mixer counts the transition
+   * from the end the lever rests at (ping-pong). */
+  lever: (panel_id: string, lever: number) =>
+    fetch("/api/v1/mixer/position", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ panel_id, lever }),
     }).then((r) => parse(r)),
   /** The T-bar: hold the ME's transition at a position (0..1); 1 completes it, 0 ends it. */
   position: (panel_id: string, position: number) =>
