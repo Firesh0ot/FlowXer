@@ -552,6 +552,51 @@ TEST(mosaic_tile_map)
     CHECK_EQ(mosaicGrid(37), 7);
 }
 
+TEST(mosaic_without_programs)
+{
+    // Each Program a stream of its own: 8 inputs and 4 MEs' Previews are 12 tiles, still 4x4;
+    // 6 inputs, 1 player and 2 MEs: 9 tiles on 3x3 (640x360 instead of 480x270).
+    auto const tiles = mosaicTiles(1920, 1080, 8, 0, 4, false);
+    CHECK_EQ(tiles.size(), 12u);
+    for (auto const& t : tiles)
+    {
+        CHECK(t.kind != MosaicTile::Kind::Program);
+    }
+    CHECK(tiles[8].id == "me1-pvw" && tiles[11].id == "me4-pvw");
+    auto const nine = mosaicTiles(1920, 1080, 6, 1, 2, false);
+    CHECK_EQ(nine.size(), 9u);
+    CHECK_EQ(nine[0].w, 640);
+    CHECK_EQ(nine[0].h, 360);
+}
+
+TEST(config_pgm_preview)
+{
+    auto const cfg = loadConfig({});
+    CHECK(cfg.pgmPreview && cfg.pgmStreams());
+    CHECK_EQ(cfg.pgmPreviewWidth, 1280);
+    CHECK_EQ(cfg.pgmPreviewHeight(), 720);
+    CHECK_EQ(cfg.pgmPreviewFps, 25);
+    CHECK_EQ(cfg.pgmPreviewKbps, 4000);
+    // Even, at most the raster; the height keeps the raster's aspect.
+    auto const odd = loadConfig({{"FLOWXER_ENGINE_PGM_PREVIEW_WIDTH", "1281"}, {"FLOWXER_ENGINE_FORMAT", "720p50"}});
+    CHECK_EQ(odd.pgmPreviewWidth, 1280);
+    CHECK_EQ(odd.pgmPreviewHeight(), 720);
+    CHECK_EQ(loadConfig({{"FLOWXER_ENGINE_PGM_PREVIEW_WIDTH", "1279"}}).pgmPreviewWidth, 1278);
+    // Off, or no mosaic: no Program streams.
+    CHECK(!loadConfig({{"FLOWXER_ENGINE_PGM_PREVIEW", "false"}}).pgmStreams());
+    CHECK(!loadConfig({{"FLOWXER_ENGINE_MOSAIC", "false"}}).pgmStreams());
+    bool threw = false;
+    try
+    {
+        loadConfig({{"FLOWXER_ENGINE_PGM_PREVIEW_KBPS", "10"}});
+    }
+    catch (ConfigError const&)
+    {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // ---- TAI grid --------------------------------------------------------------------------
 
 TEST(tai_index_arithmetic)

@@ -1,5 +1,7 @@
 #include "core/config.hpp"
 
+#include <algorithm>
+
 #include <nlohmann/json.hpp>
 
 #include <fstream>
@@ -339,6 +341,10 @@ Config loadConfig(std::map<std::string, std::string> const& env)
     cfg.mosaic = getBool(values, "FLOWXER_ENGINE_MOSAIC", cfg.mosaic);
     cfg.mosaicFps = getInt(values, "FLOWXER_ENGINE_MOSAIC_FPS", cfg.mosaicFps, 1, 60);
     cfg.mosaicKbps = getInt(values, "FLOWXER_ENGINE_MOSAIC_KBPS", cfg.mosaicKbps, 200, 50000);
+    cfg.pgmPreview = getBool(values, "FLOWXER_ENGINE_PGM_PREVIEW", cfg.pgmPreview);
+    cfg.pgmPreviewWidth = std::min(getInt(values, "FLOWXER_ENGINE_PGM_PREVIEW_WIDTH", cfg.pgmPreviewWidth, 160, 7680), cfg.width) & ~1;
+    cfg.pgmPreviewFps = getInt(values, "FLOWXER_ENGINE_PGM_PREVIEW_FPS", cfg.pgmPreviewFps, 1, 60);
+    cfg.pgmPreviewKbps = getInt(values, "FLOWXER_ENGINE_PGM_PREVIEW_KBPS", cfg.pgmPreviewKbps, 200, 50000);
     cfg.publishUrl = get(values, "PREVIEW_PUBLISH_URL", cfg.publishUrl);
     while (!cfg.publishUrl.empty() && cfg.publishUrl.back() == '/')
     {

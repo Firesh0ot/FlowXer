@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import shutil
@@ -77,12 +78,24 @@ def low_priority_prefix() -> list[str]:
     return list(_LOW_PRIORITY)
 
 
+def progress_seconds(line: str) -> float | None:
+    """The time an ffmpeg `-progress` line reports (out_time_us; out_time_ms is microseconds
+    too), in seconds; None for the other lines."""
+    key, _, value = line.strip().partition("=")
+    if key in ("out_time_us", "out_time_ms") and value.lstrip("-").isdigit():
+        return max(0, int(value)) / 1_000_000
+    return None
+
+
 def default_runner(
     cmd: Sequence[str],
     timeout: float | None = None,
     cancel: threading.Event | None = None,
+    progress: Callable[[float], None] | None = None,
 ) -> RunResult:
-    """Run at low priority. A set cancel event or the timeout kills the process."""
+    """Run at low priority. A set cancel event or the timeout kills the process. With `progress`
+    the command writes ffmpeg's `-progress` lines to stdout: each time it reports is passed on
+    (in seconds) while it runs."""
     try:
         proc = subprocess.Popen(
             low_priority_prefix() + list(cmd),
@@ -94,6 +107,8 @@ def default_runner(
         )
     except OSError as exc:
         return RunResult(code=127, stderr=str(exc))
+    if progress is not None:
+        return _run_with_progress(proc, timeout, cancel, progress)
     deadline = time.monotonic() + timeout if timeout else None
     while True:
         try:
@@ -110,6 +125,53 @@ def default_runner(
                 out, err = "", ""
             reason = "cancelled" if cancelled else f"timed out after {timeout:.0f} s"
             return RunResult(code=-9, stdout=out or "", stderr=f"{err or ''}\n{reason}", cancelled=cancelled)
+
+
+def _run_with_progress(
+    proc: subprocess.Popen,
+    timeout: float | None,
+    cancel: threading.Event | None,
+    progress: Callable[[float], None],
+) -> RunResult:
+    """default_runner with `progress`: stdout is read line by line (the progress lines, which are
+    not kept), stderr in a second thread."""
+    err_parts: list[str] = []
+
+    def read_stdout() -> None:
+        for line in proc.stdout:
+            seconds = progress_seconds(line)
+            if seconds is not None:
+                try:
+                    progress(seconds)
+                except Exception:  # a listener must not stop the reader
+                    log.exception("progress listener failed")
+
+    def read_stderr() -> None:
+        err_parts.append(proc.stderr.read())
+
+    readers = [threading.Thread(target=read_stdout, daemon=True), threading.Thread(target=read_stderr, daemon=True)]
+    for reader in readers:
+        reader.start()
+    deadline = time.monotonic() + timeout if timeout else None
+    cancelled = timed_out = False
+    while True:
+        try:
+            proc.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            cancelled = cancel is not None and cancel.is_set()
+            timed_out = deadline is not None and time.monotonic() >= deadline
+            if cancelled or timed_out:
+                proc.kill()
+                proc.wait()
+                break
+    for reader in readers:
+        reader.join(timeout=5)  # a grandchild may still hold the pipes
+    err = "".join(err_parts)
+    if cancelled or timed_out:
+        reason = "cancelled" if cancelled else f"timed out after {timeout:.0f} s"
+        return RunResult(code=-9, stderr=f"{err}\n{reason}", cancelled=cancelled)
+    return RunResult(code=proc.returncode, stderr=err)
 
 
 class FFmpeg:
@@ -188,9 +250,23 @@ class FFmpeg:
         *,
         timeout: float | None = None,
         cancel: threading.Event | None = None,
+        progress: Callable[[float], None] | None = None,
     ) -> RunResult:
+        """`progress` (an ffmpeg command; seconds of output written so far) needs a runner that
+        takes it, such as default_runner; other runners run the command without it."""
+        if progress is not None and _takes_progress(self.runner):
+            cmd = [cmd[0], "-progress", "pipe:1", *cmd[1:]]
+            log.debug("ffmpeg cmd: %s", " ".join(cmd))
+            return self.runner(cmd, timeout=timeout, cancel=cancel, progress=progress)
         log.debug("ffmpeg cmd: %s", " ".join(cmd))
         return self.runner(cmd, timeout=timeout, cancel=cancel)
+
+
+def _takes_progress(runner: Runner) -> bool:
+    try:
+        return "progress" in inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_frame_rate(value: str | None, default: float = 50.0) -> float:

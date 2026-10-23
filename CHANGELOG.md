@@ -5,6 +5,79 @@ in `docs/platform-integration-plan.md` §8.
 
 ## Unreleased
 
+### Added: Program streams, multiview widget
+
+- Engine: each ME's Program as a WebRTC stream of its own (`<prefix>/me<n>-pgm`, NVENC H.264,
+  1280×720p25 at 4 Mbit/s by default: `FLOWXER_PREVIEW_PGM`, `_WIDTH`, `_FPS`, `_KBPS`); the
+  mosaic has no Program tiles then (fewer tiles: e.g. 6 inputs, a clip player and 2 MEs fit 3×3
+  at 640×360 instead of 4×4 at 480×270). Cost on an A16: about +1.4 % NVENC per ME (960×540 at
+  2.5 Mbit/s: about +1 %), about 20 MiB GPU memory per ME, 1–2 % of a core per stream, +4 Mbit/s
+  per viewer and ME (a console with 3 MEs: about 18 Mbit/s). **NVENC sessions: 1 + MEs**
+  (was 1); the engine opens them all at start and, when the GPU cannot give them, keeps the
+  Programs as mosaic tiles (`GET /preview` → `streams_error`); `FLOWXER_PREVIEW_PGM=false` turns the
+  streams off.
+- Engine: the mosaic's and the streams' timestamps follow the real frame rate (the output rate over
+  the grains between frames): at 30, 59.94 or 60 they ran at 25 before (about 20 % slow).
+- `GET /api/v1/preview` (and `/console` → `preview`): `streams` with each Program stream
+  (`panel:<id>:pgm`, path, size, WHEP URL); the engine's `/mosaic/map` has `programs`.
+- GUI: the Program monitor and the higher-ME tiles play the Program streams (one WHEP session per
+  stream); mosaic tiles are cropped 5 px inside their edges, so the browser's scaling shows no
+  neighbouring tile.
+- Widget `multiview` (`/widget/multiview[?me=<n>][&pvw=true]`): a control-room wall of the mixer's
+  pictures with labels and tally borders (red: on air on ME `me`; green: on the Preview of any
+  ME), its layout following the mixer (MEs that do not render
+  left out) and the frame's size.
+
+### Changed (breaking API): DME crop in source pixels
+
+- **API:** a box's `crop` (`dme.crop` of `PATCH /keyers/{id}`, `PUT /keyers/{id}/dme`, each
+  keyframe of `PUT /keyers/{id}/keyframes`, `GET /keyers`, `/console`, snapshots, the export) is
+  now whole **source pixels** (`{"left": 480, "right": 480, "top": 0, "bottom": 0}`), no longer
+  fractions of the source (`0.25`). A fraction is refused (422/409: "Input should be a valid
+  integer"); a crop that leaves no picture (left + right ≥ the raster's width, top + bottom ≥
+  its height) is refused with 409. Left and right act on 4:2:2 sample pairs (an odd value goes
+  to the nearest even column), as before.
+- **Migration:** a saved state, a `POST /config/import` document and its snapshots with crops in
+  fractions are converted on load to pixels of their format (0.25 at 1080p → 480 px). A format
+  change scales every crop (keyers, keyframes, snapshots) with the raster, so the share of the
+  picture stays; so does loading a state or an import whose format differs from the mixer's (a
+  pinned `FLOWXER_FORMAT`). On restore a crop the raster cannot take loses its crop on that axis
+  (logged) instead of the whole state being dropped; an import refuses it.
+- Presets: split crops a quarter of the raster's width (480 px at 1080p) off each side.
+- GUI: crop fields in px. The engine's own control API keeps fractions (the control plane
+  converts).
+
+### Changed: tally and audio follow what is visible, through every path
+
+- Tally (TSL receivers and the console's source tiles): red for what is visible on an ME's
+  Program through any path: Program, the sources of visible luma keys and pips, and recursively
+  what the MEs it shows (re-entry as Program or in a key) have on theirs. Hidden layers do not
+  count: gain 0, a box at size 0, off screen or cropped away, and what an opaque full-raster pip
+  covers (the background included). Before, the receivers lit only each ME's Program.
+- Audio (engine): AFV follows the same rules per grain (`core/visibility.hpp`): a visible pip's or
+  luma key's source is heard; a full-raster pip silences the background it covers. Nested MEs
+  work through each ME's own PGM mix. Before, AFV followed the background only (P5 decision,
+  changed with the user).
+- `GET /console` has `on_air`: per ME id what is visible on its Program.
+- The receivers get the tally again when a mix or a key's fade or fly ends (not after a stop or
+  shutdown); one publish at a time. A full-raster pip covers the background only once it has
+  faded in.
+- **For the platform:** the raw tally export (`FLOWXER_TALLY_TSL`) is unchanged (per ME; a hidden
+  box still lights its source there).
+
+### Changed: operator console layout, higher MEs, upload progress
+
+- GUI: PREVIEW and PROGRAM take about 40 % of the window's height and are centred as a pair on a
+  wide window (no growing gap); the deck gets the rest and the console scrolls where it does not
+  fit (before, a wide window showed little but the two monitors, without a scrollbar).
+- GUI: the higher MEs are tiles after the sources (re-entry): left half to Preview, right half to
+  Program of the active ME, like the bus widget's ME buttons.
+- GUI: the library shows the upload's progress by bytes (also within each 8 MiB chunk), then a bar
+  per conversion with the item's name; they stay in view at the top, and a converting card has its
+  own bar.
+- Library: conversion jobs report ffmpeg's progress (`-progress`) for a clip's picture and a
+  stinger's colour and alpha, instead of a few fixed steps (a clip's picture: 10 % to 80 %).
+
 ### Added: clip end back to Preview
 
 - A clip player's `on_end` (`off`, `cut`, `auto`, `stinger`; `docs/clip-end.md`). When the player

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import logging
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -12,12 +14,14 @@ from pydantic import ValidationError
 
 from flowxer import __version__
 from flowxer.api.schemas import (
+    DME_CROP_MAX_PX,
     AudioConfig,
     AudioEssence,
     AudioStrip,
     AudioStripUpdate,
     ClipEnd,
     Dme,
+    DmeCrop,
     DmeKeyframe,
     DmeLoop,
     DmePreset,
@@ -89,6 +93,7 @@ from flowxer.engine.stinger import (
 )
 from flowxer.engine.tally import TallyService
 from flowxer.engine.tally_export import MeTally, TallyExport, TallySnapshot
+from flowxer.engine.visibility import KeyLayer, MeLayers, direct_visibility, visible_on_program
 from flowxer.engine.watchdog import ControlPlaneWatchdog
 from flowxer.library.models import LibraryItem, LibraryKind
 from flowxer.library.service import LibraryService
@@ -158,6 +163,108 @@ def _box_state(box: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+_CROP_SIDES = ("left", "right", "top", "bottom")
+
+
+def _even(px: float) -> int:
+    """The engine crops left and right on whole 4:2:2 sample pairs: the nearest even column."""
+    return 2 * math.floor(px / 2 + 0.5)
+
+
+def _engine_box(box: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+    """A box (or a part of one, or a keyframe) for the engine, whose crop is fractions of the
+    source: the API's pixels over the raster (left and right on even columns, so the engine's
+    float32 rounding lands on the same column as the GUI's geometry)."""
+    crop = box.get("crop")
+    if not isinstance(crop, dict):
+        return box
+    out = dict(crop)
+    for side in _CROP_SIDES:
+        if side in out:
+            out[side] = _even(out[side]) / width if side in ("left", "right") else out[side] / height
+    return {**box, "crop": out}
+
+
+def _box_from_engine_units(box: dict[str, Any], width: int, height: int) -> dict[str, Any]:
+    """The engine's box (crop in fractions, between keyframes not whole) with the crop in pixels."""
+    crop = box.get("crop")
+    if not isinstance(crop, dict):
+        return box
+    out = dict(crop)
+    for side in _CROP_SIDES:
+        if isinstance(out.get(side), (int, float)):
+            out[side] = round(out[side] * (width if side in ("left", "right") else height))
+    return {**box, "crop": out}
+
+
+def _crop_error(crop: DmeCrop, width: int, height: int) -> str | None:
+    """Why the engine would refuse the crop (left and right as it gets them: on even columns)."""
+    if _even(crop.left) + _even(crop.right) >= width or crop.top + crop.bottom >= height:
+        return (
+            f"the crop must leave a picture: left + right < {width} (each on an even column) and top + bottom < {height} "
+            "source pixels"
+        )
+    return None
+
+
+def repair_crops(data: Any, width: int, height: int) -> list[str]:
+    """A saved state's crops that the raster cannot take (no picture left, out of range) become no
+    crop on that axis; returns what it changed (for the log). Only on restore: an import refuses."""
+    fixed: list[str] = []
+
+    def walk(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "crop" and isinstance(value, dict):
+                    sides = {side: value.get(side, 0) for side in _CROP_SIDES}
+                    bad = [side for side, v in sides.items() if not isinstance(v, (int, float)) or v < 0 or v > DME_CROP_MAX_PX]
+                    pairs = {("left", "right"): width, ("top", "bottom"): height}
+                    for (a, b), size in pairs.items():
+                        values_ok = a not in bad and b not in bad
+                        whole = values_ok and (_even(sides[a]) + _even(sides[b]) if size == width else sides[a] + sides[b]) < size
+                        if not whole:
+                            fixed.append(f"{where}.crop {a}/{b} {sides[a]}/{sides[b]}")
+                            value[a] = 0
+                            value[b] = 0
+                else:
+                    walk(value, f"{where}.{key}" if where else str(key))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                walk(item, f"{where}[{index}]")
+
+    walk(data, "")
+    return fixed
+
+
+def _legacy_crop(crop: Any) -> bool:
+    """A crop saved before 2026-10-22: fractions of the source (a value between 0 and 1 that is
+    not whole; all zeros is the same in both)."""
+    return isinstance(crop, dict) and any(
+        isinstance(crop.get(side), float) and 0 < crop[side] < 1 for side in _CROP_SIDES
+    )
+
+
+def scale_crops(data: Any, sx: float, sy: float, *, legacy_only: bool | None) -> int:
+    """Every crop in a document (keyers, keyframes, snapshots: any dict under the key "crop") times
+    sx (left, right) and sy (top, bottom), rounded to whole pixels. `legacy_only` True: only crops
+    in fractions (_legacy_crop), to pixels of the raster sx × sy; False: only crops in pixels (from
+    one raster to another); None: all. Returns how many it changed."""
+    changed = 0
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key == "crop" and isinstance(value, dict) and (legacy_only is None or _legacy_crop(value) == legacy_only):
+                for side in _CROP_SIDES:
+                    if isinstance(value.get(side), (int, float)):
+                        value[side] = round(value[side] * (sx if side in ("left", "right") else sy))
+                changed += 1
+            else:
+                changed += scale_crops(value, sx, sy, legacy_only=legacy_only)
+    elif isinstance(data, list):
+        for item in data:
+            changed += scale_crops(item, sx, sy, legacy_only=legacy_only)
+    return changed
+
+
 # DME presets (docs/engine-p4.md §5): keyframe 0 off screen on the near side, keyframe 1 on.
 DME_PRESETS = [
     DmePresetInfo(name=DmePreset.corner_tl, title="Top left", keyers=1, description="1/3 size in the top left corner inside the 5 % action-safe margin, 4 px white border, soft shadow"),
@@ -170,7 +277,7 @@ DME_PRESETS = [
 ]
 # Keyframe 0 of a preset: this far beyond the raster edge (fractions), border and shadow included.
 _OFF = 0.05
-_NO_CROP = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
+_NO_CROP = {"left": 0, "right": 0, "top": 0, "bottom": 0}
 _PLAIN = {"soft": 0.0, "border": {"width": 0.0, "soft": 0.0, "opacity": 1.0}, "shadow": {"dx": 0.0, "dy": 0.0, "blur": 0.0, "opacity": 0.0}}
 
 
@@ -191,7 +298,8 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
         }
         return [(on, {**on, "x": -size / 2 - _OFF if left else 1.0 + size / 2 + _OFF})]
     if name == DmePreset.split:
-        crop = {"left": 0.25, "right": 0.25, "top": 0.0, "bottom": 0.0}
+        # A quarter of the source's width off each side (pixels).
+        crop = {"left": round(width / 4), "right": round(width / 4), "top": 0, "bottom": 0}
         return [
             ({"x": x, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN}, {"x": off, "y": 0.5, "size": 1.0, "crop": crop, **_PLAIN})
             for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
@@ -203,6 +311,10 @@ def _preset_boxes(name: DmePreset, width: int, height: int, current: dict[str, A
             for x, off in ((0.25, -0.25 - _OFF), (0.75, 1.25 + _OFF))
         ]
     return [({"x": 0.5, "y": 0.5, "size": 1.0, "crop": _NO_CROP}, _box_state(current))]
+
+
+# A mix's or a key fade's end is published this long after it (s), so it has ended for sure.
+TALLY_END_MARGIN_S = 0.05
 
 
 class MixerError(RuntimeError):
@@ -261,6 +373,12 @@ class VisionMixer:
         # Keyer id -> monotonic time until which a keyer that fades or flies off is still on air
         # (raw tally).
         self._key_until: dict[str, float] = {}
+        # A keyer fading in (Auto on, or tied to a mix): the monotonic time its fade ends. Until
+        # then it is not at full level (a full-raster pip covers nothing yet).
+        self._key_in: dict[str, float] = {}
+        # The receivers' republish timers (a mix's or a key's fade end), cancelled on stop.
+        self._tally_timers: set[threading.Timer] = set()
+        self._tally_timers_lock = threading.Lock()
         # Set by a Program start and by a stop: FLOWXER_PROGRAM_AUTOSTART stops trying.
         self._autostart_done = threading.Event()
         self.tally = TallyService()
@@ -530,6 +648,8 @@ class VisionMixer:
         format_changed = data["format_id"] != self.workspace.format_id
         if format_changed:
             fmt = format_by_id(data["format_id"])
+            # DME crops are source pixels: they keep their share of the picture in the new raster.
+            self._scale_crops(fmt.width / self.settings.width, fmt.height / self.settings.height)
             self.settings.width = fmt.width
             self.settings.height = fmt.height
             self.settings.frame_rate_num = fmt.frame_rate_num
@@ -547,6 +667,17 @@ class VisionMixer:
         self._publish_tally()
         self.refresh_library_bindings()
         return self.workspace
+
+    def _scale_crops(self, sx: float, sy: float) -> None:
+        """Every keyer's, keyframe's and snapshot's DME crop times sx, sy (a format change)."""
+        for keyer in self.keyers:
+            dump = {"dme": keyer.dme.model_dump(), "keyframes": [frame.model_dump() for frame in keyer.keyframes]}
+            if scale_crops(dump, sx, sy, legacy_only=None):
+                keyer.dme = Dme.model_validate(dump["dme"])
+                keyer.keyframes = [DmeKeyframe.model_validate(frame) for frame in dump["keyframes"]]
+        snapshots = self.snapshots.model_dump()
+        if scale_crops(snapshots, sx, sy, legacy_only=None):
+            self.snapshots = type(self.snapshots).model_validate(snapshots)
 
     @property
     def render_count(self) -> int:
@@ -647,7 +778,7 @@ class VisionMixer:
             )
         }
         if run.get("running") and keyer.stage == KeyerStage.upstream and isinstance(entry.get("dme"), dict):
-            update["dme"] = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(entry["dme"])))
+            update["dme"] = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(self._from_engine_box(entry["dme"]))))
         return keyer.model_copy(update=update)
 
     def _flies(self, keyer: Keyer) -> bool:
@@ -664,7 +795,15 @@ class VisionMixer:
         """The box where the engine has it after a command (its reply), unless a run moves it."""
         if not isinstance(reply, dict) or not isinstance(reply.get("dme"), dict) or (reply.get("run") or {}).get("running"):
             return
-        keyer.dme = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(reply["dme"])))
+        keyer.dme = Dme.model_validate(_merged(keyer.dme.model_dump(), _box_state(self._from_engine_box(reply["dme"]))))
+
+    def _from_engine_box(self, box: dict[str, Any]) -> dict[str, Any]:
+        return _box_from_engine_units(box, self.settings.width, self.settings.height)
+
+    def _check_crop(self, crop: DmeCrop) -> None:
+        error = _crop_error(crop, self.settings.width, self.settings.height)
+        if error:
+            raise MixerError(error)
 
     def _with_run(self, keyer: Keyer, reply: Any) -> Keyer:
         return self._live_keyer(keyer, reply)
@@ -700,6 +839,7 @@ class VisionMixer:
                 raise MixerError("pip and dme only on upstream keyers")
             if updated.mode == KeyMode.pip and isinstance(box_patch, dict) and box_patch.get("enabled") is False:
                 raise MixerError("a pip keyer is always a box (dme.enabled stays true)")
+            self._check_crop(updated.dme.crop)
             for name in key:
                 setattr(keyer, name, getattr(updated, name))
             # A pip is always a box (the engine does the same).
@@ -711,6 +851,7 @@ class VisionMixer:
         if enabled is not None:
             keyer.enabled = enabled
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if enabled else 0])
             self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}", {"on": enabled})
@@ -722,6 +863,7 @@ class VisionMixer:
         keyer = self.get_keyer(keyer_id)
         if keyer.stage != KeyerStage.upstream:
             raise MixerError("pip and dme only on upstream keyers")
+        self._check_crop(box.crop)
         keyer.dme = box.model_copy(deep=True)
         if keyer.mode == KeyMode.pip:
             keyer.dme.enabled = True
@@ -741,6 +883,8 @@ class VisionMixer:
             keyframes = [DmeKeyframe.model_validate(_merged(state, item)) for item in items]
         except ValidationError as exc:
             raise MixerError(f"invalid keyframe: {exc.errors()[0]['msg']}") from exc
+        for keyframe in keyframes:
+            self._check_crop(keyframe.crop)
         keyer.keyframes = keyframes
         self._box_from_engine(keyer, self._push_keyframes(keyer))
         return keyer
@@ -779,6 +923,7 @@ class VisionMixer:
         if isinstance(reply, dict) and reply.get("on") is True and not keyer.enabled:
             keyer.enabled = True
             self._key_until.pop(keyer.id, None)
+            self._key_in.pop(keyer.id, None)
             self._publish_tally()
         return self._with_run(keyer, reply)
 
@@ -830,9 +975,14 @@ class VisionMixer:
             span = sum(item.frames for item in keyer.keyframes[1:])
         if keyer.enabled:
             self._key_until.pop(keyer.id, None)
+            # Fading (or flying) in: at full level when it ends.
+            self._key_in[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_in[keyer.id])
         else:
+            self._key_in.pop(keyer.id, None)
             # The raw tally keeps it on air until the fade or the fly has ended.
             self._key_until[keyer.id] = time.monotonic() + span / self.settings.fps
+            self._tally_again_at(self._key_until[keyer.id])
         self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/auto", {"frames": frames})
         self._publish_tally()
         return keyer
@@ -846,13 +996,15 @@ class VisionMixer:
         if keyer.mode in (KeyMode.luma, KeyMode.pip):
             body["source"] = self._engine_source(keyer.source_id)
         if box is not None and keyer.stage == KeyerStage.upstream:
-            body["dme"] = box
+            body["dme"] = _engine_box(box, self.settings.width, self.settings.height)
         return self._engine_call("POST", f"/keyer/{self._keyer_number(keyer)}/settings", body, client=client)
 
     def _push_keyframes(self, keyer: Keyer, client: EngineClient | None = None) -> Any:
         if keyer.stage != KeyerStage.upstream:
             return None
-        body = {"keyframes": [item.model_dump(mode="json") for item in keyer.keyframes]}
+        body = {
+            "keyframes": [_engine_box(item.model_dump(mode="json"), self.settings.width, self.settings.height) for item in keyer.keyframes]
+        }
         return self._engine_call("PUT", f"/keyer/{self._keyer_number(keyer)}/keyframes", body, client=client)
 
     def apply_key_route(self, keyer_id: str, *, domain_id: str | None, flow_id: str | None, enabled: bool) -> None:
@@ -1567,6 +1719,10 @@ class VisionMixer:
             ],
             "FLOWXER_ENGINE_STINGER_PLAYERS": self._stinger_players(),
             "FLOWXER_ENGINE_PVW_OUTPUTS": self.settings.pvw_outputs,
+            "FLOWXER_ENGINE_PGM_PREVIEW": self.settings.preview_pgm,
+            "FLOWXER_ENGINE_PGM_PREVIEW_WIDTH": self.settings.preview_pgm_width,
+            "FLOWXER_ENGINE_PGM_PREVIEW_FPS": self.settings.preview_pgm_fps,
+            "FLOWXER_ENGINE_PGM_PREVIEW_KBPS": self.settings.preview_pgm_kbps,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN": output_domain,
             "FLOWXER_ENGINE_OUTPUT_DOMAIN_ID": self.settings.resolved_output_domain_id,
             "FLOWXER_ENGINE_OUTPUTS": [
@@ -1840,6 +1996,8 @@ class VisionMixer:
         self.state = MixerState.idle
         self.backend = "idle"
         self._mixes.clear()
+        self._key_in.clear()
+        self._cancel_tally_timers()
         self._publish_tally()
         return self.status()
 
@@ -1860,6 +2018,7 @@ class VisionMixer:
             self.library.stop()
         except Exception:
             log.exception("stopping the media library failed")
+        self._cancel_tally_timers()
         self.tally.close()
         if self.tally_export is not None:
             self.tally_export.close()
@@ -2031,10 +2190,15 @@ class VisionMixer:
             keyer.enabled = not keyer.enabled
             if self._flies(keyer):
                 keyer.dme = self._box_at(keyer, keyer.keyframes[-1 if keyer.enabled else 0])
+            self._key_in.pop(keyer.id, None)
             if keyer.enabled or frames <= 0:
                 self._key_until.pop(keyer.id, None)
+                if keyer.enabled and frames > 0:
+                    self._key_in[keyer.id] = now + frames / self.settings.fps
+                    self._tally_again_at(self._key_in[keyer.id])
             else:
                 self._key_until[keyer.id] = now + frames / self.settings.fps
+                self._tally_again_at(self._key_until[keyer.id])
 
     def _end_held_ties(self, panel: MixerPanel, frames: int = 0) -> None:
         """A T-bar transition that completes (now, or by an Auto over `frames`): its tied keyers
@@ -2148,6 +2312,7 @@ class VisionMixer:
             frames = frames or _frames(duration_ms or DEFAULT_MIX_MS, self.settings.fps)
             # Tally: both sources are on air (LH) for the whole mix, wipe or stinger.
             self._mixes[panel.id] = (outgoing, source_id, time.monotonic() + wait + frames / self.settings.fps)
+            self._tally_again_at(self._mixes[panel.id][2])
         else:
             frames = 0
             self._mixes.pop(panel.id, None)
@@ -2556,6 +2721,39 @@ class VisionMixer:
             log.warning("tally publish failed: %s", exc)
             return self.tally.status()
 
+    def _tally_again_at(self, at: float | None) -> None:
+        """The receivers' tally once more when a mix or a key's fade or fly ends (monotonic `at`):
+        what is visible changes then without an operator action."""
+        if at is None or not self.tally.receivers:
+            return
+        timer: threading.Timer
+
+        def fire() -> None:
+            with self._tally_timers_lock:
+                if timer not in self._tally_timers:
+                    return  # cancelled meanwhile
+                self._tally_timers.discard(timer)
+            self._publish_tally_quietly()
+
+        timer = threading.Timer(max(0.0, at - time.monotonic()) + TALLY_END_MARGIN_S, fire)
+        timer.daemon = True
+        with self._tally_timers_lock:
+            self._tally_timers.add(timer)
+        timer.start()
+
+    def _cancel_tally_timers(self) -> None:
+        """Stop, a reload, shutdown: no republish after them."""
+        with self._tally_timers_lock:
+            timers, self._tally_timers = self._tally_timers, set()
+        for timer in timers:
+            timer.cancel()
+
+    def _publish_tally_quietly(self) -> None:
+        try:
+            self._publish_tally()
+        except Exception:  # a timer thread must not die loudly
+            log.exception("tally publish after a mix or a key fade failed")
+
     def _export_tally(self) -> None:
         """FLOWXER_TALLY_TSL: wake the export thread, which takes the state and sends it."""
         if self.tally_export is not None:
@@ -2588,6 +2786,48 @@ class VisionMixer:
             inputs=tuple((item.id, item.label) for item in self.list_inputs()),
             mes=tuple(mes),
         )
+
+    def _me_layers(self, keyers: list[Keyer] | None = None) -> dict[str, MeLayers]:
+        """Each ME's background (Program, both sources of a running mix) and keyers as tally sees
+        them (engine/visibility.py); `keyers` as keyer_views() gives them (boxes where they are)."""
+        keyers = self.keyer_views() if keyers is None else keyers
+        now = time.monotonic()
+        out: dict[str, MeLayers] = {}
+        for panel in list(self.panels):
+            background = [panel.program_input_id] if panel.program_input_id else []
+            mix = self._mixes.get(panel.id)
+            if mix is not None and (mix[2] is None or now < mix[2]):
+                background += [source for source in mix[:2] if source and source not in background]
+            held = self._held_ties.get(panel.id, [])
+            layers = []
+            for keyer in keyers:
+                if keyer.panel_id != panel.id:
+                    continue
+                leaving = not keyer.enabled and now < self._key_until.get(keyer.id, 0.0)
+                boxed = keyer.stage == KeyerStage.upstream and (keyer.mode == KeyMode.pip or keyer.dme.enabled)
+                layers.append(
+                    KeyLayer(
+                        source_id=keyer.source_id,
+                        keys_source=keyer.mode in (KeyMode.luma, KeyMode.pip),
+                        pip=keyer.mode == KeyMode.pip,
+                        upstream=keyer.stage == KeyerStage.upstream,
+                        on_air=keyer.enabled or leaving or keyer.id in held,
+                        # Not while it fades in (the shared vectors' fade >= 1).
+                        full=keyer.enabled and keyer.id not in held and now >= self._key_in.get(keyer.id, 0.0),
+                        leaving=leaving,
+                        gain=keyer.gain,
+                        dme=keyer.dme if boxed else None,
+                    )
+                )
+            out[panel.id] = MeLayers(tuple(background), tuple(layers), self.settings.width, self.settings.height)
+        return out
+
+    def program_visibility(self, keyers: list[Keyer] | None = None) -> dict[str, list[str]]:
+        """Per ME what is visible on its Program through any path (engine/visibility.py): its
+        background unless a full-raster pip covers it, its visible keys' sources, and what the MEs
+        it shows have on their Programs, recursively."""
+        mes = self._me_layers(keyers)
+        return {panel.id: visible_on_program(panel.id, mes) for panel in list(self.panels)}
 
     def _key_tally(self, keyer: Keyer, on_air: bool) -> tuple[int, str, bool]:
         """A linear keyer's key input on the raw tally: INDEX 2000 + 100·n + k (upstream keyer k of
@@ -2777,6 +3017,7 @@ class VisionMixer:
             sources[f"stinger-{k}"] = {"peak_dbfs": entry.get("peak_dbfs", floor), "rms_dbfs": entry.get("rms_dbfs", floor)}
         engine_mes = (raw or {}).get("mes") or {}
         panels: dict[str, Any] = {}
+        layers = self._me_layers() if raw is None else {}
         pairs = (channels + 1) // 2
         for panel in self.rendered_panels():
             entry = engine_mes.get(str(self._panel_number(panel))) or {}
@@ -2787,7 +3028,8 @@ class VisionMixer:
                 measured = engine_strips.get(self._engine_strip(strip_id))
                 if measured is None:
                     setting = audio.strips.get(strip_id) or AudioStrip()
-                    on_air = kind != "stinger" and (not setting.afv or panel.program_input_id == strip_id)
+                    shown = direct_visibility(layers[panel.id]) if panel.id in layers else [panel.program_input_id]
+                    on_air = kind != "stinger" and (not setting.afv or strip_id in shown)
                     gain = setting.fader_db if on_air and not setting.mute and setting.fader_db > -90.0 else -90.0
                     measured = {"gain_db": gain, "heard": gain > -90.0}
                 strips[strip_id] = measured
@@ -3078,6 +3320,7 @@ class VisionMixer:
         """Restore an export_state() document (POST /config/import). The mixer must be stopped."""
         if self.state == MixerState.running:
             raise MixerError("stop the mixer before importing a configuration")
+        self._cancel_tally_timers()
         self._apply_state(data, checked=True)
         self._publish_tally()
         self.persist()
@@ -3129,9 +3372,35 @@ class VisionMixer:
         try:
             workspace = self._pinned(WorkspaceConfig(**dict(data.get("workspace") or {})))
             fmt = format_by_id(workspace.format_id)
+            data = copy.deepcopy(data)
+            # Crops in pixels of another format (a pinned FLOWXER_FORMAT, an import from another
+            # raster) keep their share of the picture. A missing or unknown saved format: as is.
+            saved_id = str((data.get("workspace") or {}).get("format_id") or "")
+            try:
+                saved = format_by_id(saved_id) if saved_id else None
+            except (KeyError, ValueError):
+                saved = None
+                log.warning("the saved format %r is unknown: DME crops are taken as pixels of %s", saved_id, fmt.id)
+            if saved is not None and (saved.width, saved.height) != (fmt.width, fmt.height):
+                scaled = scale_crops(data, fmt.width / saved.width, fmt.height / saved.height, legacy_only=False)
+                if scaled:
+                    log.info("scaled %d DME crops from %s to %s", scaled, saved.id, fmt.id)
+            # DME crops saved as fractions (before 2026-10-22) become pixels of the raster.
+            migrated = scale_crops(data, fmt.width, fmt.height, legacy_only=True)
+            if migrated:
+                log.info("converted %d DME crops from fractions to pixels of %dx%d", migrated, fmt.width, fmt.height)
+            if not checked:
+                # A restore keeps the rest of the state: a crop the raster cannot take goes.
+                for fixed in repair_crops(data, fmt.width, fmt.height):
+                    log.warning("the saved state's DME %s leaves no picture on %s: no crop there", fixed, fmt.id)
             inputs = [LogicalInput(**item) for item in data.get("inputs") or []]
             panels = [MixerPanel(**item) for item in data.get("panels") or []]
             keyers = [Keyer(**item) for item in data.get("keyers") or []]
+            for keyer in keyers:
+                for crop in [keyer.dme.crop, *(frame.crop for frame in keyer.keyframes)]:
+                    error = _crop_error(crop, fmt.width, fmt.height)
+                    if error:
+                        raise ValueError(f"{keyer.id}: {error}")
             slots = [StingerSlot(**item) for item in data.get("stinger_slots") or []]
             tally = [TallyReceiver(**item) for item in data.get("tally_receivers") or []]
             routes = list(data.get("nmos_receivers") or [])

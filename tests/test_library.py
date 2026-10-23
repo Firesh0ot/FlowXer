@@ -46,6 +46,7 @@ from flowxer.library.ffmpeg import (
     build_video_filter,
     conversion_threads,
     default_runner,
+    progress_seconds,
 )
 from flowxer.library.models import ConversionInfo, ConversionStatus, LibraryItem, LibraryKind
 from flowxer.library.sequence import safe_extract_tga_zip, validate_sequence
@@ -534,6 +535,73 @@ def test_default_runner_cancel_kills_the_process():
     result = default_runner([sys.executable, "-c", "import time; time.sleep(30)"], cancel=cancel)
     assert result.cancelled
     assert time.monotonic() - started < 10
+
+
+def test_progress_seconds_reads_ffmpeg_progress_lines():
+    assert progress_seconds("out_time_us=1500000\n") == 1.5
+    assert progress_seconds("out_time_ms=2000000") == 2.0  # microseconds too
+    assert progress_seconds("out_time_us=-5") == 0.0
+    assert progress_seconds("out_time_us=N/A") is None
+    assert progress_seconds("frame=12") is None
+
+
+def test_default_runner_reports_progress_while_it_runs():
+    script = (
+        "import sys, time\n"
+        "for t in (1, 2, 3):\n"
+        "    print(f'frame={t}\\nout_time_us={t * 1000000}\\nprogress=continue', flush=True)\n"
+        "    time.sleep(0.05)\n"
+        "sys.stderr.write('done')\n"
+    )
+    seen: list[float] = []
+    result = default_runner([sys.executable, "-c", script], timeout=30, progress=seen.append)
+    assert result.code == 0
+    assert seen == [1.0, 2.0, 3.0]
+    assert result.stderr == "done"
+
+
+def test_default_runner_with_progress_still_cancels():
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    result = default_runner([sys.executable, "-c", "import time; time.sleep(30)"], cancel=cancel, progress=lambda s: None)
+    assert result.cancelled and result.code == -9
+    assert time.monotonic() - started < 10
+
+
+def test_ffmpeg_run_asks_for_progress_only_from_runners_that_take_it():
+    plain: list[list[str]] = []
+    FFmpeg(runner=lambda cmd, timeout=None, cancel=None: plain.append(list(cmd)) or RunResult(code=0)).run(
+        ["ffmpeg", "-i", "x"], progress=lambda s: None
+    )
+    assert plain == [["ffmpeg", "-i", "x"]]
+
+    seen: list[float] = []
+
+    def runner(cmd, timeout=None, cancel=None, progress=None):
+        assert cmd[:3] == ["ffmpeg", "-progress", "pipe:1"]
+        progress(4.0)
+        return RunResult(code=0)
+
+    FFmpeg(runner=runner).run(["ffmpeg", "-i", "x"], progress=seen.append)
+    assert seen == [4.0]
+
+
+def test_conversion_progress_maps_ffmpeg_time_onto_the_job(tmp_path: Path):
+    from flowxer.library.convert import ConversionQueue
+    from flowxer.library.models import ConvertJob
+
+    emitted: list[float] = []
+    queue = ConversionQueue.__new__(ConversionQueue)
+    queue.on_update = lambda job: emitted.append(job.progress)
+    job = ConvertJob(id="j", item_id="i", format_id="1080p50")
+    job.progress = 0.1
+    report = queue._progress(job, 0.1, 0.8, 10.0)
+    for seconds in (0.0, 0.05, 5.0, 10.0, 12.0):
+        report(seconds)
+    # 0 s and 0.05 s (+0.35 %) are below the 1 % step; 12 s is past the end.
+    assert emitted == [0.45, 0.8]
+    assert queue._progress(job, 0.1, 0.8, 0.0) is None
 
 
 # ── finding 1: restart / config import keep library inputs and slots ─────────

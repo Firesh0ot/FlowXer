@@ -240,6 +240,17 @@ def widgets(mixer: VisionMixer = Depends(get_mixer)) -> list[dict]:
             "min_size": {"w": 240, "h": 120},
             "version": __version__,
         },
+        {
+            "id": "multiview",
+            "title": "FlowXer multiview",
+            "params": {
+                "type": "object",
+                "properties": {"me": {**me, "title": "Tally of ME", "default": 1}, "pvw": {"type": "boolean", "default": False, "title": "Previews too"}},
+                "required": [],
+            },
+            "min_size": {"w": 480, "h": 270},
+            "version": __version__,
+        },
     ]
 
 
@@ -621,6 +632,7 @@ def player_command(
 )
 def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
     mixer_status = mixer.status()
+    keyers = mixer.keyer_views()
     return ConsoleState(
         workspace=mixer.workspace,
         formats=[
@@ -635,7 +647,8 @@ def console(mixer: VisionMixer = Depends(get_mixer)) -> ConsoleState:
         ],
         inputs=mixer.list_inputs(),
         panels=mixer.panels,
-        keyers=mixer.keyer_views(),
+        keyers=keyers,
+        on_air=mixer.program_visibility(keyers),
         stinger_slots=mixer.stinger_slots,
         mixer=mixer_status,
         resources=ResourceInfo.model_validate(collect_resources(mixer)),
