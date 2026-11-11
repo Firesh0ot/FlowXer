@@ -478,7 +478,7 @@ tally format.
 
 ## Measurements (P1a, lab, 2026-10-10)
 
-Lab host iptv-web-lab-1: NVIDIA A16 GPU 0 (one GA107 of the board, PCIe Gen4 **x4** link),
+Lab host: NVIDIA A16 GPU 0 (one GA107 of the board, PCIe Gen4 **x4** link),
 driver 595.84, 2 × Xeon Gold 6136 (48 threads). Image `fxeng:p1` (318 MB). 1080p50, L = 2,
 4 MEs, 8 inputs: test player Out 1–4, replay PGM and PVW, a lab pattern writer, the browser
 source (v210a, fill only). Mosaic on (no viewers yet). Numbers from `/status` (CUDA events,
@@ -667,7 +667,7 @@ grain and counted them per input.
 
 ## P2 M2: clip players and DSK (lab, 2026-10-11)
 
-Lab host iptv-web-lab-1: A16 GPU 0, driver 595.84, Xeon Gold 6136; 1080p50.
+Lab host: A16 GPU 0, driver 595.84, Xeon Gold 6136; 1080p50.
 
 ### Clip mezzanine
 

@@ -1,4 +1,4 @@
-# FlowXer on an MXL host (hostNetwork). Edit nodeSelector, registry URL, and IPs
+# FlowXer on an MXL host (hostNetwork). Edit nodeSelector, toleration, registry URL, and IPs
 # before apply. Mixer binds loopback :9610; GUI :9620; Node API :3252. The mixer's media
 # engine needs an NVIDIA GPU (nvidia runtime class, one GPU slot) and publishes the preview
 # mosaic with its own MediaMTX (WHEP 8989, HLS 8988, ICE 8289) unless PREVIEW_PUBLISH_URL
@@ -77,7 +77,7 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: REPLACE_WITH_MXL_HOST
       tolerations:
-        - key: mxl.srf.ch/media
+        - key: mxl.example.com/media
           operator: Equal
           value: "true"
           effect: NoSchedule

@@ -1,5 +1,5 @@
 # FlowXer on the pod network with the MXL platform's standard env names
-# (mxl-poc-platform media function contract). Edit nodeSelector, registry
+# (mxl-poc-platform media function contract). Edit nodeSelector, toleration, registry
 # address, seed and tags before apply.
 #
 # The mixer listens on 0.0.0.0:9610 inside the pod (the API token guards it;
@@ -80,7 +80,7 @@ spec:
       nodeSelector:
         kubernetes.io/hostname: REPLACE_WITH_MXL_HOST
       tolerations:
-        - key: mxl.srf.ch/media
+        - key: mxl.example.com/media
           operator: Equal
           value: "true"
           effect: NoSchedule

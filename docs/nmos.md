@@ -109,7 +109,7 @@ They are one control plane:
 ## Registry
 
 Set `NMOS_REGISTRY_ADDRESS` and `NMOS_REGISTRY_PORT`, or the full URL in
-`FLOWXER_NMOS_REGISTRY_URL` (for example `http://10.0.0.5:3210`). FlowXer POSTs
+`FLOWXER_NMOS_REGISTRY_URL` (for example `http://192.0.2.5:3210`). FlowXer POSTs
 Node, Device, Source, Flow, Sender, Receiver to the Registration API once and
 then only heartbeats every 5 s. It registers again when resources change (an
 input added, an activation) or when the registry lost the node (heartbeat 404
