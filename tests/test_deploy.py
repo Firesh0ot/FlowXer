@@ -9,7 +9,7 @@ def test_kubernetes_manifest_is_host_network_non_root() -> None:
     assert "dnsPolicy: ClusterFirstWithHostNet" in text
     assert "runAsUser: 1000" in text
     assert "runAsNonRoot: true" in text
-    assert "mxl.srf.ch/media" in text
+    assert "mxl.example.com/media" in text
     assert "prometheus.io/scrape" in text
     assert "/livez" in text
     assert "/readyz" in text
