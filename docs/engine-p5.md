@@ -802,7 +802,7 @@ true peak metered (9); one stinger strip per ME (10); one collapsible AUDIO stri
 
 ## Appendix: lab measurements (2026-10-12)
 
-**Setup:** lab host iptv-web-lab-1, 2 × Xeon Gold 6136 (Skylake-SP, 3.0 GHz, 48 threads), g++
+**Setup:** lab host, 2 × Xeon Gold 6136 (Skylake-SP, 3.0 GHz, 48 threads), g++
 13.3. One thread pinned with `taskset` to CPU 46; the host ran other lab work at the same time
 (load about 4 of 48 threads). 100 warm-up grains, then 3000 grains; ms per grain as average, 99th
 percentile and maximum. The source, `fxp5-bench.cpp`, is on the lab host in `~/mxl-lab/fxp5/`,

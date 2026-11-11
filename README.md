@@ -4,6 +4,8 @@ DMF **Vision Mixer** microservice for the [EBU Dynamic Media Facility](https://t
 
 FlowXer is one of the media functions listed in [mxl-stack](https://github.com/LeeO86/mxl-stack), a collection of open-source MXL media functions with Docker Compose and Kubernetes examples.
 
+![FlowXer vision mixer web UI: preview, program, sources and transition panel](docs/images/web-ui.png)
+
 The mixer is controlled over HTTP. OpenAPI lives at `/docs` on the **GUI origin** (port **9620**). Media stays **uncompressed** on the MXL domain:
 
 | Essence | MXL media type |

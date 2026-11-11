@@ -774,7 +774,7 @@ Then the test platform, with the user's OK.
 
 ## Appendix: lab measurements (2026-10-11)
 
-**Setup:** lab host iptv-web-lab-1, NVIDIA A16 GPU 0 (GA107, 10 SMs, PCIe Gen4 x4), driver
+**Setup:** lab host, NVIDIA A16 GPU 0 (GA107, 10 SMs, PCIe Gen4 x4), driver
 595.99.02, 2 × Xeon Gold 6136. The prototype sources and scripts are on the lab host in
 `~/mxl-lab/fxp3/` (`fxp3-bench.cu`, `cuvidcaps2.c`, `fxp3-codec.sh`, `fxp3-decode*.sh`), not in
 this PR. The kernels become engine code in M1–M3.

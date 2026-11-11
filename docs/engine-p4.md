@@ -695,7 +695,7 @@ with the user's OK. One PR into `dev`, growing per milestone, as #86 and #89 did
 
 ## Appendix: lab measurements (2026-10-12)
 
-**Setup:** lab host iptv-web-lab-1, NVIDIA A16 GPU 3 (GA107, 10 SMs), CUDA 12.8 for sm_86 with
+**Setup:** lab host, NVIDIA A16 GPU 3 (GA107, 10 SMs), CUDA 12.8 for sm_86 with
 `-fmad=false -Xcompiler -ffp-contract=off`, in the `fxeng:deps` image. The prototype
 `fxp4-bench.cu` is on the lab host in `~/mxl-lab/fxp4/`, not in this PR. It becomes engine code
 in M1.
