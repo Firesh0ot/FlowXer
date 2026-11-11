@@ -633,7 +633,7 @@ counts 1.5 more for its unpack.
 
 ## 10. Milestones
 
-Each milestone is tested on the lab before the next one starts. Small and the release follow only
+Each milestone is tested on the lab before the next one starts. The test platform and the release follow only
 with the user's OK. One PR into `dev`, growing per milestone, as #86 and #89 did.
 
 | Milestone | Builds | Lab test |
@@ -641,7 +641,7 @@ with the user's OK. One PR into `dev`, growing per milestone, as #86 and #89 did
 | **M1: the box** | `core/dme.hpp` (geometry, weights, edges, shadow; one code path for the CPU and the GPU); the weight and resample kernels; the `box` layer in the fused compose; the `pip` mode and `dme` on linear and luma keyers; engine API, control plane API, state and migration; the GUI DME fields. | Bit-exact against the CPU reference for each mode, crop, sub-pixel position, border, soft, shadow, chroma siting; the M1 gate on the cost; PVW clean; tally of pip sources; re-entry with a box on the higher ME. |
 | **M2: keyframes and presets** | Keyframes, ease, runs, loop, stop; fly on the keyer's Auto; presets; the box editor on the mosaic and the keyframe list; the `dme` widget. | Each grain's state equals the reference interpolation (grain-exact start and end, skipped grains); a 25-frame fly is smooth (no whole-pixel steps); presets. |
 | **M3: ties and frame grab** | Keyer ties on the ME's Auto (fade and fly keys, stinger cut); the grab in the engine and the library, `player`, the GUI buttons. | Tied fly in grain step with the background transition; a grab of each source type equals the grain on MXL bit for bit; grab to clip player as a frame memory on air; no skipped grain during grabs. |
-| **M4: budget, soak, release readiness** | Metrics (`dme_ms`, grabs); docs (README, engine/README, CHANGELOG); the platform note. | The worst case with boxes in the engine (render, download, memory); a 2 h soak with flies, ties and grabs every few seconds. Then small, with the user's OK. |
+| **M4: budget, soak, release readiness** | Metrics (`dme_ms`, grabs); docs (README, engine/README, CHANGELOG); the platform note. | The worst case with boxes in the engine (render, download, memory); a 2 h soak with flies, ties and grabs every few seconds. Then the test platform, with the user's OK. |
 
 ## 11. Test plan
 

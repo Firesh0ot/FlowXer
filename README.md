@@ -2,6 +2,8 @@
 
 DMF **Vision Mixer** microservice for the [EBU Dynamic Media Facility](https://tech.ebu.ch/dmf/ra) Media eXchange Layer ([dmf-mxl/mxl](https://github.com/dmf-mxl/mxl)).
 
+FlowXer is one of the media functions listed in [mxl-stack](https://github.com/LeeO86/mxl-stack), a collection of open-source MXL media functions with Docker Compose and Kubernetes examples.
+
 The mixer is controlled over HTTP. OpenAPI lives at `/docs` on the **GUI origin** (port **9620**). Media stays **uncompressed** on the MXL domain:
 
 | Essence | MXL media type |
@@ -181,7 +183,7 @@ curl -X POST http://localhost:9620/api/v1/keyers/dsk-1/auto
 
 # TSL 5.0 tally/UMD to Riedel HI (same shape for Companion, VSM, BFE)
 curl -X PUT http://localhost:9620/api/v1/tally/receivers -H 'content-type: application/json' \
-  -d '{"receivers":[{"id":"hi-1","kind":"hi","label":"Riedel HI","host":"10.0.0.40","port":8900,"transport":"udp","enabled":true,"screen":0,"index_offset":0}]}'
+  -d '{"receivers":[{"id":"hi-1","kind":"hi","label":"Riedel HI","host":"192.0.2.40","port":8900,"transport":"udp","enabled":true,"screen":0,"index_offset":0}]}'
 ```
 
 ## Docker

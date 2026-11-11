@@ -685,7 +685,7 @@ Against the estimate of this section:
 
 ## 11. Milestones
 
-Each milestone is tested on the lab (A16 GPU 0) before the next one starts. Small and the
+Each milestone is tested on the lab (A16 GPU 0) before the next one starts. The test platform and the
 release follow only with the user's OK. One PR into `dev`, growing per milestone, as #86 did.
 
 | Milestone | Builds | Lab test |
@@ -693,7 +693,7 @@ release follow only with the user's OK. One PR into `dev`, growing per milestone
 | **M1: transitions and wipes** | The wipe model and patterns: CPU reference, fused compose kernel (`-fmad=false`), self-test. The transition type per ME (mix, wipe), Auto, take with a type, reverse and flip-flop, the T-bar if wanted, AFV with t, tally. The control plane API. The GUI transition section with the pattern picker, and the `bus` widget's selector. | Every code on MXL output bit-exact against the CPU reference of the input grains; exact end points; the audio crossfade; re-entry with a wipe on the higher ME; GPU ms. |
 | **M2: keyers** | Upstream keyers and DSKs per ME (linear, luma) as layers of the fused kernel. Key inputs allocated on first route, one reader per flow. NMOS receivers, environment and values, tally for keys. The P2 DSK 1 mapping and state migration. The GUI keyer and DSK panels. | Key maths exact (0 codes) for each layer on each ME; the order (USK < stinger < DSK) on known patterns; PVW clean; receivers and caps in the registry; IS-05 routing; tally INDEX; upgrade from a P2 state with `DSK 1 Key` routed. |
 | **M3: stingers** | Library import (TGA, PNG, video with alpha, WAV) into the colour + lossless alpha + sound mezzanine. Stinger players: cue, overlay, cut point, sound into PGM, AFV at the cut. The control plane (slots, auto-stinger, armed Wipe, type stinger). The GUI library. | Frame timing and cut point to the grain; sound to the sample; exact alpha; decoder memory; NVDEC load; cue on demand; import time on air. |
-| **M4: budget, soak, release readiness** | Metrics; docs (README, engine/README, CHANGELOG); the platform note. | The worst case of [§10](#10-gpu-budget) measured in the engine (render, download, upload, memory); a 2 h soak with transitions, keys and stingers every few seconds. Then small, with the user's OK. |
+| **M4: budget, soak, release readiness** | Metrics; docs (README, engine/README, CHANGELOG); the platform note. | The worst case of [§10](#10-gpu-budget) measured in the engine (render, download, upload, memory); a 2 h soak with transitions, keys and stingers every few seconds. Then the test platform, with the user's OK. |
 
 ## 12. Test plan
 
@@ -746,7 +746,7 @@ release follow only with the user's OK. One PR into `dev`, growing per milestone
   - click *f* is at the samples of grain *s + f*.
 - **Performance and soak:** the worst-case matrix, a 2 h soak, and an upgrade from P2.
 
-Then small, with the user's OK.
+Then the test platform, with the user's OK.
 
 ## 13. Open questions (for the user)
 

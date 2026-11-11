@@ -280,7 +280,7 @@ T(k) is the start of grain *k* on the TAI clock, and d is the input's delay.
   - The recommended latency (`recommended_latency_grains`) counts a delayed input's audio
     arrival lag minus its delay.
   - It counts an input's audio only while some ME hears it (on air, in a transition, AFV off and
-    not muted): a source's bursty audio that no PGM reads (on small a browser source, 533 ms, not
+    not muted): a source's bursty audio that no PGM reads (on the test platform a browser source, 533 ms, not
     on air) does not raise it. Video and key flows count as before.
 - **Range:** 0 to `FLOWXER_AUDIO_MAX_DELAY_MS` (default 1000 ms, at most 5000), in whole samples
   (1/48 ms). The GUI steps by 1 ms and by 1 frame.
@@ -699,7 +699,7 @@ and the domains at the end):
 
 ## 12. Milestones
 
-Each milestone is tested on the lab before the next one starts. Small and the release follow only
+Each milestone is tested on the lab before the next one starts. The test platform and the release follow only
 with the user's OK. One PR into `dev`, growing per milestone, as #86, #89 and #91 did.
 
 | Milestone | Builds | Lab test |
@@ -707,7 +707,7 @@ with the user's OK. One PR into `dev`, growing per milestone, as #86, #89 and #9
 | **M1: the mix** | `core/audiomix` (strips, gains and ramps, AFV weights and the Cut crossfade, delay-line index maths, channel maps). The `fx-audio` thread; delay lines, with every routed input read each grain. The engine API and `/status`. The control plane's model, API, saved state, and the push after an engine start. | The defaults reproduce P4's PGM audio bit for bit; gains and ramps exact to the sample; the delay to the sample (`bin/mxl-delay`); AFV off, re-entry, the stinger's level, FTB; changes without clicks; no extra skipped or late grain. |
 | **M2: meters** | Peak, RMS, true peak, loudness; the engine's and the control plane's `/audio/meters`; the metrics. | EBU Tech 3341 signals within ±0.1 LU; true peak within +0.2 / −0.4 dB; peaks and RMS against an offline reference of the same MXL samples; the cost at 2 and 16 channels. |
 | **M3: GUI and widget** | The AUDIO strip, the ⚙ Audio section (delay, map), the `audio` widget, the docs. | The GUI on the lab (Edge over DevTools): faders, MUTE, AFV, meters at 10 Hz; the widget in a frame. |
-| **M4: budget, soak, release readiness** | The dashboard's audio row; README, engine/README, CHANGELOG; the platform note. | The CPU in the running engine (4 MEs, 2 and 16 channels, the worst case); a 2 h soak with audio changes every few seconds next to P3's and P4's transitions, keys and boxes. Then small, with the user's OK. |
+| **M4: budget, soak, release readiness** | The dashboard's audio row; README, engine/README, CHANGELOG; the platform note. | The CPU in the running engine (4 MEs, 2 and 16 channels, the worst case); a 2 h soak with audio changes every few seconds next to P3's and P4's transitions, keys and boxes. Then the test platform, with the user's OK. |
 
 ## 13. Test plan
 
